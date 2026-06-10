@@ -1,0 +1,66 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: linux }
+          - { os: macos-latest,   label: macos }
+          - { os: windows-latest, label: msvc }
+          - { os: windows-latest, label: clang-cl, toolset: "-T ClangCL" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build ${{ matrix.toolset }} -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release
+
+      # ctest runs the default suite: regexlib_test, regexlib_std_compat_test,
+      # regexlib_scan_diff, regexlib_corpus, regexlib_fuzz.
+      # The benchmark (RE2/PCRE2/rure/cargo) is opt-in (BUILD_BENCH=OFF) and excluded.
+      # -C Release selects the config on multi-config generators (Visual Studio);
+      # it is harmless on single-config Makefile/Ninja builds.
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  lint-docs:
+    name: docs-identifier-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Backtick identifiers in docs/*.md and README.md must still exist in
+      # regexlib.h / test/*.cc — catches doc rot from renames.
+      - name: Check doc identifiers
+        run: python3 tools/check_doc_identifiers.py
+
+  sanitizers:
+    name: linux-asan-ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirrors the justfile `test-asan` recipe: RelWithDebInfo keeps the
+      # sanitizers fully instrumenting while running optimized code.
+      - name: Configure (ASan + UBSan)
+        run: >
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Build
+        run: cmake --build build-asan
+
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure

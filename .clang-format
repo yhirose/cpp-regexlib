@@ -1,0 +1,10 @@
+# Based on the cpp-httplib / cpp-peglib house style (LLVM + short-construct
+# allowances), plus SeparateDefinitionBlocks so a blank line separates adjacent
+# function/class/enum definitions for readability. The generated UCD table block
+# in regexlib.h is wrapped in `// clang-format off` / `on` and left untouched.
+BasedOnStyle: LLVM
+AllowShortBlocksOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: true
+Cpp11BracedListStyle: true
+SeparateDefinitionBlocks: Always

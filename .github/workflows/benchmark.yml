@@ -1,0 +1,59 @@
+name: Benchmark
+
+# Separate from CI so the correctness checks (build/test/sanitizers) report green
+# without waiting on this multi-minute, informational job, and so its trigger and
+# cancellation can evolve independently.
+on: [push, pull_request]
+
+# Supersede an in-flight benchmark when new commits land on the same ref; the
+# correctness CI is unaffected (it lives in its own workflow / concurrency group).
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Comparison engines: RE2 (pkg-config `re2`) and PCRE2 (`libpcre2-8`) from
+      # apt; rure (the Rust regex C API) is fetched from crates.io and built via
+      # cargo, which is preinstalled on GitHub's ubuntu runners.
+      - name: Install comparison engines
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libre2-dev libpcre2-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON
+
+      - name: Build benchmark
+        run: cmake --build build --target regexlib_bench
+
+      # Two runs: `--md` redirects the human-readable log to /dev/null and emits
+      # only the markdown tables on stdout, so the full log needs its own run
+      # without the flag. (The job is informational; a second pass is cheap.)
+      - name: Run benchmark (markdown tables)
+        run: ./build/test/regexlib_bench 10 --md > bench.md
+      - name: Run benchmark (full log)
+        run: ./build/test/regexlib_bench 10 | tee bench.txt
+
+      # Render on the run's Summary page: native markdown tables (throughput,
+      # real-world workload groups — log parsing, templates/markup, per-call
+      # latency for cpp-httplib / lexer / data validation, ReDoS immunity — and
+      # compile time) followed by the full log in a collapsible code block.
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          {
+            echo "# Benchmark"
+            echo
+            if [ -f bench.md ]; then cat bench.md; else echo "_(markdown tables not produced)_"; fi
+            echo
+            echo "<details><summary>Full benchmark log (Sherlock, real-world workload groups, ReDoS immunity, compile, program size)</summary>"
+            echo
+            echo '```text'
+            [ -f bench.txt ] && cat bench.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

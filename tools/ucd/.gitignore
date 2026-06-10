@@ -1,0 +1,7 @@
+# The raw UCD text inputs are large and reproducible; do not commit them.
+# Only VERSION + SHA256SUMS are tracked (they pin the inputs); fetch with
+#   python3 tools/fetch_ucd.py
+*.txt
+auxiliary/
+emoji/
+!.gitignore
