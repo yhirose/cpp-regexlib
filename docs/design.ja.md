@@ -99,7 +99,7 @@ struct Segmented {
 
 `segment()` には **ASCII 高速パス**（全バイト `< 0x80` → 各バイトが自身のクラスタ、
 `byte_begin[i] == i`、デコード/分割なし）と**一般パス**（コードポイントへデコードし
-各バイトオフセットを保持、`unicode::grapheme_length` でクラスタにまとめる）があり
+各バイトオフセットを保持、`reg::unicode::grapheme_length` でクラスタにまとめる）があり
 ます。`segment_cp()` は UnicodeScalar 用：1 コードポイント1エントリ——素の UTF-8
 デコードで**書記素分割ではない**。Pike VM はどちらの `Segmented` でも変更なく走り
 ます。

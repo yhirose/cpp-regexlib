@@ -104,7 +104,7 @@ struct Segmented {
 `segment()` has an **ASCII fast path** (every byte `< 0x80` → each byte is its
 own cluster, `byte_begin[i] == i`, no decode/break work) and a **general path**
 (decode to code points remembering byte offsets, then group via
-`unicode::grapheme_length`). `segment_cp()` is the UnicodeScalar counterpart:
+`reg::unicode::grapheme_length`). `segment_cp()` is the UnicodeScalar counterpart:
 one entry per code point — a plain UTF-8 decode, **not** grapheme breaking. The
 Pike VM runs over either `Segmented` unchanged.
 

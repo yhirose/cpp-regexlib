@@ -58,7 +58,7 @@ The generated block lives between `// [BEGIN GENERATED UCD BLOCK]` and
   simple case folding). Code points that have only a full fold (ß, İ, …) have no
   simple fold and return the code point unchanged.
 * **Official UAX #29 test** — `ucd/auxiliary/GraphemeBreakTest.txt` passes 766/766
-  through `unicode::is_grapheme_boundary`.
+  through `reg::unicode::is_grapheme_boundary`.
 * The regexlib test/fuzz/corpus suites pass with the generated tables.
 
 ---

@@ -47,6 +47,11 @@
 // then review the UAX #29 rule skeleton (is_grapheme_boundary) for rule
 // changes.
 
+// Nested inside `reg` (rather than a top-level `unicode` namespace) so it does
+// not collide with other libraries that define their own top-level `unicode`
+// namespace — notably cpp-unicodelib. Refer to it as `reg::unicode` from
+// outside the library.
+namespace reg {
 namespace unicode {
 
 // General_Category — the set of categories is fixed by Unicode and never
@@ -1389,6 +1394,7 @@ inline size_t decode_codepoint(const char *s8, size_t l, char32_t &out) {
 } // namespace utf8
 
 } // namespace unicode
+} // namespace reg
 
 #if defined(_MSC_VER)
 #include <intrin.h> // _BitScanForward / _BitScanForward64 (portable ctz)
