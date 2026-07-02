@@ -917,6 +917,157 @@ void test_grapheme_aware() {
   CHECK(!Regex("[a-z]").test(family));
 }
 
+// Regex::find_at(text, pos) is one stateless step of find_iter(): stepping it
+// from 0 must visit exactly the same matches, and next_pos must follow the
+// engine's empty-match advance rule (one grapheme in Grapheme mode / one code
+// point in CodePoint mode) so an external stepper always progresses and never
+// resumes mid-cluster.
+void test_find_at() {
+  // Parity harness: step find_at from 0 and compare the visited (begin, end)
+  // spans against find_iter over the same subject.
+  auto same_as_iter = [](const Regex &re, std::string_view s) {
+    std::vector<std::pair<size_t, size_t>> want;
+    for (auto m : re.find_iter(s)) want.emplace_back(m.begin(), m.end());
+    std::vector<std::pair<size_t, size_t>> got;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+      auto r = re.find_at(s, pos);
+      if (!r.m.matched()) {
+        if (r.next_pos != s.size() + 1) return false; // done sentinel
+        break;
+      }
+      got.emplace_back(r.m.begin(), r.m.end());
+      if (r.next_pos <= pos) return false; // a step must always progress
+      pos = r.next_pos;
+    }
+    return got == want;
+  };
+
+  // Non-empty match: next_pos == match end.
+  {
+    Regex re("b+");
+    auto r = re.find_at("abba", 0);
+    CHECK(r.m.matched() && r.m.begin() == 1 && r.m.end() == 3);
+    CHECK(r.m.str() == "bb");
+    CHECK(r.next_pos == 3);
+    r = re.find_at("abba", 3);
+    CHECK(!r.m.matched());
+    CHECK(r.next_pos == 5); // size() + 1: no scan positions remain
+  }
+
+  // pos at / past end, empty text.
+  {
+    Regex star("a*");
+    auto r = star.find_at("xy", 2); // empty match at end is still found
+    CHECK(r.m.matched() && r.m.begin() == 2 && r.m.end() == 2);
+    CHECK(r.next_pos == 3);
+    CHECK(!star.find_at("xy", 3).m.matched());
+    CHECK(star.find_at("xy", 3).next_pos == 3);
+    r = star.find_at("", 0);
+    CHECK(r.m.matched() && r.m.begin() == 0 && r.m.end() == 0);
+    CHECK(r.next_pos == 1);
+    CHECK(!Regex("a").find_at("", 0).m.matched());
+  }
+
+  // Empty matches over a combining sequence: "xéy" (é as e+◌́) has cluster
+  // boundaries 0,1,4,5 — the resume never lands inside e+◌́.
+  {
+    Regex star("q*");
+    std::string s = "xe\xCC\x81y";
+    size_t pos = 0;
+    std::vector<size_t> starts;
+    while (pos <= s.size()) {
+      auto r = star.find_at(s, pos);
+      if (!r.m.matched()) break;
+      starts.push_back(r.m.begin());
+      pos = r.next_pos;
+    }
+    CHECK((starts == std::vector<size_t>{0, 1, 4, 5}));
+  }
+
+  // CR-LF fuses: "a\r\nb" scan positions are 0,1,3,4 — an empty match before
+  // \r resumes after \n, never between them.
+  {
+    Regex star("q*");
+    std::string s = "a\r\nb";
+    auto r = star.find_at(s, 1);
+    CHECK(r.m.matched() && r.m.begin() == 1 && r.m.end() == 1);
+    CHECK(r.next_pos == 3);
+  }
+
+  // Grapheme vs CodePoint divergence on the same subject: e+◌́ is one step in
+  // Grapheme mode, two in CodePoint mode.
+  {
+    std::string s = "e\xCC\x81";
+    auto egc = make_egc("q*").find_at(s, 0);
+    CHECK(egc.m.matched() && egc.next_pos == 3);
+    auto us = make_us("q*").find_at(s, 0);
+    CHECK(us.m.matched() && us.next_pos == 1);
+    auto us2 = make_us("q*").find_at(s, 1);
+    CHECK(us2.m.matched() && us2.m.begin() == 1 && us2.next_pos == 3);
+  }
+
+  // Regional-indicator pair: one cluster of 8 bytes in Grapheme mode, one
+  // code point (4 bytes) per step in CodePoint mode.
+  {
+    std::string flag = "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5"; // 🇯🇵
+    auto r = make_egc("q*").find_at(flag, 0);
+    CHECK(r.m.matched() && r.next_pos == 8);
+    auto us = make_us("q*").find_at(flag, 0);
+    CHECK(us.m.matched() && us.next_pos == 4);
+  }
+
+  // find_at is a positioned scan of the full subject, not a search of the
+  // suffix: ^ only matches at 0, and \b sees the real left context.
+  {
+    Regex caret("^a");
+    CHECK(caret.find_at("aba", 0).m.matched());
+    CHECK(!caret.find_at("aba", 2).m.matched());
+    Regex wb("\\bx");
+    CHECK(!wb.find_at("yx", 1).m.matched()); // y|x is not a word boundary
+    CHECK(wb.find_at(" x", 1).m.matched());
+  }
+
+  // Captures and named groups come through the owning MatchResult.
+  {
+    Regex re(R"((\w+)=(?<val>\w+))");
+    auto r = re.find_at("k1=v1 k2=v2", 5);
+    CHECK(r.m.matched() && r.m.str() == "k2=v2");
+    CHECK(r.m.group(1).str() == "k2");
+    CHECK(r.m.group("val").str() == "v2");
+    CHECK(r.next_pos == 11);
+  }
+
+  // Parity with find_iter across tiers: literal, alternation, asserts,
+  // captures, nullable patterns, non-ASCII (grapheme Pike), CR-LF subjects,
+  // and CodePoint mode.
+  std::string prose;
+  for (int i = 0; i < 8; i++)
+    prose += "Sherlock said e\xCC\x81 to Holmes\r\nkey=value \xF0\x9F\x87\xAF"
+             "\xF0\x9F\x87\xB5 done ";
+  const char *pats[] = {"Holmes",        "Sherlock|value", "\\bkey\\b",
+                        "(\\w+)=(\\w+)", "q*",             "\\w*",
+                        "e?",            "said .*?Holmes", "(?:)"};
+  for (const char *p : pats) {
+    CHECK(same_as_iter(Regex(p), prose));
+    CHECK(same_as_iter(make_us(p), prose));
+  }
+  CHECK(same_as_iter(Regex("a*"), std::string_view{}));
+  CHECK(same_as_iter(Regex("^x", Multiline), "x\r\nx\nx"));
+
+  // The FindCache overload steps identically while reusing warm DFAs.
+  {
+    Regex re("(\\w+)");
+    Regex::FindCache cache;
+    std::string s = "one two";
+    auto r1 = re.find_at(s, 0, cache);
+    CHECK(r1.m.matched() && r1.m.str() == "one" && r1.next_pos == 3);
+    auto r2 = re.find_at(s, r1.next_pos, cache);
+    CHECK(r2.m.matched() && r2.m.str() == "two" && r2.next_pos == 7);
+    CHECK(!re.find_at(s, r2.next_pos, cache).m.matched());
+  }
+}
+
 // The CRLF-tolerant byte path (analyze_crlf_byte_safe) must reproduce the
 // grapheme engine on a non-ASCII subject containing CR-LF clusters. We compare
 // find_all of the bare pattern (which may take the byte DFA) against the same
@@ -2164,6 +2315,7 @@ int main() {
   test_find_all_and_replace();
   test_byte_offsets();
   test_grapheme_aware();
+  test_find_at();
   test_crlf_byte_path();
   test_suffix_prefilter();
   test_inner_prefilter();

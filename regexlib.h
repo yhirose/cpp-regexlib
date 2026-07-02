@@ -5163,6 +5163,34 @@ public:
   MatchIter find_iter(std::string_view text, FindCache &cache) const;
   MatchIter find_iter(std::string &&text) const = delete;
 
+  // Stateless positional scan step: the leftmost match at or after byte offset
+  // `pos`, plus the position the scan resumes from — exactly one step of
+  // find_iter(), for external steppers (e.g. a generator) that cannot hold a
+  // MatchIter across calls. Stepping find_at from 0 visits the same matches as
+  // find_iter; in particular `next_pos` follows the engine's empty-match
+  // advance rule for this Regex's match unit — one grapheme cluster in
+  // Grapheme mode, one code point in CodePoint mode — so a scan always makes
+  // progress and never resumes mid-cluster.
+  //
+  // Precondition: `pos` is 0 or a `next_pos` previously returned for the same
+  // text (a valid scan position; this anchors left-context rules such as
+  // regional-indicator parity). Anchors and word boundaries see the full
+  // subject: find_at(text, pos) is a scan positioned at `pos`, not a fresh
+  // search of text.substr(pos) — `^` does not match at a non-zero `pos`.
+  //
+  // Each call is an independent scan step (the per-subject engine state a
+  // MatchIter would carry is rebuilt per call, beyond what FindCache keeps
+  // warm); for bulk iteration inside one call frame, find_iter()/find_all()
+  // remain the right tools.
+  struct FindAt {
+    MatchResult m;       // unmatched when there is no match at/after pos
+    size_t next_pos = 0; // resume position: the match end, or one grapheme /
+                         // code point past an empty match; text.size() + 1
+                         // when no scan positions remain
+  };
+  FindAt find_at(std::string_view text, size_t pos) const;
+  FindAt find_at(std::string_view text, size_t pos, FindCache &cache) const;
+
   // Lazy split: a range over the substrings between matches (see SplitIter).
   // Like find_iter, a temporary std::string subject is rejected (the pieces
   // are views); bind it to a variable first.
@@ -12922,6 +12950,30 @@ public:
     }; // captures branch on ncap_ within Dfa
 
     void advance();   // step to the next match (or set done_)
+
+    // find_at() support: position this scan at byte offset `pos` (a valid
+    // scan position — 0 or a previously returned resume position) before the
+    // first advance(). resume_pos_ moves with it: nothing has been yielded by
+    // THIS scan, so a fused-tier downgrade must not re-walk before `pos`.
+    // The Pike cursor is remapped only if the segmentation was already built
+    // at construction; otherwise build_seg() maps pos_ on the first step.
+    void seek(size_t pos) {
+      pos_ = static_cast<int>(pos);
+      resume_pos_ = pos_;
+      if (seg_ready_) gpos_ = Regex::byte_to_cp(seg_, pos_);
+    }
+
+    // find_at() support: the byte-offset resume cursor after a yielded match.
+    // The byte tiers keep it in pos_ directly; the Pike tier's grapheme /
+    // code-point cursor maps back through the segmentation (byte_begin[gn] ==
+    // text size; gpos_ == gn + 1 means no scan positions remain).
+    size_t resume_byte() const {
+      if (tier_ != Tier::Pike || !seg_ready_) return static_cast<size_t>(pos_);
+      size_t gn = seg_.graphemes.size();
+      return static_cast<size_t>(gpos_) <= gn ? seg_.byte_begin[gpos_]
+                                              : text_.size() + 1;
+    }
+
     void build_seg(); // lazily segment for a Pike step / cap downgrade
     void downgrade(); // DFA state cap -> continue on the Pike VM
     // Fused-collapse bail: the lazy eligibility scan found the subject
@@ -15293,6 +15345,28 @@ inline Regex::MatchIter Regex::find_iter(std::string_view text) const {
 inline Regex::MatchIter Regex::find_iter(std::string_view text,
                                     FindCache &cache) const {
   return MatchIter(*this, text, cache);
+}
+
+inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos) const {
+  return find_at(text, pos, thread_cache());
+}
+
+// One find_iter() step, stateless: seek a fresh MatchIter to `pos` and
+// advance() once, so the tier dispatch and the empty-match resume rule (Pike:
+// one grapheme / code-point index; byte tiers: us_step_byte) have exactly one
+// home — this cannot drift from what iteration does.
+inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos,
+                                    FindCache &cache) const {
+  FindAt r;
+  r.next_pos = text.size() + 1;
+  if (pos > text.size()) return r; // past the last scan position
+  MatchIter it(*this, text, cache);
+  it.seek(pos);
+  it.advance();
+  if (it.done_) return r;
+  r.m = it.one_[0].to_owned();
+  r.next_pos = it.resume_byte();
+  return r;
 }
 
 inline Regex::SplitIter Regex::split(std::string_view text) const {

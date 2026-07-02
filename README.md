@@ -115,6 +115,13 @@ class Regex {
   // Lazy iterator over the pieces between matches; N matches yield N+1 pieces.
   SplitIter split(std::string_view text) const;
 
+  // One stateless scan step, for external steppers (generators/coroutines):
+  // the leftmost match at/after pos, plus the resume position — the match
+  // end, or one grapheme / code point (per the match unit) past an empty
+  // match, so a scan always progresses and never resumes mid-cluster.
+  struct FindAt { MatchResult m; size_t next_pos; };
+  FindAt find_at(std::string_view text, size_t pos) const;
+
   // A FindCache reuses the compiled automaton across calls instead of
   // rebuilding it each time (~6x on a many-document tokenize):
   class FindCache;

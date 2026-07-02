@@ -168,6 +168,7 @@ Methods:
 | `re.find_iter(s, cache)` | as above, reusing a `Regex::FindCache` |
 | `re.find_all(s)` | `Regex::MatchList` — eager columnar container (see below) |
 | `re.split(s)` | `Regex::SplitIter` — lazy range of the pieces between matches |
+| `re.find_at(s, pos)` | `Regex::FindAt` — one stateless scan step at/after `pos` (see below) |
 | `re.replace_all(s, repl)` | `std::string` — replace every match (`$`-grammar below) |
 | `re.replace_first(s, repl)` | `std::string` — replace only the leftmost match |
 
@@ -234,6 +235,50 @@ same deleted-rvalue rule.
 std::string csv = "a,bb,,ccc";
 for (auto field : re_comma.split(csv)) use(field);   // "a", "bb", "", "ccc"
 ```
+
+### `find_at()` — one stateless scan step
+
+```cpp
+struct Regex::FindAt {
+  MatchResult m;   // unmatched when there is no match at/after pos
+  size_t next_pos; // resume position; text.size() + 1 when scanning is done
+};
+FindAt Regex::find_at(std::string_view text, size_t pos) const;
+FindAt Regex::find_at(std::string_view text, size_t pos, FindCache &cache) const;
+```
+
+`re.find_at(s, pos)` performs exactly one step of `find_iter()` without holding
+an iterator: the leftmost match at or after byte offset `pos`, plus the
+position the scan resumes from. It exists for **external steppers** — a
+generator or coroutine that must persist a plain integer between calls instead
+of a live `MatchIter`. Stepping `find_at` from 0 visits exactly the same
+matches as `find_iter`.
+
+`next_pos` follows the engine's empty-match advance rule for this `Regex`'s
+match unit — the match end for a non-empty match, and one **grapheme cluster**
+(Grapheme mode) or one **code point** (CodePoint mode) past an empty match — so
+a scan always makes progress and never resumes mid-cluster (e.g. an empty match
+before the `\r` of a CR-LF resumes after the `\n`, never between them). A
+caller-side boundary computation cannot know the match unit; the engine does.
+
+```cpp
+size_t pos = 0;                        // the only state between calls
+while (pos <= text.size()) {
+  auto [m, next] = re.find_at(text, pos);
+  if (!m.matched()) break;
+  use(m);
+  pos = next;                          // always > pos: guaranteed progress
+}
+```
+
+Precondition: `pos` is `0` or a `next_pos` previously returned for the same
+text (a valid scan position — this anchors left-context rules such as
+regional-indicator parity). Anchors and word boundaries see the full subject:
+`find_at(s, pos)` is a scan *positioned* at `pos`, not a search of
+`s.substr(pos)`, so `^` does not match at a non-zero `pos` and `\b` sees the
+real left context. Each call is an independent scan step (per-subject engine
+state beyond the `FindCache` is rebuilt); for bulk iteration inside one call
+frame, `find_iter()`/`find_all()` remain the right tools.
 
 ### `find_all()` — the eager columnar container
 
