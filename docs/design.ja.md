@@ -646,7 +646,16 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
   8 ビットマスクの1ビットを持ち、16 バイトチャンクごとに `PSHUFB`/`TBL` ニブル
   ルックアップ＋シフト重ね AND で、いずれかのリテラルの `N` バイト前置が現れる lane
   だけ非零になる。`N` は最短リテラルが許す最長 fingerprint（最大4）。NEON と SSSE3 は
-  手書き、scalar `teddy_hit` が末尾/フォールバック。`fox|dog|cat` を ~19 → ~390 MB/s。
+  手書き、scalar `teddy_hit` が末尾/フォールバック。SSSE3 スキャン（`_mm_shuffle_epi8`）
+  は x86-64 ベースライン（SSE2）に含まれないため、素の `-O2` Release は `__SSSE3__` も
+  `-mssse3` も持たず、以前は無言で scalar Teddy に落ちていた――リテラル選択パターンで
+  ~10–18× の崖となり、既定の Linux ビルド全てが踏んでいた（macOS は NEON、cl.exe は
+  SSSE3 ベースラインを仮定）。現在このスキャンは `target("ssse3")` を付けた
+  `teddy_scan_ssse3` に置き、キャッシュ済み `cpu_has_ssse3()` の実行時判定
+  （`__builtin_cpu_supports`、`REGEXLIB_SSSE3_DYNAMIC` tier）経由で呼ぶので、PSHUFB
+  パスは SSE2 ベースラインでコンパイルされ CPU が対応していれば動く――ビルドフラグ不要。
+  `REGEXLIB_DISABLE_SSSE3` で scalar パスを強制できる（特殊なツールチェーン / A-B 計測）。
+  `fox|dog|cat` を ~19 → ~390 MB/s。
   **全**候補が完全な ASCII リテラル（共有前置だけでなく――`analyze_literal_alternation`
   → `literal_alt_`）のときは、Teddy は prefilter ではなくマッチャそのものになる：
   `literal_alt_locate` が Teddy ヒットを取り、リテラルを選択順に試して span を

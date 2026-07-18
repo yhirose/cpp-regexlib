@@ -1417,16 +1417,45 @@ inline size_t decode_codepoint(const char *s8, size_t l, char32_t &out) {
      (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)))
 #include <emmintrin.h>
 #define REGEXLIB_SSE2 1
-// SSSE3 gate. Real MSVC (cl.exe) exposes every intrinsic unconditionally, so
-// _MSC_VER alone enables the Teddy PSHUFB path there. clang-cl ALSO defines
-// _MSC_VER but follows clang semantics: _mm_shuffle_epi8 is an always_inline
-// that requires the `ssse3` target feature, which is off by default — so it must
-// be excluded (it defines __clang__) and falls back to the scalar Teddy unless
-// the user actually compiled with -mssse3 (which defines __SSSE3__).
+// SSSE3 gate for the Teddy PSHUFB path (_mm_shuffle_epi8). Three tiers:
+//
+//   1. Compile-time SSSE3 (REGEXLIB_SSSE3): the intrinsic is usable directly in
+//      any function. Reached when the TU is built with -mssse3 (defines
+//      __SSSE3__) OR under real MSVC (cl.exe), which exposes every x64 intrinsic
+//      unconditionally — its CPUID-free ISA policy assumes an SSSE3 baseline.
+//
+//   2. Runtime dispatch (REGEXLIB_SSSE3 + REGEXLIB_SSSE3_DYNAMIC): GCC/Clang on
+//      a non-Windows x86 target that was NOT built with -mssse3 (the DEFAULT for
+//      a plain `-O2` Release — SSE2 is the x86-64 baseline but SSSE3 is not). We
+//      still include <tmmintrin.h> (its intrinsics self-guard with a
+//      `target("ssse3")` attribute, so including without -mssse3 is fine — they
+//      just can't be CALLED outside an ssse3 context) and enable the SSSE3 code
+//      paths, but gate every call behind a cached __builtin_cpu_supports("ssse3")
+//      check; the PSHUFB Teddy scan itself carries __attribute__((target("ssse3")))
+//      so it compiles at the SSE2 baseline. This closes the perf cliff where a
+//      default Linux build silently ran the scalar Teddy fallback (~10-18x slower
+//      on literal-alternation patterns) despite the CPU supporting SSSE3.
+//
+//   3. Neither: scalar Teddy fallback (correct, just slower). This is where
+//      clang-cl without -mssse3 lands — __builtin_cpu_supports is unreliable on
+//      the Windows target, so we do not opt it into runtime dispatch.
 #if defined(__SSSE3__) || (defined(_MSC_VER) && !defined(__clang__))
 #include <tmmintrin.h> // _mm_shuffle_epi8 (PSHUFB) for the Teddy table lookup
 #define REGEXLIB_SSSE3 1
+#elif (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#include <tmmintrin.h> // intrinsics carry their own target("ssse3") attribute
+#define REGEXLIB_SSSE3 1
+#define REGEXLIB_SSSE3_DYNAMIC 1
 #endif
+#endif
+
+// Function attribute enabling the SSSE3 instruction set for one function even
+// when the TU baseline is only SSE2 (runtime-dispatch tier above). Empty in the
+// compile-time-SSSE3 and non-x86 tiers, where no per-function opt-in is needed.
+#if defined(REGEXLIB_SSSE3_DYNAMIC)
+#define REGEXLIB_TARGET_SSSE3 __attribute__((target("ssse3")))
+#else
+#define REGEXLIB_TARGET_SSSE3
 #endif
 
 // Portable always-inline for lambdas/functions on hot paths: GNU attribute
@@ -1567,6 +1596,27 @@ inline int bit_ctz64(uint64_t x) {
 #endif
 #else
   return __builtin_ctzll(x);
+#endif
+}
+
+// Does the running CPU support SSSE3 (the PSHUFB the Teddy scan needs)? Only
+// consulted in the runtime-dispatch tier (REGEXLIB_SSSE3_DYNAMIC); the
+// compile-time and non-x86 tiers answer at build time, so this returns a
+// constant there and the branch folds away. Cached in a function-local static:
+// __builtin_cpu_supports reads the CPUID-backed __cpu_model (initialized by an
+// ELF constructor on glibc), cheap but not free, and teddy_next runs once per
+// match.
+inline bool cpu_has_ssse3() {
+#if defined(REGEXLIB_DISABLE_SSSE3)
+  // Escape hatch: force the scalar Teddy path everywhere. Defensive for exotic
+  // toolchains where __builtin_cpu_supports is unreliable, and the hook the
+  // fallback-path tests flip to exercise the scalar walk on an SSSE3 host.
+  return false;
+#elif defined(REGEXLIB_SSSE3_DYNAMIC)
+  static const bool ok = __builtin_cpu_supports("ssse3");
+  return ok;
+#else
+  return true; // compile-time SSSE3, or the caller is already SSSE3-guarded
 #endif
 }
 
@@ -8838,6 +8888,64 @@ private:
     return false;
   }
 
+#if defined(REGEXLIB_SSSE3)
+  // SSSE3 (PSHUFB) Teddy scan: a complete scan returning the first candidate
+  // index in [from, slen), or slen if none. Split out of teddy_scan so it can
+  // carry REGEXLIB_TARGET_SSSE3 — which enables the `ssse3` target for THIS
+  // function only, letting the PSHUFB intrinsics compile when the TU baseline is
+  // just SSE2 (the runtime-dispatch tier; empty otherwise). Reached only when
+  // detail::cpu_has_ssse3() holds. The member-table lookup is written out inline
+  // rather than via a lambda: on Clang a lambda's operator() does NOT inherit
+  // the enclosing function's target attribute, so an always_inline
+  // _mm_shuffle_epi8 inside it fails to compile.
+  template <int N>
+  REGEXLIB_TARGET_SSSE3 size_t teddy_scan_ssse3(const unsigned char *p,
+                                                size_t slen, size_t from) const {
+    size_t b = from;
+    if (b + 16 <= slen) {
+      __m128i lo[N], hi[N]; // constant N: unrolled into registers
+      for (int j = 0; j < N; j++) {
+        lo[j] = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(plan_->teddy_.lo[j].data()));
+        hi[j] = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(plan_->teddy_.hi[j].data()));
+      }
+      const __m128i lomask = _mm_set1_epi8(0x0F);
+      constexpr size_t step = static_cast<size_t>(17 - N);
+      for (; b + 16 <= slen; b += step) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + b));
+        __m128i vlo = _mm_and_si128(v, lomask);
+        __m128i vhi = _mm_and_si128(_mm_srli_epi16(v, 4), lomask);
+        __m128i c = _mm_and_si128(_mm_shuffle_epi8(lo[0], vlo),
+                                  _mm_shuffle_epi8(hi[0], vhi));
+        __m128i m1 = _mm_and_si128(_mm_shuffle_epi8(lo[1], vlo),
+                                   _mm_shuffle_epi8(hi[1], vhi));
+        c = _mm_and_si128(c, _mm_srli_si128(m1, 1));
+        if constexpr (N >= 3) {
+          __m128i m2 = _mm_and_si128(_mm_shuffle_epi8(lo[2], vlo),
+                                     _mm_shuffle_epi8(hi[2], vhi));
+          c = _mm_and_si128(c, _mm_srli_si128(m2, 2));
+        }
+        if constexpr (N >= 4) {
+          __m128i m3 = _mm_and_si128(_mm_shuffle_epi8(lo[3], vlo),
+                                     _mm_shuffle_epi8(hi[3], vhi));
+          c = _mm_and_si128(c, _mm_srli_si128(m3, 3));
+        }
+        unsigned mask = static_cast<unsigned>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(c, _mm_setzero_si128())));
+        mask = (~mask) & 0xFFFFu; // bit L set where lane L survived
+        if (mask) return b + static_cast<size_t>(detail::bit_ctz32(mask));
+      }
+    }
+    // Post-SIMD tail (and the whole scan when the subject is < 16 bytes).
+    while (b + static_cast<size_t>(N) <= slen) {
+      if (teddy_hit(p + b)) return b;
+      b++;
+    }
+    return slen;
+  }
+#endif
+
   // Index of the first position in [from, slen) where some literal's N-byte
   // prefix occurs, or slen if none. Soundness: every match start begins with
   // one of these fingerprints (analyze_teddy proved it), so no start is
@@ -8913,34 +9021,11 @@ private:
       }
     }
 #elif defined(REGEXLIB_SSSE3)
-    if (b + 16 <= slen) {
-      __m128i lo[N], hi[N]; // constant N: unrolled into registers
-      for (int j = 0; j < N; j++) {
-        lo[j] = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(plan_->teddy_.lo[j].data()));
-        hi[j] = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(plan_->teddy_.hi[j].data()));
-      }
-      const __m128i lomask = _mm_set1_epi8(0x0F);
-      constexpr size_t step = static_cast<size_t>(17 - N);
-      for (; b + 16 <= slen; b += step) {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + b));
-        __m128i vlo = _mm_and_si128(v, lomask);
-        __m128i vhi = _mm_and_si128(_mm_srli_epi16(v, 4), lomask);
-        auto member = [&](int j) {
-          return _mm_and_si128(_mm_shuffle_epi8(lo[j], vlo),
-                               _mm_shuffle_epi8(hi[j], vhi));
-        };
-        __m128i c = member(0);
-        c = _mm_and_si128(c, _mm_srli_si128(member(1), 1));
-        if constexpr (N >= 3) c = _mm_and_si128(c, _mm_srli_si128(member(2), 2));
-        if constexpr (N >= 4) c = _mm_and_si128(c, _mm_srli_si128(member(3), 3));
-        unsigned mask = static_cast<unsigned>(
-            _mm_movemask_epi8(_mm_cmpeq_epi8(c, _mm_setzero_si128())));
-        mask = (~mask) & 0xFFFFu; // bit L set where lane L survived
-        if (mask) return b + static_cast<size_t>(detail::bit_ctz32(mask));
-      }
-    }
+    // PSHUFB Teddy: usable directly when the TU is compile-time SSSE3, and
+    // behind a runtime CPU check + target("ssse3") function otherwise (see
+    // REGEXLIB_SSSE3_DYNAMIC). cpu_has_ssse3() is a compile-time `true` in the
+    // former, so the branch and the scalar tail below fold away there.
+    if (detail::cpu_has_ssse3()) return teddy_scan_ssse3<N>(p, slen, from);
 #endif
     while (b + static_cast<size_t>(N) <= slen) {
       if (teddy_hit(p + b)) return b;

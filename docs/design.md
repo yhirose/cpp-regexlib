@@ -706,7 +706,17 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   mask; per 16-byte chunk a `PSHUFB`/`TBL` nibble lookup plus a shifted-overlap AND
   leaves a nonzero lane exactly where some literal's `N`-byte prefix occurs.
   `N` is the longest fingerprint the shortest literal allows (capped at 4). NEON
-  and SSSE3 are hand-written; a scalar `teddy_hit` is the tail/fallback. Lifted
+  and SSSE3 are hand-written; a scalar `teddy_hit` is the tail/fallback. The
+  SSSE3 scan (`_mm_shuffle_epi8`) is not part of the x86-64 baseline (SSE2 is),
+  so a plain `-O2` Release build defines neither `__SSSE3__` nor `-mssse3` and
+  used to silently fall to the scalar Teddy — a ~10–18× cliff on
+  literal-alternation patterns that hit every default Linux build (macOS is NEON;
+  cl.exe assumes an SSSE3 baseline). The scan now lives in a
+  `target("ssse3")`-tagged `teddy_scan_ssse3` reached through a cached
+  `cpu_has_ssse3()` runtime check (`__builtin_cpu_supports`, `REGEXLIB_SSSE3_DYNAMIC`
+  tier), so the PSHUFB path compiles at the SSE2 baseline and runs whenever the
+  CPU supports it — no build flag required. `REGEXLIB_DISABLE_SSSE3` forces the
+  scalar path (exotic toolchains / A-B testing). Lifted
   `fox|dog|cat` ~19 → ~390 MB/s. When **every** alternative is a full ASCII
   literal (not just a shared prefix — `analyze_literal_alternation` → `literal_alt_`),
   Teddy is not a prefilter but the matcher itself: `literal_alt_locate` takes the
