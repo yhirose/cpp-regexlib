@@ -8162,6 +8162,19 @@ private:
   // the pair probes) and answers for those 16 positions; the vector loops
   // bound off so every predicate load stays inside [0, n). The scalar tail
   // covers the final positions one byte at a time.
+  //
+  // Deliberately NO runtime AVX2 dispatch here (unlike the Teddy SSSE3 scan):
+  // it was tried — shared always_inline body, target("avx2") wrapper, cached
+  // __builtin_cpu_supports pick, fully VEX-encoded per objdump — and measured
+  // a net LOSS (Sherlock memmem cases 0.72x, [a-q][^u-z]{13}x 0.87x, P-core
+  // pinned A/B). VEX encoding gains ~25% only while the scan stays inlined
+  // into its caller (whole-TU -mavx builds); an attributed wrapper cannot be
+  // inlined into baseline callers, and outlining this function loses the
+  // caller fusion (find_substr's probe+verify compile as one unit), which
+  // costs more than VEX wins. Teddy tolerates that because teddy_scan was
+  // already effectively outlined and its SIMD-vs-scalar gap is 10-18x, not
+  // encoding-level. Host-tuned builds (-march=native / -mavx2) get the VEX
+  // win the sound way: the whole TU is VEX, nothing is outlined.
   template <class Pred, class Visit>
   static size_t scan64_visit(const unsigned char *p, size_t n, size_t off,
                              const Pred &pr, Visit visit) {

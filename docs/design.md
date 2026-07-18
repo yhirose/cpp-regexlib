@@ -716,7 +716,13 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   `cpu_has_ssse3()` runtime check (`__builtin_cpu_supports`, `REGEXLIB_SSSE3_DYNAMIC`
   tier), so the PSHUFB path compiles at the SSE2 baseline and runs whenever the
   CPU supports it — no build flag required. `REGEXLIB_DISABLE_SSSE3` forces the
-  scalar path (exotic toolchains / A-B testing). Lifted
+  scalar path (exotic toolchains / A-B testing). The same dispatch shape was
+  tried on `scan64_visit` for the VEX/AVX2 encoding win and **rejected on
+  measurement**: an attributed wrapper cannot inline into baseline callers, and
+  outlining the scan loses the caller fusion (probe + verify as one compiled
+  unit), costing more than VEX gains — see the comment at `scan64_visit`.
+  Host-tuned builds (`-march=native`, `REGEXLIB_ENABLE_NATIVE`) deliver that
+  win instead. Lifted
   `fox|dog|cat` ~19 → ~390 MB/s. When **every** alternative is a full ASCII
   literal (not just a shared prefix — `analyze_literal_alternation` → `literal_alt_`),
   Teddy is not a prefilter but the matcher itself: `literal_alt_locate` takes the
