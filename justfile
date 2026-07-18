@@ -29,10 +29,18 @@ bench *args="10":
     cmake --build build-bench --target regexlib_bench
     ./build-bench/test/regexlib_bench {{args}}
 
+# `bench`, tuned for THIS machine's CPU (REGEXLIB_ENABLE_NATIVE -> -march=native):
+# ~15-50% faster on several pattern shapes from VEX/AVX2 codegen. The binary is
+# not portable and the numbers are not comparable to the default `bench` or CI.
+bench-native *args="10":
+    cmake -B build-bench-native -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON -DREGEXLIB_ENABLE_NATIVE=ON
+    cmake --build build-bench-native --target regexlib_bench
+    ./build-bench-native/test/regexlib_bench {{args}}
+
 # Check that backtick identifiers in docs/*.md and README.md still exist in
 # regexlib.h / test/*.cc (catches doc rot from renames). Also run by CI.
 lint-docs:
     python3 tools/check_doc_identifiers.py
 
 clean:
-    rm -rf build build-asan build-bench
+    rm -rf build build-asan build-bench build-bench-native

@@ -230,6 +230,16 @@ consequences are worth stating plainly:
   [benchmark](https://github.com/yhirose/cpp-regexlib/actions/workflows/benchmark.yml)
   workflow tracks where it stands against `std::regex`, RE2, rure, and PCRE2-JIT.
 
+- **SIMD is automatic; host-tuned builds are opt-in.** The hot scans use
+  NEON/SSE2 (baseline on every target), and the SSSE3 Teddy multi-literal scan
+  selects itself at runtime by CPU detection — a plain `-O2`/`Release` build
+  already gets all of this. On top of that, compiling for the build machine's
+  CPU (`-march=native` on GCC/Clang) adds roughly 15–50% on several pattern
+  shapes on x86-64 through VEX/AVX2 code generation. Header consumers just add
+  that flag to their own build; this repo's CMake exposes it as
+  `-DREGEXLIB_ENABLE_NATIVE=ON` (default OFF — the resulting binary requires
+  the build machine's CPU features and is not portable).
+
 For the engine internals, please see [docs/design.md](docs/design.md).
 
 License

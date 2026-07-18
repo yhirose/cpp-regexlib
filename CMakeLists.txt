@@ -29,6 +29,23 @@ target_include_directories(regexlib INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(regexlib INTERFACE cxx_std_17)
 
+# Opt-in: compile for the build machine's CPU. The engine's SIMD fast paths
+# (NEON/SSE2 baseline, SSSE3 Teddy via runtime dispatch) need no flags, but
+# host-tuned codegen (VEX-encoded SIMD, AVX2) adds ~15-50% on several pattern
+# shapes on x86-64. Propagated through the INTERFACE target so consumer TUs
+# that include regexlib.h get it too. Default OFF: the resulting binaries only
+# run on CPUs with the build machine's features. MSVC has no "native" — the
+# closest widely useful tier, /arch:AVX2, stands in for it there.
+option(REGEXLIB_ENABLE_NATIVE
+  "Tune for the host CPU (-march=native; /arch:AVX2 on MSVC). Non-portable binaries." OFF)
+if(REGEXLIB_ENABLE_NATIVE)
+  if(MSVC)
+    target_compile_options(regexlib INTERFACE /arch:AVX2)
+  else()
+    target_compile_options(regexlib INTERFACE -march=native)
+  endif()
+endif()
+
 option(BUILD_TESTS "Build cpp-regexlib tests" ON)
 
 if(BUILD_TESTS)
