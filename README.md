@@ -131,6 +131,13 @@ class Regex {
   // find_all() can also own its subject, so matches outlive the input string:
   MatchList find_all     (std::string &&text) const;  // move the subject in
   MatchList find_all_copy(std::string_view text) const;  // copy the subject in
+
+  // Pattern introspection. named_groups() maps each capture name to its index
+  // (name-ordered, empty when the pattern names none) — the way to discover the
+  // names of a pattern that arrives at runtime, since group("name") can only
+  // answer for a name you already have.
+  size_t           group_count() const;
+  const NameMap   &named_groups() const;  // std::map<std::string,int,std::less<>>
 };
 
 // One type for both the whole match and every group: group(0) is the whole

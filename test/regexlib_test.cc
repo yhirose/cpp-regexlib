@@ -754,6 +754,46 @@ void test_named_groups() {
   CHECK(m.group("mon").str() == "05");
   CHECK(m.group("nope").matched() == false);
   CHECK(Regex("(?'q'\\d+)").search("x42").group("q").str() == "42"); // (?'name')
+
+  // A name longer than the small-string limit: group(name) looks the
+  // string_view up directly, so this must not depend on any per-call copy.
+  CHECK(Regex("(?<a_very_long_capture_group_name>\\d+)")
+            .search("x42")
+            .group("a_very_long_capture_group_name")
+            .str() == "42");
+}
+
+// named_groups(): introspection of the name -> index mapping. group(name) only
+// answers for a name you already know; this is the only way to discover them.
+void test_named_groups_introspection() {
+  Regex re("(?<year>\\d{4})-(?<mon>\\d{2})-(\\d{2})(?<day>x)?");
+  const auto &names = re.named_groups();
+  CHECK(names.size() == 3); // group 3 is unnamed -> absent
+  CHECK(names.at("year") == 1);
+  CHECK(names.at("mon") == 2);
+  CHECK(names.at("day") == 4);
+  CHECK(names.count("nope") == 0);
+
+  // Indices agree with group(name) on a real match.
+  auto m = re.search("2026-05-17");
+  for (const auto &kv : names)
+    CHECK(m.group(kv.first).begin() ==
+          m.group(static_cast<size_t>(kv.second)).begin());
+
+  // Iteration order is deterministic (sorted by name), so callers can list a
+  // pattern's groups reproducibly.
+  std::vector<std::string> order;
+  for (const auto &kv : names)
+    order.push_back(kv.first);
+  CHECK(order == std::vector<std::string>({"day", "mon", "year"}));
+
+  // No named groups -> empty map (not an error).
+  CHECK(Regex("(\\d+)-(\\d+)").named_groups().empty());
+  CHECK(Regex("plain").named_groups().empty());
+
+  // Survives materialization into an owning result.
+  auto owned = re.search("2026-05-17").group("mon").to_owned();
+  CHECK(owned.str() == "05");
 }
 
 void test_boundaries_and_flags() {
@@ -2309,6 +2349,7 @@ int main() {
   test_matches();
   test_unicode_scalar();
   test_named_groups();
+  test_named_groups_introspection();
   test_boundaries_and_flags();
   test_text_anchors();
   test_constructor_flags();

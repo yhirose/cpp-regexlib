@@ -164,6 +164,32 @@ reg::Regex re(pat, reg::IgnoreCase, reg::MatchUnit::CodePoint); // フラグ＋�
 | `re.replace_all(s, repl)` | `std::string` — 全マッチを置換（`$`-文法は下記） |
 | `re.replace_first(s, repl)` | `std::string` — 最左マッチのみ置換 |
 
+#### パターンの内省
+
+| メソッド | 戻り値 |
+| --- | --- |
+| `re.group_count()` | `size_t` — パターン中のキャプチャグループ数（グループ 0 を除く） |
+| `re.named_groups()` | `const reg::NameMap&` — グループ名 -> グループ番号 |
+
+`reg::NameMap` は `std::map<std::string, int, std::less<>>` なので、イテレーション
+は名前順で決定的になり、検索は `std::string_view` をアロケーションなしで受け取り
+ます。載るのは名前付きグループのみで、無名グループはエントリを持たず、名前付き
+グループの無いパターンでは空マップになります。番号は `m.group(i)` に渡すものと
+同じです。
+
+`m.group("name")` は既に知っている名前にしか答えられないので、名前を**発見**する
+手段はこちらです ―― 実行時に与えられたパターン（設定ファイル由来など）の
+グループを列挙したい場合に使います:
+
+```cpp
+reg::Regex re(pattern_from_config);
+for (const auto &[name, index] : re.named_groups())
+  std::printf("%s -> %zu\n", name.c_str(), static_cast<size_t>(index));
+```
+
+同じマッピングは RE2 の `NamedCapturingGroups()`、Python の `Pattern.groupindex`、
+Java (20+) の `Pattern.namedGroups()` にもあります。
+
 #### 唯一のマッチ型
 
 （サブ）マッチは **`Match`** 一つ —— 全体マッチもキャプチャグループも同じ型で、

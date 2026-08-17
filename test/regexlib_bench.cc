@@ -31,7 +31,6 @@
 #include <random>
 #include <regex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>  // open (silencing stdout in --md mode)
@@ -1346,7 +1345,7 @@ static void run_size_bench() {
          "jmp", "KiB(x2)");
 
   for (auto &p : pats) {
-    unordered_map<string, int> named;
+    reg::NameMap named;
     bool icase = false, ml = false, da = false;
     d::Parser parser(p.pat, named, icase, ml, da);
     d::Node root = parser.parse();

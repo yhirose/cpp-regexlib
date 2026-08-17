@@ -172,6 +172,31 @@ Methods:
 | `re.replace_all(s, repl)` | `std::string` — replace every match (`$`-grammar below) |
 | `re.replace_first(s, repl)` | `std::string` — replace only the leftmost match |
 
+#### Pattern introspection
+
+| Method | Result |
+| --- | --- |
+| `re.group_count()` | `size_t` — capture groups in the pattern (excluding group 0) |
+| `re.named_groups()` | `const reg::NameMap&` — group name -> group index |
+
+`reg::NameMap` is a `std::map<std::string, int, std::less<>>`, so iteration is
+ordered by name and lookup accepts a `std::string_view` without allocating. Only
+named groups appear; an unnamed group has no entry, and a pattern with no named
+groups yields an empty map. Indices are the same ones `m.group(i)` takes.
+
+`m.group("name")` only answers for a name you already know, so this is the way to
+*discover* them — for a pattern that arrives at runtime (from a config file, say)
+and whose groups you want to enumerate:
+
+```cpp
+reg::Regex re(pattern_from_config);
+for (const auto &[name, index] : re.named_groups())
+  std::printf("%s -> %zu\n", name.c_str(), static_cast<size_t>(index));
+```
+
+RE2 exposes the same mapping as `NamedCapturingGroups()`, Python as
+`Pattern.groupindex`, and Java (20+) as `Pattern.namedGroups()`.
+
 #### One match type
 
 A (sub)match is a **`Match`** — used for the whole match and for every capture

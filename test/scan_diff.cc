@@ -31,40 +31,36 @@ static std::vector<MatchResult> find_all(const Regex &re, std::string_view s) {
   return v;
 }
 
+// Flatten one match's groups onto `out`: begin/end per group, or the sentinel
+// pair for an unmatched one.
+template <class M>
+static void append_spans(const M &m, std::vector<uint32_t> &out) {
+  for (size_t g = 0; g <= m.group_count(); g++) {
+    reg::Match c = m.group(g);
+    if (c.matched()) {
+      out.push_back(static_cast<uint32_t>(c.begin()));
+      out.push_back(static_cast<uint32_t>(c.end()));
+    } else {
+      out.push_back(0xffffffffu);
+      out.push_back(0xffffffffu);
+    }
+  }
+}
+
 // Collect scan() as a flat span list: [b0,e0, b1,e1, ...] over all
 // groups/matches.
 static std::vector<uint32_t> scan_spans(const Regex &re, std::string_view t) {
   std::vector<uint32_t> out;
-  for (auto m : re.find_iter(t)) {
-    for (size_t g = 0; g <= m.group_count(); g++) {
-      reg::Match cg = m.group(g);
-      if (cg.matched()) {
-        out.push_back(static_cast<uint32_t>(cg.begin()));
-        out.push_back(static_cast<uint32_t>(cg.end()));
-      } else {
-        out.push_back(0xffffffffu);
-        out.push_back(0xffffffffu);
-      }
-    }
-  }
+  for (auto m : re.find_iter(t))
+    append_spans(m, out);
   return out;
 }
 
 static std::vector<uint32_t> find_all_spans(const Regex &re,
                                             std::string_view t) {
   std::vector<uint32_t> out;
-  for (auto &m : find_all(re, t)) {
-    for (size_t g = 0; g <= m.group_count(); g++) {
-      reg::Match c = m.group(g);
-      if (c.matched()) {
-        out.push_back(static_cast<uint32_t>(c.begin()));
-        out.push_back(static_cast<uint32_t>(c.end()));
-      } else {
-        out.push_back(0xffffffffu);
-        out.push_back(0xffffffffu);
-      }
-    }
-  }
+  for (auto &m : find_all(re, t))
+    append_spans(m, out);
   return out;
 }
 
@@ -190,8 +186,10 @@ int main() {
       a.push_back(m.end());
     }
     auto b = scan_spans(re, subj);
-    // scan_spans uses no-cache; both must match find_all whole spans.
+    // scan_spans uses no-cache; both must match find_all whole spans. `\w+` has
+    // no capture groups, so the two span vectors have the same shape.
     check(!a.empty(), "cache overload nonempty");
+    check(a == b, "cache overload spans");
   }
 
   std::printf("\nscan_diff: %d passed, %d failed\n", g_pass, g_fail);
