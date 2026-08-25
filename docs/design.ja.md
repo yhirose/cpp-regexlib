@@ -440,8 +440,33 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
 
 `can_match_empty_`（nullable）は CRLF 許容に**非空**マッチを追加要求します（空マッチ
 がクラスタ内部の LF に落ちうる——バイトモードには在るが書記素モードには無い位置）。
+
 `simple_from_crlf_ok` は `simple_from` ＋「CR×LF クラスタを許可」で、ASCII ラン全体
 （`\r\n` 改行を含む）を次の非ASCII バイトまで SIMD スキップします。
+
+リテラル規則自身に落とし穴があります: ペアは byte-safe ですが**書記素プログラムでは
+safe ではありません**。パーサは `\r\n` を1書記素に融合し（`fuse_literal_graphemes`）、
+*書記素*プログラム（`prog_`・`assert_lf_prog_`、`cp=false` でコンパイル）はリテラルを
+「コードポイント列全体を intern した1個の `Op::Char`」として持ちます。つまりペアは
+そこでは2コードポイントの単一ユニットで、その上の DFA は**バイト**を刻む——
+どのバイトにも一致せず歩行が死にます。`crlf_byte_safe` がペアを許すのはバイト
+プログラム（自分の2バイトとして素直にマッチする）向けの話なので、
+`crlf_byte_safe_` と書記素プログラムを組み合わせる唯一のゲートである
+`ascii_grapheme_ok` は追加で `!crlf_fused_lit_` を要求します。`cp_prog_` と one-pass
+表は対象外です: それらは `cp=true` でコンパイルされ、`emit_cp_lit` がペアを
+1コードポイント1命令に割ります。
+これが無いと `\r\n$` を `"x\r\n"` に当てて書記素 Pike が `[1,3)` を返すのに no-match と
+なり、`(\r\n)$` はエントリポイントが割れて `search` / `find_all` / `find_iter` が
+`[1,3)` を返す一方 `test` だけが不一致でした。
+
+失格したパターンが Pike ではなくバイト tier に着地するよう、2つのバイト側ゲートが
+対になる例外を持ちます。`egc_byte_path` は `byte_path_` パターンのために純 ASCII の
+CRLF subject を許容し、`assert_byte_path_ok` は assert パターン（`byte_path_` を
+持たないので前者を使えない）のために同じことをします——条件も理由も同じ
+（`crlf_byte_safe_ && !can_match_empty_`）。後者が無いと `\r\n` リテラルを持つ assert
+パターンは書記素 Pike まで落ち、512 KB の純 ASCII HTTP ヘッダに対して
+`\b\w+\r\n` の `find_all` が 14.0 MB/s、`\r\n$` の `search` が 550 ns でした
+（有りなら 283 MB/s・74 ns）。
 
 §7 のプレフィルタと合わせ、`/Sherlock/` を ~24 → ~13000 MB/s にしました。
 

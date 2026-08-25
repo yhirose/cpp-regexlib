@@ -468,9 +468,35 @@ a pattern is safe if no element observes the difference:
 
 `can_match_empty_` (nullable) additionally forces a **non-empty** match for CRLF
 admission (an empty match could land on the LF interior to a cluster — a position
-that exists in byte mode but not grapheme). `simple_from_crlf_ok` is then
-`simple_from` plus "a CR×LF cluster is permitted", SIMD-skipping whole ASCII runs
-(including the `\r\n` breaks) to the next non-ASCII byte.
+that exists in byte mode but not grapheme).
+
+`simple_from_crlf_ok` is then `simple_from` plus "a CR×LF cluster is permitted",
+SIMD-skipping whole ASCII runs (including the `\r\n` breaks) to the next
+non-ASCII byte.
+
+One caveat is the literal rule's own: the pair is byte-safe but **not**
+grapheme-program-safe. The parser fuses `\r\n` into one grapheme
+(`fuse_literal_graphemes`), and the *grapheme* programs (`prog_`,
+`assert_lf_prog_`, compiled `cp=false`) hold a literal as one `Op::Char`
+interning the whole code-point string — so the pair is a two-code-point unit
+there, and the DFAs over those programs step **bytes**: no byte matches it and
+the walk dies. `crlf_byte_safe` admits it for the byte programs, which match it
+as its own two bytes, so `ascii_grapheme_ok` — the one gate that pairs
+`crlf_byte_safe_` with a grapheme program — additionally requires
+`!crlf_fused_lit_`. Not `cp_prog_` and not the one-pass tables: those compile
+`cp=true`, where `emit_cp_lit` splits the pair into one op per code point.
+Without it, `\r\n$` over `"x\r\n"` was a no-match where the grapheme Pike matches
+`[1,3)`, and `(\r\n)$` split the entry points: `search` / `find_all` /
+`find_iter` matched `[1,3)` while `test` said no.
+
+Both byte gates then carry the matching exception, so a disqualified pattern
+lands on a byte tier instead of the Pike. `egc_byte_path` admits a pure-ASCII
+CRLF subject for a `byte_path_` pattern, and `assert_byte_path_ok` does the same
+for an assert pattern (which has no `byte_path_`, so it cannot use the first) —
+same `crlf_byte_safe_ && !can_match_empty_` condition, same reason. Without the
+second, an assert pattern with a `\r\n` literal fell all the way to the grapheme
+Pike: over 512 KB of pure-ASCII HTTP headers, `\b\w+\r\n` `find_all` measured
+14.0 MB/s and `\r\n$` `search` 550 ns, against 283 MB/s and 74 ns with it.
 
 Together with the §7 prefilters this took `/Sherlock/` from ~24 to ~13000 MB/s.
 

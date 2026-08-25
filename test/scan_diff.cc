@@ -167,6 +167,19 @@ int main() {
       {"^(\\w+)$", kUS},
       {"(\\s+)$", Flag::Multiline},
       {"(\\s+)$|zq", Flag::Multiline},
+      // A parser-fused CR-LF literal: byte-matchable as its own two bytes,
+      // NOT consumable by a byte-stepping DFA over a grapheme program. No
+      // pattern here held one, so the tier that cannot run it went unnoticed
+      // even though the CRLF subjects above would have exposed it.
+      {"\\r\\n", 0},
+      {"\\r\\n$", 0},
+      {"(\\r\\n)$", 0},
+      {"(\\r\\n)$", kUS},
+      {"(\\w+)\\r\\n", 0},
+      {"(\\w+)\\r\\n$", 0},
+      {"\\r\\nline2", 0},
+      {"^(\\w+): (.*)\\r\\n", 0},
+      {"[\\r\\n]+$", 0},
   };
   const std::string subjects[] = {
       "",
@@ -187,6 +200,8 @@ int main() {
       "ab\xc3",                  // truncated UTF-8: a lone lead byte at the end
       std::string(4096, 'q') + " ab\xc3", // the same, past the walk budget
       std::string(4096, ' ') + "123 456 789 000",
+      "x\r\n",                            // a CR-LF cluster at the very end
+      "HTTP/1.1 200 OK\r\nHost: a\r\n\r\n", // pure-ASCII CRLF, the httplib shape
   };
 
   for (const auto &c : cases)

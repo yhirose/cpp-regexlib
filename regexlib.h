@@ -7338,6 +7338,47 @@ private:
       return false; // a kind added later is not inert until it says so
     }
 
+    // Does a Lit node hold a `\r` or `\n`? Under crlf_byte_safe such a literal
+    // is always a `\r\n` PAIR, which the parser fuses into one grapheme (see
+    // fuse_literal_graphemes) — and that is the one element whose byte form and
+    // grapheme form are not interchangeable. The BYTE programs match it as two
+    // code points, exactly the cluster's bytes, which is why crlf_byte_safe
+    // admits it. The GRAPHEME programs hold it as a single two-code-point unit,
+    // and the DFAs over them step BYTES: they cannot consume it at all. See
+    // ascii_grapheme_ok, the one gate that pairs crlf_byte_safe_ with a
+    // grapheme program.
+    static bool has_crlf_literal(const detail::Node &n) {
+      using K = detail::Node::Kind;
+      switch (n.kind) {
+      case K::Lit:
+        return n.lit.find(U'\r') != std::u32string::npos ||
+               n.lit.find(U'\n') != std::u32string::npos;
+      case K::Concat:
+      case K::Alt:
+      case K::Repeat:
+      case K::Group:
+      case K::LookAround:
+        for (const auto &k : n.kids)
+          if (has_crlf_literal(k)) return true;
+        return false;
+      case K::Class:   // matched against the cluster's BASE code point, so a
+      case K::AnyChar: // class or `.` holding \r is not a fused literal
+      case K::Empty:
+      case K::BOL:
+      case K::EOL:
+      case K::WordBoundary:
+      case K::NonWordBoundary:
+      case K::BeginText:
+      case K::EndText:
+      case K::EndTextNL:
+        return false; // no literal payload
+      }
+      // Enumerated rather than defaulted, like crlf_inert: a Kind added later
+      // should trip -Wswitch, and until it is classified it must fail toward
+      // the SAFE tier, which for this predicate means true.
+      return true;
+    }
+
     // Decide whether the byte path may serve CRLF subjects. CRLF-byte-safe
     // patterns (crlf_byte_safe above) plus a non-empty match (an empty match
     // could otherwise land on the LF interior to a cluster, which exists in byte
@@ -7349,6 +7390,7 @@ private:
       // for the extra walk.
       crlf_inert_ = multiline_ && crlf_inert(root);
       crlf_byte_safe_ = crlf_byte_safe(root, false, /*inside_repeat=*/false);
+      crlf_fused_lit_ = has_crlf_literal(root);
     }
 
     // Rough English-prose commonness of a byte (higher = more common). Used to
@@ -8152,6 +8194,12 @@ private:
     // keeps CRLF byte safety. false for every non-multiline pattern (nothing
     // reads it there).
     bool crlf_inert_ = false;
+    // A Lit node holds a \r or \n (see has_crlf_literal). Under
+    // crlf_byte_safe_ — the only place this is read — that is necessarily a
+    // parser-fused CR-LF grapheme: byte-safe, grapheme-program-UNSAFE. On its
+    // own it also covers a lone \r/\n literal, which crlf_byte_safe rejects
+    // anyway.
+    bool crlf_fused_lit_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
     // Whole pattern is a single printable-ASCII literal (capture-free, !icase,
@@ -10920,7 +10968,20 @@ private:
     size_t n = text.size(), i = 0;
     while (i < n && p[i] < 0x80)
       i++;
-    if (i == n) return false; // pure ASCII -> the ASCII assert tier
+    if (i == n)
+      // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT when that
+      // tier has just refused a fused CR-LF literal on a CR-LF-bearing subject
+      // (ascii_grapheme_ok's !crlf_fused_lit_), where the only rung left below
+      // is the grapheme Pike. An assert pattern has no byte_path_, so it cannot
+      // take egc_byte_path's pure-ASCII rung, which exists for exactly this
+      // case and on exactly this condition. Same argument: the byte assert
+      // program holds the pair as its own two bytes, on pure ASCII a code point
+      // IS a byte, crlf_byte_safe_ keeps every match boundary out of the pair
+      // (and is false for any multiline anchor), and !can_match_empty_ keeps an
+      // empty match off its interior. crlf_fused_lit_ leads so no other pattern
+      // pays the contains_crlf scan.
+      return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
+             !plan_->can_match_empty_ && contains_crlf(text);
     if (plan_->crlf_byte_safe_ && !plan_->can_match_empty_)
       return simple_from_crlf_ok(text, i);
     return simple_from(text, i);
@@ -11212,9 +11273,30 @@ private:
   // subject has no CR-LF at all, byte ≡ cluster and the fast path is correct.
   // The first-non-ASCII index is precomputed by the caller (is_ascii ⟺ fna ==
   // size) and shared with egc_byte_path at the dispatch site.
+  //
+  // !crlf_fused_lit_ is the one place this gate is STRICTER than the byte
+  // path's. The DFAs behind it locate the span over the GRAPHEME programs
+  // (prog_, assert_lf_prog_ — compiled cp=false, where a Lit is ONE Op::Char
+  // interning the whole code-point string) while stepping BYTES, so a
+  // parser-fused CR-LF literal is a two-code-point unit no byte can match and
+  // the walk dies on it. crlf_byte_safe admits the pair because the BYTE
+  // programs match it as its own two bytes, which is true of them and not of
+  // these. `\r\n$` over "x\r\n" was no-match here while the grapheme Pike
+  // matched [1,3), and `(\r\n)$` split the entry points: search / find_all /
+  // find_iter matched [1,3) while test() said no.
+  // (Not cp_prog_, nor the one-pass tables: those compile cp=true, where
+  // emit_cp_lit splits the pair into one op per code point. cp_prog_ only
+  // resolves groups inside a span these DFAs already located.)
+  //
+  // egc_byte_path makes the same exception from the other side — it admits a
+  // pure-ASCII CRLF subject precisely so a crlf_byte_safe pattern reaches the
+  // byte programs instead of this tier. That covers byte_path_ patterns; an
+  // assert pattern has no byte_path_, so it needs this gate.
   bool ascii_grapheme_ok(std::string_view text, size_t fna) const {
     return fna == text.size() &&
-           ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_) || !contains_crlf(text));
+           ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
+             !plan_->crlf_fused_lit_) ||
+            !contains_crlf(text));
   }
 
   // True when the grapheme rules forbid a break between two adjacent code
@@ -13978,12 +14060,18 @@ private:
   }
 
   // EGC fuses the ASCII pair CR-LF into ONE grapheme, so a byte-wise walk is
-  // cluster-correct only when the pattern cannot split a CR-LF (the
-  // ascii_grapheme_ok condition). Otherwise the walk must treat '\r' exactly
-  // like a non-ASCII byte — bail, discarding any recorded accept, and let a
-  // cluster-aware tier decide. US mode never fuses, so it never bails on CR.
-  // This is what makes the one-walk tiers sound on ANY subject (no caller
+  // cluster-correct only when the pattern cannot split a CR-LF
+  // (crlf_byte_safe_ && !can_match_empty_). Otherwise the walk must treat '\r'
+  // exactly like a non-ASCII byte — bail, discarding any recorded accept, and
+  // let a cluster-aware tier decide. US mode never fuses, so it never bails on
+  // CR. This is what makes the one-walk tiers sound on ANY subject (no caller
   // gate needed).
+  //
+  // ascii_grapheme_ok adds !crlf_fused_lit_ on top of the same pair; this walk
+  // does NOT need it, and the asymmetry is deliberate. compact_onepass_table
+  // and build_cp_onepass compile cp=true, where emit_cp_lit splits a fused
+  // CR-LF literal into one step per code point — the walk consumes it. It is
+  // the cp=false grapheme programs behind ascii_grapheme_ok that cannot.
   bool onepass_walk_bails_cr() const {
     return !plan_->us_ &&
            !(plan_->crlf_byte_safe_ && !plan_->can_match_empty_);

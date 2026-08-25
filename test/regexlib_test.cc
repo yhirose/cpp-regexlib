@@ -2410,6 +2410,56 @@ void test_body_dollar() {
     CHECK(rows(make_egc(R"((?m)^(\w+))"), "ab\r\ncd") ==
           (std::vector<std::string>{"0,2=ab", "4,6=cd"}));
   }
+  { // A parser-fused CR-LF LITERAL is the other half of the same asymmetry:
+    // the byte programs match it as its own two bytes (which is why
+    // crlf_byte_safe admits the pair, and why the byte tiers keep it), but the
+    // grapheme programs hold it as ONE two-code-point unit that a byte-stepping
+    // DFA cannot consume at all — so ascii_grapheme_ok must not route such a
+    // pattern onto them for a CRLF subject. "x\r\n" is x=0 \r=1 \n=2.
+    const std::string s = "x\r\n";
+    CHECK(rows(make_egc(R"(\r\n$)"), s) ==
+          std::vector<std::string>{"1,3="});          // was no-match
+    CHECK(rows(make_egc(R"(\r\n\z)"), s) ==
+          std::vector<std::string>{"1,3="});          // was no-match
+    CHECK(rows(make_egc(R"(x\r\n$)"), s) ==
+          std::vector<std::string>{"0,3="});          // was no-match
+    // The capture form split the entry points instead of failing outright:
+    // search / find_all / find_iter matched [1,3) and test() said no.
+    CHECK(rows(make_egc(R"((\r\n)$)"), s) ==
+          (std::vector<std::string>{"1,3=\r\n"}));
+    // The literal need not end the match, and the anchor need not be `$`.
+    CHECK(rows(make_egc(R"(\r\nz$)"), "x\r\nz") ==
+          std::vector<std::string>{"1,4="});          // was no-match
+    // A non-multiline `$` is EndText, so a cluster that is not at the end does
+    // NOT match — the fix must not turn that into a false positive.
+    CHECK(rows(make_egc(R"(\r\n$)"), "x\r\ny").empty());
+    // Controls that were always right and must stay right: no anchor at all,
+    // and a class (matched by the cluster's base code point) instead of a
+    // literal.
+    CHECK(rows(make_egc(R"(\r\n)"), s) == std::vector<std::string>{"1,3="});
+    CHECK(rows(make_egc(R"([\r\n]+$)"), s) ==
+          std::vector<std::string>{"1,3="});
+    // An assert pattern has no byte_path_, so it cannot take egc_byte_path's
+    // pure-ASCII CRLF rung; assert_byte_path_ok grows the matching one, or
+    // these fall to the grapheme Pike over the whole subject. Drive that on a
+    // real-sized pure-ASCII header block so the routing, not just the answer,
+    // is exercised — and check the LAST match, which is where a tier that
+    // cannot consume the fused literal stops early.
+    {
+      std::string hdr;
+      for (int i = 0; i < 400; i++) hdr += "Header-Name: value\r\n";
+      const size_t n = hdr.size();
+      auto tail = rows(make_egc(R"(\r\n$)"), hdr);
+      CHECK(tail == std::vector<std::string>{std::to_string(n - 2) + "," +
+                                             std::to_string(n) + "="});
+      CHECK(rows(make_egc(R"(\b\w+\r\n)"), hdr).size() == 400);
+      CHECK(rows(make_egc(R"(\r\n\z)"), hdr).size() == 1);
+      // Non-ASCII keeps taking the byte tier it always did.
+      std::string mixed;
+      for (int i = 0; i < 400; i++) mixed += "café: v\r\n";
+      CHECK(rows(make_egc(R"(\r\n$)"), mixed).size() == 1);
+    }
+  }
 }
 
 // A user-supplied FindCache may be shared across Regexes and across
