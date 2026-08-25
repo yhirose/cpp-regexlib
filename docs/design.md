@@ -282,6 +282,25 @@ prefilters need no budget: their verifies are O(1)/pattern-bounded (literal,
 Teddy, anchor flags) or shape-bounded by admission (the var-pre suffix's
 one-atom rule, the word scan's one-candidate-per-word).
 
+The unbounded one-pass candidate drivers add a **profitability rule** to the
+same budget (`WalkBudget::spend_profitable`): whether a candidate+verify
+driver beats the single-pass chain depends on the subject, not the pattern
+(`(\w+)\s+(\d+)` over key=value text: every candidate matches, one walk per
+match; over prose: every word is a candidate and every walk fails after the
+word). Each failed walk is charged an estimate of its cost in chain-bytes —
+its SIMD run skips at `kRunCost` each (setup plus an exit mispredict; the
+expensive part of a failure) and its table steps at half a byte (independent
+candidate walks overlap in the pipeline, unlike the chain's one dependency
+chain) — and the driver bails as soon as the charge exceeds the distance
+scanned, after a `kMinScan` proving window so short subjects keep the
+one-walk latency shape. The callers resume the chain from the bail point,
+so the loss is bounded by that window, not a subject's worth. Two exact
+refinements keep the driver's own work down first: a failed walk reports
+the end of its first restartable run (`CpOnePass::State::restart_ok`: every
+looping byte also takes the start state there, so a walk begun inside the
+run converges with the one that entered it — if that one failed, all of
+them do), and the position scan resumes there instead of at the next byte.
+
 ### Safety net: the DFA state cap
 
 Interned states are bounded; exceeding the cap abandons the DFA and falls back to

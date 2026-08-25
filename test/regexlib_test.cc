@@ -629,6 +629,53 @@ void test_unicode_scalar() {
     auto r = Regex("/users/(\\d+)", US).search("/users/123456");
     CHECK(r.matched() && r.group(1).str() == "123456" && r.end() == 13);
   }
+  // The position-scan driver's failure paths: over prose, `(\w+)\s+(\d+)`
+  // makes every word a candidate whose walk runs the word and fails, so (a)
+  // the failed walk's first run skips the rest of the word (restart_ok) and
+  // (b) the profitability rule bails to the chain part-way through a long
+  // subject, which resumes from the bail point. Sprinkle matches so both the
+  // driver's and the chain's halves must find theirs; find_all and find_iter
+  // must agree with each other and with the pattern's obvious count.
+  {
+    std::string prose;
+    size_t expect = 0;
+    while (prose.size() < 64 * 1024) {
+      for (int i = 0; i < 40; i++) prose += "lorem ipsum dolor sit amet ";
+      prose += "id 4711 ";
+      expect++;
+    }
+    Regex ws("(\\w+)\\s+(\\d+)", US);
+    auto rows = find_all(ws, prose);
+    CHECK(rows.size() == expect);
+    CHECK(!rows.empty() && rows[0].group(1).str() == "id" &&
+          rows[0].group(2).str() == "4711");
+    size_t n = 0;
+    for (auto it : ws.find_iter(prose)) {
+      CHECK(n < rows.size() && it.begin() == rows[n].begin() &&
+            it.end() == rows[n].end());
+      n++;
+    }
+    CHECK(n == expect);
+    CHECK(find_all(make_egc("(\\w+)\\s+(\\d+)"), prose).size() == expect);
+    // A require_end (`body$`) plan: the walk ACCEPTS at a position the
+    // trailing `$` rejects, so the driver treats it as a failure and reads
+    // the walk's report — the path where `body$` differs from every other
+    // pattern shape, and the one no other test drives.
+    {
+      Regex tail("(\\d{3}) (\\d+)$", US);
+      auto m = tail.search("123 456 789 000");
+      CHECK(m.matched() && m.begin() == 8 && m.end() == 15 &&
+            m.group(1).str() == "789" && m.group(2).str() == "000");
+      CHECK(find_all(tail, "123 456 789 000").size() == 1);
+      std::string many;
+      for (int i = 0; i < 2000; i++) many += "123 456 ";
+      many += "999 12345";
+      auto big = tail.search(many);
+      CHECK(big.matched() && big.begin() == many.size() - 9 &&
+            big.end() == many.size());
+      CHECK(!tail.search("123 456 789 000x").matched());
+    }
+  }
   // named captures
   {
     auto nm = Regex("(?<w>\\p{L}+)", US).search("12 héllo");

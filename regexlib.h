@@ -3890,6 +3890,13 @@ struct CpOnePass {
     // bails as usual.
     bool loop_ok = false;
     std::array<uint8_t, 16> loop_tbl{};
+    // Candidate-skip admission for the position-scan driver: every byte in
+    // this state's self-loop set also takes the START state here. Then a
+    // walk begun anywhere inside one of this state's runs reaches this state
+    // at the run's end exactly as the walk that entered the run first did,
+    // and is identical from there — so when that first walk fails, every
+    // start inside the run fails too and scan_onepass_find skips them.
+    bool restart_ok = false;
     // Packed per-byte transition for the hot walks: the next state id plus
     // the two flags the per-byte loop needs — whether this (state, byte)
     // writes a slot (kStepWrite -> consult mask[b]) and whether the NEXT
@@ -4067,9 +4074,14 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
   // its looping set as a nibble table for the walk's SIMD run scan. The
   // table test is exact for any set, so short-exit repeats (`\S+`, `[^"]*`)
   // and short-member ones (`\d+`, `[A-Z]+`) qualify alike.
+  // The candidate-skip admission (State::restart_ok) rides along: it walks
+  // the same self-loop bytes and needs only the START state's `next`, which
+  // the interning loop above has already finished.
+  const std::array<int, 128> &start_next =
+      op.states[static_cast<size_t>(op.start)].next;
   for (auto &S : op.states) {
     int id = static_cast<int>(&S - op.states.data());
-    bool loops = false, ok = true;
+    bool loops = false, ok = true, restart = true;
     std::array<uint8_t, 16> tbl{};
     for (int b = 0; b < 128; b++) {
       if (S.next[b] != id) continue;
@@ -4077,12 +4089,17 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
         ok = false;
         break;
       }
+      // Every looping byte must also take the START state here — `\w+`'s loop
+      // state reached from a `(\w+)…` start qualifies, the `\w+` after a
+      // literal `x` does not (the start consumes only `x`).
+      if (start_next[b] != id) restart = false;
       loops = true;
       tbl[b & 15] |= static_cast<uint8_t>(1u << (b >> 4));
     }
     if (ok && loops) {
       S.loop_ok = true;
       S.loop_tbl = tbl;
+      S.restart_ok = restart;
     }
     // A step entry is dead unless filled below: [128, 256) permanently (a
     // non-ASCII byte — see State::step), and any ASCII byte with no transition.
@@ -4590,15 +4607,61 @@ class Regex {
   //     with kWalkBail and the site falls back, permanently for that loop, to
   //     the proven single-pass machinery. Worst case: one wasted
   //     subject-length of walking, once — O(n) total.
+  //   - The one-pass candidate drivers use spend_profitable(walk, scanned),
+  //     which adds a PROFITABILITY rule on top of the same bound. A candidate + verify
+  //     driver only pays off when candidates are sparse or verifies succeed;
+  //     whether they do depends on the subject, not the pattern
+  //     (`(\w+)\s+(\d+)`: every word is a candidate and every walk runs the
+  //     word and fails — chain-beating on key=value text, half the chain's
+  //     speed on prose). The rule estimates the driver's work in chain-bytes
+  //     (the chain's single dependent-load DFA pass, ~2.6 ns/byte) and bails
+  //     as soon as that estimate exceeds the distance scanned: from there the
+  //     chain would already have been ahead. What a failed walk costs is
+  //     what it did, not how far it got: a SIMD run skip that ended in
+  //     failure is the expensive part (its setup plus an exit mispredict —
+  //     the prose candidate above, two runs and three steps, measured ~24 ns
+  //     = kRunCost chain-bytes per run), while plain table steps overlap
+  //     across the independent candidate walks and cost about half a chain
+  //     byte each (`(\d{3}) (\d+)$` over a log: three-step, run-free failed
+  //     candidates at ~4 ns, a driver FASTER than the chain, which a flat
+  //     per-candidate charge would wrongly bail). kMinScan gives the driver
+  //     a window to prove itself, so a short subject never bails on the rule
+  //     (per-call latency keeps the one-walk shape) and the wasted prefix on
+  //     a long one is a few KB, not a subject's worth. The callers resume
+  //     their chain from the bail point, so nothing scanned is redone. O(n)
+  //     still: charge <= max(kMinScan, pos) <= max(kMinScan, n).
+  // What a cp_onepass_find walk reports to its driver. Filled on every
+  // return: an accept is not necessarily a match the caller keeps (a
+  // require_end `body$` plan rejects one that does not land at n), and such a
+  // caller reads this exactly as it reads a failure's.
+  struct OnePassWalk {
+    int walked = 0; // bytes consumed (the linearity charge)
+    int skip = 0;   // candidates in [s + 1, skip) provably fail too
+    int runs = 0;   // SIMD run skips taken (the expensive part of a failure)
+  };
   class WalkBudget {
     int left_;
+    // 64-bit: the charge can reach ~9.5x the subject length (each failed walk
+    // is charged up to 8.5 bytes per byte walked, and the linearity bound
+    // admits a subject's worth of failed walking), which overflows an int
+    // well before `left_`'s own 2 GB range.
+    int64_t charge_ = 0;
 
   public:
+    static constexpr int kRunCost = 8;           // chain-bytes per failed run
+    static constexpr int kStepsPerChainByte = 2; // table steps per chain byte
+    static constexpr int kMinScan = 2048;
     explicit WalkBudget(size_t subject_len)
         : left_(static_cast<int>(subject_len)) {}
     bool spend(int walked) {
       left_ -= walked;
       return left_ >= 0;
+    }
+    // Linearity AND profitability: `scanned` is the subject distance covered
+    // so far, the yardstick the charge is measured against.
+    bool spend_profitable(const OnePassWalk &w, int scanned) {
+      charge_ += w.walked / kStepsPerChainByte + kRunCost * w.runs;
+      return spend(w.walked) && charge_ <= std::max(kMinScan, scanned);
     }
   };
 
@@ -4679,8 +4742,8 @@ public:
         // the EGC ASCII tier: one walk over the match yields end + captures
         // (see cp_onepass_find), replacing the forward + reverse + bounded
         // capture chain below — which was this tier's whole cost on a short
-        // subject (`/users/(\d+)`: 131ns vs the EGC tier's 56ns on the same
-        // pattern and subject). Sound on any subject: the walk bails on a
+        // subject (`/users/(\d+)`: ~131 ns vs the EGC tier's ~56 ns on the
+        // same pattern and subject). Sound on any subject: the walk bails on a
         // non-ASCII byte (US has no grapheme fusion to gate on), and the
         // byte_prefix_ memmem candidates are UTF-8 self-delimiting. -1 is a
         // definitive no-match; kWalkBail / kCap fall through to the chain.
@@ -5013,8 +5076,8 @@ public:
       // !dfa_ok_ and so never reaches this cap_bitstate_ rung, but the rung
       // must not silently drop the trailing `$` if that gating ever widens.
       if (plan_->onepass_unbounded_) {
-        int walked = 0;
-        int e = cp_onepass_find(text, 0, sc.saves, walked);
+        OnePassWalk w;
+        int e = cp_onepass_find(text, 0, sc.saves, w);
         if (e >= 0)
           return onepass_end_ok(e, text) ? build_result_bytes(text, sc.saves)
                                          : MatchResult{};
@@ -5720,7 +5783,15 @@ private:
           // position, its match mask) is exact. !icase_ keeps the candidate
           // drivers' plain memmem sound; !can_match_empty_ guarantees walk
           // progress.
+          // US: a byte prefix holding a non-ASCII byte means every walk bails
+          // at its first candidate (no accept is reachable before that byte),
+          // so the drivers could only ever add a memmem + bail ahead of the
+          // chain. Leave such plans on the chain.
+          const bool prefix_nonascii =
+              std::any_of(byte_prefix_.text.begin(), byte_prefix_.text.end(),
+                          [](unsigned char b) { return b >= 0x80; });
           const bool unb = !icase_ && !can_match_empty_ &&
+                           !(us_ && prefix_nonascii) &&
                            onepass_unbounded_ast_ok(root, false);
           cp_onepass_ =
               detail::build_cp_onepass(cp_prog_, icase_, dotall_, /*cut=*/unb);
@@ -12094,13 +12165,14 @@ private:
   }
 
   // Capture twin of inner_fill: ReverseInner locate per match + columnar
-  // capture rows (the byte_fill_capture_lf layout). False on a DFA state-cap
-  // or a capture-engine bail (caller clears `spans` and falls back).
-  bool inner_fill_capture(std::string_view text, LazyDfa &lfu, LazyDfa &lfa,
-                          LazyDfa &rv, LazyDfa &pre_rev, Scratch &sc,
-                          std::vector<uint32_t> &spans) const {
+  // capture rows (the byte_fill_capture_lf layout), from `from`. False on a
+  // DFA state-cap or a capture-engine bail (caller drops the rows this call
+  // added and falls back).
+  bool inner_fill_capture(std::string_view text, int from, LazyDfa &lfu,
+                          LazyDfa &lfa, LazyDfa &rv, LazyDfa &pre_rev,
+                          Scratch &sc, std::vector<uint32_t> &spans) const {
     std::vector<int> saves;
-    int from = 0, s = -1;
+    int s = -1;
     WalkBudget budget(text.size());
     for (;;) {
       int e = inner_find(lfu, lfa, rv, pre_rev, text, from, s, budget);
@@ -12372,8 +12444,8 @@ private:
   // the same code as its open-coded loop. `from` lets a caller resume where a
   // faster loop bailed (see onepass_fill).
   template <class Emit>
-  bool dfa_locate_all_lf(std::string_view text, LazyDfa &lfu, LazyDfa &rv,
-                         Emit emit, int from = 0) const {
+  bool dfa_locate_all_lf(std::string_view text, int from, LazyDfa &lfu,
+                         LazyDfa &rv, Emit emit) const {
     int n = static_cast<int>(text.size());
     int start = from;
     while (start <= n) {
@@ -12415,18 +12487,15 @@ private:
   // code-point capture resolution (see byte_find_all_capture_lf for why the
   // byte one-pass is not used). Byte-offset rows. Correct for any dfa_ok_
   // pattern.
-  bool byte_fill_capture_lf(std::string_view text, LazyDfa &lfu, LazyDfa &rv,
-                            Scratch &sc, std::vector<uint32_t> &spans,
-                            int from = 0) const {
+  bool byte_fill_capture_lf(std::string_view text, int from, LazyDfa &lfu,
+                            LazyDfa &rv, Scratch &sc,
+                            std::vector<uint32_t> &spans) const {
     std::vector<int> saves;
-    return dfa_locate_all_lf(
-        text, lfu, rv,
-        [&](int s, int e) {
-          if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
-          append_match_spans_bytes(saves, spans);
-          return true;
-        },
-        from);
+    return dfa_locate_all_lf(text, from, lfu, rv, [&](int s, int e) {
+      if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
+      append_match_spans_bytes(saves, spans);
+      return true;
+    });
   }
 
   // Build the result for a capture-free DFA match over an ASCII byte range
@@ -12983,9 +13052,10 @@ public:
                                   // variant (also rejects lone CR/LF; a bail
                                   // re-primes the unfused ladder instead of
                                   // downgrading to the Pike)
-    bool op_unb_ = false; // ASCII Dfa tier, captures: candidate + UNBOUNDED
-                          // one-pass drives the find (one walk per match);
-                          // cleared on a budget bail -> located-span chain
+    bool op_unb_ = false; // Dfa tier (EGC ASCII / US), captures: candidate +
+                          // UNBOUNDED one-pass drives the find (one walk per
+                          // match); cleared on a budget / non-ASCII bail ->
+                          // located-span chain
     bool inner_off_ = false; // ReverseInner branch hit its walk budget ->
                              // permanently use the located-span chain
     bool suffix_off_ = false; // suffix branch hit its walk budget ->
@@ -13681,9 +13751,17 @@ private:
   // position, so tracking just (last accepting position, its match mask) —
   // instead of snapshotting the whole slot array at every accept — is exact.
   int cp_onepass_find(std::string_view t, int s, std::vector<int> &out,
-                      int &walked) const {
+                      OnePassWalk &w) const {
     const detail::CpOnePass &op = plan_->cp_onepass_;
     int pos = s;
+    // w.skip: when this walk FAILS, every candidate start in [s + 1, skip)
+    // provably fails too (see State::restart_ok) — the position-scan driver
+    // resumes at `skip`. s + 1 unless the walk's first run is a restartable
+    // one, in which case the run's end. w.runs feeds the budget's
+    // profitability rule (see WalkBudget). Both are kept in locals and
+    // written to `w` on exit; written through the reference inside the walk
+    // they cost a measurable few percent on short dense matches.
+    int skip = s + 1, runs = 0;
     const int n = static_cast<int>(t.size());
     const int nslots = op.nslots;
     int saves[detail::CpOnePass::kMaxSlots];
@@ -13702,19 +13780,42 @@ private:
     // exact; interior accepts collapse to the run's end boundary, recorded
     // after the skip. No scalar pre-probe: measured, every probe is one more
     // data-dependent branch per run and lost even on 1-3 byte tokens.
+    // `base` is the position of the walk's first consumed byte, so the only
+    // runs starting at or before base + 1 are the start state's own and the
+    // one the first transition enters — exactly the two whose end is a sound
+    // `skip` (every start before it is already proven to fail). Deciding that
+    // inside run_skip, which runs once per state ENTRY rather than per byte,
+    // keeps the loop below at the one packed load and one dead test it was
+    // built around: a shared step function taking a return code, and an
+    // in-loop "is this the first step" test, each measured 3-4% on short
+    // dense matches (`\[([^\]]+)\]\(([^)]+)\)`, ~10 steps per match).
+    int base = s;
     auto run_skip = [&]() REGEXLIB_ALWAYS_INLINE {
       if (!S->loop_ok) return;
       int q = static_cast<int>(run_scan(p, static_cast<size_t>(n),
                                         static_cast<size_t>(pos),
                                         S->loop_tbl.data()));
       if (q == pos) return;
+      const bool early = pos <= base + 1;
       pos = q;
+      runs++;
+      if (early && S->restart_ok) skip = pos;
       if (S->can_match) {
         acc_pos = pos;
         acc_mask = S->match_mask;
       }
     };
+    // Written on EVERY return but a match the caller keeps: a caller whose
+    // onepass_end_ok() rejects the accept (a require_end `body$` plan, whose
+    // walk can accept somewhere other than n) treats the walk as FAILED and
+    // reads the report — so the accept path must fill it too.
+    auto report = [&]() REGEXLIB_ALWAYS_INLINE {
+      w.walked = pos - s;
+      w.skip = skip;
+      w.runs = runs;
+    };
     run_skip();
+    base = pos; // the walk's first consumed byte
     for (;;) {
       if (pos == n) break;
       unsigned char b = p[pos];
@@ -13723,7 +13824,7 @@ private:
       uint32_t v = S->step[b];
       if (v == detail::CpOnePass::kStepDead) {
         if (b >= 128) {
-          walked = pos - s;
+          report();
           return kWalkBail; // could extend the match -> fall back
         }
         break; // the unique path died; the last accept is the end
@@ -13743,7 +13844,7 @@ private:
         run_skip(); // probe the run skip once, on entry only
       }
     }
-    walked = pos - s;
+    report();
     if (acc_pos < 0) return -1;
     for (uint64_t m = acc_mask; m; m &= m - 1)
       saves[detail::bit_ctz64(m)] = acc_pos;
@@ -13908,12 +14009,12 @@ private:
                                            probe2);
       if (!h) return -1;
       int s = static_cast<int>(h - p);
-      int walked = 0;
-      int e = cp_onepass_find(t, s, saves, walked);
+      OnePassWalk w;
+      int e = cp_onepass_find(t, s, saves, w);
       if (e == kWalkBail) return kWalkBail;
       if (e > s && onepass_end_ok(e, t)) return e;
-      if (!budget.spend(walked))
-        return kWalkBail; // quadratic guard -> linear chain
+      if (!budget.spend_profitable(w, s))
+        return kWalkBail; // quadratic guard / unprofitable -> linear chain
       scan = s + 1; // the prefix here completes no match
     }
     return -1;
@@ -13939,22 +14040,69 @@ private:
     // The first-byte prune is usable only when the set was computed
     // (first_bytes_.ok; a `.`-led pattern has none — every position is then a
     // real candidate, and its walk dies wherever the pattern disagrees).
-    const bool fb = plan_->first_bytes_.ok;
-    const bool sparse = fb && plan_->first_bytes_.sparse;
+    const bool sparse =
+        plan_->first_bytes_.ok && plan_->first_bytes_.sparse;
+    // US plans never compute first_bytes_ (analyze_first_bytes is ASCII-only);
+    // their 256-wide byte_first_bytes_ (from the byte program) is the prune
+    // there, sound on any UTF-8: a non-ASCII lead byte that can start a match
+    // is a member, and the walk then bails on it. Without this the US walk
+    // started at EVERY position, which on a sparse-start pattern lost to the
+    // located-span chain it replaced (`(\d+)\s+(\w+)` over ASCII prose,
+    // find_all: 2834 MB/s chain alone, 250 unpruned, 2940 pruned). Only the
+    // sparse form is usable: `.sparse` is set once the set was filled, while
+    // a non-sparse set is indistinguishable from the unfilled early return.
+    const bool bsparse = plan_->us_ && plan_->byte_first_bytes_.sparse;
     for (int pos = from; pos < n; pos++) {
       if (sparse) {
         pos = static_cast<int>(skip_to_first_byte(p, static_cast<size_t>(n),
                                                   static_cast<size_t>(pos)));
         if (pos >= n) return -1;
-      } else if (fb && p[pos] < 0x80 && !plan_->first_bytes_.set[p[pos]]) {
-        continue; // cheap reject: this byte starts no match
+      } else if (bsparse) {
+        pos = static_cast<int>(skip_to_byte_start(p, static_cast<size_t>(n),
+                                                  static_cast<size_t>(pos)));
+        if (pos >= n) return -1;
       }
-      int walked = 0;
-      int e = cp_onepass_find(t, pos, saves, walked);
+      // (No scalar first_bytes_ rung here: the byte-0 test below asks the
+      // same question — can a match start on this byte — off the one-pass
+      // start state's own table, which is never weaker than first_bytes_.)
+      // Two-step reject before the walk: most failed candidates die on their
+      // first or second byte (the byte after a match; a literal head's second
+      // byte — `([Hh]olmes)` over prose rejects every "he" here), and those
+      // are exactly the walks whose cost is all setup. Same packed table as
+      // the walk, so the verdict is the walk's: dead on byte 0 means no match
+      // starts here; dead on byte 1 means none unless the first transition
+      // already accepted (a one-byte match), which is left to the walk. A
+      // non-ASCII byte reads dead too and must bail exactly as the walk
+      // would.
+      {
+        const detail::CpOnePass &op = plan_->cp_onepass_;
+        const unsigned char b0 = p[pos];
+        const uint32_t v0 = op.states[static_cast<size_t>(op.start)].step[b0];
+        if (v0 == detail::CpOnePass::kStepDead) {
+          if (b0 >= 0x80) return kWalkBail;
+          continue;
+        }
+        if (pos + 1 < n && !(v0 & detail::CpOnePass::kStepAccept)) {
+          const unsigned char b1 = p[pos + 1];
+          const uint32_t v1 =
+              op.states[v0 & detail::CpOnePass::kStepIdMask].step[b1];
+          if (v1 == detail::CpOnePass::kStepDead) {
+            if (b1 >= 0x80) return kWalkBail;
+            continue;
+          }
+        }
+      }
+      OnePassWalk w;
+      int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkBail) return kWalkBail;
       if (e > pos && onepass_end_ok(e, t)) return e;
-      if (!budget.spend(walked))
-        return kWalkBail; // adversarial overlap -> located-span chain
+      if (!budget.spend_profitable(w, pos))
+        return kWalkBail; // overlap / unprofitable -> located-span chain
+      // The failed walk's first run proves every start inside it fails too
+      // (see State::restart_ok): resume at the run's end, not the next byte.
+      // Over prose with `(\w+)\s+(\d+)` this is the difference between one
+      // walk per word and one per BYTE of every word.
+      pos = w.skip - 1; // the loop's pos++ lands on `skip`
     }
     return -1;
   }
@@ -13994,6 +14142,12 @@ private:
   // Dispatch head shared by the onepass driver users: the scalar chain when
   // the whole pattern is a forced chain (no automaton at all; see
   // chain_capture_find), else the candidate-driven one-pass walk.
+  //
+  // Its four search() call sites stay open-coded on purpose (budget, dispatch,
+  // build_result_bytes / MatchResult{}): folding them into a helper with a
+  // MatchResult out-parameter was tried and measured +7-11 ns per search()
+  // on the httplib latency set (`/users/(\d+)` 44 -> 53 ns; the extra
+  // MatchResult move), so the duplication buys the direct return.
   int capture_find_dispatch(FindCache &fc, std::string_view t, int from,
                             std::vector<int> &saves, WalkBudget &budget) const {
     if (plan_->chain_.ok) {
@@ -14097,13 +14251,13 @@ private:
   // candidate drivers. True on completion; false on a cap / budget /
   // non-ASCII bail, with `resume` = the position the loop had reached. The
   // rows appended so far are exact (each is a leftmost-first match, and the
-  // loop advanced past it), so a caller may keep them and continue its
+  // loop advanced past it), so every caller keeps them and continues its
   // located-span chain from `resume` — the MatchIter shape — rather than
   // clear and redo the subject. That matters on the US tier, where any
   // non-ASCII byte after the first match bails the walk; a clear-and-redo
-  // there cost more than the chain alone (measured: `(\w+)=(\w+)` over a
-  // 256 KB kv corpus with one 'é' at the middle, find_all 101 -> 85 MB/s
-  // with clear-and-redo vs 249 without the 'é').
+  // there cost more than the chain alone (measured on `(\w+)=(\w+)` over a
+  // 256 KB kv corpus with one 'é' at the middle, find_all: chain alone
+  // 101 MB/s, clear-and-redo 85, resume 144; 254 with no 'é' at all).
   bool onepass_fill(FindCache &fc, std::string_view bytes,
                     std::vector<int> &saves, std::vector<uint32_t> &spans,
                     int &resume) const {
@@ -14119,13 +14273,6 @@ private:
       append_match_spans_bytes(saves, spans);
       from = e; // !can_match_empty_ -> progress
     }
-  }
-  // Clear-and-redo form for the callers whose chain has no resume point.
-  bool onepass_fill(FindCache &fc, std::string_view bytes,
-                    std::vector<int> &saves,
-                    std::vector<uint32_t> &spans) const {
-    int resume = 0;
-    return onepass_fill(fc, bytes, saves, spans, resume);
   }
 
   // ReverseInner + unbounded one-pass walk: for onepass_unbounded_ patterns
@@ -14153,12 +14300,12 @@ private:
       int s_floor = dfa_reverse_scan(pre_rev, text, ls, /*floor=*/from);
       if (s_floor == LazyDfa::kCap) return LazyDfa::kCap;
       if (s_floor >= 0) {
-        int walked = 0;
-        int e = cp_onepass_find(text, s_floor, saves, walked);
+        OnePassWalk w;
+        int e = cp_onepass_find(text, s_floor, saves, w);
         if (e == kWalkBail) return kWalkBail;
         if (e > s_floor && onepass_end_ok(e, text)) return e;
-        if (!budget.spend(walked))
-          return kWalkBail; // quadratic guard
+        if (!budget.spend_profitable(w, ls))
+          return kWalkBail; // quadratic guard / unprofitable
       }
       scan = ls + 1; // this occurrence anchors no match; try the next
     }
@@ -14474,7 +14621,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
           return;
         out.spans_.clear();
       }
-      if (dfa_locate_all_lf(bytes, lfu, rv, [&](int s, int e) {
+      if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
             out.spans_.push_back(static_cast<uint32_t>(s));
             out.spans_.push_back(static_cast<uint32_t>(e));
             return true;
@@ -14497,8 +14644,8 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
       // as columnar rows. No byte prefilters here: plan_us_prefilters only
       // analyzes capture-FREE US patterns, so suffix_/inner_ are never
       // planned on this path.
-      if (byte_fill_capture_lf(bytes, c.lfu(*this), c.rv(*this), c.sc_,
-                               out.spans_, resume))
+      if (byte_fill_capture_lf(bytes, resume, c.lfu(*this), c.rv(*this),
+                               c.sc_, out.spans_))
         return;
       out.spans_
           .clear(); // cap tripped — fall through to the code-point Pike VM
@@ -14509,12 +14656,13 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     // subject below).
     if (assert_byte_path_ok(bytes)) {
       std::vector<int> saves;
-      // `body$` one-pass find first (see onepass_require_end_).
-      if (plan_->capture_scan_ok()) {
-        if (onepass_fill(c, bytes, saves, out.spans_)) return;
-        out.spans_.clear();
-      }
-      int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
+      // `body$` one-pass find first (see onepass_require_end_); on a bail the
+      // assert chain resumes from the last one-pass row (see onepass_fill).
+      int resume = 0;
+      if (plan_->capture_scan_ok() &&
+          onepass_fill(c, bytes, saves, out.spans_, resume))
+        return;
+      int n = static_cast<int>(bytes.size()), start = resume, s = 0, e = 0;
       WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
       while (start <= n &&
              assert_byte_find_span(c, bytes, start, s, e, &wbudget)) {
@@ -14611,7 +14759,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
       out.spans_.clear(); // cap — fall through to the full DFA loop / Pike
     }
 
-    if (dfa_locate_all_lf(bytes, lfu, rv, [&](int s, int e) {
+    if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
           out.spans_.push_back(static_cast<uint32_t>(s));
           out.spans_.push_back(static_cast<uint32_t>(e));
           return true;
@@ -14623,12 +14771,12 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     // ReverseInner locate first when planned (same CRLF-collapse caveat as the
     // capture-free tier above).
     if (plan_->inner_.active() && !plan_->byte_crlf_collapse_) {
-      if (inner_fill_capture(bytes, c.blfu(*this), c.blfa(*this), c.brv(*this),
-                             c.inrev(*this), c.sc_, out.spans_))
+      if (inner_fill_capture(bytes, 0, c.blfu(*this), c.blfa(*this),
+                             c.brv(*this), c.inrev(*this), c.sc_, out.spans_))
         return;
       out.spans_.clear();
     }
-    if (byte_fill_capture_lf(bytes, c.blfu(*this), c.brv(*this), c.sc_,
+    if (byte_fill_capture_lf(bytes, 0, c.blfu(*this), c.brv(*this), c.sc_,
                              out.spans_))
       return;
     out.spans_.clear(); // cap — fall through to the grapheme Pike VM
@@ -14652,7 +14800,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
           return;
         out.spans_.clear();
       }
-      if (dfa_locate_all_lf(bytes, lfu, rv, [&](int s, int e) {
+      if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
             out.spans_.push_back(static_cast<uint32_t>(s));
             out.spans_.push_back(static_cast<uint32_t>(e));
             return true;
@@ -14672,20 +14820,24 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     // Candidate + UNBOUNDED one-pass first: one walk over each match yields
     // its end and captures (see cp_onepass_find), replacing the forward +
     // reverse + bounded-capture chain. A bail (failed-walk budget; non-ASCII
-    // is impossible on this tier) clears and falls through.
-    if (plan_->capture_scan_ok()) {
-      if (onepass_fill(c, bytes, saves, out.spans_)) return;
-      out.spans_.clear();
-    }
+    // is impossible on this tier) hands the rest of the subject to the chain
+    // from `resume` (see onepass_fill).
+    int resume = 0;
+    if (plan_->capture_scan_ok() &&
+        onepass_fill(c, bytes, saves, out.spans_, resume))
+      return;
     // ReverseInner locate first when planned (ASCII tier: byte == code point,
-    // the inner byte programs are sound here — see the capture-free twin).
+    // the inner byte programs are sound here — see the capture-free twin). Its
+    // own bail drops only the rows it added: the one-pass rows before
+    // `resume` stay, and the full scan below continues from `resume` too.
     if (plan_->inner_.active()) {
-      if (inner_fill_capture(bytes, c.lfu(*this), c.lfa(*this), c.rv(*this),
-                             c.inrev(*this), c.sc_, out.spans_))
+      const size_t keep = out.spans_.size();
+      if (inner_fill_capture(bytes, resume, c.lfu(*this), c.lfa(*this),
+                             c.rv(*this), c.inrev(*this), c.sc_, out.spans_))
         return;
-      out.spans_.clear();
+      out.spans_.resize(keep);
     }
-    if (byte_fill_capture_lf(bytes, c.lfu(*this), c.rv(*this), c.sc_,
+    if (byte_fill_capture_lf(bytes, resume, c.lfu(*this), c.rv(*this), c.sc_,
                              out.spans_))
       return;
     out.spans_.clear(); // cap — fall through to the grapheme Pike VM
@@ -14695,12 +14847,13 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
   // groups with the assertion-aware bitstate, emit columnar capture rows —
   // same layout as Dfa/Ascii+cap, replacing the grapheme Pike.
   if (plan_->assert_cap_ && assert_find_ok(bytes, fna)) {
-    // `body$` one-pass find first (see onepass_require_end_).
-    if (plan_->capture_scan_ok()) {
-      if (onepass_fill(c, bytes, saves, out.spans_)) return;
-      out.spans_.clear();
-    }
-    int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
+    // `body$` one-pass find first (see onepass_require_end_); on a bail the
+    // assert chain resumes from the last one-pass row (see onepass_fill).
+    int resume = 0;
+    if (plan_->capture_scan_ok() &&
+        onepass_fill(c, bytes, saves, out.spans_, resume))
+      return;
+    int n = static_cast<int>(bytes.size()), start = resume, s = 0, e = 0;
     WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
     while (start <= n && assert_find_span(c, bytes, start, s, e, &wbudget)) {
       if (!capture_saves_bytes(bytes, s, e, c.sc_, saves)) break;
