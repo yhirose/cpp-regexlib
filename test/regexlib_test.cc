@@ -2210,6 +2210,43 @@ void test_onepass_leftmost_first() {
     }
     CHECK(k == 1 && e0 == 3);
   }
+  { // CAPTURE-FREE US search() takes the same drivers, for the span alone
+    // (saves 0/1). Every answer must equal what the located-span chain gives,
+    // so each case is checked against find_all's first row - the chain still
+    // serves find_all - and against test().
+    const std::string long_pad(4096, 'x');
+    struct { const char *pat; std::string subj; size_t b, e; } cases[] = {
+        {R"([A-Za-z_]\w*)", "  getElementById()", 2, 16},
+        {R"(//[^\n]*)", "x = 1; // trailing\nnext", 7, 18},
+        {R"(/users/\d+)", "GET /users/123456 HTTP", 4, 17},
+        {R"(\d+(?:\.\d+)?)", "v3.14159x", 1, 8},
+        // the walk's own run-skip must not overshoot the leftmost match
+        {R"(\w+)", "  ab cd", 2, 4},
+        // no match: the driver must report it definitively, not fall through
+        {R"([A-Za-z_]\w*)", "1234 5678", 0, 0},
+        // long subject: the walk is O(match), the chain was O(subject) twice
+        {R"([A-Za-z_]\w*)", long_pad + " tail", 0, 4096},
+    };
+    for (auto &c : cases) {
+      Regex re = make_us(c.pat);
+      auto m = re.search(c.subj);
+      auto all = find_all(re, c.subj);
+      if (c.b == 0 && c.e == 0) {
+        CHECK(!m.matched() && all.empty() && !re.test(c.subj));
+      } else {
+        CHECK(m.matched() && m.begin() == c.b && m.end() == c.e);
+        CHECK(!all.empty() && all[0].begin() == c.b && all[0].end() == c.e);
+        CHECK(re.test(c.subj));
+      }
+    }
+    // Non-ASCII bails the walk to the chain; both must agree, and a match
+    // starting after the non-ASCII byte is the case the bail must not lose.
+    Regex re_na = make_us(R"([A-Za-z_]\w*)");
+    const std::string na = "\xc3\xa9 abc";
+    auto m_na = re_na.search(na);
+    CHECK(m_na.matched() && m_na.begin() == 3 && m_na.end() == 6);
+    CHECK(find_all(re_na, na).size() == 1);
+  }
   { // US (CodePoint) mode routes through the same drivers
     Regex re = make_us(R"((x)(?:ab)?(?:abc)?)");
     auto m = re.search("xabc");

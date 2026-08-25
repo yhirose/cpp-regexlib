@@ -4741,6 +4741,23 @@ public:
                            cache.inrev(*this), text, r))
             return r;
         }
+        // [Tier: Dfa/US+onepass] Candidate + UNBOUNDED one-pass walk, the
+        // capture tier's driver run for its SPAN (saves 0/1) rather than its
+        // groups: one pass where dfa_search_lf below needs two (unanchored
+        // forward DFA for the end, then the reverse DFA for the start). The
+        // prefilter rungs above stay in front — they answer from a memmem hit
+        // without walking at all. -1 is a definitive no-match; kWalkBail /
+        // kCap fall through to the chain.
+        // (onepass_unbounded_, not capture_scan_ok(): the scalar chain's other
+        // half is a CAPTURE engine — for a span it only re-walks what the
+        // prefilters above already do, and running it here measured a
+        // regression on every shape the walk itself declines.)
+        if (plan_->onepass_unbounded_) {
+          WalkBudget budget(text.size());
+          int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
+          if (e >= 0) return build_dfa_result(text, sc.saves[0], e);
+          if (e == -1) return MatchResult{};
+        }
         if (dfa_search_lf(cache.lfu(*this), cache.rv(*this), text, 0, r))
           return r;
         // state cap tripped — fall through to the code-point Pike VM.
@@ -5763,7 +5780,15 @@ private:
       // patterns (ambiguous capture writes), which keep using the backtracker.
       onepass_unbounded_ = false;
       onepass_anchored_start_ = false;
-      if (ncap_ > 0 && !whole_match_capture_ && !cp_prog_.insts.empty()) {
+      // ncap == 0 is admitted too: the compiler emits Save 0/1 (the whole
+      // match) at every capture count, so the SAME walk that yields a capture
+      // pattern's groups yields a capture-free pattern's span — and the same
+      // candidate drivers then replace the capture-free chain's two passes
+      // (unanchored forward DFA for the end, reverse DFA for the start) with
+      // one. cp_prog_ exists for every US plan (compile_core) and for an
+      // assert-capture plan; an EGC capture-free plan has none, so the guard
+      // below leaves it on the chain rather than compiling a program for it.
+      if (!whole_match_capture_ && !cp_prog_.insts.empty()) {
         if (assert_cap_ || byte_assert_cap_) {
           // Assert-capture: cp_prog_ carries assert ops, so build_cp_onepass bails
           // and capture resolution falls to the backtracker. But the span [s, e)
@@ -5839,8 +5864,16 @@ private:
           const bool unb = !icase_ && !can_match_empty_ &&
                            !(us_ && prefix_nonascii) &&
                            onepass_unbounded_ast_ok(root, false);
-          cp_onepass_ =
-              detail::build_cp_onepass(cp_prog_, icase_, dotall_, /*cut=*/unb);
+          // At ncap == 0 the table has exactly one consumer, the unbounded
+          // walk, so an inadmissible pattern must not build one: capture
+          // resolution (the other consumer, at ncap > 0) has no groups to
+          // resolve here. Building it anyway put a multi-KB table in every
+          // capture-free Plan and cost the patterns that cannot use it
+          // 6-14% per call — `/\*.*?\*/` 122 -> 130 ns, `"(?:\\.|[^"\\])*"`
+          // 87 -> 99 — purely from the fatter Plan.
+          if (ncap_ > 0 || unb)
+            cp_onepass_ =
+                detail::build_cp_onepass(cp_prog_, icase_, dotall_, /*cut=*/unb);
           onepass_unbounded_ = cp_onepass_.ok && unb;
         }
       }
