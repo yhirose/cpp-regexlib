@@ -3876,21 +3876,31 @@ struct CpOnePass {
     std::array<uint64_t, 128> mask; // capture slots to set to the current pos
     uint64_t match_mask = 0;
     bool can_match = false;
-    // Self-loop acceleration (rure's DFA accel): when the state loops on
-    // itself for all but a few ASCII bytes (a repeat run like `\S+`, exits =
-    // the whitespace bytes) AND no looping byte writes a slot, the walk can
-    // skip the whole run with one SIMD scan for the exit set instead of a
-    // dependent table load per byte. accel_cnt < 0 = not eligible.
-    int8_t accel_cnt = -1;
-    std::array<unsigned char, 8> accel_exit{};
+    // Self-loop run skip (rure's DFA accel, generalized to any set): when the
+    // state loops on itself for some ASCII bytes (a repeat run: `\S+`, `\d+`,
+    // `[^"]*`) AND no looping byte writes a slot, the walk skips the whole
+    // run with one SIMD membership scan (run_scan) instead of a dependent
+    // table load per byte. loop_tbl is the looping set as a nibble table:
+    // bit h of loop_tbl[l] is set iff ASCII byte (h << 4 | l) self-loops.
+    // Two 16-lane table lookups (low nibble -> row, high nibble -> bit) test
+    // 16 bytes at once, exact for ANY ASCII set — no exit-count cap, and no
+    // per-call splat of an exit list (the old PredInList form's fixed cost,
+    // which lost on the short runs real data is made of). A byte >= 0x80
+    // never tests as a member, so a run stops there and the per-byte loop
+    // bails as usual.
+    bool loop_ok = false;
+    std::array<uint8_t, 16> loop_tbl{};
     // Packed per-byte transition for the hot walks: the next state id plus
     // the two flags the per-byte loop needs — whether this (state, byte)
     // writes a slot (kStepWrite -> consult mask[b]) and whether the NEXT
     // state accepts (kStepAccept -> update the last-accept tracking). One
     // dependent load per byte instead of three (next[b], the mask_nonzero
     // bitmap and the next state's can_match live on three cache lines).
-    // kStepDead = no transition. Filled by the build post-pass.
-    std::array<uint32_t, 128> step{};
+    // kStepDead = no transition. 256 entries: [128, 256) hold kStepDead, so
+    // the per-byte loop has no `>= 0x80` test — a non-ASCII byte reads dead
+    // and is told apart from a real dead transition only on that cold path.
+    // Filled by the build post-pass.
+    std::array<uint32_t, 256> step{};
   };
   static constexpr uint32_t kStepDead = 0xFFFFFFFFu;
   static constexpr uint32_t kStepIdMask = 0x0FFFFFFFu;
@@ -4052,44 +4062,34 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
     S.can_match = match;
     S.match_mask = matchmask;
   }
-  // Self-loop acceleration post-pass (see State::accel_cnt): a state that
-  // loops on itself for all but <= 8 ASCII bytes, with no slot writes on the
-  // looping bytes, marks those exit bytes for the walk's SIMD run skip. <= 8
-  // exits implies >= 120 self-loop bytes, so eligible states are exactly the
-  // long-run repeats (`\S+`, `[^"']{0,30}`, `.+`).
+  // Self-loop run-skip post-pass (see State::loop_ok): a state that loops on
+  // itself for >= 1 ASCII byte, with no slot write on any looping byte, gets
+  // its looping set as a nibble table for the walk's SIMD run scan. The
+  // table test is exact for any set, so short-exit repeats (`\S+`, `[^"]*`)
+  // and short-member ones (`\d+`, `[A-Z]+`) qualify alike.
   for (auto &S : op.states) {
     int id = static_cast<int>(&S - op.states.data());
-    int cnt = 0;
-    bool ok = true;
-    std::array<unsigned char, 8> exits{};
+    bool loops = false, ok = true;
+    std::array<uint8_t, 16> tbl{};
     for (int b = 0; b < 128; b++) {
-      if (S.next[b] == id) {
-        if (S.mask[b] != 0) {
-          ok = false;
-          break;
-        }
-      } else {
-        if (cnt == 8) {
-          ok = false;
-          break;
-        }
-        exits[cnt++] = static_cast<unsigned char>(b);
+      if (S.next[b] != id) continue;
+      if (S.mask[b] != 0) {
+        ok = false;
+        break;
       }
+      loops = true;
+      tbl[b & 15] |= static_cast<uint8_t>(1u << (b >> 4));
     }
-    // cnt >= 1: a state that loops on EVERY ASCII byte would hand PredInList
-    // an empty exit list, whose lanes() compares against an uninitialized
-    // splat register; such states (a trailing dotall repeat) stay on the
-    // per-byte loop.
-    if (ok && cnt >= 1) {
-      S.accel_cnt = static_cast<int8_t>(cnt);
-      S.accel_exit = exits;
+    if (ok && loops) {
+      S.loop_ok = true;
+      S.loop_tbl = tbl;
     }
+    // A step entry is dead unless filled below: [128, 256) permanently (a
+    // non-ASCII byte — see State::step), and any ASCII byte with no transition.
+    S.step.fill(CpOnePass::kStepDead);
     for (int b = 0; b < 128; b++) {
       int nx = S.next[b];
-      if (nx < 0) {
-        S.step[b] = CpOnePass::kStepDead;
-        continue;
-      }
+      if (nx < 0) continue;
       uint32_t v = static_cast<uint32_t>(nx);
       if (S.mask[b] != 0) v |= CpOnePass::kStepWrite;
       if (op.states[nx].can_match) v |= CpOnePass::kStepAccept;
@@ -8081,6 +8081,79 @@ private:
   }
 #endif
 
+  // Scalar run scan from `off`: the post-SIMD tail, and the whole scan when
+  // the subject is shorter than one vector or the target has no usable SIMD.
+  // Shared by run_scan and its SSSE3 twin (calling this un-attributed helper
+  // from the target("ssse3") function is fine — the tail is cold).
+  static size_t run_scan_tail(const unsigned char *p, size_t n, size_t off,
+                              const uint8_t *tbl) {
+    for (; off < n; off++) {
+      unsigned char c = p[off];
+      if (c >= 0x80 || !(tbl[c & 15] & (1u << (c >> 4)))) break;
+    }
+    return off;
+  }
+
+#if defined(REGEXLIB_SSSE3)
+  // PSHUFB twin of run_scan's NEON body, split into its own function so it can
+  // carry REGEXLIB_TARGET_SSSE3 and still compile under an SSE2 baseline (the
+  // same shape as teddy_scan_ssse3).
+  REGEXLIB_TARGET_SSSE3 static size_t run_scan_ssse3(const unsigned char *p,
+                                                     size_t n, size_t off,
+                                                     const uint8_t *tbl) {
+    const __m128i T = _mm_loadu_si128(reinterpret_cast<const __m128i *>(tbl));
+    // 1 << hi for hi < 8; 0 for hi >= 8 (a byte >= 0x80 is never a member).
+    const __m128i B = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0,
+                                    0, 0, 0, 0);
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    for (; off + 16 <= n; off += 16) {
+      __m128i v = simd_load(p, off);
+      __m128i row = _mm_shuffle_epi8(T, _mm_and_si128(v, lomask));
+      // _mm_srli_epi16 shifts 16-bit lanes, so a byte's result carries the low
+      // nibble of its neighbour; the AND drops it, leaving exactly p[i] >> 4
+      // (0..15, never setting PSHUFB's zeroing bit 7). Same idiom as teddy.
+      __m128i bit =
+          _mm_shuffle_epi8(B, _mm_and_si128(_mm_srli_epi16(v, 4), lomask));
+      unsigned nonmember = static_cast<unsigned>(_mm_movemask_epi8(
+          _mm_cmpeq_epi8(_mm_and_si128(row, bit), _mm_setzero_si128())));
+      if (nonmember)
+        return off + static_cast<size_t>(detail::bit_ctz32(nonmember));
+    }
+    return run_scan_tail(p, n, off, tbl);
+  }
+#endif
+
+  // One-pass self-loop run scan (see CpOnePass::State::loop_tbl): the first
+  // index in [off, n) whose byte is NOT in the nibble-table set `tbl`; bytes
+  // >= 0x80 are never members. One 16-byte block per step — two table lookups
+  // and a bit test — so a run of a dozen bytes (the common token) costs one
+  // block plus its exit branch, and a long one streams at the block rate.
+  // Not routed through scan64: its 64-byte stride and entry ramp are shaped
+  // for sparse probes, not for runs that end within the first block.
+  static REGEXLIB_ALWAYS_INLINE size_t run_scan(const unsigned char *p, size_t n,
+                                                size_t off, const uint8_t *tbl) {
+#if defined(REGEXLIB_NEON)
+    const uint8x16_t T = vld1q_u8(tbl);
+    // 1 << hi for hi < 8; 0 for hi >= 8 (a byte >= 0x80 is never a member).
+    const uint8x16_t B =
+        vcombine_u8(vcreate_u8(0x8040201008040201ull), vcreate_u8(0));
+    for (; off + 16 <= n; off += 16) {
+      uint8x16_t v = simd_load(p, off);
+      uint8x16_t row = vqtbl1q_u8(T, vandq_u8(v, vdupq_n_u8(0x0F)));
+      uint8x16_t bit = vqtbl1q_u8(B, vshrq_n_u8(v, 4));
+      uint64_t nonmember = lane_bits(vceqzq_u8(vandq_u8(row, bit)));
+      if (nonmember)
+        return off + (static_cast<size_t>(detail::bit_ctz64(nonmember)) >> 2);
+    }
+#elif defined(REGEXLIB_SSSE3)
+    // Compile-time SSSE3, or the runtime-dispatched tier (cpu_has_ssse3 is a
+    // compile-time `true` in the former; see teddy_scan). SSE2-only builds
+    // and non-SIMD targets take the scalar loop.
+    if (detail::cpu_has_ssse3()) return run_scan_ssse3(p, n, off, tbl);
+#endif
+    return run_scan_tail(p, n, off, tbl);
+  }
+
   // Core form: call `visit(i)` on each hit index in order; the first accepted
   // hit (visit returns true) is returned, rejected hits continue IN PLACE —
   // no rescan of the current 64-byte stride. Returns >= n if no hit is
@@ -8278,8 +8351,8 @@ private:
   };
 
   // Widens a predicate's stop set with the non-ASCII bytes (>= 0x80) — every
-  // EGC-fused scan and the one-pass run skip compose their base probe this
-  // way. The inner predicate loads the block again; identical loads CSE.
+  // EGC-fused scan composes its base probe this way. The inner predicate
+  // loads the block again; identical loads CSE.
   template <class P> struct PredOrNonAscii {
     P inner;
     explicit PredOrNonAscii(P inner_) : inner(inner_) {}
@@ -8492,7 +8565,7 @@ private:
   static constexpr size_t kSimdSetMax = 8;
 
   // p[i] in a small enumerated byte list (2..kSimdSetMax bytes) — the
-  // dead-byte skips and the one-pass run skip's exit set.
+  // dead-byte skips (skip_to_set_byte).
   struct PredInList {
     const unsigned char *list;
     size_t cnt;
@@ -13539,10 +13612,12 @@ private:
     const detail::CpOnePass::State *S = states + st;
     while (pos < hi) {
       unsigned char b = p[pos];
-      if (b >= 128) return false; // non-ASCII code point -> backtracker
+      // A non-ASCII byte reads kStepDead from step[128..255] (see State::step),
+      // and both outcomes leave the same way — no `>= 0x80` test needed here.
       uint32_t v = S->step[b];
       if (v == detail::CpOnePass::kStepDead)
-        return false; // path died before hi (unreachable invariant)
+        return false; // non-ASCII (-> backtracker), or the path died before hi
+                      // (an unreachable invariant); the caller handles both
       if (v & detail::CpOnePass::kStepWrite)
         for (uint64_t m = S->mask[b]; m; m &= m - 1)
           saves[detail::bit_ctz64(m)] = pos;
@@ -13598,45 +13673,41 @@ private:
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int acc_pos = S->can_match ? pos : -1;
     uint64_t acc_mask = S->can_match ? S->match_mask : 0;
-    // Self-loop run skip (engaged once per state ENTRY, never re-probed on a
-    // scalar self-loop step): a long-run repeat state (`\S+`) advances with
-    // one SIMD scan for its few exit bytes (or a non-ASCII byte) instead of a
-    // dependent table load per byte. The state is unchanged across the run
-    // and no looping byte writes a slot (build-time admission), so resuming
-    // the per-byte loop at the exit is exact; interior accepts collapse to
-    // the run's end boundary, recorded after the skip. Four bytes are probed
-    // scalar first — short runs (a few-char value) cost less on the per-byte
-    // loop than the SIMD scan's setup.
-    auto accel = [&]() REGEXLIB_ALWAYS_INLINE {
-      if (S->accel_cnt < 0 || pos + 4 > n) return;
-      const uint32_t myid = static_cast<uint32_t>(S - states);
-      auto loops = [&](int i) {
-        return p[i] < 128 &&
-               (S->step[p[i]] & detail::CpOnePass::kStepIdMask) == myid;
-      };
-      if (!(loops(pos) && loops(pos + 1) && loops(pos + 2) && loops(pos + 3)))
-        return;
-      pos = static_cast<int>(
-          scan64(p, static_cast<size_t>(n), static_cast<size_t>(pos) + 4,
-                 or_nonascii(PredInList(S->accel_exit.data(),
-                                        static_cast<size_t>(S->accel_cnt)))));
+    // Self-loop run skip (engaged once per state ENTRY; after it the next
+    // byte is by construction not a self-loop byte): a repeat state (`\S+`,
+    // `\d+`) advances with one SIMD membership scan of its looping set (or
+    // to a non-ASCII byte) instead of a dependent table load per byte. The
+    // state is unchanged across the run and no looping byte writes a slot
+    // (build-time admission), so resuming the per-byte loop at the exit is
+    // exact; interior accepts collapse to the run's end boundary, recorded
+    // after the skip. No scalar pre-probe: measured, every probe is one more
+    // data-dependent branch per run and lost even on 1-3 byte tokens.
+    auto run_skip = [&]() REGEXLIB_ALWAYS_INLINE {
+      if (!S->loop_ok) return;
+      int q = static_cast<int>(run_scan(p, static_cast<size_t>(n),
+                                        static_cast<size_t>(pos),
+                                        S->loop_tbl.data()));
+      if (q == pos) return;
+      pos = q;
       if (S->can_match) {
         acc_pos = pos;
         acc_mask = S->match_mask;
       }
     };
-    accel();
+    run_skip();
     for (;;) {
       if (pos == n) break;
       unsigned char b = p[pos];
-      if (b >= 128) {
-        walked = pos - s;
-        return kWalkBail; // could extend the match -> fall back
-      }
-      // One packed load per byte: id + write flag + next-accept flag.
+      // One packed load per byte: id + write flag + next-accept flag. A
+      // non-ASCII byte reads kStepDead from step[128..255] (see State::step).
       uint32_t v = S->step[b];
-      if (v == detail::CpOnePass::kStepDead)
+      if (v == detail::CpOnePass::kStepDead) {
+        if (b >= 128) {
+          walked = pos - s;
+          return kWalkBail; // could extend the match -> fall back
+        }
         break; // the unique path died; the last accept is the end
+      }
       if (v & detail::CpOnePass::kStepWrite)
         for (uint64_t m = S->mask[b]; m; m &= m - 1)
           saves[detail::bit_ctz64(m)] = pos;
@@ -13649,7 +13720,7 @@ private:
       }
       if (nxt != S) {
         S = nxt;
-        accel(); // probe the run skip once, on entry only
+        run_skip(); // probe the run skip once, on entry only
       }
     }
     walked = pos - s;
