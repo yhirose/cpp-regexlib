@@ -4529,9 +4529,12 @@ private:
   // to 7 capture groups (group 0 + 7 => 16 slots) — so an owning result for a
   // captured match needs no heap allocation up through the wide
   // validate-and-extract shapes (an ISO-8601 datetime is 6 groups, a
-  // Combined-Log line 7). At 8 slots (3 groups) the ISO date paid ~20 ns of
-  // malloc per search(); the extra 32 inline bytes cost nothing measurable
-  // on the 1-3 group results.
+  // Combined-Log line 7). At 8 slots (3 groups) the six-group ISO date paid a
+  // malloc per search(): 114 ns against 96 here (EGC 119 / 101). The extra 32
+  // inline bytes cost nothing measurable on the 1-3 group results, which were
+  // inline either way (`^(\d{4})-(\d{2})-(\d{2})$` 54/55, `/users/(\d+)`
+  // 40/42). Measured -O3 -DNDEBUG, median of 25x200 calls, US mode, each
+  // binary run alone, the two headers differing in this line only.
   small_vector<uint32_t, 16> spans_;
   NameMap names_; // name -> group index
 };
@@ -4985,19 +4988,23 @@ public:
     }
     FindCache &cache = thread_cache(); // reuse this thread's persistent DFAs
     Scratch &sc = cache.sc_;
+    // Classify the subject once (first non-ASCII byte) and share it across the
+    // gate below and every EGC gate in the ladder, instead of a fresh O(n)
+    // SIMD pass per gate (assert_find_ok takes the index precomputed, by
+    // contract). A US plan's branch returns without reading it, so the ternary
+    // keeps US off the scan.
+    const size_t fna = plan_->us_ ? text.size() : first_nonascii(text);
     // [Tier: AnchoredOnePass+cap] `^body$` with captures: the one-pass walk
     // from the single candidate 0 yields the end AND the groups (see
-    // onepass_anchored_start_) — the same gates as search()'s `body$`
-    // dispatch (assert_byte_path_ok / assert_find_ok), which is where the
-    // walk's soundness on the subject is decided; a bail falls to the ladder.
+    // onepass_anchored_start_) — the same gates AND the same front door as
+    // search()'s `body$` dispatch (assert_byte_path_ok / assert_find_ok, then
+    // capture_find_dispatch), which is where the walk's soundness on the
+    // subject is decided; a bail falls to the ladder.
     if (plan_->onepass_anchored_start_ &&
-        (plan_->us_ ? assert_byte_path_ok(text)
-                    : assert_find_ok(text, first_nonascii(text)))) {
-      OnePassWalk w;
-      int e = cp_onepass_find(text, 0, sc.saves, w);
-      if (e >= 0)
-        return onepass_end_ok(e, text) ? build_result_bytes(text, sc.saves)
-                                       : MatchResult{};
+        (plan_->us_ ? assert_byte_path_ok(text) : assert_find_ok(text, fna))) {
+      WalkBudget budget(text.size()); // unread: the anchored driver walks once
+      int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
+      if (e >= 0) return build_result_bytes(text, sc.saves);
       if (e == -1) return MatchResult{};
     }
     if (plan_->us_) {
@@ -5029,8 +5036,6 @@ public:
       auto seg = detail::segment_cp(text);
       return run(plan_->cp_prog_, seg, 0, /*anchored=*/true, sc);
     }
-
-    const size_t fna = first_nonascii(text); // classify once; share across gates
 
     // [Tier: Dfa/EgcByte] EGC byte path (non-ASCII, no multi-code-point
     // cluster): anchored leftmost-first end from the byte forward DFA.
@@ -5787,17 +5792,24 @@ private:
           // with the single candidate 0: strip_boundary_asserts already
           // dropped both anchors from the one-pass program, and the drivers
           // read onepass_anchored_start_. Without it such a pattern paid the
-          // assert DFA locate + the bitstate (~150 ns on an ISO date, vs
-          // ~30 ns for its capture-free twin on the AnchoredOnePass tier).
+          // assert DFA locate + the bitstate: search() on a six-group ISO
+          // date measured 147 ns, against 38 for its capture-free twin on the
+          // AnchoredOnePass tier (96 with this, the rest being the six
+          // groups' materialization). Measured -O3 -DNDEBUG, median of
+          // 25x200 calls, US mode, each binary run alone.
           if (cp_onepass_.ok && !icase_ && !can_match_empty_ &&
               root.kind == detail::Node::Kind::Concat && !root.kids.empty() &&
               is_text_end_anchor(root.kids.back())) {
+            // [lo, hi) is the body's kid range, peeled the same lo/hi way
+            // plan_anchored_onepass peels its own: the trailing anchor is
+            // known present (the `if` above), a leading one is optional.
+            const size_t hi = root.kids.size() - 1;
+            const bool anchored_start =
+                hi > 0 && is_text_begin_anchor(root.kids.front());
+            const size_t lo = anchored_start ? 1 : 0;
             detail::Node body;
             body.kind = detail::Node::Kind::Concat;
-            body.kids.assign(root.kids.begin(), root.kids.end() - 1);
-            const bool anchored_start =
-                !body.kids.empty() && is_text_begin_anchor(body.kids.front());
-            if (anchored_start) body.kids.erase(body.kids.begin());
+            body.kids.assign(root.kids.begin() + lo, root.kids.begin() + hi);
             if (onepass_body_ok(body)) {
               onepass_unbounded_ = true;
               onepass_require_end_ = true;
@@ -5906,9 +5918,11 @@ private:
     // walk decides the span, which is all test() and every no-match need,
     // and a capture consumer resolves the groups on the decided [0, e)
     // (`^body$` goes one better — see onepass_anchored_start_). Barring
-    // ncap != 0 here sent `^(a+)+$` on its ReDoS input to the assert DFA
-    // (72 ns) where `^(?:a+)+$` took 44, and test() on a captured validator
-    // all the way to search()'s bitstate (ISO date: 164 ns vs 20).
+    // ncap != 0 here sent `^(a+)+$` on its ReDoS input to the assert DFA —
+    // search() 75 ns where its capture-free twin `^(?:a+)+$` took 44 — and
+    // test() on a captured validator all the way to search()'s bitstate (the
+    // six-group ISO date: 161 ns, against 20 for the twin). Measured
+    // -O3 -DNDEBUG, median of 25x200 calls, US mode, each binary run alone.
     void plan_anchored_onepass(const detail::Node &root) {
       using K = detail::Node::Kind;
       aop_.ok = false;

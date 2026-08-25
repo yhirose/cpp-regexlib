@@ -2256,8 +2256,11 @@ void test_onepass_leftmost_first() {
     // entry point — and every no-match (wrong char, short, trailing junk)
     // is decided by the same walk / the capture-stripped AnchoredOnePass.
     for (int us = 0; us < 2; us++) {
-      Regex re = us ? make_us(R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$)")
-                    : Regex(R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$)");
+      // Pin the unit on BOTH legs: a bare Regex would build in whatever the
+      // ambient default happens to be, so the "EGC" half would only be EGC by
+      // convention.
+      auto make = [&](const char *p) { return us ? make_us(p) : make_egc(p); };
+      Regex re = make(R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$)");
       const std::string ok = "2026-06-08T12:34";
       auto m = re.search(ok);
       CHECK(m.matched() && m.begin() == 0 && m.end() == ok.size() &&
@@ -2290,8 +2293,7 @@ void test_onepass_leftmost_first() {
       // agree with the ASCII answer on the same shape.
       const std::string nonascii = "2026-06-08T12:3\xc3\xa9";
       CHECK(!re.test(nonascii) && !re.search(nonascii).matched());
-      Regex re2 = us ? make_us(R"(^(\S+)@(\S+)$)")
-                     : Regex(R"(^(\S+)@(\S+)$)");
+      Regex re2 = make(R"(^(\S+)@(\S+)$)");
       auto m2 = re2.search("caf\xc3\xa9@x.\xc3\xa9");
       CHECK(m2.matched() && m2.group(1).str() == "caf\xc3\xa9" &&
             m2.group(2).str() == "x.\xc3\xa9");
@@ -2312,9 +2314,11 @@ void test_onepass_leftmost_first() {
     // above): the walk bails; the ladder reports the cluster-aware end.
     CHECK(re.match("xab\xcc\x81 tail").end() == 1);
   }
-  { // ReDoS shape with a capture: the miss is decided by the compact walk
-    // (previously the assert DFA — captures barred the table), the hit still
-    // resolves its group; test()/search()/match() agree.
+  { // ReDoS shapes with a capture. `^(a+)+$` / `^(\d+)*$` get the compact walk
+    // for the miss (previously the assert DFA — captures barred the table);
+    // `^(a|aa)+$` holds an Alt, which onepass_body_ok rejects, so it stays on
+    // the assert chain — it is here to keep the two tiers answering alike.
+    // The hit still resolves its group; test()/search()/match() agree.
     for (const char *p : {R"(^(a+)+$)", R"(^(a|aa)+$)", R"(^(\d+)*$)"}) {
       Regex re(p);
       const std::string miss = std::string(28, 'a') + "!";
