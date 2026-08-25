@@ -4967,17 +4967,35 @@ public:
         return build_dfa_result(text, 0, m);
       return MatchResult{};
     }
-    // [Tier: AnchoredOnePass] `^body$` / `^body` validators (ncap == 0 by
-    // admission): one walk from 0 decides match() outright, before even the
-    // cache fetch. Mode-independent — a non-ASCII byte falls to the ladder.
-    if (plan_->aop_.ok) {
+    // [Tier: AnchoredOnePass] `^body$` / `^body` validators: one walk from 0
+    // decides match() outright, before even the cache fetch. Mode-independent
+    // — a non-ASCII byte falls to the ladder. With captures the walk still
+    // settles every no-match (`^(a+)+$` on its ReDoS input, the common
+    // validator miss); a match needs the groups, which the ladder resolves —
+    // or, for `^body$`, the capture one-pass below yields in the same walk.
+    if (plan_->aop_.ok && !plan_->onepass_anchored_start_) {
       int e0 = 0;
       int r = anchored_onepass_try(text, e0);
       if (r == 0) return MatchResult{};
-      if (r > 0) return build_dfa_result(text, 0, e0);
+      if (r > 0 && plan_->ncap_ == 0) return build_dfa_result(text, 0, e0);
     }
     FindCache &cache = thread_cache(); // reuse this thread's persistent DFAs
     Scratch &sc = cache.sc_;
+    // [Tier: AnchoredOnePass+cap] `^body$` with captures: the one-pass walk
+    // from the single candidate 0 yields the end AND the groups (see
+    // onepass_anchored_start_) — the same gates as search()'s `body$`
+    // dispatch (assert_byte_path_ok / assert_find_ok), which is where the
+    // walk's soundness on the subject is decided; a bail falls to the ladder.
+    if (plan_->onepass_anchored_start_ &&
+        (plan_->us_ ? assert_byte_path_ok(text)
+                    : assert_find_ok(text, first_nonascii(text)))) {
+      OnePassWalk w;
+      int e = cp_onepass_find(text, 0, sc.saves, w);
+      if (e >= 0)
+        return onepass_end_ok(e, text) ? build_result_bytes(text, sc.saves)
+                                       : MatchResult{};
+      if (e == -1) return MatchResult{};
+    }
     if (plan_->us_) {
       // [Tier: Dfa/US] anchored: the leftmost-first byte DFA gives the end.
       if (plan_->dfa_match_free()) {
@@ -5735,6 +5753,7 @@ private:
       // lazy/alternation). build_cp_onepass returns ok=false for non-one-pass
       // patterns (ambiguous capture writes), which keep using the backtracker.
       onepass_unbounded_ = false;
+      onepass_anchored_start_ = false;
       if (ncap_ > 0 && !whole_match_capture_ && !cp_prog_.insts.empty()) {
         if (assert_cap_ || byte_assert_cap_) {
           // Assert-capture: cp_prog_ carries assert ops, so build_cp_onepass bails
@@ -5759,15 +5778,26 @@ private:
           // asserts, unbounded-one-pass body): the candidate drivers serve
           // the whole find with the accept-at-n condition — one walk per
           // candidate instead of the assert DFA + reverse + capture chain.
+          // `^body$` (a leading text-begin anchor too — the validate-and-
+          // extract shape, `^(\d{4})-(\d{2})-(\d{2})$`) is the same admission
+          // with the single candidate 0: strip_boundary_asserts already
+          // dropped both anchors from the one-pass program, and the drivers
+          // read onepass_anchored_start_. Without it such a pattern paid the
+          // assert DFA locate + the bitstate (~150 ns on an ISO date, vs
+          // ~30 ns for its capture-free twin on the AnchoredOnePass tier).
           if (cp_onepass_.ok && !icase_ && !can_match_empty_ &&
               root.kind == detail::Node::Kind::Concat && !root.kids.empty() &&
               is_text_end_anchor(root.kids.back())) {
             detail::Node body;
             body.kind = detail::Node::Kind::Concat;
             body.kids.assign(root.kids.begin(), root.kids.end() - 1);
+            const bool anchored_start =
+                !body.kids.empty() && is_text_begin_anchor(body.kids.front());
+            if (anchored_start) body.kids.erase(body.kids.begin());
             if (onepass_body_ok(body)) {
               onepass_unbounded_ = true;
               onepass_require_end_ = true;
+              onepass_anchored_start_ = anchored_start;
             }
           }
         } else {
@@ -5809,6 +5839,11 @@ private:
     bool is_text_end_anchor(const detail::Node &n) const {
       using K = detail::Node::Kind;
       return n.kind == K::EndText || (n.kind == K::EOL && !multiline_);
+    }
+    // Its mirror: a hard text-begin anchor (the `^` of `^body` / `^body$`).
+    bool is_text_begin_anchor(const detail::Node &n) const {
+      using K = detail::Node::Kind;
+      return n.kind == K::BeginText || (n.kind == K::BOL && !multiline_);
     }
     // Assert-free body satisfying the unbounded one-pass AST rules — the
     // shared body eligibility for every one-walk tier (unbounded capture
@@ -5862,22 +5897,27 @@ private:
     // see build_cp_onepass). This replaces the assert-DFA scan (one
     // transition load per byte plus the dispatch around it) for the classic
     // anchored validators (UUID / IPv4 / ISO-8601 / semver / hex).
+    //
+    // Capture patterns are admitted too, on the capture-STRIPPED body: the
+    // walk decides the span, which is all test() and every no-match need,
+    // and a capture consumer resolves the groups on the decided [0, e)
+    // (`^body$` goes one better — see onepass_anchored_start_). Barring
+    // ncap != 0 here sent `^(a+)+$` on its ReDoS input to the assert DFA
+    // (72 ns) where `^(?:a+)+$` took 44, and test() on a captured validator
+    // all the way to search()'s bitstate (ISO date: 164 ns vs 20).
     void plan_anchored_onepass(const detail::Node &root) {
       using K = detail::Node::Kind;
       aop_.ok = false;
       // Mode-independent: the walk consumes ASCII code points only (byte ==
       // code point == grapheme there) and bails to the assert tiers on a
       // non-ASCII byte, so EGC and US dispatch can both use it.
-      if (ncap_ != 0 || !text_anchored_ || root.kind != K::Concat ||
-          root.kids.empty())
+      if (!text_anchored_ || root.kind != K::Concat || root.kids.empty())
         return;
       // Shadowed at dispatch: the gate-free AssertAnchor tier serves
       // `^literal$` shapes at every entry point before aop_ is consulted,
       // so the table would be dead weight. plan_assert_tiers already ran.
       if (assert_.anchor_gatefree) return;
-      const detail::Node &first = root.kids.front();
-      if (!(first.kind == K::BeginText ||
-            (first.kind == K::BOL && !multiline_)))
+      if (!is_text_begin_anchor(root.kids.front()))
         return; // the anchor must be the literal first element
       size_t lo = 1, hi = root.kids.size();
       bool require_end = false;
@@ -5887,7 +5927,8 @@ private:
       }
       detail::Node body;
       body.kind = K::Concat;
-      body.kids.assign(root.kids.begin() + lo, root.kids.begin() + hi);
+      for (size_t i = lo; i < hi; i++)
+        body.kids.push_back(detail::strip_captures(root.kids[i]));
       if (!onepass_body_ok(body)) return; // interior assert -> assert tiers
       if (!compact_onepass_table(body, aop_, /*cut=*/!require_end)) return;
       aop_.require_end = require_end;
@@ -7683,16 +7724,25 @@ private:
     // as AnchoredOnePass's require_end: accepts are increasing, so the last
     // accept equals n iff any accept does.
     bool onepass_require_end_ = false;
+    // With onepass_require_end_: the pattern ALSO carries a leading text-begin
+    // anchor (`^body$`, the validate-and-extract shape), likewise stripped
+    // from the one-pass program. Position 0 is then the only candidate, so
+    // the drivers collapse to one walk from 0 (onepass_driver_find) — no
+    // memmem / position scan, and a find from any later floor is a definitive
+    // no-match.
+    bool onepass_anchored_start_ = false;
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
     // determinized cp-automaton compacted for the walk — u16 rows (256 B per
-    // state, vs CpOnePass's 1.5 KB: no capture masks exist at ncap == 0) and
-    // a parallel per-state accept byte the loop reads OFF the next-state
-    // dependency chain. require_end distinguishes `^body$` (uncut table; the
-    // walk's last accept must land exactly at n) from bare `^body`
-    // (leftmost-first-cut table; the walk's last accept IS the
-    // leftmost-first end — see build_cp_onepass).
+    // state, vs CpOnePass's 1.5 KB: the body is capture-stripped, so no
+    // capture masks exist) and a parallel per-state accept byte the loop
+    // reads OFF the next-state dependency chain. require_end distinguishes
+    // `^body$` (uncut table; the walk's last accept must land exactly at n)
+    // from bare `^body` (leftmost-first-cut table; the walk's last accept IS
+    // the leftmost-first end — see build_cp_onepass). Built for capture
+    // patterns too: the walk decides the SPAN (test(), and every no-match),
+    // and a consumer that needs the groups resolves them on it.
     AnchoredOnePass aop_;
     // [Tier: WordOnePass] the `\b body \b` shape (ncap == 0, assert-free
     // greedy-only ONE-PASS body whose first and last consuming atoms are
@@ -14286,6 +14336,17 @@ private:
   // assert_cap_ (`body$`) dispatchers in search / fill_matches / MatchIter.
   int onepass_driver_find(FindCache &fc, std::string_view t, int from,
                           std::vector<int> &saves, WalkBudget &budget) const {
+    // `^body$`: position 0 is the only candidate (a text-begin anchor), so a
+    // find from any later floor is a definitive no-match and the whole find
+    // is one walk — no scan, no budget (nothing to re-walk). A bail (non-
+    // ASCII byte) falls back to the assert chain as the other drivers do.
+    if (plan_->onepass_anchored_start_) {
+      if (from > 0) return -1;
+      OnePassWalk w;
+      int e = cp_onepass_find(t, 0, saves, w);
+      if (e == kWalkBail) return kWalkBail;
+      return (e > 0 && onepass_end_ok(e, t)) ? e : -1;
+    }
     // The grapheme-program prefix (EGC plans) or the byte-program prefix (US
     // plans; possibly multi-byte UTF-8 — still a sound memmem needle, and the
     // walk itself bails on any non-ASCII byte before consuming one).

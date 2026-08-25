@@ -1020,6 +1020,13 @@ static vector<LPat> validation_pats() {
       {"IPv4", R"(^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$)", "192.168.100.42", 0},
       {"ISO-8601 datetime", R"(^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$)",
        "2026-06-08T12:34:56", 0},
+      // The same validator with its fields captured (validate-and-extract):
+      // the per-call cost of resolving six groups on top of the decision.
+      // Without a row for it the capture ladder's anchored gaps were invisible
+      // (the group-free twin above took a one-walk tier this one did not).
+      {"ISO-8601 datetime (captures)",
+       R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$)",
+       "2026-06-08T12:34:56", 0},
       {"semver", R"(^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$)", "1.10.3-rc.2", 0},
       {"hex color", R"(^#[0-9a-fA-F]{6}$)", "#1a2b3c", 0},
   };

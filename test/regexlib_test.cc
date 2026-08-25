@@ -2251,6 +2251,82 @@ void test_onepass_leftmost_first() {
     auto m = re.search("xabc");
     CHECK(m.matched() && m.end() == 4 && m.group(1).str() == "x");
   }
+  { // `^body$` WITH captures (the validate-and-extract shape): one one-pass
+    // walk from 0 yields the end and the groups, in both modes and at every
+    // entry point — and every no-match (wrong char, short, trailing junk)
+    // is decided by the same walk / the capture-stripped AnchoredOnePass.
+    for (int us = 0; us < 2; us++) {
+      Regex re = us ? make_us(R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$)")
+                    : Regex(R"(^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$)");
+      const std::string ok = "2026-06-08T12:34";
+      auto m = re.search(ok);
+      CHECK(m.matched() && m.begin() == 0 && m.end() == ok.size() &&
+            m.group(1).str() == "2026" && m.group(3).str() == "08" &&
+            m.group(5).str() == "34");
+      auto mm = re.match(ok);
+      CHECK(mm.matched() && mm.end() == ok.size() &&
+            mm.group(2).str() == "06" && mm.group(4).str() == "12");
+      CHECK(re.test(ok));
+      auto all = find_all(re, ok);
+      CHECK(all.size() == 1 && all[0].group(5).str() == "34");
+      size_t k = 0;
+      for (auto it : re.find_iter(ok)) {
+        CHECK(it.group(1).str() == "2026");
+        k++;
+      }
+      CHECK(k == 1);
+      for (const char *bad : {"2026-06-08T12:3", "2026-06-08T12:345",
+                              "x026-06-08T12:34", "2026-06-08 12:34", ""}) {
+        CHECK(!re.test(bad));
+        CHECK(!re.search(bad).matched());
+        CHECK(!re.match(bad).matched());
+        CHECK(find_all(re, bad).empty());
+      }
+      // Not at 0 -> not a match (the anchor); the padded tail keeps the
+      // walk budget from masking a driver that scans past 0.
+      const std::string shifted = " " + ok + pad;
+      CHECK(!re.test(shifted) && !re.search(shifted).matched());
+      // Non-ASCII in the subject: the walk bails to the chain, which must
+      // agree with the ASCII answer on the same shape.
+      const std::string nonascii = "2026-06-08T12:3\xc3\xa9";
+      CHECK(!re.test(nonascii) && !re.search(nonascii).matched());
+      Regex re2 = us ? make_us(R"(^(\S+)@(\S+)$)")
+                     : Regex(R"(^(\S+)@(\S+)$)");
+      auto m2 = re2.search("caf\xc3\xa9@x.\xc3\xa9");
+      CHECK(m2.matched() && m2.group(1).str() == "caf\xc3\xa9" &&
+            m2.group(2).str() == "x.\xc3\xa9");
+      CHECK(re2.test("caf\xc3\xa9@x.\xc3\xa9") && !re2.test("caf\xc3\xa9@ "));
+    }
+  }
+  { // `^body` (no $) WITH captures: the capture-stripped AnchoredOnePass
+    // walk decides every no-match; a match falls to the ladder for the
+    // groups, and all entry points agree on the leftmost-first end.
+    Regex re(R"(^(x)(?:ab)?(?:abc)?)");
+    auto m = re.search("xabc");
+    CHECK(m.matched() && m.begin() == 0 && m.end() == 3 &&
+          m.group(1).str() == "x");
+    CHECK(re.match("xabc").end() == 3 && re.match("xabc").group(1).str() == "x");
+    CHECK(re.test("xabc") && !re.test("yabc") && !re.match("yabc").matched());
+    CHECK(find_all(re, "xabc").size() == 1);
+    // grapheme cluster right after the would-be end (see the ncap == 0 twin
+    // above): the walk bails; the ladder reports the cluster-aware end.
+    CHECK(re.match("xab\xcc\x81 tail").end() == 1);
+  }
+  { // ReDoS shape with a capture: the miss is decided by the compact walk
+    // (previously the assert DFA — captures barred the table), the hit still
+    // resolves its group; test()/search()/match() agree.
+    for (const char *p : {R"(^(a+)+$)", R"(^(a|aa)+$)", R"(^(\d+)*$)"}) {
+      Regex re(p);
+      const std::string miss = std::string(28, 'a') + "!";
+      CHECK(!re.test(miss) && !re.search(miss).matched() &&
+            !re.match(miss).matched());
+    }
+    Regex re(R"(^(a+)+$)");
+    const std::string hit(28, 'a');
+    auto m = re.search(hit);
+    CHECK(m.matched() && m.end() == 28 && m.group(1).matched());
+    CHECK(re.test(hit) && re.match(hit).matched());
+  }
   { // Trailing-\b bodies whose accepting states continue on a non-word byte
     // must reject the WordOnePass shortcut and take the assert chain, which
     // backtracks to the shorter accept. test()/search() must agree.
