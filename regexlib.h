@@ -4526,9 +4526,13 @@ private:
   int ngroups_ = 0;                 // capture groups (group 0 = whole match)
   detail::OwnedText buf_;           // the whole-match text (subject[begin:end])
   // Absolute group offsets (2 per group, kSpanNone = unmatched). Inline for up
-  // to 3 capture groups (group 0 + 3 => 8 slots), the typical capture count —
-  // so an owning result for a captured match needs no heap allocation.
-  small_vector<uint32_t, 8> spans_;
+  // to 7 capture groups (group 0 + 7 => 16 slots) — so an owning result for a
+  // captured match needs no heap allocation up through the wide
+  // validate-and-extract shapes (an ISO-8601 datetime is 6 groups, a
+  // Combined-Log line 7). At 8 slots (3 groups) the ISO date paid ~20 ns of
+  // malloc per search(); the extra 32 inline bytes cost nothing measurable
+  // on the 1-3 group results.
+  small_vector<uint32_t, 16> spans_;
   NameMap names_; // name -> group index
 };
 
