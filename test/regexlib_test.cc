@@ -603,6 +603,32 @@ void test_unicode_scalar() {
     auto caps = Regex("(é)(\\w)", US).search("xéy");
     CHECK(caps.group(1).str() == "é" && caps.group(2).str() == "y");
   }
+  // Dfa/US+cap: the candidate + unbounded one-pass walk drives capture finds
+  // in US mode too (search / find_all / find_iter), bailing to the located-
+  // span chain at a non-ASCII byte. find_all must keep the rows found before
+  // the bail and resume the chain from it — neither drop them nor redo the
+  // subject — and every entry point must agree.
+  {
+    Regex kv("(\\w+)=(\\w+)", US);
+    std::string s = "a=b cé=d e=f é g=h";
+    auto first = kv.search(s);
+    CHECK(first.matched() && first.group(1).str() == "a" &&
+          first.group(2).str() == "b");
+    auto rows = find_all(kv, s);
+    CHECK(rows.size() == 4 && rows[0].str() == "a=b" &&
+          rows[1].group(1).str() == "cé" && rows[1].group(2).str() == "d" &&
+          rows[2].str() == "e=f" && rows[3].group(2).str() == "h");
+    size_t n = 0;
+    for (auto it : kv.find_iter(s)) {
+      CHECK(n < rows.size() && it.str() == rows[n].str() &&
+            it.group(1).begin() == rows[n].group(1).begin());
+      n++;
+    }
+    CHECK(n == rows.size());
+    // The per-call shape that motivated the tier: one walk, no reverse pass.
+    auto r = Regex("/users/(\\d+)", US).search("/users/123456");
+    CHECK(r.matched() && r.group(1).str() == "123456" && r.end() == 13);
+  }
   // named captures
   {
     auto nm = Regex("(?<w>\\p{L}+)", US).search("12 héllo");

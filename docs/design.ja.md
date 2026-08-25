@@ -226,7 +226,7 @@ bitstate を溢れる場合はコードポイント Pike へフォールバッ�
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なし・貪欲のみの body） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——u16 行、accept バイトは依存チェーン外。末尾 `$` は「accept==n」比較（uncut テーブル）。素の `^body` は leftmost-first cut テーブルを使い、最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；`+cap`: 有界 cp エンジンでグループ解決 |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；`+cap`: まず候補＋unbounded one-pass 歩行（1 マッチ 1 歩行で終端とグループを得る。非ASCII バイトで chain へ bail し、`fill_matches` は subject をやり直さず bail 位置から chain を再開）、次に located-span chain＋有界 cp エンジンでグループ解決 |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；`+cap` 同上 |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa`（開始復元はキャッシュ済 `AssertRevDfa`）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |

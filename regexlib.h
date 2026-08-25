@@ -4675,10 +4675,25 @@ public:
           return r;
         // state cap tripped — fall through to the code-point Pike VM.
       } else if (plan_->dfa_find_caps()) {
-        // [Tier: Dfa/US+cap] the leftmost-first byte DFA locates the span; the
-        // code-point backtracker (run_captures_bytes, bounded by the lf end)
-        // resolves groups. No byte prefilters here: plan_us_prefilters only
-        // analyzes capture-FREE US patterns, so suffix_/inner_ are never
+        // [Tier: Dfa/US+cap] Candidate + UNBOUNDED one-pass first, exactly as
+        // the EGC ASCII tier: one walk over the match yields end + captures
+        // (see cp_onepass_find), replacing the forward + reverse + bounded
+        // capture chain below — which was this tier's whole cost on a short
+        // subject (`/users/(\d+)`: 131ns vs the EGC tier's 56ns on the same
+        // pattern and subject). Sound on any subject: the walk bails on a
+        // non-ASCII byte (US has no grapheme fusion to gate on), and the
+        // byte_prefix_ memmem candidates are UTF-8 self-delimiting. -1 is a
+        // definitive no-match; kWalkBail / kCap fall through to the chain.
+        if (plan_->capture_scan_ok()) {
+          WalkBudget budget(text.size());
+          int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
+          if (e >= 0) return build_result_bytes(text, sc.saves);
+          if (e == -1) return MatchResult{};
+        }
+        // Located-span chain: the leftmost-first byte DFA locates the span;
+        // the code-point backtracker (run_captures_bytes, bounded by the lf
+        // end) resolves groups. No byte prefilters here: plan_us_prefilters
+        // only analyzes capture-FREE US patterns, so suffix_/inner_ are never
         // planned on this path.
         int e = dfa_forward_lf(cache.lfu(*this), text, 0);
         if (e != LazyDfa::kCap) {
@@ -12354,12 +12369,13 @@ private:
   // to stop the scan early at a definitive end (e.g. a capture engine declining
   // the located span). Returns false only on a DFA state-cap, so the caller
   // falls back to the Pike. Inlined per call site, so each variant compiles to
-  // the same code as its open-coded loop.
+  // the same code as its open-coded loop. `from` lets a caller resume where a
+  // faster loop bailed (see onepass_fill).
   template <class Emit>
   bool dfa_locate_all_lf(std::string_view text, LazyDfa &lfu, LazyDfa &rv,
-                         Emit emit) const {
+                         Emit emit, int from = 0) const {
     int n = static_cast<int>(text.size());
-    int start = 0;
+    int start = from;
     while (start <= n) {
       int e = dfa_forward_lf(lfu, text, start);
       if (e == LazyDfa::kCap) return false;
@@ -12400,13 +12416,17 @@ private:
   // byte one-pass is not used). Byte-offset rows. Correct for any dfa_ok_
   // pattern.
   bool byte_fill_capture_lf(std::string_view text, LazyDfa &lfu, LazyDfa &rv,
-                            Scratch &sc, std::vector<uint32_t> &spans) const {
+                            Scratch &sc, std::vector<uint32_t> &spans,
+                            int from = 0) const {
     std::vector<int> saves;
-    return dfa_locate_all_lf(text, lfu, rv, [&](int s, int e) {
-      if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
-      append_match_spans_bytes(saves, spans);
-      return true;
-    });
+    return dfa_locate_all_lf(
+        text, lfu, rv,
+        [&](int s, int e) {
+          if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
+          append_match_spans_bytes(saves, spans);
+          return true;
+        },
+        from);
   }
 
   // Build the result for a capture-free DFA match over an ASCII byte range
@@ -14074,20 +14094,38 @@ private:
   }
 
   // The whole-subject one-pass find loop: columnar capture rows via the
-  // candidate drivers. True on completion; false on a cap / budget bail (the
-  // caller clears `spans` and falls back to its located-span chain).
+  // candidate drivers. True on completion; false on a cap / budget /
+  // non-ASCII bail, with `resume` = the position the loop had reached. The
+  // rows appended so far are exact (each is a leftmost-first match, and the
+  // loop advanced past it), so a caller may keep them and continue its
+  // located-span chain from `resume` — the MatchIter shape — rather than
+  // clear and redo the subject. That matters on the US tier, where any
+  // non-ASCII byte after the first match bails the walk; a clear-and-redo
+  // there cost more than the chain alone (measured: `(\w+)=(\w+)` over a
+  // 256 KB kv corpus with one 'é' at the middle, find_all 101 -> 85 MB/s
+  // with clear-and-redo vs 249 without the 'é').
   bool onepass_fill(FindCache &fc, std::string_view bytes,
-                    std::vector<int> &saves,
-                    std::vector<uint32_t> &spans) const {
+                    std::vector<int> &saves, std::vector<uint32_t> &spans,
+                    int &resume) const {
     int from = 0;
     WalkBudget budget(bytes.size());
     for (;;) {
       int e = capture_find_dispatch(fc, bytes, from, saves, budget);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
+      if (e == LazyDfa::kCap || e == kWalkBail) {
+        resume = from;
+        return false;
+      }
       if (e < 0) return true;
       append_match_spans_bytes(saves, spans);
       from = e; // !can_match_empty_ -> progress
     }
+  }
+  // Clear-and-redo form for the callers whose chain has no resume point.
+  bool onepass_fill(FindCache &fc, std::string_view bytes,
+                    std::vector<int> &saves,
+                    std::vector<uint32_t> &spans) const {
+    int resume = 0;
+    return onepass_fill(fc, bytes, saves, spans, resume);
   }
 
   // ReverseInner + unbounded one-pass walk: for onepass_unbounded_ patterns
@@ -14444,13 +14482,23 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
         return;
       out.spans_.clear(); // state cap tripped — fall through to the Pike VM
     } else if (plan_->dfa_find_caps()) {
-      // [Tier: Dfa/US+cap] leftmost-first byte DFA locates each span; the
-      // code-point backtracker (bounded by the lf end) resolves captures as
-      // columnar rows. No byte prefilters here: plan_us_prefilters only
+      // [Tier: Dfa/US+cap] Candidate + UNBOUNDED one-pass first (one walk per
+      // match yields end + captures; see the search() twin for soundness). A
+      // bail (budget / non-ASCII / reverse cap) keeps the rows found so far
+      // and hands the rest of the subject to the chain from `resume` — the
+      // MatchIter shape (see onepass_fill for why not clear-and-redo).
+      int resume = 0;
+      if (plan_->capture_scan_ok()) {
+        std::vector<int> saves;
+        if (onepass_fill(c, bytes, saves, out.spans_, resume)) return;
+      }
+      // Located-span chain: the leftmost-first byte DFA locates each span;
+      // the code-point backtracker (bounded by the lf end) resolves captures
+      // as columnar rows. No byte prefilters here: plan_us_prefilters only
       // analyzes capture-FREE US patterns, so suffix_/inner_ are never
       // planned on this path.
       if (byte_fill_capture_lf(bytes, c.lfu(*this), c.rv(*this), c.sc_,
-                               out.spans_))
+                               out.spans_, resume))
         return;
       out.spans_
           .clear(); // cap tripped — fall through to the code-point Pike VM
@@ -14801,6 +14849,9 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       tier_ = Tier::Dfa;
       fwd_kind_ = kLfu;
       rev_kind_ = kRv;
+      // Captures: the unbounded one-pass walk drives the find, as on the EGC
+      // ASCII tier (see the search() twin); a bail reverts to the chain.
+      op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
     } else if (re.assert_byte_path_ok(text)) {
       // [Tier: Assert/Byte] shared byte assert engine: the per-step Assert
       // handler resolves captures when ncap_ > 0 (the same path EGC uses for a
