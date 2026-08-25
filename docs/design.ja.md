@@ -211,6 +211,16 @@ prefilter・同じ `cp_prog_` bitstate capture 解決を使う。モード依存
 クラスタ無し）。EGC-ASCII の書記素 assert DFA は別の高速路として残る。US で span が
 bitstate を溢れる場合はコードポイント Pike へフォールバック。
 
+**この tier での capture は US 専用。** `assert_cap_` は ASCII subject 前提で
+`cp_prog_` を組む（`assert_find_ok` が `ascii_grapheme_ok` でゲートする）ので、
+EGC の capture パターンは非ASCII subject では書記素 Pike のまま。そこではバイト
+オートマトンの答えが書記素エンジンの答えではないからで、末尾が単独の UTF-8 先頭
+バイトの subject がそれを露呈する（書記素エンジンはその不正バイトに独自クラスタを
+与え `([^ ]+)$` にマッチするが、バイトオートマトンは継続バイトを要求してマッチ
+しない）。この理由から `assert_byte_path_ok` 自身が `ncap_ == 0` ゲートを持ち、
+どの階段もそれを継承する。以前は各呼び出し側に書き下されており、書き忘れた 1 箇所が
+まさにこの段落の元になった。
+
 ### tier の正式名（ソース中の `[Tier: …]` ラベル）
 
 上の番号付き tier は「どのエンジンが走るか」を表す。各公開エントリポイント
@@ -230,7 +240,7 @@ bitstate を溢れる場合はコードポイント Pike へフォールバッ�
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；`+cap` 同上 |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa`（開始復元はキャッシュ済 `AssertRevDfa`）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)`（US: 任意 subject；EGC: 非ASCII simple） | `ByteAssertDfa` / `ByteAssertRevDfa`、同じ prefilter |
+| `Assert/Byte` | `assert_byte_path_ok(text)`（US: 任意 subject；EGC: 非ASCII simple **かつ capture なし**） | `ByteAssertDfa` / `ByteAssertRevDfa`、同じ prefilter；`+cap` は US 専用（上記参照） |
 | `Pike` / `Pike/cp` | 常時（フォールバック） | `prog_` 上の書記素 Pike VM；US: `cp_prog_` 上のコードポイント Pike |
 
 どの階段も適格な tier を上から試し、DFA state cap で次へフォールスルーする。
@@ -411,6 +421,21 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
   同じ span、間に境界なし）。`\r`/`\n` の**ちょうど一方**にマッチするクラスは
   乖離し不安全；
 - `.` は dotall 時のみ `\r`/`\n` に触れ、そのとき透過的のみ；
+- **Multiline** の `^`/`$` は `crlf_inert` なパターンでのみ可。これらは何も消費
+  しないが、multiline のアンカーは行終端*に*束縛し、ASCII tier はそれを任意の
+  改行バイトで発火させる——よって CR-LF ペアの中では2つのコードポイントの**間**にも
+  束縛する。1クラスタとしか見ない書記素エンジンには無い位置で、バイト側のアンカー
+  集合は書記素側の上位集合、余分はちょうどクラスタ内部である。これは
+  パターンのどの要素も単独の `\r`/`\n` を消費できないとき（`crlf_inert`）無害:
+  そのときマッチは内部から開始できず（`\n` を消費する必要がある。空マッチは別途
+  排除済み）、そこで終了もできず、跨ぐこともできない（どちらも `\r` を消費して
+  いる必要がある）ので、余分なアンカーが撒くスレッドは accept 前に死ぬ。
+  `(?m)^\w+` は高速 tier に残り、`(?m)(\s+)$` は残らない。後者を
+  `"ab\r\n01 x\r\n"` に当てると書記素エンジンは1件（末尾クラスタ）、バイトエンジンは
+  2件で、しかも `\s+` を最初のクラスタの内部で止める（Multiline でなければ
+  テキストアンカーで、内部位置には一切触れない）。リテラルの `\r\n` ペアは上の
+  リテラル規則では許容されるが inert ではない: この判定は内部に到達するかであり、
+  ペアを消費することは到達することだから；
 - 透過性は群境界、固定回数/非貪欲構造で止まる。
 
 `can_match_empty_`（nullable）は CRLF 許容に**非空**マッチを追加要求します（空マッチ

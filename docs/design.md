@@ -223,6 +223,16 @@ mode-aware gate (US: any subject; EGC: non-ASCII, no multi-code-point cluster).
 The EGC-ASCII grapheme assert DFA stays as a separate fast path. US captures
 whose span overflows the bitstate still fall back to the code-point Pike.
 
+**Captures on this tier are US-only.** `assert_cap_` compiles `cp_prog_` for an
+ASCII subject (`assert_find_ok` gates on `ascii_grapheme_ok`), so an EGC capture
+pattern on a non-ASCII subject keeps the grapheme Pike — the byte automaton's
+answer is not the grapheme engine's there, and a subject ending in a lone UTF-8
+lead byte shows it (the grapheme engine gives the invalid byte its own cluster
+and matches `([^ ]+)$`; the byte automaton wants a continuation byte and does
+not). `assert_byte_path_ok` itself carries the `ncap_ == 0` gate for that
+reason, so every ladder inherits it — it used to be spelled out at each call
+site, and the one site that forgot is what this paragraph is about.
+
 ### Canonical tier names (the `[Tier: …]` labels)
 
 The numbered tiers above say *what engine runs*; each public entry point
@@ -243,7 +253,7 @@ carries a `[Tier: …]` label in the source, with one canonical name per
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); `+cap` as above |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa` (start recovery via the cached `AssertRevDfa`) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple) | `ByteAssertDfa` / `ByteAssertRevDfa`, same prefilters |
+| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | `ByteAssertDfa` / `ByteAssertRevDfa`, same prefilters; `+cap` is US-only (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
 Every ladder tries its eligible tiers top-down and falls through on a DFA
@@ -438,6 +448,22 @@ a pattern is safe if no element observes the difference:
   cluster in one — same span, no boundary between). A class matching **exactly
   one** of `\r`/`\n` diverges and is unsafe;
 - `.` touches `\r`/`\n` only under dotall, and only transparently;
+- `^`/`$` under **Multiline** only when the pattern is `crlf_inert`. They consume
+  nothing, but a multiline anchor *binds at* the line terminator, and the ASCII
+  tier fires it on any line-break byte — so inside a CR-LF pair it also binds
+  **between** the two code points, a position the grapheme engine, seeing one
+  cluster, does not have. The byte anchor set is a superset of the grapheme one
+  and the extra element is exactly the cluster interior. That is harmless when no
+  element of the pattern can consume a lone `\r` or `\n` (`crlf_inert`): a match
+  cannot then start there (it would consume the `\n`; the empty match is already
+  excluded), end there, or cross it (either would have consumed the `\r`), so the
+  extra anchors seed threads that die before accepting. `(?m)^\w+` stays on the
+  fast tiers; `(?m)(\s+)$` does not, and over `"ab\r\n01 x\r\n"` it is one match
+  to the grapheme engine — the trailing cluster — and two to the byte engine,
+  which also stops `\s+` inside the first cluster. (Without Multiline they are
+  text anchors and touch no interior position at all.) A literal `\r\n` pair is
+  not inert even though the literal rule above admits it: this test is about
+  reaching the interior, and consuming the pair reaches it;
 - transparency stops at group boundaries and at fixed-count / non-greedy structure.
 
 `can_match_empty_` (nullable) additionally forces a **non-empty** match for CRLF

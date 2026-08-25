@@ -81,6 +81,19 @@ static void diff(const char *pat, unsigned flags, const std::string &subj) {
                     std::to_string(subj.size()) + "B";
   check(a == b, "span mismatch " + tag);
 
+  // search() and test() are two more tier ladders over the same question, and
+  // a tier wired into one but not the others shows up only by comparing them:
+  // search() is find_all()'s first row and test() is "there is a row".
+  auto one = re.search(subj);
+  std::vector<uint32_t> first;
+  if (one.matched()) append_spans(one, first);
+  check(one.matched() == !b.empty(), "search vs find_all (matched) " + tag);
+  if (one.matched() && first.size() <= b.size())
+    check(first == std::vector<uint32_t>(
+                       b.begin(), b.begin() + static_cast<long>(first.size())),
+          "search vs find_all (first row) " + tag);
+  check(re.test(subj) == !b.empty(), "test vs find_all " + tag);
+
   // Early break: the first k matches from scan must equal find_all's first k.
   auto full = find_all(re, subj);
   size_t k = 0, want = full.size() / 2;
@@ -128,6 +141,32 @@ int main() {
       {"(a|b)*", 0},
       {"Holmes", 0},
       {"\\w+\\s+\\w+", 0},
+      // `body$`: a trailing text anchor makes the one-pass walk's accept a
+      // match only when it lands at n, the one shape where an ACCEPTING walk
+      // is a failure to its caller. Nothing here carried a trailing `$` before
+      // (only the Multiline `\w+$` above, which is a different anchor), so a
+      // require_end tier wired into one entry point and not another went
+      // unseen. Both units where the shape has a unit-specific driver; the two
+      // Multiline rows are EGC-only on purpose (`crlf_byte_safe` is an EGC
+      // gate, and US never fuses CR-LF).
+      {"(\\w+)$", 0},
+      {"(\\w+)$", kUS},
+      {"(\\d{3}) (\\d+)$", 0},
+      {"(\\d{3}) (\\d+)$", kUS},
+      {"(\\w+) (\\d+)$", 0},
+      {"(\\w+) (\\d+)$", kUS},
+      {"(a+)(b+)$", 0},
+      {"(a+)(b+)$", kUS},
+      {"([^ ]+)$", 0},
+      {"([^ ]+)$", kUS},
+      {"(\\w+)\\z", 0},
+      {"(\\w+)\\z", kUS},
+      {"\\.([a-z]+)$", 0},
+      {"\\.([a-z]+)$", kUS},
+      {"^(\\w+)$", 0},
+      {"^(\\w+)$", kUS},
+      {"(\\s+)$", Flag::Multiline},
+      {"(\\s+)$|zq", Flag::Multiline},
   };
   const std::string subjects[] = {
       "",
@@ -143,6 +182,11 @@ int main() {
       "x x x x x x x x",
       "  spaced   out  words  ",
       "café Holmes café Watson", // mixed ASCII/non-ASCII
+      "123 456 789 000",         // only the last group reaches a trailing $
+      "aa 11 bb 22 cc 33",       // dense candidates, one match at the end
+      "ab\xc3",                  // truncated UTF-8: a lone lead byte at the end
+      std::string(4096, 'q') + " ab\xc3", // the same, past the walk budget
+      std::string(4096, ' ') + "123 456 789 000",
   };
 
   for (const auto &c : cases)

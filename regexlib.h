@@ -4919,8 +4919,8 @@ public:
       return MatchResult{};
     }
 
-    // [Tier: Assert/Byte] capture-free, non-ASCII simple subject.
-    if (plan_->ncap_ == 0 && assert_byte_path_ok(text)) {
+    // [Tier: Assert/Byte] capture-free (EGC), non-ASCII simple subject.
+    if (assert_byte_path_ok(text)) {
       int s = 0, e = 0;
       if (assert_byte_find_span(cache, text, 0, s, e))
         return build_dfa_result(text, s, e);
@@ -5109,7 +5109,7 @@ public:
     // [Tier: Assert/Byte] capture-free, non-ASCII, anchored at 0:
     // leftmost-first end via the anchored lf byte assert DFA (balfa over the
     // bare byte_prog_).
-    if (plan_->ncap_ == 0 && assert_byte_path_ok(text)) {
+    if (assert_byte_path_ok(text)) {
       int e = assert_byte_fwd_scan_lf(cache, text, 0, /*anchored=*/true);
       if (e >= 0) return build_dfa_result(text, 0, e);
       return MatchResult{};
@@ -7267,8 +7267,75 @@ private:
         for (const auto &k : n.kids)
           if (!crlf_byte_safe(k, false, inside_repeat)) return false;
         return true;
-      default: return true; // anchors / lookaround (zero-width; non-DFA anyway)
+      case K::BOL:
+      case K::EOL:
+        // Under Multiline these bind AT the line terminator, and the ASCII tier
+        // fires them on ANY line-break byte (see empty_flags) — so inside a
+        // CR-LF pair they also bind at the position BETWEEN the two code
+        // points, which the grapheme engine, seeing one cluster, does not have.
+        // The byte anchor set is thus a SUPERSET of the grapheme one, and the
+        // extra element is exactly the cluster interior.
+        //
+        // That is harmless when nothing in the pattern can consume a lone `\r`
+        // or `\n` (crlf_inert_): a match cannot then start at the interior (it
+        // would have to consume the `\n`; the empty match is excluded by every
+        // consumer's !can_match_empty_), end there, or cross it (either would
+        // have consumed the `\r`), so the extra anchors seed threads that die
+        // before accepting. Without that, the interior is reachable and the two
+        // engines part: `(?m)(\s+)$` over "ab\r\n01 x\r\n" is ONE match to the
+        // grapheme engine (the trailing cluster) and two to the byte engine,
+        // which also stops `\s+` inside the first cluster. Non-multiline `^`/`$`
+        // are text anchors and touch no interior position at all.
+        return !multiline_ || crlf_inert_;
+      case K::WordBoundary:
+      case K::NonWordBoundary:
+      case K::BeginText:
+      case K::EndText:
+      case K::EndTextNL:
+      case K::LookAround:
+      case K::Empty:
+        return true; // zero-width, and \b/\B read only word-ness (CR and LF are
+                     // both non-word, so the cluster interior changes nothing)
       }
+      return true;
+    }
+
+    // Can NO element of `n` consume a `\r` or a `\n`? Then no match can touch
+    // the interior of a CR-LF cluster, which is what lets a multiline anchor
+    // keep CRLF byte safety above. A literal `\r\n` PAIR is deliberately not
+    // inert here even though crlf_byte_safe admits it: this predicate is about
+    // reaching the interior, and a pattern that consumes the pair reaches it.
+    bool crlf_inert(const detail::Node &n) const {
+      using K = detail::Node::Kind;
+      switch (n.kind) {
+      case K::Lit:
+        return n.lit.find(U'\r') == std::u32string::npos &&
+               n.lit.find(U'\n') == std::u32string::npos;
+      case K::Class: {
+        const std::u32string cr(1, U'\r'), lf(1, U'\n');
+        return !n.cls.matches(cr, icase_) && !n.cls.matches(lf, icase_);
+      }
+      case K::AnyChar:
+        return !dotall_; // `.` reaches \r/\n only under dotall
+      case K::Concat:
+      case K::Alt:
+      case K::Repeat:
+      case K::Group:
+      case K::LookAround:
+        for (const auto &k : n.kids)
+          if (!crlf_inert(k)) return false;
+        return true;
+      case K::Empty:
+      case K::BOL:
+      case K::EOL:
+      case K::WordBoundary:
+      case K::NonWordBoundary:
+      case K::BeginText:
+      case K::EndText:
+      case K::EndTextNL:
+        return true; // consumes nothing
+      }
+      return false; // a kind added later is not inert until it says so
     }
 
     // Decide whether the byte path may serve CRLF subjects. CRLF-byte-safe
@@ -7277,6 +7344,10 @@ private:
     // mode but not in the grapheme one) let the byte DFA reproduce the grapheme
     // engine on a CRLF subject.
     void analyze_crlf_byte_safe(const detail::Node &root) {
+      // crlf_byte_safe reads crlf_inert_ for the multiline anchors, so it is
+      // computed first. Only multiline patterns consult it, so only they pay
+      // for the extra walk.
+      crlf_inert_ = multiline_ && crlf_inert(root);
       crlf_byte_safe_ = crlf_byte_safe(root, false, /*inside_repeat=*/false);
     }
 
@@ -8076,6 +8147,11 @@ private:
     // together) that is the atom of an unbounded greedy repetition. See
     // analyze_crlf_byte_safe.
     bool crlf_byte_safe_ = false; // byte DFA == grapheme engine on a CRLF subject
+    // Multiline pattern whose every element refuses \r and \n (see crlf_inert):
+    // its extra anchor positions inside a CR-LF cluster are unreachable, so it
+    // keeps CRLF byte safety. false for every non-multiline pattern (nothing
+    // reads it there).
+    bool crlf_inert_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
     // Whole pattern is a single printable-ASCII literal (capture-free, !icase,
@@ -10829,6 +10905,13 @@ private:
     // semantics, on ANY subject — no grapheme/CRLF concern (US never fuses
     // CR-LF), so no non-ASCII / simple_from gate.
     if (plan_->us_) return true;
+    // EGC mode: capture-free only. assert_cap_ compiles cp_prog_ for an ASCII
+    // subject (assert_find_ok gates on ascii_grapheme_ok), so an EGC capture
+    // pattern on a non-ASCII subject belongs to the grapheme Pike. This lives
+    // here rather than at the call sites because it drifted: search / match /
+    // fill_matches each spelled it out and find_iter did not, and `([^ ]+)$`
+    // over a subject ending in a lone UTF-8 lead byte then had two answers.
+    if (plan_->ncap_ > 0) return false;
     // EGC mode: only a non-ASCII subject with no multi-code-point grapheme
     // cluster (so byte == grapheme); a pure-ASCII subject uses the grapheme
     // assert tier, and the CRLF gate matches the regular byte path.
@@ -14878,8 +14961,8 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     return;
   }
 
-  // [Tier: Assert/Byte] capture-free, non-ASCII simple subject: byte spans.
-  if (plan_->ncap_ == 0 && assert_byte_path_ok(bytes)) {
+  // [Tier: Assert/Byte] capture-free (EGC), non-ASCII simple subject: byte spans.
+  if (assert_byte_path_ok(bytes)) {
     int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
     WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
     while (start <= n &&
@@ -15007,8 +15090,9 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
     } else if (re.assert_byte_path_ok(text)) {
       // [Tier: Assert/Byte] shared byte assert engine: the per-step Assert
-      // handler resolves captures when ncap_ > 0 (the same path EGC uses for a
-      // non-ASCII subject).
+      // handler resolves captures when ncap_ > 0. US only — EGC shares the
+      // engine but not the captures (assert_byte_path_ok gates its rung on
+      // ncap_ == 0).
       tier_ = Tier::Assert;
       assert_byte_ = true;
       op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
@@ -15072,6 +15156,10 @@ inline void Regex::MatchIter::reprime_unfused() {
     // find (see onepass_require_end_); a bail reverts to the assert chain.
     op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
   } else if (re.assert_byte_path_ok(text)) { // [Tier: Assert/Byte]
+    // EGC: capture-free, by assert_byte_path_ok's own gate. This rung is where
+    // that gate went missing — a capture pattern read its groups off the byte
+    // assert engine and disagreed with search() and find_all() on the same
+    // subject (`([^ ]+)$` over one ending in a lone UTF-8 lead byte).
     tier_ = Tier::Assert;
     assert_byte_ = true;
   } else { // [Tier: Pike]
@@ -15415,9 +15503,10 @@ inline void Regex::MatchIter::advance() {
         done_ = true;
         return;
       }
-      if (re_->plan_->ncap_ > 0) { // resolve groups within [s, e) — both the ASCII
-                            // grapheme assert tier and the US/non-ASCII byte
-                            // assert tier route captures here
+      // Resolve groups within [s, e): the ASCII grapheme assert tier and the US
+      // byte assert tier route captures here (EGC's byte assert rung is
+      // capture-free — see assert_byte_path_ok).
+      if (re_->plan_->ncap_ > 0) {
         if (!re_->capture_saves_bytes(text_, s, e, sc_, saves_)) {
           done_ = true;
           return;

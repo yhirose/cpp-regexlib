@@ -2287,6 +2287,131 @@ void test_onepass_leftmost_first() {
   }
 }
 
+// A trailing `$` (`body$`) is the one pattern shape whose one-pass walk can
+// ACCEPT somewhere the caller rejects — the require_end plan demands the accept
+// land at n — so every driver, every entry point and both match units have to
+// agree about a rejected accept. Neither the suite nor the differential dump
+// had a single trailing-`$` pattern until this function; the throughput bench's
+// `(\d{3}) (\d+)$` row matches nothing, so a wrong none read as a win there.
+//
+// Each case asserts the four public entry points against each other: search()
+// is find_all()'s first row, test() is "find_all is non-empty", and find_iter()
+// (lazy) is find_all() (eager). A tier that serves only one of them — as the
+// iterator's byte-assert rung once did — shows up here and nowhere else.
+void test_body_dollar() {
+  // spans + group 1 of every match, from all four entry points; they must be
+  // one answer. Returns find_all's rows for the caller to check against the
+  // pattern's obvious meaning.
+  auto rows = [](const Regex &re, const std::string &s) {
+    std::vector<std::string> all, iter;
+    for (auto m : re.find_all(s))
+      all.push_back(std::to_string(m.begin()) + "," + std::to_string(m.end()) +
+                    "=" + std::string(m.group(1).str()));
+    for (auto m : re.find_iter(s))
+      iter.push_back(std::to_string(m.begin()) + "," + std::to_string(m.end()) +
+                     "=" + std::string(m.group(1).str()));
+    CHECK(all == iter);
+    CHECK(re.test(s) == !all.empty());
+    auto one = re.search(s);
+    CHECK(one.matched() == !all.empty());
+    // !all.empty() too: CHECK records and returns, so on the very divergence
+    // this function hunts (search matches, find_all does not) the line above
+    // reports and execution continues into all[0].
+    if (one.matched() && !all.empty())
+      CHECK(all[0] == std::to_string(one.begin()) + "," +
+                          std::to_string(one.end()) + "=" +
+                          std::string(one.group(1).str()));
+    return all;
+  };
+  // The shapes from the original report, in both units. Padding puts the match
+  // past WalkBudget's kMinScan window, where a driver that bails behaves
+  // differently from one that does not (see test_onepass_leftmost_first).
+  const std::string pad(4096, ' '), qpad(4096, 'q');
+  for (const std::string &lead : {std::string(), pad, qpad}) {
+    const size_t k = lead.size();
+    for (int us = 0; us < 2; us++) {
+      auto re = [&](const char *p) { return us ? make_us(p) : make_egc(p); };
+      { // the reported case: only the LAST group of digits reaches $
+        auto v = rows(re(R"((\d{3}) (\d+)$)"), lead + "123 456 789 000");
+        CHECK(v.size() == 1 && v[0] == std::to_string(k + 8) + "," +
+                                           std::to_string(k + 15) + "=789");
+      }
+      { // the greedy run from the first word ends short of n and is rejected
+        auto v = rows(re(R"((\w+)$)"), lead + "aa bb");
+        CHECK(v.size() == 1 && v[0] == std::to_string(k + 3) + "," +
+                                           std::to_string(k + 5) + "=bb");
+      }
+      { // two greedy runs, the leftmost start that still reaches n
+        auto v = rows(re(R"((a+)(b+)$)"), lead + "ab aabb");
+        CHECK(v.size() == 1 && v[0] == std::to_string(k + 3) + "," +
+                                           std::to_string(k + 7) + "=aa");
+      }
+      { // dense candidates, none of which reach n but the last
+        auto v = rows(re(R"((\w+) (\d+)$)"), lead + "aa 11 bb 22 cc 33");
+        CHECK(v.size() == 1 && v[0] == std::to_string(k + 12) + "," +
+                                           std::to_string(k + 17) + "=cc");
+      }
+      { // a body$ that matches nothing: every candidate accepts short of n
+        CHECK(rows(re(R"((\d+)$)"), lead + "12 34 xy").empty());
+      }
+      // \z is the same hard text anchor as a non-multiline $: the same row
+      CHECK(rows(re(R"((\w+)\z)"), lead + "aa bb") ==
+            std::vector<std::string>{std::to_string(k + 3) + "," +
+                                     std::to_string(k + 5) + "=bb"});
+    }
+  }
+  { // Regression: the iterator's byte-assert rung served EGC capture patterns
+    // on a non-ASCII subject, a tier search() and find_all() reserve for
+    // capture-FREE patterns (assert_cap_ compiles for an ASCII subject only).
+    // A subject ending in a lone UTF-8 lead byte is where the two engines part:
+    // the grapheme engine gives the invalid byte its own cluster and matches,
+    // the byte automaton wants a continuation byte and does not — so find_iter
+    // reported no match where search() and find_all() reported one.
+    for (const char *pat : {R"(([^ ]+)$)", R"((\w+)$)", R"((.)$)"}) {
+      Regex re = make_egc(pat);
+      const std::string s = "ab\xc3"; // \xc3 with no continuation byte
+      CHECK(rows(re, s).size() == 1);
+      CHECK(rows(re, std::string(4096, 'q') + " ab\xc3").size() == 1);
+    }
+  }
+  { // Regression: a Multiline anchor binds AT the line terminator, i.e. BETWEEN
+    // the CR and the LF of a cluster the grapheme engine cannot break — so it
+    // must clear crlf_byte_safe_, which admits CRLF subjects to the byte and
+    // assert tiers. "ab\r\n01 x\r\n" has ONE match ($ at end of text, the
+    // trailing cluster): the byte engine saw two and stopped `\s+` inside the
+    // first cluster, and an alternation form returned none at all.
+    const std::string s = "ab\r\n01 x\r\n";
+    for (const char *pat : {R"((?m)(\s+)$)", R"((?m)(\s+)$|zq)",
+                            R"((?m)zq|(\s+)$)", R"((?m)[abc]*(\s+)[abc]*$)"}) {
+      // The group is the WHOLE trailing cluster: the byte engine stopped `\s+`
+      // inside it, so pinning the span alone would not have caught that.
+      CHECK(rows(make_egc(pat), s) ==
+            std::vector<std::string>{"8,10=\r\n"});
+    }
+    // Without Multiline the anchors are text anchors and CRLF safety stands —
+    // and the answer is the same row, not merely "some row".
+    CHECK(rows(make_egc(R"((\s+)$)"), s) ==
+          std::vector<std::string>{"8,10=\r\n"});
+  }
+  { // The same divergence at its smallest, on a PURE-ASCII CRLF subject (the
+    // ASCII assert tier, which is where the extra anchor positions live — a
+    // non-ASCII subject takes the byte tier, whose kCtxPrevCR already excludes
+    // the cluster interior). "a\r\nb" is a=0 \r=1 \n=2 b=3.
+    const std::string s = "a\r\nb";
+    // Before the fix this matched [2,4) — a match STARTING inside the cluster.
+    CHECK(rows(make_egc(R"((?m)^([^a]+)$)"), s) ==
+          std::vector<std::string>{"3,4=b"});
+    // Before the fix this matched [1,2) — the CR alone, splitting the cluster.
+    CHECK(rows(make_egc(R"((?m)(\s+)$)"), s).empty());
+    // Before the fix: [2,3) and [5,6), both cluster interiors.
+    CHECK(rows(make_egc(R"((?m)^([^ ]+))"), " \r\n \r\n").empty());
+    // A crlf_inert pattern keeps the fast tiers AND the right answer: `\w`
+    // refuses \r and \n, so no match can reach a cluster interior.
+    CHECK(rows(make_egc(R"((?m)^(\w+))"), "ab\r\ncd") ==
+          (std::vector<std::string>{"0,2=ab", "4,6=cd"}));
+  }
+}
+
 // A user-supplied FindCache may be shared across Regexes and across
 // interleaved iterators; every cached-DFA consumer must re-bind it before
 // reading (a stale binding serves another Regex's DFAs — wrong results, and a
@@ -2451,6 +2576,7 @@ int main() {
   test_walk_budget_linearity();
   test_scalar_chain_soundness();
   test_onepass_leftmost_first();
+  test_body_dollar();
   test_findcache_shared_rebind();
   test_invalid_patterns();
   test_resource_limits();
