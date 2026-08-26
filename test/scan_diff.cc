@@ -180,6 +180,30 @@ int main() {
       {"\\r\\nline2", 0},
       {"^(\\w+): (.*)\\r\\n", 0},
       {"[\\r\\n]+$", 0},
+      // A repeat that can run MORE THAN ONCE over a VARIABLE-width body: the
+      // walk accepts once per iteration count, so its LAST accept is the
+      // longest parse and not the leftmost-first end. Every pattern here was
+      // fixed-width under its repeats, so the tiers reading a cut table's last
+      // accept (AnchoredOnePass's `^body`, the unbounded walk) agreed with the
+      // Pike by luck of the corpus. `^(?:[a-cb].{0,4})+` shipped WRONG.
+      {"(?:[a-cb].{0,4})+", 0},
+      {"(?:[a-cb].{0,4})+", kUS},
+      {"^(?:[a-cb].{0,4})+", 0},
+      {"^(?:[a-cb].{0,4})+", kUS},
+      {"(?:a.{0,2})+", 0},
+      {"(?:\\w.?)+", 0},
+      {"(?:[ab]x?)+", 0},
+      {"((?:[a-cb].{0,4})+)", 0}, // the capture twin: must stay on the chain
+      {"(?:[a-cb].{0,4})+$", 0},  // uncut (require_end): admission must differ
+      {"\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b", 0}, // WordOnePass, also uncut
+      // Capture-FREE shapes the one-walk driver now serves at every entry
+      // point (search / find_all / find_iter), including one whose match is
+      // long enough that the walk's SIMD run skip is what runs.
+      {"[^\\n]+", 0},
+      {"[^\\n]+", kUS},
+      {"[a-z]+", kUS},
+      {"//[^\\n]*", 0},
+      {"/users/\\d+", kUS},
   };
   const std::string subjects[] = {
       "",
@@ -202,6 +226,9 @@ int main() {
       std::string(4096, ' ') + "123 456 789 000",
       "x\r\n",                            // a CR-LF cluster at the very end
       "HTTP/1.1 200 OK\r\nHost: a\r\n\r\n", // pure-ASCII CRLF, the httplib shape
+      "bbc 23_\n_2", // the cut-lemma repro: one iteration ends at 5, two at 7
+      "abcabc x abcabc",
+      std::string(1000, 'a') + "\n" + std::string(999, 'b'), // long matches
   };
 
   for (const auto &c : cases)
