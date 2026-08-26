@@ -565,100 +565,174 @@ void invariant_fuzz_unicode(int iters) {
   }
 }
 
-void invariant_fuzz(int iters) {
-  for (int it = 0; it < iters; it++) {
-    std::string pat = gen_alt(3);
-    reg::Regex *re = nullptr;
+// The whole invariant battery for ONE generated pattern over a list of
+// subjects: every surface checked for self-consistency, then all of them
+// against the forced-Pike reference. invariant_fuzz and the shape-targeted
+// generator below share this, so a new generator cannot silently check less
+// than the old one does.
+void check_pattern(const std::string &pat,
+                   const std::vector<std::string> &subjects) {
+  reg::Regex *re = nullptr;
+  try {
+    re = new reg::Regex(pat);
+  } catch (const reg::RegexError &) {
+    return; // rejecting a pattern is fine
+  } catch (...) {
+    fail("non-RegexError thrown at construction", pat, "");
+    return;
+  }
+  // Appending an always-true zero-width assertion forces the full Pike VM:
+  // the assertion makes the program non-DFA-able (so the tier-1/tier-2 DFA
+  // paths bow out), while `(?:\b|\B)` matches at every position and consumes
+  // nothing, so the whole match is identical to the bare pattern. This is an
+  // oracle-free DFA-vs-Pike reference — search/find_all take the DFA path for
+  // DFA-able patterns, this forces the Pike path for the same matches.
+  reg::Regex *pike = nullptr;
+  try {
+    pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)");
+  } catch (...) {
+    pike = nullptr; // wrapping may hit a limit; skip the differential then
+  }
+  reg::Regex::FindCache cache; // reused across this pattern's subjects
+  for (const std::string &subj : subjects) {
+    reg::MatchResult m;
+    std::vector<reg::MatchResult> all;
     try {
-      re = new reg::Regex(pat);
-    } catch (const reg::RegexError &) {
-      continue; // rejecting a pattern is fine
+      m = re->search(subj);
+      all = find_all(*re, subj);
+      if (re->test(subj) != m.matched())
+        fail("test() != search().matched()", pat, subj);
     } catch (...) {
-      fail("non-RegexError thrown at construction", pat, "");
+      fail("matcher threw", pat, subj);
       continue;
     }
-    // Appending an always-true zero-width assertion forces the full Pike VM:
-    // the assertion makes the program non-DFA-able (so the tier-1/tier-2 DFA
-    // paths bow out), while `(?:\b|\B)` matches at every position and consumes
-    // nothing, so the whole match is identical to the bare pattern. This is an
-    // oracle-free DFA-vs-Pike reference — search/find_all take the DFA path for
-    // DFA-able patterns, this forces the Pike path for the same matches.
-    reg::Regex *pike = nullptr;
+    check_match(m, subj, pat, subj);
+    // match() and search() must agree whenever the leftmost match is anchored
+    // at 0 (both take the DFA path for tier-1 patterns; the Pike reference is
+    // the wrapped pattern checked below).
+    reg::MatchResult am;
     try {
-      pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)");
+      am = re->match(subj);
     } catch (...) {
-      pike = nullptr; // wrapping may hit a limit; skip the differential then
+      fail("match() threw", pat, subj);
+      continue;
     }
-    reg::Regex::FindCache cache; // reused across this pattern's subjects
-    for (int s = 0; s < 5; s++) {
-      std::string subj = gen_subject();
-      reg::MatchResult m;
-      std::vector<reg::MatchResult> all;
+    bool anchored = m.matched() && m.begin() == 0;
+    if (am.matched() != anchored)
+      fail("match() != (search anchored at 0)", pat, subj);
+    else if (am.matched() && (am.end() != m.end() || am.str() != m.str()))
+      fail("match() span != search span at 0", pat, subj);
+    // find_all must agree with search on the leftmost match.
+    if (m.matched()) {
+      if (all.empty())
+        fail("search matched but find_all empty", pat, subj);
+      else if (all[0].begin() != m.begin() || all[0].str() != m.str())
+        fail("find_all[0] != search", pat, subj);
+    } else if (!all.empty()) {
+      fail("search no-match but find_all non-empty", pat, subj);
+    }
+    // find_all results must advance (non-regressing positions).
+    for (size_t i = 1; i < all.size(); i++) {
+      check_match(all[i], subj, pat, subj);
+      if (all[i].begin() < all[i - 1].end())
+        fail("find_all overlaps/regresses", pat, subj);
+    }
+    // DFA-vs-Pike differential: the wrapped pattern's whole matches (its
+    // group-0 spans) must equal the DFA find_all spans, one for one.
+    if (pike) {
+      std::vector<reg::MatchResult> ref;
       try {
-        m = re->search(subj);
-        all = find_all(*re, subj);
-        if (re->test(subj) != m.matched())
-          fail("test() != search().matched()", pat, subj);
+        ref = find_all(*pike, subj);
       } catch (...) {
-        fail("matcher threw", pat, subj);
+        fail("pike reference threw", pat, subj);
         continue;
       }
-      check_match(m, subj, pat, subj);
-      // match() and search() must agree whenever the leftmost match is anchored
-      // at 0 (both take the DFA path for tier-1 patterns; the Pike reference is
-      // the wrapped pattern checked below).
-      reg::MatchResult am;
-      try {
-        am = re->match(subj);
-      } catch (...) {
-        fail("match() threw", pat, subj);
-        continue;
-      }
-      bool anchored = m.matched() && m.begin() == 0;
-      if (am.matched() != anchored)
-        fail("match() != (search anchored at 0)", pat, subj);
-      else if (am.matched() && (am.end() != m.end() || am.str() != m.str()))
-        fail("match() span != search span at 0", pat, subj);
-      // find_all must agree with search on the leftmost match.
-      if (m.matched()) {
-        if (all.empty())
-          fail("search matched but find_all empty", pat, subj);
-        else if (all[0].begin() != m.begin() || all[0].str() != m.str())
-          fail("find_all[0] != search", pat, subj);
-      } else if (!all.empty()) {
-        fail("search no-match but find_all non-empty", pat, subj);
-      }
-      // find_all results must advance (non-regressing positions).
-      for (size_t i = 1; i < all.size(); i++) {
-        check_match(all[i], subj, pat, subj);
-        if (all[i].begin() < all[i - 1].end())
-          fail("find_all overlaps/regresses", pat, subj);
-      }
-      // DFA-vs-Pike differential: the wrapped pattern's whole matches (its
-      // group-0 spans) must equal the DFA find_all spans, one for one.
-      if (pike) {
-        std::vector<reg::MatchResult> ref;
-        try {
-          ref = find_all(*pike, subj);
-        } catch (...) {
-          fail("pike reference threw", pat, subj);
-          continue;
-        }
-        if (ref.size() != all.size())
-          fail("find_all count != Pike", pat, subj);
-        else
-          // Whole spans AND capture groups must equal the Pike. The
-          // (?:PAT)(?:\b|\B) wrap is non-capturing, so the reference keeps
-          // PAT's own groups — this validates the leftmost-first capture
-          // tiers (S3) against the Pike.
-          for (size_t i = 0; i < all.size(); i++)
-            compare_groups(all[i], ref[i], "find_all vs Pike", pat, subj);
-      }
-      check_cache(*re, subj, all, cache, pat);
-      check_scan(*re, subj, all, pat);
+      if (ref.size() != all.size())
+        fail("find_all count != Pike", pat, subj);
+      else
+        // Whole spans AND capture groups must equal the Pike. The
+        // (?:PAT)(?:\b|\B) wrap is non-capturing, so the reference keeps
+        // PAT's own groups — this validates the leftmost-first capture
+        // tiers (S3) against the Pike.
+        for (size_t i = 0; i < all.size(); i++)
+          compare_groups(all[i], ref[i], "find_all vs Pike", pat, subj);
     }
-    delete re;
-    delete pike;
+    check_cache(*re, subj, all, cache, pat);
+    check_scan(*re, subj, all, pat);
+  }
+  delete re;
+  delete pike;
+}
+
+void invariant_fuzz(int iters) {
+  for (int it = 0; it < iters; it++) {
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 5; s++)
+      subjects.push_back(gen_subject());
+    check_pattern(gen_alt(3), subjects);
+  }
+}
+
+// --- One-walk tier shapes: a repeat that can run more than once over a
+// variable-width body. ---
+//
+// The one-walk tiers (AnchoredOnePass, WordOnePass, the unbounded capture
+// walk) decide a match by reading a one-pass table's LAST accept as the
+// leftmost-first end. For this exact family that reading is wrong: a long
+// single iteration and two short ones end at different offsets, BOTH accept,
+// and the last one is the longest parse rather than the end a backtracker
+// commits to. `(?:[a-cb].{0,4})+` over "bbc 23_\n_2" accepts at 5 and again at
+// 7, and 5 is the answer. Two bugs of exactly this shape shipped (one on the
+// bare `^body` table, one on WordOnePass without a trailing `\b`), so the
+// structural rules that bar it now live in one predicate — onepass_body_ok /
+// onepass_cut_ast_ok in regexlib.h.
+//
+// gen_alt reaches the family only by accident: it has to draw the anchor, the
+// group, a repeat quantifier ON the group and a variable-width quantifier
+// INSIDE it, all in one pattern, and then a subject that separates the two
+// parses. This generator draws only from that family, so the differential
+// actually gets to see it.
+std::string gen_onepass_repeat() {
+  // A leading `^` or `\b` is what puts a pattern on the one-walk tiers at all
+  // (AnchoredOnePass / WordOnePass); unanchored draws still reach the
+  // unbounded capture walk through the candidate drivers.
+  static const char *HEAD[] = {"^", "\\b", "^", "\\b", "", "\\b\\w*"};
+  static const char *ATOM[] = {"[a-c]", ".",  "\\w", "\\d",
+                               "a",     "\\s", "[a-cA-C1-3]"};
+  // Quantifiers that make the repeat body VARIABLE-width (the whole point).
+  static const char *VQ[] = {"{0,2}", "{0,4}", "?", "*", "{0,3}", "{1,3}"};
+  // Quantifiers on the group itself that let it run more than once.
+  static const char *RQ[] = {"+", "*", "{1,3}", "{2,}", "{1,}", "{2,4}"};
+  // A tail that can push the reported end past a passed-over accept, and the
+  // trailing anchors that switch the table to its uncut flavour.
+  static const char *TAIL[] = {"", "$", "\\b", "x?", "[qr]", "\\d?", "_*"};
+  std::string body;
+  int k = U(2, 3);
+  int vq_at = U(0, k - 1); // at least one variable-width piece
+  for (int i = 0; i < k; i++) {
+    body += ATOM[U(0, 6)];
+    if (i == vq_at || U(0, 1)) body += VQ[U(0, 5)];
+  }
+  std::string grp = (U(0, 2) == 0 ? "(" : "(?:") + body + ")";
+  return std::string(HEAD[U(0, 5)]) + grp + RQ[U(0, 5)] + TAIL[U(0, 6)];
+}
+
+void invariant_fuzz_onepass_repeat(int iters) {
+  for (int it = 0; it < iters; it++) {
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 3; s++)
+      subjects.push_back(gen_subject());
+    // One padded subject per pattern. The candidate drivers' WalkBudget is
+    // seeded from the subject length, so on a 10-byte subject a couple of
+    // failed candidate walks exhaust it and the driver hands the find back to
+    // the proven chain — hiding whatever the walk would have answered. The
+    // filler is `\n`, which only `\s` among the atoms above matches (dotall is
+    // off, so `.` does not): padding buys budget while usually leaving the
+    // interesting positions at the two ends rather than burying them under
+    // thousands of matches for the Pike reference to reproduce.
+    subjects.push_back(gen_subject() + std::string(4096, '\n') +
+                       gen_subject());
+    check_pattern(gen_onepass_repeat(), subjects);
   }
 }
 
@@ -1023,6 +1097,9 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
     return total / jobs + (t < total % jobs ? 1 : 0);
   };
   invariant_fuzz(share(inv));
+  // A fifth of the budget: its subjects are 4 KB, so an iteration costs about
+  // what five of invariant_fuzz's do.
+  invariant_fuzz_onepass_repeat(share(inv / 5));
   invariant_fuzz_literal(share(inv));
   invariant_fuzz_assert_suffix(share(inv));
   invariant_fuzz_assert_unicode(share(inv));
