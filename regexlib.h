@@ -4856,6 +4856,16 @@ public:
           inner_search(cache.lfu(*this), cache.lfa(*this), cache.rv(*this),
                        cache.inrev(*this), text, r))
         return r;
+      // [Tier: Dfa/Ascii+onepass] the span from one walk, as the US tier does
+      // (see there): the ASCII subject makes byte offset == grapheme index, so
+      // the code-point walk's span IS the grapheme engine's, and the walk bails
+      // on a non-ASCII byte and on `\r` where a CR-LF cluster could split.
+      if (plan_->onepass_unbounded_) {
+        WalkBudget budget(text.size());
+        int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
+        if (e >= 0) return build_dfa_result(text, sc.saves[0], e);
+        if (e == -1) return MatchResult{};
+      }
       if (dfa_search_lf(cache.lfu(*this), cache.rv(*this), text, 0, r))
         return r;
       // state cap tripped — fall through to the Pike VM.
@@ -5785,11 +5795,14 @@ private:
       // pattern's groups yields a capture-free pattern's span — and the same
       // candidate drivers then replace the capture-free chain's two passes
       // (unanchored forward DFA for the end, reverse DFA for the start) with
-      // one. cp_prog_ exists for every US plan (compile_core) and for an
-      // assert-capture plan; an EGC capture-free plan has none, so the guard
-      // below leaves it on the chain rather than compiling a program for it.
-      if (!whole_match_capture_ && !cp_prog_.insts.empty()) {
-        if (assert_cap_ || byte_assert_cap_) {
+      // one. cp_prog_ is already there for a US plan (compile_core), an EGC
+      // capture plan (plan_egc_captures) and an assert-capture plan; the EGC
+      // capture-free case compiles its own below, but only once admission has
+      // said the walk will actually run.
+      if (!whole_match_capture_) {
+        if (cp_prog_.insts.empty() && (assert_cap_ || byte_assert_cap_)) {
+          // no code-point program to build a one-pass over (nothing to do)
+        } else if (assert_cap_ || byte_assert_cap_) {
           // Assert-capture: cp_prog_ carries assert ops, so build_cp_onepass bails
           // and capture resolution falls to the backtracker. But the span [s, e)
           // is already located (the DFA verified the assertions), so over it a
@@ -5867,6 +5880,17 @@ private:
                            !(us_ && prefix_nonascii) &&
                            onepass_unbounded_ast_ok(root, false) &&
                            onepass_cut_ast_ok(root);
+          // An EGC capture-free plan has no code-point program: plan_egc_captures
+          // builds one only at ncap > 0, and the grapheme program cannot serve
+          // the walk (it interns a literal as ONE op over its code points, where
+          // the walk steps bytes). Compile it here — but only for a pattern
+          // `unb` has just admitted, so the construction cost (this repo's
+          // headline is a ~35 ns constructor) lands on the patterns that get
+          // the one walk, not on every capture-free pattern.
+          if (unb && ncap_ == 0 && !us_ && dfa_ok_ && cp_prog_.insts.empty())
+            cp_prog_ = detail::Compiler::compile(root, /*ncap=*/0, /*us=*/false,
+                                                 /*reverse=*/false, dotall_,
+                                                 /*cp=*/true);
           // At ncap == 0 the table has exactly one consumer, the unbounded
           // walk, so an inadmissible pattern must not build one: capture
           // resolution (the other consumer, at ncap > 0) has no groups to
@@ -5874,7 +5898,7 @@ private:
           // capture-free Plan and cost the patterns that cannot use it
           // 6-14% per call — `/\*.*?\*/` 122 -> 130 ns, `"(?:\\.|[^"\\])*"`
           // 87 -> 99 — purely from the fatter Plan.
-          if (ncap_ > 0 || unb)
+          if (!cp_prog_.insts.empty() && (ncap_ > 0 || unb))
             cp_onepass_ =
                 detail::build_cp_onepass(cp_prog_, icase_, dotall_, /*cut=*/unb);
           onepass_unbounded_ = cp_onepass_.ok && unb;
