@@ -1,0 +1,87 @@
+name: abidiff
+
+# tags-ignore: pushing a release tag would otherwise start a run that resolves
+# the previous release to the tag it just pushed, i.e. diffs the library
+# against itself. The release commit's own branch-push run is what gates the
+# next release.
+on:
+  push:
+    tags-ignore: ['**']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  abi:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    container:
+      image: debian:testing
+
+    steps:
+    - name: Install dependencies
+      run: apt -y --update install --no-install-recommends
+        abigail-tools
+        ca-certificates
+        g++
+        git
+
+    - uses: actions/checkout@v4
+      with:
+        path: current
+
+    - uses: actions/checkout@v4
+      with:
+        path: previous
+        fetch-depth: 0
+
+    # scripts/release.sh reads this job's conclusion to pick the bump type, so
+    # before the first release (no tag to diff against) it must still report
+    # success rather than fail on `git describe`.
+    - name: Checkout previous release
+      id: previous
+      working-directory: previous
+      run: |
+        git config --global --add safe.directory "$PWD"
+        # --match 'v*' keeps "previous release" meaning the same thing here as
+        # in scripts/release.sh, which looks for `git tag --list 'v*'`.
+        tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+        if [ -z "$tag" ]; then
+          echo "No release tag yet; nothing to diff against."
+          echo "found=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "Previous release: $tag"
+        echo "found=1" >> "$GITHUB_OUTPUT"
+        git checkout "$tag"
+
+    - name: Build current
+      if: steps.previous.outputs.found == '1'
+      working-directory: current
+      run: |
+        mkdir -p build
+        g++ -std=c++17 -g -fPIC -shared abi/abi_probe.cc -o build/libregexlib-abi.so
+
+    - name: Build previous
+      if: steps.previous.outputs.found == '1'
+      working-directory: previous
+      run: |
+        # The probe is the harness, regexlib.h is what changes — build the
+        # previous header against the current probe.
+        mkdir -p abi build
+        cp ../current/abi/abi_probe.cc abi/abi_probe.cc
+        g++ -std=c++17 -g -fPIC -shared abi/abi_probe.cc -o build/libregexlib-abi.so
+
+    - name: Run abidiff
+      if: steps.previous.outputs.found == '1'
+      run: abidiff
+        --headers-dir1 previous
+        --headers-dir2 current
+        previous/build/libregexlib-abi.so
+        current/build/libregexlib-abi.so

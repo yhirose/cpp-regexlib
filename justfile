@@ -44,3 +44,8 @@ lint-docs:
 
 clean:
     rm -rf build build-asan build-bench build-bench-native
+
+# Bump the version, tag, and push a release (dry-run; --run to execute). The
+# bump type comes from the abidiff CI result; --minor / --major force it.
+release *args:
+    @./scripts/release.sh {{args}}
