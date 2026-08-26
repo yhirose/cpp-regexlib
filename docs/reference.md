@@ -303,7 +303,10 @@ regional-indicator parity). Anchors and word boundaries see the full subject:
 `s.substr(pos)`, so `^` does not match at a non-zero `pos` and `\b` sees the
 real left context. Each call is an independent scan step (per-subject engine
 state beyond the `FindCache` is rebuilt); for bulk iteration inside one call
-frame, `find_iter()`/`find_all()` remain the right tools.
+frame, `find_iter()`/`find_all()` remain the right tools. A step allocates
+nothing beyond the `MatchResult` it returns — its scan buffers come from the
+`FindCache` (the thread-local one for the two-argument form), so a stepping
+loop does not pay a fresh scan's first-touch allocations per position.
 
 ### `find_all()` — the eager columnar container
 

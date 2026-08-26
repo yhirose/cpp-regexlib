@@ -13054,6 +13054,17 @@ public:
         balfa_;                            // leftmost-first byte assert DFA
     std::optional<ByteAssertRevDfa> barv_; // cached reverse assertion DFA
     Scratch sc_;                           // reused Pike buffers (tier 2/3)
+    // find_at()'s scan buffers. A find_at call runs one scan step through a
+    // throwaway MatchIter, whose own buffers are empty and grow on first
+    // touch — two allocations (the capture-slot vector and the one-row span
+    // vector) that a real iteration amortizes over its whole scan and a
+    // stateless step pays every call. find_at swaps these in for the step and
+    // back out before the iterator dies, so a stepping loop allocates once
+    // rather than twice per position. Not usable by a LIVE MatchIter, which
+    // keeps its own (two scans may interleave on one cache); safe here
+    // because the step begins and ends inside find_at.
+    std::vector<int> step_saves_;
+    std::vector<uint32_t> step_spans_;
     friend class Regex;
     friend class MatchIter;
 
@@ -15913,11 +15924,19 @@ inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos,
   r.next_pos = text.size() + 1;
   if (pos > text.size()) return r; // past the last scan position
   MatchIter it(*this, text, cache);
+  // Borrow the cache's warm step buffers for the duration (see step_saves_):
+  // one swapped-in pair instead of two first-touch allocations per call.
+  // Single exit past this point so they always go back.
+  it.saves_.swap(cache.step_saves_);
+  it.one_.spans_.swap(cache.step_spans_);
   it.seek(pos);
   it.advance();
-  if (it.done_) return r;
-  r.m = it.one_[0].to_owned();
-  r.next_pos = it.resume_byte();
+  if (!it.done_) {
+    r.m = it.one_[0].to_owned();
+    r.next_pos = it.resume_byte();
+  }
+  it.saves_.swap(cache.step_saves_);
+  it.one_.spans_.swap(cache.step_spans_);
   return r;
 }
 
