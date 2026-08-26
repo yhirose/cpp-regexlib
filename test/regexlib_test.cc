@@ -2240,6 +2240,46 @@ void test_onepass_leftmost_first() {
     CHECK(make_us(R"(//[^\n]*)").search("x // c").end() == 6);
     CHECK(make_us(R"(\d+(?:\.\d+)?)").search("v3.14").end() == 5);
   }
+  { // Capture-free find_all AND find_iter take the same one-walk driver, so
+    // all three entry points must report the same rows. The long-line subject
+    // is the shape the tier exists for (each match is a whole line, where the
+    // located-span chain walks it twice), and the non-ASCII one forces the
+    // walk to bail mid-subject: the rows found before the bail are kept and
+    // the chain continues from there, which is where a resume bug would show
+    // up as a dropped or duplicated match.
+    const std::string lines =
+        std::string(1000, 'a') + "\n" + std::string(999, 'b') + "\n" + "c";
+    const std::string mixed =
+        "alpha beta \xc3\xa9 gamma delta " + std::string(600, 'z');
+    for (int us = 0; us < 2; us++) {
+      for (const char *pat : {R"(\w+)", R"([^\n]+)", R"([a-z]+)"}) {
+        Regex re = us ? make_us(pat) : make_egc(pat);
+        for (const std::string *s : {&lines, &mixed}) {
+          auto all = find_all(re, *s);
+          // find_iter must agree row for row with find_all
+          size_t i = 0;
+          for (auto it : re.find_iter(*s)) {
+            CHECK(i < all.size() && it.begin() == all[i].begin() &&
+                  it.end() == all[i].end());
+            i++;
+          }
+          CHECK(i == all.size());
+          // and search() must be find_all's first row
+          auto m = re.search(*s);
+          CHECK(m.matched() == !all.empty());
+          if (!all.empty())
+            CHECK(m.begin() == all[0].begin() && m.end() == all[0].end());
+          CHECK(re.test(*s) == m.matched());
+          // every row is non-empty, in order, and non-overlapping
+          size_t prev = 0;
+          for (size_t k = 0; k < all.size(); k++) {
+            CHECK(all[k].end() > all[k].begin() && all[k].begin() >= prev);
+            prev = all[k].end();
+          }
+        }
+      }
+    }
+  }
   { // CAPTURE-FREE US search() takes the same drivers, for the span alone
     // (saves 0/1). Every answer must equal what the located-span chain gives,
     // so each case is checked against find_all's first row - the chain still

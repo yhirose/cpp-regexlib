@@ -219,6 +219,26 @@ static string make_words(size_t target_bytes, int needle_period = 0) {
   return out;
 }
 
+// ~target_bytes of long lines (~1 KB of letters each). Every match a
+// capture-free pattern finds here is a WHOLE line, where the dense corpora
+// above give it 1-12 bytes at a time. That distinction is a tier boundary, not
+// a detail: the located-span chain walks each match twice (forward for the
+// end, reverse for the start) and the one-pass walk crosses it once with a
+// SIMD run skip, so the two are within noise on short matches and orders apart
+// here. With no row of this shape the whole difference was invisible.
+static string make_long_lines(size_t target_bytes) {
+  mt19937 rng(0xC0FFEE);
+  uniform_int_distribution<int> ch(0, 25);
+  string out;
+  out.reserve(target_bytes + 1024);
+  while (out.size() < target_bytes) {
+    for (int i = 0; i < 1023; i++)
+      out.push_back(char('a' + ch(rng)));
+    out.push_back('\n');
+  }
+  return out;
+}
+
 // Same as make_words, but inject a single non-ASCII grapheme near the middle.
 // One non-ASCII byte flips is_ascii() for the WHOLE subject, disabling every
 // DFA tier — this case measures the depth of that cliff vs the pure-ASCII one.
@@ -1402,6 +1422,13 @@ int main(int argc, char *argv[]) {
 
   // A-2 target: dense capture-free greedy -> regexlib tier 1 (pure DFA).
   cases.push_back({"dense \\w+ (tier1)", "\\w+", false, {make_words(MB)}});
+
+  // The same capture-free shapes where each match is a WHOLE ~1 KB line
+  // instead of a 1-12 byte word (see make_long_lines): per-match cost is the
+  // walk over the match, not the per-match overhead the dense rows measure.
+  cases.push_back({"long-match \\w+", "\\w+", false, {make_long_lines(MB)}});
+  cases.push_back(
+      {"long-match [^\\n]+", "[^\\n]+", false, {make_long_lines(MB)}});
 
   // A-1 target: literal alternation -> regexlib tier 3 (Pike + first-byte
   // skip). Non-capturing so it stays capture-free; still longest-unsafe

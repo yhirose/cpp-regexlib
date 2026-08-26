@@ -13404,10 +13404,11 @@ public:
                                   // variant (also rejects lone CR/LF; a bail
                                   // re-primes the unfused ladder instead of
                                   // downgrading to the Pike)
-    bool op_unb_ = false; // Dfa tier (EGC ASCII / US), captures: candidate +
-                          // UNBOUNDED one-pass drives the find (one walk per
-                          // match); cleared on a budget / non-ASCII bail ->
-                          // located-span chain
+    bool op_unb_ = false; // Dfa tier (EGC ASCII / US): candidate + UNBOUNDED
+                          // one-pass drives the find (one walk per match,
+                          // yielding the groups where there are any and the
+                          // span where there are not); cleared on a budget /
+                          // non-ASCII bail -> located-span chain
     bool inner_off_ = false; // ReverseInner branch hit its walk budget ->
                              // permanently use the located-span chain
     bool suffix_off_ = false; // suffix branch hit its walk budget ->
@@ -14990,7 +14991,18 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
           return;
         out.spans_.clear();
       }
-      if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
+      // [Tier: Dfa/US+onepass] The capture tier's driver loop run for its SPAN:
+      // one walk per match where dfa_locate_all_lf below takes two (forward for
+      // the end, reverse for the start). append_match_spans_bytes writes
+      // ncap_ + 1 = 1 row per match here, i.e. exactly the (begin, end) pair
+      // this tier's columnar layout wants. A bail keeps the rows found so far
+      // and hands the rest to the chain from `resume` (see onepass_fill).
+      int resume = 0;
+      if (plan_->onepass_unbounded_) {
+        std::vector<int> saves;
+        if (onepass_fill(c, bytes, saves, out.spans_, resume)) return;
+      }
+      if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
             out.spans_.push_back(static_cast<uint32_t>(s));
             out.spans_.push_back(static_cast<uint32_t>(e));
             return true;
@@ -15169,7 +15181,14 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
           return;
         out.spans_.clear();
       }
-      if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
+      // [Tier: Dfa/Ascii+onepass] one walk per match for the span, as the US
+      // tier does (see there); ASCII subject, so byte offset == grapheme index.
+      int resume = 0;
+      if (plan_->onepass_unbounded_) {
+        std::vector<int> op_saves;
+        if (onepass_fill(c, bytes, op_saves, out.spans_, resume)) return;
+      }
+      if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
             out.spans_.push_back(static_cast<uint32_t>(s));
             out.spans_.push_back(static_cast<uint32_t>(e));
             return true;
@@ -15373,7 +15392,8 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       rev_kind_ = kRv;
       // Captures: the unbounded one-pass walk drives the find, as on the EGC
       // ASCII tier (see the search() twin); a bail reverts to the chain.
-      op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
+      op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
+                              : re.plan_->onepass_unbounded_;
     } else if (re.assert_byte_path_ok(text)) {
       // [Tier: Assert/Byte] shared byte assert engine: the per-step Assert
       // handler resolves captures when ncap_ > 0. US only — EGC shares the
@@ -15381,7 +15401,8 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       // ncap_ == 0).
       tier_ = Tier::Assert;
       assert_byte_ = true;
-      op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
+      op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
+                              : re.plan_->onepass_unbounded_;
     } else { // [Tier: Pike/cp]
       tier_ = Tier::Pike;
       cp_mode_ = true;
@@ -15435,12 +15456,14 @@ inline void Regex::MatchIter::reprime_unfused() {
     rev_kind_ = kRv;
     // Captures: drive the find with the unbounded one-pass walk (prefix /
     // inner / position-scan candidates — see cp_onepass_find).
-    op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
+    op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
+                              : re.plan_->onepass_unbounded_;
   } else if (re.assert_find_ok(text, fna)) { // [Tier: Assert/Ascii]
     tier_ = Tier::Assert;
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
-    op_unb_ = re.plan_->ncap_ > 0 && re.plan_->capture_scan_ok();
+    op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
+                              : re.plan_->onepass_unbounded_;
   } else if (re.assert_byte_path_ok(text)) { // [Tier: Assert/Byte]
     // EGC: capture-free, by assert_byte_path_ok's own gate. This rung is where
     // that gate went missing — a capture pattern read its groups off the byte
