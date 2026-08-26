@@ -240,8 +240,8 @@ static string make_long_lines(size_t target_bytes) {
 }
 
 // Same as make_words, but inject a single non-ASCII grapheme near the middle.
-// One non-ASCII byte flips is_ascii() for the WHOLE subject, disabling every
-// DFA tier — this case measures the depth of that cliff vs the pure-ASCII one.
+// One non-ASCII byte takes the WHOLE subject off the ASCII tiers — this case
+// measures the depth of that cliff vs the pure-ASCII one.
 static string make_words_one_nonascii(size_t target_bytes) {
   string s = make_words(target_bytes);
   s.insert(s.size() / 2, "\xC3\xA9"); // 'é' (U+00E9, 2 bytes UTF-8)
@@ -664,8 +664,8 @@ static void run_case(const Case &c, int iters) {
 // bench code is original.
 //
 // NOTE: the corpus is UTF-8 with ~33 non-ASCII bytes (a BOM and a few curly
-// quotes, 0.006%). That is enough to flip is_ascii() for the whole subject and
-// take regexlib off its ASCII fast paths (prefix memmem skip, DFA tiers) onto
+// quotes, 0.006%). That is enough to classify the whole subject as non-ASCII
+// and take regexlib off its ASCII fast paths (prefix memmem skip, DFA tiers) onto
 // the grapheme engine — so these numbers expose regexlib's non-ASCII cliff on
 // real- world text. RE2/Rust handle UTF-8 natively and have no such cliff,
 // hence the large gap on literal/sparse patterns. See docs / the EGC byte path
@@ -1447,9 +1447,9 @@ int main(int argc, char *argv[]) {
                    {make_words(MB)}});
 
   // C-6 target: the non-ASCII cliff. Identical to dense \w+ but one 'é' near
-  // the middle flips is_ascii() and disables every DFA tier for the subject in
-  // EGC mode. UnicodeScalar mode keeps the same \w+ on the byte DFA (no
-  // is_ascii gate) — the cliff is gone — so the US row should land near the
+  // the middle takes the subject off every ASCII DFA tier in EGC mode.
+  // UnicodeScalar mode keeps the same \w+ on the byte DFA (no ASCII gate) —
+  // the cliff is gone — so the US row should land near the
   // pure-ASCII tier-1 numbers, not the EGC-with-one-é grapheme-Pike fallback.
   cases.push_back({"\\w+ + 1 non-ASCII, EGC",
                    "\\w+",

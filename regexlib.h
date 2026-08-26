@@ -1381,12 +1381,6 @@ inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
   return false;
 }
 
-inline size_t decode_codepoint(const char *s8, size_t l, char32_t &out) {
-  size_t bytes;
-  if (decode_codepoint(s8, l, bytes, out)) return bytes;
-  return 0;
-}
-
 // Lenient decode: on invalid UTF-8, stand the raw byte in for the code point
 // and consume exactly one byte, so a scan over a malformed subject still makes
 // progress and never straddles the next lead byte. Returns the byte length.
@@ -1849,6 +1843,12 @@ struct Segmented {
   bool ascii = false; // all bytes < 0x80, so grapheme index == byte index
 };
 
+inline bool all_ascii(std::string_view s8) {
+  for (unsigned char c : s8)
+    if (c >= 0x80) return false;
+  return true;
+}
+
 // Build a Segmented where every byte is its own entry — the ASCII case with no
 // CR-LF fusion. Shared by segment() (only when the subject has no `\r`, since a
 // CR-LF must fuse) and segment_cp() (code-point mode never fuses).
@@ -1875,13 +1875,7 @@ inline Segmented segment(std::string_view s8) {
   // with a `\r` therefore falls to the grapheme path so the pair fuses (a lone
   // CR is its own cluster either way; gating on any `\r` is a sound, near-exact
   // proxy for the CR-LF pair since `\r` in text is almost always CRLF).
-  bool ascii = true;
-  for (unsigned char c : s8)
-    if (c >= 0x80) {
-      ascii = false;
-      break;
-    }
-  if (ascii && memchr(s8.data(), '\r', s8.size()) == nullptr)
+  if (all_ascii(s8) && memchr(s8.data(), '\r', s8.size()) == nullptr)
     return segment_ascii_bytes(s8);
 
   // Decode to code points while remembering each code point's byte offset.
@@ -1924,13 +1918,7 @@ inline Segmented segment_cp(std::string_view s8) {
   // ASCII fast path: a byte < 0x80 is its own code point. Code-point mode does
   // NOT fuse CR-LF (that is grapheme semantics), so unlike segment() this stays
   // byte-per-entry even with `\r\n` present.
-  bool ascii = true;
-  for (unsigned char c : s8)
-    if (c >= 0x80) {
-      ascii = false;
-      break;
-    }
-  if (ascii) return segment_ascii_bytes(s8);
+  if (all_ascii(s8)) return segment_ascii_bytes(s8);
 
   Segmented seg;
   seg.graphemes.reserve(s8.size());
@@ -2622,7 +2610,8 @@ struct Parser {
           return make_node(Node::Kind::Empty);
         }
         if (is(U':')) {
-          pos++; // (?im:...) scoped — applied globally in this PoC
+          pos++; // (?im:...) — the flags apply to the whole pattern, not
+                 // just the group (scoped flags are not supported)
         } else {
           error(RegexError::Code::BadInlineFlags, "malformed inline flags");
         }
@@ -2640,8 +2629,9 @@ struct Parser {
     return g;
   }
 
-  // Capture groups nested inside a lookaround do not export their captures in
-  // this PoC, so they are compiled as non-capturing.
+  // Capture groups nested inside a lookaround do not export their captures
+  // (the body is a separate boolean program), so they are compiled as
+  // non-capturing.
   int assign_capture() { return in_look ? -1 : ++ncap; }
 
   Node parse_lookaround(bool behind, bool negate) {
@@ -2995,10 +2985,7 @@ struct Inst {
 
   int cls_idx() const { return x; } // Class -> Program::classes
 
-  int sub_idx() const {
-    return x;
-  } // Look  -> Program::subs (reverse-compiled
-    // for lookbehind)
+  int sub_idx() const { return x; } // Look -> Program::subs
 
   unsigned char blo() const { return static_cast<unsigned char>(x); }
 
@@ -3031,6 +3018,9 @@ struct Program {
 using ByteRange = std::pair<unsigned char, unsigned char>;
 using ByteSeq = std::vector<ByteRange>;
 
+// Unlike unicode::utf8::encode_codepoint this also encodes surrogates (as the
+// 3-byte form): a class range may be written to include them, and the range
+// splitter needs a byte pattern for every code point it is handed.
 inline int utf8_encode_cp(char32_t cp, unsigned char b[4]) {
   if (cp <= 0x7F) {
     b[0] = static_cast<unsigned char>(cp);
@@ -3349,8 +3339,7 @@ struct Compiler {
   // pattern (insts 0..2), turning the program into the unanchored
   // leftmost-first form the lf DFAs run. Raw bytes — not an AST `.*?`, which
   // would expand to a code-point automaton — and emitted FIRST, so no
-  // post-hoc target relocation pass over the whole program is needed (the
-  // old prepend_byte_prefix rebuilt and shifted every instruction).
+  // post-hoc target relocation pass over the whole program is needed.
   static Program compile(const Node &root, int ncap, bool us = false,
                          bool reverse = false, bool dotall = false,
                          bool cp = false, bool icase = false,
@@ -3500,10 +3489,9 @@ struct Compiler {
     }
   }
 
-  static std::vector<std::pair<char32_t, char32_t>>
-  normalize_ranges(std::vector<std::pair<char32_t, char32_t>> rs) {
+  static CpRanges normalize_ranges(CpRanges rs) {
     std::sort(rs.begin(), rs.end());
-    std::vector<std::pair<char32_t, char32_t>> out;
+    CpRanges out;
     for (auto &r : rs) {
       if (out.empty() || r.first > out.back().second + 1)
         out.push_back(r);
@@ -3514,9 +3502,8 @@ struct Compiler {
   }
 
   // Complement of normalized `rs` within [0, 0x10FFFF].
-  static std::vector<std::pair<char32_t, char32_t>>
-  complement_ranges(const std::vector<std::pair<char32_t, char32_t>> &rs) {
-    std::vector<std::pair<char32_t, char32_t>> out;
+  static CpRanges complement_ranges(const CpRanges &rs) {
+    CpRanges out;
     char32_t next = 0;
     for (auto &r : rs) {
       if (r.first > next) out.push_back({next, r.first - 1});
@@ -3606,7 +3593,7 @@ struct Compiler {
   // Emit a code-point set (ranges) as a UTF-8 byte automaton: an alternation of
   // byte-range sequences (order is irrelevant — a class is a union). The block
   // is built once per (set, direction) and cached (class_block_cached).
-  void emit_utf8_ranges(const std::vector<std::pair<char32_t, char32_t>> &rs) {
+  void emit_utf8_ranges(const CpRanges &rs) {
     append_block(class_block_cached(rs, reverse_));
   }
 
@@ -3712,13 +3699,11 @@ struct Compiler {
       i.look_behind = n.look_behind;
       i.look_negate = n.look_negate;
       // The lookaround body is its own program (captures are not exported).
-      // Lookbehind bodies are reverse-compiled so they can be matched
-      // right-to-left from the assertion position in one linear pass; in US
-      // mode the body is a byte program too, and a lookbehind body's bytes are
-      // reversed (reverse=us_) so the right-to-left byte scan matches them.
-      // A lookbehind body is reverse-compiled and, in byte (us_) or code-point
-      // (cp_) mode, its units are emitted in reverse so the right-to-left scan
-      // matches them; a lookahead body is compiled forward.
+      // A lookbehind body is reverse-compiled so it can be matched
+      // right-to-left from the assertion position in one linear pass; in byte
+      // (us_) or code-point (cp_) mode its units are emitted in reverse too,
+      // so the right-to-left scan matches them. A lookahead body is compiled
+      // forward.
       bool body_rev = n.look_behind && (us_ || cp_);
       i.x = intern_sub(std::make_shared<Program>(
           compile(n.look_behind ? reverse_ast(n.kids[0]) : n.kids[0], 0, us_,
@@ -4747,11 +4732,10 @@ public:
         // forward DFA for the end, then the reverse DFA for the start). The
         // prefilter rungs above stay in front — they answer from a memmem hit
         // without walking at all. -1 is a definitive no-match; kWalkBail /
-        // kCap fall through to the chain.
-        // (onepass_unbounded_, not capture_scan_ok(): the scalar chain's other
-        // half is a CAPTURE engine — for a span it only re-walks what the
-        // prefilters above already do, and running it here measured a
-        // regression on every shape the walk itself declines.)
+        // kCap fall through to the chain. (Gated on onepass_unbounded_ rather
+        // than capture_scan_ok(): the scalar chain is a CAPTURE engine and is
+        // never planned at ncap == 0, so here the two coincide and the
+        // narrower name states what actually runs.)
         if (plan_->onepass_unbounded_) {
           WalkBudget budget(text.size());
           int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
@@ -5560,7 +5544,7 @@ private:
       if (teddy_.ok && ncap_ == 0) analyze_literal_alternation(root);
       // Whole-match capture (every group wraps the entire match, e.g. (\w+)): the
       // leftmost-first-located [start, end) is each group's span, so the direct
-      // fill (capture_saves_bytes / find_all_spans / match()) needs no capture
+      // fill (capture_saves_bytes / find_all / match()) needs no capture
       // engine. No longest-safe gate — the located span is leftmost-first on
       // every tier.
       whole_match_capture_ = ncap_ > 0 && dfa_ok_ &&
@@ -6184,32 +6168,6 @@ private:
       wop_.ok = true;
     }
 
-    // See onepass_unbounded_: no Alt anywhere, every Repeat greedy, and no
-    // capturing Group inside a Repeat. (LookAround already excludes the
-    // pattern from the one-pass build.)
-    // Does `n` always consume the SAME number of positions? (Conservative: an
-    // alternation says no even when its branches happen to agree, and anything
-    // not listed says no.) A repeat that can run more than once needs this of
-    // its body — see onepass_cut_ast_ok.
-    static bool node_fixed_width(const detail::Node &n) {
-      using K = detail::Node::Kind;
-      switch (n.kind) {
-      case K::Empty:
-      case K::Lit:
-      case K::AnyChar:
-      case K::Class: return true;
-      case K::Concat:
-      case K::Group:
-        for (const auto &k : n.kids)
-          if (!node_fixed_width(k)) return false;
-        return true;
-      case K::Repeat:
-        return n.rmax >= 0 && n.rmin == n.rmax && !n.kids.empty() &&
-               node_fixed_width(n.kids[0]);
-      default: return false; // Alt, assertions, lookaround
-      }
-    }
-
     // The extra rule for a table built with the leftmost-first CUT, whose
     // consumer reads the walk's LAST accept as the leftmost-first end (the
     // unbounded walk, AnchoredOnePass's bare `^body`, and WordOnePass without
@@ -6235,13 +6193,16 @@ private:
     static bool onepass_cut_ast_ok(const detail::Node &n) {
       using K = detail::Node::Kind;
       if (n.kind == K::Repeat && (n.rmax < 0 || n.rmax > 1) &&
-          !n.kids.empty() && !node_fixed_width(n.kids[0]))
+          !n.kids.empty() && !node_fixed(n.kids[0]))
         return false;
       for (const auto &k : n.kids)
         if (!onepass_cut_ast_ok(k)) return false;
       return true;
     }
 
+    // See onepass_unbounded_: no Alt anywhere, every Repeat greedy, and no
+    // capturing Group inside a Repeat. (LookAround already excludes the
+    // pattern from the one-pass build.)
     static bool onepass_unbounded_ast_ok(const detail::Node &n,
                                          bool in_repeat) {
       using K = detail::Node::Kind;
@@ -6611,19 +6572,15 @@ private:
       first_bytes_.sparse = count <= 32;
     }
 
-    // Byte-program counterpart of extract_prefix + analyze_first_bytes, built
-    // from byte_prog_ so the prefilter is sound over arbitrary UTF-8 (the
-    // grapheme program's prefilter is ASCII-only and is disabled on the byte
-    // path). Called after byte_prog_ is compiled. The byte automaton is
-    // self-delimiting, so a byte-literal prefix found by memmem always lands on a
-    // real match start, and the first-byte set spans 0..255 (covering non-ASCII
-    // lead bytes).
-    // Build the byte-level dead-skip prefilter (literal byte prefix memmem +
-    // sparse first-byte set) from a byte forward program. `prog` is the
+    // Byte-program counterpart of extract_prefix + analyze_first_bytes: the
+    // byte-level dead-skip prefilter (literal byte prefix memmem + sparse
+    // first-byte set over 0..255, covering non-ASCII lead bytes). `prog` is the
     // NON-prefixed forward byte program: byte_prog_ on the EGC byte path, or
-    // prog_ in UnicodeScalar mode (where prog_ is itself a byte automaton). Sound
-    // on any UTF-8 — the byte DFA scans raw bytes, so an exact-byte memmem / lead-
-    // byte skip never desynchronizes a multi-byte code point.
+    // prog_ in UnicodeScalar mode (where prog_ is itself a byte automaton).
+    // Sound on any UTF-8 — the byte automaton is self-delimiting, so an
+    // exact-byte memmem / lead-byte skip never desynchronizes a multi-byte code
+    // point (the grapheme program's prefilter is ASCII-only and is disabled on
+    // the byte path).
     void analyze_byte_prefilter(const detail::Program &prog) {
       using Op = detail::Inst::Op;
       byte_prefilter_ok_ = false;
@@ -6694,25 +6651,31 @@ private:
       byte_prefilter_ok_ = byte_prefix_.active() || byte_first_bytes_.sparse;
     }
 
-    // True if `n` matches a FIXED number of elements (so a given start has exactly
-    // one possible end). This makes the suffix-driven scan equal to leftmost-first
-    // find: each suffix occurrence maps to a unique candidate match, with no greedy
-    // longer/shorter ambiguity (which `a.{0,2}x` would have). Conservatively
-    // rejects alternation, anchors, lookaround, and any non-fixed-count repeat —
-    // and (being finite) it also bounds the reverse scan to O(maxlen).
+    // True if `n` always consumes the SAME number of elements (so a given start
+    // has exactly one possible end). For the suffix prefilters this makes the
+    // suffix-driven scan equal to leftmost-first find: each suffix occurrence
+    // maps to a unique candidate match, with no greedy longer/shorter ambiguity
+    // (which `a.{0,2}x` would have), and (being finite) it bounds the reverse
+    // scan to O(maxlen). For the cut-built one-pass tables it is what a repeat
+    // that can run more than once needs of its body (see onepass_cut_ast_ok).
+    // Conservative: an alternation says no even when its branches happen to
+    // agree, and anchors / lookaround say no.
     static bool node_fixed(const detail::Node &n) {
       using K = detail::Node::Kind;
       switch (n.kind) {
+      case K::Empty:
       case K::Lit:
       case K::Class:
       case K::AnyChar: return true;
-      case K::Repeat: return n.rmin == n.rmax && node_fixed(n.kids[0]);
+      case K::Repeat:
+        return n.rmax >= 0 && n.rmin == n.rmax && !n.kids.empty() &&
+               node_fixed(n.kids[0]);
       case K::Concat:
       case K::Group:
         for (const auto &k : n.kids)
           if (!node_fixed(k)) return false;
         return true;
-      default: return false; // Alt / anchors / lookaround / Empty
+      default: return false; // Alt / anchors / lookaround
       }
     }
 
@@ -7444,8 +7407,8 @@ private:
         return true;
       }
       case K::Class: {
-        const std::u32string cr(1, U'\r'), lf(1, U'\n');
-        bool mr = n.cls.matches(cr, icase_), mn = n.cls.matches(lf, icase_);
+        bool mr = n.cls.matches_cp(U'\r', icase_);
+        bool mn = n.cls.matches_cp(U'\n', icase_);
         if (!mr && !mn) return true; // does not touch \r/\n
         if (mr != mn) return false;  // matches one but not both -> diverges
         return transparent;          // both: safe only as the greedy-run atom
@@ -7520,10 +7483,9 @@ private:
       case K::Lit:
         return n.lit.find(U'\r') == std::u32string::npos &&
                n.lit.find(U'\n') == std::u32string::npos;
-      case K::Class: {
-        const std::u32string cr(1, U'\r'), lf(1, U'\n');
-        return !n.cls.matches(cr, icase_) && !n.cls.matches(lf, icase_);
-      }
+      case K::Class:
+        return !n.cls.matches_cp(U'\r', icase_) &&
+               !n.cls.matches_cp(U'\n', icase_);
       case K::AnyChar:
         return !dotall_; // `.` reaches \r/\n only under dotall
       case K::Concat:
@@ -7784,18 +7746,17 @@ private:
       }
     }
 
+    // Does the consuming instruction `in` accept the single byte `b`? A byte
+    // program tests its range; a grapheme/code-point program treats the byte
+    // as the one-code-point cluster it is (the ASCII-tier premise).
     bool inst_matches_byte(const detail::Program &prog, const detail::Inst &in,
                            unsigned char b) const {
       using Op = detail::Inst::Op;
-      if (in.op == Op::Byte)
-        return b >= in.blo() && b <= in.bhi(); // US byte program
-      std::u32string g(1, static_cast<char32_t>(b));
-      switch (in.op) {
-      case Op::Char: return lit_match(prog.lits[in.lit_idx()], g);
-      case Op::Class: return prog.classes[in.cls_idx()].matches(g, icase_);
-      case Op::Any: return dotall_ || !detail::is_line_break(g);
-      default: return false;
-      }
+      if (in.op == Op::Byte) return b >= in.blo() && b <= in.bhi();
+      if (in.op != Op::Char && in.op != Op::Class && in.op != Op::Any)
+        return false;
+      return detail::cp_inst_matches(prog, in, static_cast<char32_t>(b),
+                                     icase_, dotall_);
     }
 
     // Does the consuming instruction `in` (Char/Class/Any) match grapheme `g`?
@@ -7884,7 +7845,9 @@ private:
     // EITHER engine behind it does: the unbounded one-pass walk or the
     // scalar capture chain (which needs no automaton at all, so it must not
     // be gated on one-pass admission — a counted repeat can blow the
-    // one-pass state cap while the chain handles it natively).
+    // one-pass state cap while the chain handles it natively). The chain is
+    // planned only at ncap > 0, so for a capture-free plan this is exactly
+    // onepass_unbounded_.
     bool capture_scan_ok() const { return onepass_unbounded_ || chain_.ok; }
     // With onepass_unbounded_: the pattern carries a trailing text-end anchor
     // (`body$`), stripped from the one-pass program — a candidate's walk
@@ -8075,7 +8038,6 @@ private:
     // the per-candidate non-ASCII / CR-LF bails, so the chain conditions
     // (analyze_suffix_scalar_verify with the cls end rules) must hold.
     void analyze_class_suffix(const detail::Node &root) {
-      using K = detail::Node::Kind;
       const size_t nk = root.kids.size();
       if (nk < 2) return;
       SuffixPrefilter::AnchorClass a0, a1;
@@ -8344,9 +8306,9 @@ private:
     // no assign-then-seal protocol to forget and no stale value to carry.
     int match_pc() const { return static_cast<int>(prog_.insts.size()) - 1; }
 
-    // Reverse-compiled program for the find DFA (built only for tier-1
-    // patterns: longest-safe ∧ capture-free). Used to recover a match's leftmost
-    // start by scanning leftward from its end. See docs/design.md.
+    // Reverse-compiled program for the find DFAs (built for every DFA-eligible
+    // pattern, dfa_assert_ok_). Used to recover a match's leftmost start by
+    // scanning leftward from its end. See docs/design.md.
     Compiled rev_prog_;
 
     // Unanchored leftmost-first forward program: `(?s:.)*?` prefix + pattern. The
@@ -8377,7 +8339,7 @@ private:
     // UnicodeScalar mode, used to run a non-ASCII subject whose every grapheme
     // cluster is a single code point on the byte DFA instead of the grapheme Pike
     // (there grapheme-unit and code-point-unit matching coincide). byte_path_ is
-    // set only for a regular, longest-safe pattern with a reverse program.
+    // set only for a regular (dfa_find_ok) EGC pattern.
     Compiled byte_prog_, byte_rev_prog_;
 
     // Unanchored leftmost-first byte program (`(?s:.)*?`+pattern, us=true), for
@@ -8434,11 +8396,10 @@ private:
     std::vector<std::string> literal_alt_;
   };
 
-  // The plan is written only by its constructor; every match entry point is
-  // const, so it is effectively immutable for the life of the Regex.
-  // The shared, immutable execution plan (see intern_plan). shared_ptr (not
-  // a value): identical patterns share one compiled Plan, and the process-
-  // wide intern cache can evict entries without invalidating live Regexes.
+  // The shared, immutable execution plan (see intern_plan): written only by
+  // its constructor, and every match entry point is const. shared_ptr (not a
+  // value): identical patterns share one compiled Plan, and the process-wide
+  // intern cache can evict entries without invalidating live Regexes.
   std::shared_ptr<const Plan> plan_;
 
   // Process-wide Plan interning. A Plan is immutable after construction and a
@@ -9114,6 +9075,8 @@ private:
     return scan64(p, n, off, PredNonAscii{});
   }
 
+  // --- Literal tier: memmem locate + per-match grapheme-boundary check ---
+
   // A printable-ASCII literal occurrence at byte [h, h+m) is a valid EGC match
   // iff it sits on grapheme boundaries. Each literal byte is one
   // Grapheme_Cluster_Break=Other code point (printable ASCII, gated at
@@ -9125,8 +9088,6 @@ private:
   // these pairs — the pairwise gb_fuses needs no cluster history when one side
   // is Other (the history-sensitive rules GB9c/GB11/GB12-13 require specific
   // non-Other properties on both sides).
-  // --- Literal tier: memmem locate + per-match grapheme-boundary check ---
-
   bool literal_boundary_ok(std::string_view t, int h, int m) const {
     using GB = unicode::GraphemeBreak;
     int n = static_cast<int>(t.size());
@@ -9227,8 +9188,7 @@ private:
   void literal_alt_fill(std::string_view t, std::vector<uint32_t> &spans) const {
     int from = 0, s = 0, e = 0;
     while (literal_alt_locate(t, from, s, e)) {
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = e; // non-overlapping (every literal is non-empty)
     }
   }
@@ -10655,8 +10615,7 @@ private:
                           std::vector<uint32_t> &spans) const {
     int from = 0, s = 0, e = 0;
     while (assert_anchor_locate(text, from, s, e)) {
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = e; // non-overlapping (the literal is non-empty)
     }
   }
@@ -11221,7 +11180,7 @@ private:
   // These programs are dfa_ok_, so they carry no Op::Assert* at all — which
   // makes this exactly dfa_closure_assert_lf with no condition bits set, and it
   // forwards there rather than keeping a second copy of the ordered walk. (The
-  // byte tier's close_no_assert_lf already leans on the same equivalence.)
+  // byte tier's close_no_assert<LF> leans on the same equivalence.)
   void dfa_closure_lf(const detail::Program &prog,
                       const std::vector<int> &seeds, std::vector<int> &out,
                       std::vector<char> &seen, int match_pc) const {
@@ -11273,14 +11232,8 @@ private:
     }
   }
 
-  struct Scratch; // reusable Pike VM buffers, defined below; tier 2 needs it
+  struct Scratch; // reusable Pike VM buffers, defined below
 
-  // Shared lazy-DFA driver. A state is a sorted, de-duplicated set of program
-  // counters (interned to an int id); byte transitions are built on demand. A
-  // state is accepting if it contains `match_pc`. `next` returns the
-  // destination state, or kCap if the interned-state count exceeds the cap (the
-  // caller then falls back to the Pike VM). Drives the boolean test() DFA and
-  // the forward/reverse find DFAs over either the forward or reverse program.
   // Packed DFA edge. Every CACHED transition stores the destination id plus
   // the flags the scan loops test at every byte — accept, leftmost-first
   // front (match is the highest-priority thread), and dead (empty state set)
@@ -11299,6 +11252,12 @@ private:
     kEdgeDead = 1 << (kEdgeIdBits + 2),
   };
 
+  // Shared lazy-DFA driver. A state is a sorted, de-duplicated set of program
+  // counters (interned to an int id); byte transitions are built on demand. A
+  // state is accepting if it contains `match_pc`. `next` returns the
+  // destination state, or kCap if the interned-state count exceeds the cap (the
+  // caller then falls back to the Pike VM). Drives the boolean test() DFA and
+  // the forward/reverse find DFAs over either the forward or reverse program.
   struct LazyDfa {
     // Pointers (not references) so LazyDfa is a regular movable value type: it
     // lives inside std::optional in a FindCache and, in future, inside a pooled
@@ -11407,11 +11366,9 @@ private:
       return nx >= 0 ? nx : next(s, b);
     }
 
-    // Transition from state `s` on byte `b`. Returns the destination state, or
-    // kCap on state-cap overflow.
+    // The cache-miss path of step(): build the transition from state `s` on
+    // byte `b`. Returns the destination state, or kCap on state-cap overflow.
     int next(int s, unsigned char b) {
-      int nxt = trans[s][b];
-      if (nxt >= 0) return nxt;
       std::vector<int> seeds;
       for (int pc : states[s]) // ordered: priority preserved for the lf closure
         if (pc != match_pc && re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
@@ -11423,7 +11380,7 @@ private:
         re->dfa_closure_lf(*prog, seeds, out, seen, match_pc);
       else
         re->plan_->dfa_closure(*prog, std::move(seeds), out, seen);
-      nxt = intern_state(std::move(out));
+      int nxt = intern_state(std::move(out));
       trans[s][b] = nxt; // indexed after intern_state (vectors may have grown)
       if (static_cast<int>(states.size()) > limits::kMaxDfaStates) return kCap;
       return nxt;
@@ -11441,34 +11398,7 @@ private:
     return e >= 0;
   }
 
-  // Whole-subject ASCII gate (chooses the byte-DFA tiers over the grapheme
-  // engine). On a fast-matching pattern this O(n) pre-scan is a large fraction
-  // of find_all, so it is vectorized: OR all bytes and test the high bit once.
-  // The all-ASCII path (the case this gate exists to admit) cannot early-exit
-  // anyway, so accumulating loses nothing there; a non-ASCII subject (which
-  // routes to a slower EGC/US tier regardless) just scans to the SIMD tail.
   // --- Subject classification: ASCII / simple-grapheme / CRLF gates ---
-
-  static bool is_ascii(std::string_view text) {
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    size_t n = text.size(), i = 0;
-#if defined(REGEXLIB_NEON)
-    uint8x16_t acc = vdupq_n_u8(0);
-    for (; i + 16 <= n; i += 16)
-      acc = vorrq_u8(acc, vld1q_u8(p + i));
-    if (vmaxvq_u8(acc) >= 0x80) return false;
-#elif defined(REGEXLIB_SSE2)
-    __m128i acc = _mm_setzero_si128();
-    for (; i + 16 <= n; i += 16)
-      acc = _mm_or_si128(
-          acc, _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + i)));
-    if (_mm_movemask_epi8(acc)) return false; // high bit of any lane
-#endif
-    for (; i < n; i++)
-      if (p[i] >= 0x80) return false;
-    return true;
-  }
 
   // True if the subject contains a CR-LF pair — on an ASCII subject the only
   // multi-code-point grapheme cluster (GB3), hence the only thing that makes the
@@ -11820,8 +11750,7 @@ private:
         if (!egc_match_clean(text, static_cast<size_t>(hit),
                              static_cast<size_t>(reach)))
           return false; // match interior/end holds a fusing cluster -> Pike
-        spans.push_back(static_cast<uint32_t>(hit));
-        spans.push_back(static_cast<uint32_t>(e));
+        push_span(spans, hit, e);
         from = e;
       } else {
         if (!budget.spend(reach - hit))
@@ -11831,24 +11760,21 @@ private:
     }
   }
 
-  // The non-ASCII EGC byte path applies when the byte programs are built and
-  // the subject is non-ASCII with no multi-code-point grapheme cluster. A
-  // vectorized scan finds the first non-ASCII byte (== is_ascii's cost); a
-  // pure-ASCII subject bails here to the cheaper ASCII tiers without any decode
-  // pass. Only a genuinely non-ASCII subject pays the simple-check, and only
-  // over the remainder — the old gate rescanned the whole subject (is_ascii
-  // then a separate simple-check over [0, n)).
   // Index of the first non-ASCII (>= 0x80) byte, or text.size() if all ASCII.
   // SIMD; the shared primitive behind both byte-path gates (egc_byte_path and
   // ascii_grapheme_ok). Computing it once per call and threading it avoids a
   // redundant O(n) pass — for a fast literal find the dispatch gates would
-  // otherwise dominate (see the egc / is_ascii passes in MatchIter/search).
+  // otherwise dominate. A pure-ASCII subject bails to the cheaper ASCII tiers
+  // without any decode pass; only a genuinely non-ASCII one pays the
+  // grapheme simple-check, and only over the remainder.
   static size_t first_nonascii(std::string_view text) {
     return skip_to_nonascii(
         reinterpret_cast<const unsigned char *>(text.data()), text.size(), 0);
   }
 
-  // The first-non-ASCII index `i` is precomputed by the caller (shared with
+  // The non-ASCII EGC byte path applies when the byte programs are built and
+  // the subject is non-ASCII with no multi-code-point grapheme cluster. The
+  // first-non-ASCII index `i` is precomputed by the caller (shared with
   // ascii_grapheme_ok at the dispatch site, so the subject is classified once).
   bool egc_byte_path(std::string_view text, size_t i) const {
     if (!plan_->byte_path_) return false;
@@ -12354,8 +12280,7 @@ private:
       int e = suffix_find(fwd, rv, text, from, s, budget);
       if (e == LazyDfa::kCap || e == kWalkBail) return false;
       if (e < 0) return true;
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = e; // the real (re-expanded) end -> skips suffixes inside the match
     }
   }
@@ -12422,8 +12347,7 @@ private:
       int e = suffix_egc_find(fwd, rv, text, from, s, budget, collapse);
       if (e == LazyDfa::kCap || e == kWalkBail) return false;
       if (e < 0) return true;
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = e;
     }
   }
@@ -12516,8 +12440,7 @@ private:
       int e = inner_find(lfu, lfa, rv, pre_rev, text, from, s, budget);
       if (e == LazyDfa::kCap || e == kWalkBail) return false;
       if (e < 0) return true;
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = (e > s) ? e : us_step_byte(text, e); // empty match -> step one
     }
   }
@@ -12718,8 +12641,7 @@ private:
       int e = icase_prefix_find(blfa, text, from, sc, s, budget);
       if (e == LazyDfa::kCap || e == kWalkBail) return false;
       if (e < 0) return true;
-      spans.push_back(static_cast<uint32_t>(s));
-      spans.push_back(static_cast<uint32_t>(e));
+      push_span(spans, s, e);
       from = e; // non-empty match (literal prefix) -> e > s, progress guaranteed
     }
   }
@@ -12867,9 +12789,8 @@ private:
   }
 
   // Leftmost-first columnar byte-tier capture fill: lf locate + bounded
-  // code-point capture resolution (see byte_find_all_capture_lf for why the
-  // byte one-pass is not used). Byte-offset rows. Correct for any dfa_ok_
-  // pattern.
+  // code-point capture resolution (capture_saves_bytes). Byte-offset rows.
+  // Correct for any dfa_ok_ pattern.
   bool byte_fill_capture_lf(std::string_view text, int from, LazyDfa &lfu,
                             LazyDfa &rv, Scratch &sc,
                             std::vector<uint32_t> &spans) const {
@@ -13016,7 +12937,7 @@ private:
   };
 
 public:
-  // Persistent per-thread DFA cache for find_all / find_all_spans. Holds only
+  // Persistent per-thread DFA cache for find_all / find_iter. Holds only
   // text-independent state — the lazy DFAs (transition tables for a fixed
   // program) and the reused Pike Scratch buffers — so reusing one across many
   // documents skips per-call DFA construction. Opaque to callers; only the
@@ -13053,7 +12974,7 @@ public:
     std::optional<ByteAssertDfa> balfu_,
         balfa_;                            // leftmost-first byte assert DFA
     std::optional<ByteAssertRevDfa> barv_; // cached reverse assertion DFA
-    Scratch sc_;                           // reused Pike buffers (tier 2/3)
+    Scratch sc_;                           // reused Pike / backtracker buffers
     // find_at()'s scan buffers. A find_at call runs one scan step through a
     // throwaway MatchIter, whose own buffers are empty and grow on first
     // touch — two allocations (the capture-slot vector and the one-row span
@@ -13250,13 +13171,14 @@ public:
     FindCache() = default;
   };
 
-  // Columnar result container returned by matches(): match offsets in a flat
+  // Columnar result container returned by find_all(): match offsets in a flat
   // Structure-of-Arrays (one uint32 row of 2*(ngroups+1) byte offsets per
   // match) plus a single subject buffer that the per-match str()/group() views
   // point into — no per-match std::string or std::vector. Accessed through a
   // lightweight Match proxy (range-for / operator[]). Self-contained when it
   // owns the subject (find_all(string&&) / find_all_copy); when it borrows
-  // (matches(string_view)), it follows the usual string_view lifetime contract.
+  // (find_all(string_view)), it follows the usual string_view lifetime
+  // contract.
   class MatchList {
     bool owns_ = false;
     std::string owned_;           // owning mode: holds the subject
@@ -13570,17 +13492,12 @@ private:
     return word_at(seg, sp - 1, n) != word_at(seg, sp, n);
   }
 
-  // Evaluate a zero-width lookaround instruction at position `sp`.
+  // Evaluate a zero-width lookaround instruction at position `sp`: does the
+  // body match starting at sp (lookahead), or — for a lookbehind, whose body
+  // is reverse-compiled — some window ending at sp, scanned right-to-left?
   bool eval_look(const detail::Program &prog, const detail::Inst &in,
                  const detail::Segmented &seg, int sp, int n) const {
-    const detail::Program &sub = *prog.subs[in.sub_idx()];
-    if (!in.look_behind) {
-      // Lookahead: does the body match starting at sp?
-      return sub_match(sub, seg, sp, /*require_end=*/-1, n);
-    }
-    // Lookbehind: does the reverse-compiled body match some window ending at
-    // sp, scanning right-to-left?
-    return sub_match_reverse(sub, seg, sp, n);
+    return sub_match(*prog.subs[in.sub_idx()], seg, sp, n, in.look_behind);
   }
 
   // Follow ε-transitions (Jmp/Split/Save/asserts/lookaround), adding reachable
@@ -13670,58 +13587,13 @@ private:
     match_steps() += pops;
   }
 
-  // Boolean Pike-VM run for lookaround bodies: anchored at `start`, succeeds if
-  // a thread reaches Match at position `require_end` (or any position when
-  // require_end < 0). Captures are not tracked.
+  // Boolean Pike-VM run for a lookaround body, anchored at `from`: succeeds
+  // if a thread reaches Match. A lookahead body consumes graphemes rightward
+  // from `from`; a lookbehind body (`behind`) is reverse-compiled and consumes
+  // them leftward, so it succeeds on any window ending at `from`. Captures are
+  // not tracked; linear in the number of graphemes scanned.
   bool sub_match(const detail::Program &prog, const detail::Segmented &seg,
-                 int start, int require_end, int n) const {
-    using Op = detail::Inst::Op;
-    int psz = static_cast<int>(prog.insts.size());
-    std::vector<Thread> clist, nlist;
-    clist.reserve(psz);
-    nlist.reserve(psz);
-    std::vector<int> visited(psz, -1);
-    int gen = 0;
-
-    gen++;
-    add_thread(prog, clist, visited, gen, 0, Saves(prog.nslots), seg,
-               start, n);
-
-    long budget = step_budget(n); // shared cumulative counter, not reset here
-    for (int sp = start; sp <= n; sp++) {
-      if (clist.empty()) break;
-      if (match_steps() > budget)
-        throw RegexError(RegexError::Code::StepBudgetExceeded,
-                         "regex match step budget exceeded");
-      int next_gen = ++gen;
-      const std::u32string *g = (sp < n) ? &seg.graphemes[sp] : nullptr;
-      for (auto &t : clist) {
-        const detail::Inst &in = prog.insts[t.pc];
-        switch (in.op) {
-        case Op::Char:
-        case Op::Any:
-        case Op::Class:
-          if (plan_->consumes(prog, in, g))
-            add_thread(prog, nlist, visited, next_gen, t.pc + 1, t.saves, seg,
-                       sp + 1, n);
-          break;
-        case Op::Match:
-          if (require_end < 0 || sp == require_end) return true;
-          break;
-        default: break;
-        }
-      }
-      std::swap(clist, nlist);
-      nlist.clear();
-    }
-    return false;
-  }
-
-  // Boolean Pike-VM run for lookbehind: matches a reverse-compiled body by
-  // consuming graphemes leftward from `from`. Succeeds if the body matches any
-  // window ending at `from`. Linear in the number of graphemes scanned.
-  bool sub_match_reverse(const detail::Program &prog,
-                         const detail::Segmented &seg, int from, int n) const {
+                 int from, int n, bool behind) const {
     using Op = detail::Inst::Op;
     int psz = static_cast<int>(prog.insts.size());
     std::vector<Thread> clist, nlist;
@@ -13734,15 +13606,19 @@ private:
     add_thread(prog, clist, visited, gen, 0, Saves(prog.nslots), seg, from,
                n);
 
+    const int step = behind ? -1 : 1;
     long budget = step_budget(n); // shared cumulative counter, not reset here
-    for (int p = from; p >= 0; p--) {
+    for (int sp = from; behind ? sp >= 0 : sp <= n; sp += step) {
       if (clist.empty()) break;
       if (match_steps() > budget)
         throw RegexError(RegexError::Code::StepBudgetExceeded,
                          "regex match step budget exceeded");
       int next_gen = ++gen;
-      // The grapheme immediately to the left of position p.
-      const std::u32string *g = (p > 0) ? &seg.graphemes[p - 1] : nullptr;
+      // The grapheme consumed next: the one at sp scanning right, the one
+      // immediately left of sp scanning left.
+      const std::u32string *g =
+          behind ? (sp > 0 ? &seg.graphemes[sp - 1] : nullptr)
+                 : (sp < n ? &seg.graphemes[sp] : nullptr);
       for (auto &t : clist) {
         const detail::Inst &in = prog.insts[t.pc];
         switch (in.op) {
@@ -13751,10 +13627,9 @@ private:
         case Op::Class:
           if (plan_->consumes(prog, in, g))
             add_thread(prog, nlist, visited, next_gen, t.pc + 1, t.saves, seg,
-                       p - 1, n);
+                       sp + step, n);
           break;
-        case Op::Match:
-          return true; // body matched some window ending at `from`
+        case Op::Match: return true;
         default: break;
         }
       }
@@ -13767,8 +13642,8 @@ private:
   // Pike VM match loop: finds the leftmost-first match at or after `start`. On
   // success returns true and moves the capture saves (grapheme/code-point
   // indices) into `out_saves`; the byte-offset/string result is built
-  // separately. Shared by run() (-> MatchResult) and matches() (-> columnar
-  // byte offsets). `prog` is the grapheme program (EGC) or the code-point
+  // separately. Shared by run() (-> MatchResult) and the columnar fills (->
+  // byte-offset rows). `prog` is the grapheme program (EGC) or the code-point
   // program (UnicodeScalar), with `seg` segmented to match (one grapheme / one
   // code point per entry) — the loop body is identical either way.
   bool run_saves(const detail::Program &prog, const detail::Segmented &seg,
@@ -13856,8 +13731,8 @@ private:
   // explored once: linear O(prog_size * span_bytes), and its result equals the
   // Pike's. Captures (byte offsets) live in one array, mutated forward and
   // undone on backtrack — no per-thread Saves copy-on-write. On ASCII a "code
-  // point" is one byte, so this also serves EGC-ASCII tier 2 (prog = grapheme
-  // program). Used only on DFA-bounded spans, which are anchored and
+  // point" is one byte, so this also serves the EGC ASCII tiers (prog =
+  // grapheme program). Used only on DFA-bounded spans, which are anchored and
   // assert/lookaround- free (those make a program DFA-ineligible), so only
   // consuming/Save/Split ops appear. Returns false with overflow=true when
   // prog_size*span exceeds the cap (caller -> Pike); a plain no-match returns
@@ -13937,17 +13812,7 @@ private:
           // it would index past the gen-stamped visited bitmap. Stop this
           // branch instead.
           if (pos + static_cast<int>(blen) > hi) break;
-          bool ok;
-          if (in.op == Op::Char) {
-            const std::u32string &lit = prog.lits[in.lit_idx()];
-            ok = lit.size() == 1 && (icase ? detail::fold(lit[0]) ==
-                                                 detail::fold(cp)
-                                           : lit[0] == cp);
-          } else if (in.op == Op::Any)
-            ok = dotall || !detail::is_line_break_cp(cp);
-          else
-            ok = prog.classes[in.cls_idx()].matches_cp(cp, icase);
-          if (!ok) break;
+          if (!detail::cp_inst_matches(prog, in, cp, icase, dotall)) break;
           pc++;
           pos += static_cast<int>(blen);
           continue;
@@ -14750,6 +14615,12 @@ private:
     return r;
   }
 
+  // A capture-free match [s, e) -> one columnar row (the begin, end pair).
+  static void push_span(std::vector<uint32_t> &spans, int s, int e) {
+    spans.push_back(static_cast<uint32_t>(s));
+    spans.push_back(static_cast<uint32_t>(e));
+  }
+
   // Byte-offset saves -> one columnar row of byte offsets (no strings).
   void append_match_spans_bytes(const std::vector<int> &saves,
                                 std::vector<uint32_t> &spans) const {
@@ -14915,9 +14786,6 @@ private:
     return r;
   }
 
-  // Sentinel for an unmatched capture group in a columnar span row.
-  static constexpr uint32_t kSpanNone = ::reg::kSpanNone;
-
   // Construct a Match view (Match's constructor is private; Regex is a friend).
   // Lets the nested MatchList/MatchIter — members of Regex, hence able to reach
   // this private static — hand out unified Match views over their span rows.
@@ -14990,8 +14858,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
   if (plan_->literal_only_) {
     int from = 0, s, e;
     while (literal_locate(bytes, from, s, e)) {
-      out.spans_.push_back(static_cast<uint32_t>(s));
-      out.spans_.push_back(static_cast<uint32_t>(e));
+      push_span(out.spans_, s, e);
       from = e;
     }
     return;
@@ -15045,8 +14912,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
         if (onepass_fill(c, bytes, saves, out.spans_, resume)) return;
       }
       if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
-            out.spans_.push_back(static_cast<uint32_t>(s));
-            out.spans_.push_back(static_cast<uint32_t>(e));
+            push_span(out.spans_, s, e);
             return true;
           }))
         return;
@@ -15095,8 +14961,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
           int b = saves[0], en = saves[1];
           start = (en > b) ? en : us_step_byte(bytes, en);
         } else {
-          out.spans_.push_back(static_cast<uint32_t>(s));
-          out.spans_.push_back(static_cast<uint32_t>(e));
+          push_span(out.spans_, s, e);
           start = (e > s) ? e : us_step_byte(bytes, e);
         }
       }
@@ -15183,8 +15048,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     }
 
     if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
-          out.spans_.push_back(static_cast<uint32_t>(s));
-          out.spans_.push_back(static_cast<uint32_t>(e));
+          push_span(out.spans_, s, e);
           return true;
         }))
       return;
@@ -15231,8 +15095,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
         if (onepass_fill(c, bytes, op_saves, out.spans_, resume)) return;
       }
       if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
-            out.spans_.push_back(static_cast<uint32_t>(s));
-            out.spans_.push_back(static_cast<uint32_t>(e));
+            push_span(out.spans_, s, e);
             return true;
           }))
         return;
@@ -15301,8 +15164,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
     WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
     while (start <= n && assert_find_span(c, bytes, start, s, e, &wbudget)) {
-      out.spans_.push_back(static_cast<uint32_t>(s));
-      out.spans_.push_back(static_cast<uint32_t>(e));
+      push_span(out.spans_, s, e);
       start = (e > s) ? e : e + 1;
     }
     return;
@@ -15314,8 +15176,7 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
     WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
     while (start <= n &&
            assert_byte_find_span(c, bytes, start, s, e, &wbudget)) {
-      out.spans_.push_back(static_cast<uint32_t>(s));
-      out.spans_.push_back(static_cast<uint32_t>(e));
+      push_span(out.spans_, s, e);
       start = (e > s) ? e : us_step_byte(bytes, e);
     }
     return;
@@ -15434,8 +15295,7 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       rev_kind_ = kRv;
       // Captures: the unbounded one-pass walk drives the find, as on the EGC
       // ASCII tier (see the search() twin); a bail reverts to the chain.
-      op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
-                              : re.plan_->onepass_unbounded_;
+      op_unb_ = re.plan_->capture_scan_ok();
     } else if (re.assert_byte_path_ok(text)) {
       // [Tier: Assert/Byte] shared byte assert engine: the per-step Assert
       // handler resolves captures when ncap_ > 0. US only — EGC shares the
@@ -15443,8 +15303,7 @@ inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
       // ncap_ == 0).
       tier_ = Tier::Assert;
       assert_byte_ = true;
-      op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
-                              : re.plan_->onepass_unbounded_;
+      op_unb_ = re.plan_->capture_scan_ok();
     } else { // [Tier: Pike/cp]
       tier_ = Tier::Pike;
       cp_mode_ = true;
@@ -15498,14 +15357,12 @@ inline void Regex::MatchIter::reprime_unfused() {
     rev_kind_ = kRv;
     // Captures: drive the find with the unbounded one-pass walk (prefix /
     // inner / position-scan candidates — see cp_onepass_find).
-    op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
-                              : re.plan_->onepass_unbounded_;
+    op_unb_ = re.plan_->capture_scan_ok();
   } else if (re.assert_find_ok(text, fna)) { // [Tier: Assert/Ascii]
     tier_ = Tier::Assert;
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
-    op_unb_ = re.plan_->ncap_ > 0 ? re.plan_->capture_scan_ok()
-                              : re.plan_->onepass_unbounded_;
+    op_unb_ = re.plan_->capture_scan_ok();
   } else if (re.assert_byte_path_ok(text)) { // [Tier: Assert/Byte]
     // EGC: capture-free, by assert_byte_path_ok's own gate. This rung is where
     // that gate went missing — a capture pattern read its groups off the byte
@@ -15572,8 +15429,7 @@ inline void Regex::MatchIter::advance() {
         done_ = true;
         return;
       }
-      one_.spans_.push_back(static_cast<uint32_t>(s2));
-      one_.spans_.push_back(static_cast<uint32_t>(e2));
+      push_span(one_.spans_, s2, e2);
       pos_ = e2;
       return;
     }
@@ -15631,8 +15487,7 @@ inline void Regex::MatchIter::advance() {
           downgrade(); // a fusing cluster touches the match -> Pike from resume
           break;
         }
-        one_.spans_.push_back(static_cast<uint32_t>(s2));
-        one_.spans_.push_back(static_cast<uint32_t>(e2));
+        push_span(one_.spans_, s2, e2);
         pos_ = e2;
         resume_pos_ = e2;
         return;
@@ -15672,8 +15527,7 @@ inline void Regex::MatchIter::advance() {
           done_ = true;
           return;
         }
-        one_.spans_.push_back(static_cast<uint32_t>(s2));
-        one_.spans_.push_back(static_cast<uint32_t>(e2));
+        push_span(one_.spans_, s2, e2);
         pos_ = e2;
         resume_pos_ = e2;
         return;
@@ -15697,8 +15551,7 @@ inline void Regex::MatchIter::advance() {
           done_ = true;
           return;
         }
-        one_.spans_.push_back(static_cast<uint32_t>(s2));
-        one_.spans_.push_back(static_cast<uint32_t>(e2));
+        push_span(one_.spans_, s2, e2);
         pos_ = e2; // non-nullable prefix pattern -> e2 > s2
         return;
       }
@@ -15749,8 +15602,7 @@ inline void Regex::MatchIter::advance() {
           done_ = true;
           return;
         }
-        one_.spans_.push_back(static_cast<uint32_t>(s2));
-        one_.spans_.push_back(static_cast<uint32_t>(e2));
+        push_span(one_.spans_, s2, e2);
         pos_ = e2; // non-nullable suffix pattern -> e2 > s2
         return;
       }
@@ -15786,8 +15638,7 @@ inline void Regex::MatchIter::advance() {
           }
           re_->append_match_spans_bytes(saves_, one_.spans_);
         } else {
-          one_.spans_.push_back(static_cast<uint32_t>(s2));
-          one_.spans_.push_back(static_cast<uint32_t>(e2));
+          push_span(one_.spans_, s2, e2);
         }
         pos_ = e2; // non-nullable (interior literal) -> e2 > s2
         return;
@@ -15807,8 +15658,7 @@ inline void Regex::MatchIter::advance() {
         break;
       }
       if (re_->plan_->ncap_ == 0) { // capture-free: the located span is the only row
-        one_.spans_.push_back(static_cast<uint32_t>(s));
-        one_.spans_.push_back(static_cast<uint32_t>(e));
+        push_span(one_.spans_, s, e);
       } else { // resolve groups within [s, e) (group 0 == [s, e))
         if (!re_->capture_saves_bytes(text_, s, e, sc_, saves_)) {
           done_ = true;
@@ -15867,8 +15717,7 @@ inline void Regex::MatchIter::advance() {
         pos_ = (en > b) ? en : Regex::us_step_byte(text_, en);
         return;
       }
-      one_.spans_.push_back(static_cast<uint32_t>(s));
-      one_.spans_.push_back(static_cast<uint32_t>(e));
+      push_span(one_.spans_, s, e);
       // ASCII: us_step_byte(e) == e + 1; the US byte tier steps a code point.
       pos_ = (e > s) ? e : Regex::us_step_byte(text_, e);
       return;
@@ -15954,7 +15803,7 @@ inline Regex::SplitIter Regex::split(std::string_view text,
 //------------------------------------------------------------------------------
 
 // A thin <regex>-compatible facade over the engine above. The native engine
-// uses PascalCase names (Regex, RegexError, MatchResult, Capture); these
+// uses PascalCase names (Regex, RegexError, MatchResult, Match); these
 // std::regex-shaped types use snake_case (regex, smatch, regex_search, …) so
 // the two coexist in this namespace without clashing. It mirrors the std::regex
 // surface (basic_regex / smatch / sub_match / regex_search / regex_match /

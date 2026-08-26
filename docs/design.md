@@ -408,8 +408,8 @@ The operand-pool split lets both share the exact same `Inst`/`Program` types.
 
 ## 4. The non-ASCII cliff and the EGC byte path
 
-Every DFA tier is a byte/code-point automaton, so historically an `is_ascii()`
-gate dropped *any* non-ASCII subject off every DFA tier onto the grapheme Pike —
+Every DFA tier is a byte/code-point automaton, so historically a whole-subject
+ASCII gate dropped *any* non-ASCII subject off every DFA tier onto the grapheme Pike —
 a ~6× cliff (dense `\w+`: 58 → 9 MB/s with one `é`). On real prose the trigger
 was subtler: **CRLF line endings**, where each `\r\n` is one cluster (UAX #29
 GB3), pushed the whole subject onto the grapheme Pike at ~24 MB/s.
@@ -580,7 +580,7 @@ cluster, excluded by `!can_match_empty_`.
 The `CodePoint` match unit (`reg::set_default_match_unit`) switches the matching
 unit to the **Unicode scalar (code point)** — the RE2 / Rust `regex` model — and
 removes the cliff entirely: the
-byte DFA runs directly over raw UTF-8 with no segmentation and no `is_ascii`
+byte DFA runs directly over raw UTF-8 with no segmentation and no ASCII
 gate. Syntax, leftmost-first semantics, linear time, and byte-offset reporting
 are unchanged; only the unit of `.`/classes and the offset boundary change.
 

@@ -383,7 +383,7 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
 
 ## 4. 非ASCII の崖と EGC バイトパス
 
-どの DFA tier もバイト/コードポイントオートマトンなので、歴史的に `is_ascii()` ゲートが
+どの DFA tier もバイト/コードポイントオートマトンなので、歴史的に subject 全体の ASCII ゲートが
 *あらゆる*非ASCII subject を全 DFA tier から書記素 Pike へ落としていました——~6× の崖
 （密 `\w+`：`é` 1つで 58 → 9 MB/s）。実世界の散文では引き金はより微妙で、**CRLF 改行**
 ——各 `\r\n` が1クラスタ（UAX #29 GB3）——が subject 全体を書記素 Pike（~24 MB/s）へ
@@ -541,7 +541,7 @@ byte DFA に残って全速。唯一の食い違いは CR-LF 内部 LF 位置の
 `CodePoint` マッチ単位（`reg::set_default_match_unit`）はマッチ単位を **Unicode
 スカラ（コードポイント）**——RE2 / Rust `regex` のモデル——に切り替え、崖を完全に
 除去：バイト DFA が生の UTF-8 を分割
-なし・`is_ascii` ゲートなしで直接走ります。構文・leftmost-first 意味論・線形時間・
+なし・ASCII ゲートなしで直接走ります。構文・leftmost-first 意味論・線形時間・
 バイトオフセット報告は不変；変わるのは `.`/クラスの単位とオフセット境界だけ。
 
 §3 の**2プログラム**（`prog_`/バイト + `cp_prog_`/コードポイント）を保ちます。
