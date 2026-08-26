@@ -5848,7 +5848,7 @@ private:
             detail::Node body;
             body.kind = detail::Node::Kind::Concat;
             body.kids.assign(root.kids.begin() + lo, root.kids.begin() + hi);
-            if (onepass_body_ok(body)) {
+            if (onepass_body_ok(body, /*cut=*/false)) {
               onepass_unbounded_ = true;
               onepass_require_end_ = true;
               onepass_anchored_start_ = anchored_start;
@@ -5921,13 +5921,38 @@ private:
       using K = detail::Node::Kind;
       return n.kind == K::BeginText || (n.kind == K::BOL && !multiline_);
     }
-    // Assert-free body satisfying the unbounded one-pass AST rules — the
-    // shared body eligibility for every one-walk tier (unbounded capture
-    // find, AnchoredOnePass, WordOnePass).
-    static bool onepass_body_ok(const detail::Node &body) {
+    // Body eligibility for the one-walk tiers, parameterised by the table
+    // flavour the caller is about to build (see compact_onepass_table's
+    // `cut`). The body must be assert-free either way — the walk consumes
+    // bytes and has nowhere to evaluate a `\b` or a `^`.
+    //
+    // Past that, the two flavours want opposite things:
+    //
+    //  - cut=true. The consumer reads the walk's LAST accept as the
+    //    leftmost-first end, which is a claim about thread PRIORITY. The
+    //    build's cut only orders threads correctly when priority is ascending
+    //    pc order (Alt-free, greedy-only — onepass_unbounded_ast_ok) and only
+    //    prunes across threads, not within one (onepass_cut_ast_ok). Both
+    //    rules apply.
+    //
+    //  - cut=false. The table is the FULL accept set and the consumer picks
+    //    the accept by an external condition that admits exactly one: `body$`
+    //    / `^body$` take the accept at n, WordOnePass takes the one its
+    //    trailing `\b` allows (its admission loop below proves no other
+    //    accept can). With the end forced, priority never enters, so
+    //    alternation, laziness and a captured group under a repeat are all
+    //    fine and build_cp_onepass is the entire check: it bails on exactly
+    //    the ambiguity that would matter (two Match paths in one state, or a
+    //    capture slot written on some paths and not others), and what it
+    //    admits writes each slot as a function of (state, byte) — one
+    //    assignment, no priority to resolve. Insisting on the cut rules here
+    //    kept `^(a|aa)+$` and `^(?:a|a)*$` on the assert DFA.
+    static bool onepass_body_ok(const detail::Node &body, bool cut) {
       for (const auto &k : body.kids)
         if (node_has_assert(k)) return false;
-      return onepass_unbounded_ast_ok(body, /*in_repeat=*/false);
+      if (!cut) return true;
+      return onepass_unbounded_ast_ok(body, /*in_repeat=*/false) &&
+             onepass_cut_ast_ok(body);
     }
 
     // Any zero-width assertion / lookaround anywhere under `n`?
@@ -5963,16 +5988,17 @@ private:
     };
 
     // [Tier: AnchoredOnePass] admission. The validation shape `^body$` (or
-    // `^body`) with an assert-free body that satisfies the unbounded one-pass
-    // rules (one-pass, no alternation, greedy-only, no captured group under a
-    // repeat) is fully decided by ONE one-pass walk from position 0. For
-    // `^body$` the FULL (uncut) accept set answers `accept == n`; for bare
-    // `^body` the table is built with the leftmost-first cut, so the walk's
-    // last accept is the exact leftmost-first end (greediness alone is not
-    // enough: ^x(?:ab)?(?:abc)? on "xabc" commits at 3, not the longest 4 —
-    // see build_cp_onepass). This replaces the assert-DFA scan (one
-    // transition load per byte plus the dispatch around it) for the classic
-    // anchored validators (UUID / IPv4 / ISO-8601 / semver / hex).
+    // `^body`) with a one-pass, assert-free body is fully decided by ONE
+    // one-pass walk from position 0. For `^body$` the FULL (uncut) accept set
+    // answers `accept == n` — the end is forced, so the body needs nothing
+    // beyond assert-freedom and may alternate (`^(a|aa)+$`) or be lazy. For
+    // bare `^body` the table is built with the leftmost-first cut, so the
+    // walk's last accept is the exact leftmost-first end, and the body must
+    // satisfy the cut rules (greediness alone is not enough:
+    // ^x(?:ab)?(?:abc)? on "xabc" commits at 3, not the longest 4 — see
+    // build_cp_onepass and onepass_body_ok). This replaces the assert-DFA
+    // scan (one transition load per byte plus the dispatch around it) for the
+    // classic anchored validators (UUID / IPv4 / ISO-8601 / semver / hex).
     //
     // Capture patterns are admitted too, on the capture-STRIPPED body: the
     // walk decides the span, which is all test() and every no-match need,
@@ -6007,13 +6033,10 @@ private:
       body.kind = K::Concat;
       for (size_t i = lo; i < hi; i++)
         body.kids.push_back(detail::strip_captures(root.kids[i]));
-      if (!onepass_body_ok(body)) return; // interior assert -> assert tiers
-      // Without a trailing `$` the table is built WITH the cut and the walk's
-      // last accept IS the reported end, so the body must satisfy the cut rule
-      // (see onepass_cut_ast_ok); `^body$` reads accept == n instead and does
-      // not. `^(?:[a-cb].{0,4})+` over "bbc 23_\n_2" reported [0,7) here where
-      // the Pike gives [0,5).
-      if (!require_end && !onepass_cut_ast_ok(body)) return;
+      // The table flavour decides the body rules (see onepass_body_ok): a
+      // bare `^body` reads the walk's last accept and needs the cut ones, a
+      // `^body$` reads accept == n and needs none past assert-freedom.
+      if (!onepass_body_ok(body, /*cut=*/!require_end)) return;
       if (!compact_onepass_table(body, aop_, /*cut=*/!require_end)) return;
       aop_.require_end = require_end;
       aop_.ok = true;
@@ -6122,7 +6145,13 @@ private:
       detail::Node body;
       body.kind = K::Concat;
       body.kids.assign(root.kids.begin() + lo, root.kids.begin() + hi);
-      if (!onepass_body_ok(body)) return;
+      // Same table flavour as compact_onepass_table below, so the body rules
+      // match it (see onepass_body_ok). Without a trailing `\b` this table
+      // carries the cut and word_onepass_find reads its last accept as the
+      // leftmost-first end — a shape whose repeat can run twice over a
+      // variable-width body then reports the longest parse:
+      // `\b(?:[a-cb].{0,4})+x?` over "bbc 23_\n_2" gave [0,7) for [0,5).
+      if (!onepass_body_ok(body, /*cut=*/!trail)) return;
       // `\b` at the edges must be decidable by one byte test each: the body
       // must START and END on ASCII word characters only.
       if (!node_head_word_only(body.kids.front())) return;
@@ -6183,7 +6212,8 @@ private:
 
     // The extra rule for a table built with the leftmost-first CUT, whose
     // consumer reads the walk's LAST accept as the leftmost-first end (the
-    // unbounded walk, and AnchoredOnePass's bare `^body`). A repeat that can
+    // unbounded walk, AnchoredOnePass's bare `^body`, and WordOnePass without
+    // a trailing `\b` — onepass_body_ok routes all three). A repeat that can
     // run more than once must consume a fixed width per iteration: otherwise
     // its iterations end at several offsets, the walk records an accept at
     // each, and the last is the LONGEST parse rather than the leftmost-first
@@ -6197,10 +6227,11 @@ private:
     //
     // The tiers whose table is built UNCUT neither need this nor may pay for
     // it: `body$` / `^body$` (the accept must land at n, so a longer parse is
-    // not a wrong answer) and WordOnePass (the trailing `\b` picks the
-    // accept). Folding the rule into onepass_unbounded_ast_ok charged them
-    // too and cost the IPv4 extraction row — `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`,
-    // whose `{3}` body is variable-width — 613 -> 264 MB/s.
+    // not a wrong answer) and WordOnePass WITH a trailing `\b` (which picks
+    // the accept). Folding the rule into onepass_unbounded_ast_ok charged
+    // them too and cost the IPv4 extraction row —
+    // `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`, whose `{3}` body is
+    // variable-width — 613 -> 264 MB/s.
     static bool onepass_cut_ast_ok(const detail::Node &n) {
       using K = detail::Node::Kind;
       if (n.kind == K::Repeat && (n.rmax < 0 || n.rmax > 1) &&

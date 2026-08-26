@@ -2239,6 +2239,66 @@ void test_onepass_leftmost_first() {
     CHECK(make_us(R"([A-Za-z_]\w*)").search("  getElementById").end() == 16);
     CHECK(make_us(R"(//[^\n]*)").search("x // c").end() == 6);
     CHECK(make_us(R"(\d+(?:\.\d+)?)").search("v3.14").end() == 5);
+    // The same lemma on the THIRD tier that reads a cut table's last accept:
+    // WordOnePass without a trailing `\b`. It needs three top-level elements,
+    // so a bare `\b<repeat>` never reached it and the first fix missed it —
+    // `\b(?:[a-cb].{0,4})+x?` read [0,7) here on the released engine.
+    // scan_diff cannot see this one: every surface shares the tier and they
+    // agree with each other while all being wrong, so the spans are asserted
+    // outright (against std::regex ECMAScript, which is leftmost-first).
+    struct { const char *pat; size_t b, e; } wop[] = {
+        {R"(\b(?:[a-cb].{0,4})+x?)", 0, 5},
+        {R"(\b(?:[a-cb].{0,4})+z?)", 0, 5},
+        {R"(\b(?:[a-c].{0,4})+[0-9]?)", 0, 6},
+        {R"(\b(?:\w\w.?)+x?)", 0, 3},
+        {R"(\b(?:[a-c]x?y?)+\b)", 0, 3}, // trailing `\b`: uncut, unaffected
+    };
+    for (auto &c : wop) {
+      for (int us = 0; us < 2; us++) {
+        Regex re = us ? make_us(c.pat) : make_egc(c.pat);
+        auto m = re.search(subj);
+        CHECK(m.matched() && m.begin() == c.b && m.end() == c.e);
+        auto all = find_all(re, subj);
+        CHECK(!all.empty() && all[0].begin() == c.b && all[0].end() == c.e);
+      }
+    }
+  }
+  { // Alternation under a table built UNCUT. `^body$` reads accept == n and
+    // WordOnePass reads the accept its trailing `\b` allows, so the end is
+    // forced and thread priority never enters — the cut's Alt-free rule does
+    // not apply and these shapes belong on the one walk. They had been taking
+    // the assert DFA: test() on `^(a|aa)+$` over 30 a's measured 574 ns
+    // against 36 with the walk (-O3 -DNDEBUG, median of 25x200 calls, US).
+    struct { const char *pat, *subj; size_t b, e; int g1b, g1e; } cases[] = {
+        {R"(^(a|aa)+$)", "aaaa", 0, 4, 3, 4},
+        {R"(^(?:a|a)*$)", "aaaa", 0, 4, -1, -1},
+        {R"(^(?:abc|ab|a)+$)", "abcab", 0, 5, -1, -1},
+        {R"(^(\w|\d\d)+$)", "a1b", 0, 3, 2, 3},
+        {R"((?:a|ab)+$)", "xxabab", 2, 6, -1, -1},
+        {R"(\b\w+(?:ab|cd)\b)", "zz qqcd rr", 3, 7, -1, -1},
+        {R"(^(a|aa)+)", "aaaa", 0, 4, 3, 4}, // the cut twin: still barred
+    };
+    for (auto &c : cases) {
+      for (int us = 0; us < 2; us++) {
+        Regex re = us ? make_us(c.pat) : make_egc(c.pat);
+        auto m = re.search(c.subj);
+        CHECK(m.matched() && m.begin() == c.b && m.end() == c.e);
+        CHECK(re.test(c.subj));
+        if (c.g1b >= 0)
+          CHECK(m.group(1).matched() &&
+                m.group(1).begin() == static_cast<size_t>(c.g1b) &&
+                m.group(1).end() == static_cast<size_t>(c.g1e));
+        auto all = find_all(re, c.subj);
+        CHECK(!all.empty() && all[0].begin() == c.b && all[0].end() == c.e);
+      }
+    }
+    // A failing input must still fail (the accept-at-n condition is what the
+    // uncut table is read through).
+    for (int us = 0; us < 2; us++) {
+      Regex re = us ? make_us(R"(^(a|aa)+$)") : make_egc(R"(^(a|aa)+$)");
+      CHECK(!re.search("aaab").matched() && !re.test("aaab"));
+      CHECK(!re.search(std::string(30, 'a') + "!").matched());
+    }
   }
   { // Capture-free find_all AND find_iter take the same one-walk driver, so
     // all three entry points must report the same rows. The long-line subject

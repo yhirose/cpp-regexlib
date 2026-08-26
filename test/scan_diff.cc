@@ -196,6 +196,28 @@ int main() {
       {"((?:[a-cb].{0,4})+)", 0}, // the capture twin: must stay on the chain
       {"(?:[a-cb].{0,4})+$", 0},  // uncut (require_end): admission must differ
       {"\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b", 0}, // WordOnePass, also uncut
+      // The same shape on WordOnePass WITHOUT a trailing `\b`, whose table
+      // also carries the cut. Nothing above reached it: the tier needs three
+      // top-level elements, so a bare `\b<repeat>` is out and only a repeat
+      // followed by something lands there. `\b(?:[a-cb].{0,4})+x?` shipped
+      // WRONG (it read [0,7) on "bbc 23_\n_2" for [0,5)).
+      {"\\b(?:[a-cb].{0,4})+x?", 0},
+      {"\\b(?:[a-cb].{0,4})+x?", kUS},
+      {"\\b(?:\\w\\w.?)+x?", 0},
+      {"\\b(?:\\w.?)+\\d?", 0},
+      {"\\b(?:[a-c]x?y?)+\\b", 0}, // the trailing-`\b` twin: uncut, unaffected
+      // Alternation under a table built UNCUT. The end is forced there (an
+      // accept at n, or the one accept a trailing `\b` allows), so priority
+      // never enters and the cut rules do not apply — these took the assert
+      // DFA until onepass_body_ok started asking which flavour it was for.
+      {"^(a|aa)+$", 0},
+      {"^(a|aa)+$", kUS},
+      {"^(?:a|a)*$", 0},
+      {"^(?:abc|ab|a)+$", 0},
+      {"^(\\w|\\d\\d)+$", 0},
+      {"(?:a|ab)+$", 0},
+      {"\\b\\w+(?:ab|cd)\\b", 0},
+      {"^(a|aa)+", 0}, // the cut twin: still barred, still correct
       // Capture-FREE shapes the one-walk driver now serves at every entry
       // point (search / find_all / find_iter), including one whose match is
       // long enough that the walk's SIMD run skip is what runs.
@@ -228,6 +250,8 @@ int main() {
       "HTTP/1.1 200 OK\r\nHost: a\r\n\r\n", // pure-ASCII CRLF, the httplib shape
       "bbc 23_\n_2", // the cut-lemma repro: one iteration ends at 5, two at 7
       "abcabc x abcabc",
+      "aaaaaaaa",  // the overlapping-alternation validators' matching input
+      "aaaaaaaab", // and the one that fails only at the trailing anchor
       std::string(1000, 'a') + "\n" + std::string(999, 'b'), // long matches
   };
 
