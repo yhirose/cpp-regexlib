@@ -5861,9 +5861,12 @@ private:
           const bool prefix_nonascii =
               std::any_of(byte_prefix_.text.begin(), byte_prefix_.text.end(),
                           [](unsigned char b) { return b >= 0x80; });
+          // onepass_cut_ast_ok: this table is built WITH the cut and the walk's
+          // last accept is read as the leftmost-first end (see there).
           const bool unb = !icase_ && !can_match_empty_ &&
                            !(us_ && prefix_nonascii) &&
-                           onepass_unbounded_ast_ok(root, false);
+                           onepass_unbounded_ast_ok(root, false) &&
+                           onepass_cut_ast_ok(root);
           // At ncap == 0 the table has exactly one consumer, the unbounded
           // walk, so an inadmissible pattern must not build one: capture
           // resolution (the other consumer, at ncap > 0) has no groups to
@@ -5981,6 +5984,12 @@ private:
       for (size_t i = lo; i < hi; i++)
         body.kids.push_back(detail::strip_captures(root.kids[i]));
       if (!onepass_body_ok(body)) return; // interior assert -> assert tiers
+      // Without a trailing `$` the table is built WITH the cut and the walk's
+      // last accept IS the reported end, so the body must satisfy the cut rule
+      // (see onepass_cut_ast_ok); `^body$` reads accept == n instead and does
+      // not. `^(?:[a-cb].{0,4})+` over "bbc 23_\n_2" reported [0,7) here where
+      // the Pike gives [0,5).
+      if (!require_end && !onepass_cut_ast_ok(body)) return;
       if (!compact_onepass_table(body, aop_, /*cut=*/!require_end)) return;
       aop_.require_end = require_end;
       aop_.ok = true;
@@ -6125,6 +6134,59 @@ private:
     // See onepass_unbounded_: no Alt anywhere, every Repeat greedy, and no
     // capturing Group inside a Repeat. (LookAround already excludes the
     // pattern from the one-pass build.)
+    // Does `n` always consume the SAME number of positions? (Conservative: an
+    // alternation says no even when its branches happen to agree, and anything
+    // not listed says no.) A repeat that can run more than once needs this of
+    // its body — see onepass_cut_ast_ok.
+    static bool node_fixed_width(const detail::Node &n) {
+      using K = detail::Node::Kind;
+      switch (n.kind) {
+      case K::Empty:
+      case K::Lit:
+      case K::AnyChar:
+      case K::Class: return true;
+      case K::Concat:
+      case K::Group:
+        for (const auto &k : n.kids)
+          if (!node_fixed_width(k)) return false;
+        return true;
+      case K::Repeat:
+        return n.rmax >= 0 && n.rmin == n.rmax && !n.kids.empty() &&
+               node_fixed_width(n.kids[0]);
+      default: return false; // Alt, assertions, lookaround
+      }
+    }
+
+    // The extra rule for a table built with the leftmost-first CUT, whose
+    // consumer reads the walk's LAST accept as the leftmost-first end (the
+    // unbounded walk, and AnchoredOnePass's bare `^body`). A repeat that can
+    // run more than once must consume a fixed width per iteration: otherwise
+    // its iterations end at several offsets, the walk records an accept at
+    // each, and the last is the LONGEST parse rather than the leftmost-first
+    // one the backtracker commits to — `(?:[a-cb].{0,4})+` over "bbc 23_\n_2"
+    // accepts at 5 (one iteration, `.{0,4}` greedy) and again at 7 (a shorter
+    // first iteration letting a second run), where leftmost-first is 5. The
+    // cut does not save this: it orders threads, and both accepts lie on one
+    // thread's path. A `?` / `{n,n}` repeat is exempt — running at most once,
+    // it cannot re-enter at a new offset (the adjacent-nullable shape
+    // `(x)(?:ab)?(?:abc)?` IS what the cut handles).
+    //
+    // The tiers whose table is built UNCUT neither need this nor may pay for
+    // it: `body$` / `^body$` (the accept must land at n, so a longer parse is
+    // not a wrong answer) and WordOnePass (the trailing `\b` picks the
+    // accept). Folding the rule into onepass_unbounded_ast_ok charged them
+    // too and cost the IPv4 extraction row — `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`,
+    // whose `{3}` body is variable-width — 613 -> 264 MB/s.
+    static bool onepass_cut_ast_ok(const detail::Node &n) {
+      using K = detail::Node::Kind;
+      if (n.kind == K::Repeat && (n.rmax < 0 || n.rmax > 1) &&
+          !n.kids.empty() && !node_fixed_width(n.kids[0]))
+        return false;
+      for (const auto &k : n.kids)
+        if (!onepass_cut_ast_ok(k)) return false;
+      return true;
+    }
+
     static bool onepass_unbounded_ast_ok(const detail::Node &n,
                                          bool in_repeat) {
       using K = detail::Node::Kind;

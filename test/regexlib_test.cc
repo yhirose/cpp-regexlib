@@ -2210,6 +2210,36 @@ void test_onepass_leftmost_first() {
     }
     CHECK(k == 1 && e0 == 3);
   }
+  { // A repeat that can run MORE THAN ONCE over a VARIABLE-width body has an
+    // accept per iteration count, and the walk's last accept is then the
+    // LONGEST parse, not the leftmost-first one. `(?:[a-cb].{0,4})+` over
+    // "bbc 23_\n_2" is [0,5) (one iteration, `.{0,4}` greedy); the walk
+    // reported [0,7) (a shorter first iteration letting a second run). This
+    // shipped in AnchoredOnePass, whose `^body` table is built with the same
+    // cut, so the anchored form was wrong on the released engine.
+    const std::string subj = "bbc 23_\n_2";
+    struct { const char *pat; size_t b, e; } cases[] = {
+        {R"(^(?:[a-cb].{0,4})+)", 0, 5},   // AnchoredOnePass (was [0,7))
+        {R"((?:[a-cb].{0,4})+)", 0, 5},    // unanchored capture-free
+        {R"(^(?:a.{0,2})+)", 0, 0},        // control: no match at 0 here
+        {R"((?:[a-cb].{0,4})+$)", 0, 0},   // body$ admission, same body
+    };
+    for (auto &c : cases) {
+      for (int us = 0; us < 2; us++) {
+        Regex re = us ? make_us(c.pat) : make_egc(c.pat);
+        auto m = re.search(subj);
+        if (c.e == 0) continue; // shape kept only to exercise the admission
+        CHECK(m.matched() && m.begin() == c.b && m.end() == c.e);
+        CHECK(re.test(subj) == m.matched());
+        auto all = find_all(re, subj);
+        CHECK(!all.empty() && all[0].begin() == c.b && all[0].end() == c.e);
+      }
+    }
+    // Fixed-width bodies stay admitted (the wins this guard must not undo).
+    CHECK(make_us(R"([A-Za-z_]\w*)").search("  getElementById").end() == 16);
+    CHECK(make_us(R"(//[^\n]*)").search("x // c").end() == 6);
+    CHECK(make_us(R"(\d+(?:\.\d+)?)").search("v3.14").end() == 5);
+  }
   { // CAPTURE-FREE US search() takes the same drivers, for the span alone
     // (saves 0/1). Every answer must equal what the located-span chain gives,
     // so each case is checked against find_all's first row - the chain still
