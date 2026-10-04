@@ -55,6 +55,15 @@ struct PlanProbe {
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
+  // Served by the Pike VM and by nothing else (no literal, DFA or assert
+  // tier planned): what a reference Regex has to be.
+  static bool pike_only(const Regex &re) {
+    const auto &p = *re.plan_;
+    return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
+           !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
+           !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
+           !p.aop_.ok && !p.wop_.ok;
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -63,6 +72,18 @@ namespace {
 
 using reg::detail::PlanProbe;
 
+// `pat` on the grapheme Pike, forced there by an always-true lookahead (the
+// next cluster is anything, or the text ends): the same matches and groups,
+// and a lookaround is a construct neither DFA family compiles. The
+// wrap these tests used to use, `(?:PAT)(?:\b|\B)`, predates the assert
+// tiers, which serve it — so it had come to compare a tier with itself. The
+// plan is asked, so a reference cannot drift off the Pike unnoticed again.
+inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0) {
+  reg::Regex re("(?:" + pat + ")(?=[\\s\\S]|$)", flags);
+  check(PlanProbe::pike_only(re), "pike_twin: reference is Pike-only",
+        __LINE__);
+  return re;
+}
 using reg::DotAll;
 using reg::IgnoreCase;
 using reg::Multiline;
@@ -1527,7 +1548,7 @@ void test_crlf_byte_path() {
          "Holmes\r\nWatson and a Holmes\r\n";
   auto same_as_pike = [&](const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?:\\b|\\B)"); // always-true; forces Pike
+    Regex pike = pike_twin(pat);
     auto a = find_all(bare, s), b = find_all(pike, s);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -1573,7 +1594,7 @@ void test_crlf_byte_path() {
   // the grapheme Pike and still agree.
   auto same_on = [&](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?:\\b|\\B)");
+    Regex pike = pike_twin(pat);
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2287,7 +2308,7 @@ void test_ascii_icase_prefilter() {
 
 void test_assert_dfa() {
   auto same = [](const std::string &s, const std::string &p) {
-    Regex bare(p), pike("(?:" + p + ")(?:\\b|\\B)");
+    Regex bare(p), pike = pike_twin(p);
     auto a = find_all(bare, s), b = find_all(pike, s);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2349,7 +2370,7 @@ void test_assert_dfa() {
   // Differential vs the forced Pike, with the Multiline flag and subjects
   // carrying CR / CRLF / vertical tab.
   auto samef = [](const std::string &s, const std::string &p, unsigned fl) {
-    Regex bare(p, fl), pike("(?:" + p + ")(?:\\b|\\B)", fl);
+    Regex bare(p, fl), pike = pike_twin(p, fl);
     auto a = find_all(bare, s), b = find_all(pike, s);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2605,7 +2626,7 @@ void test_longest_safe_repeat() {
   // 23_") where greedy yields only [0,5) ("bbc 2").
   auto agrees_with_pike = [](const std::string &pat, const std::string &sub) {
     Regex re(pat);
-    Regex pike("(?:" + pat + ")(?:\\b|\\B)"); // wrap forces the full Pike VM
+    Regex pike = pike_twin(pat);
     auto all = find_all(re, sub);
     auto ref = find_all(pike, sub);
     CHECK(all.size() == ref.size());

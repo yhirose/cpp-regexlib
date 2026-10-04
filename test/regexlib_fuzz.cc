@@ -35,6 +35,23 @@
 
 #include "regexlib.h"
 
+// The fuzzer's view into a Regex's plan (the header declares the peer and
+// befriends it): whether a Regex is served by the Pike VM and by nothing
+// else. Every reference below is built through pike_reference(), which asks.
+namespace reg {
+namespace detail {
+struct PlanProbe {
+  static bool pike_only(const Regex &re) {
+    const auto &p = *re.plan_;
+    return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
+           !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
+           !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
+           !p.aop_.ok && !p.wop_.ok;
+  }
+};
+} // namespace detail
+} // namespace reg
+
 namespace {
 
 // Per-thread RNG so workers run independent, reproducible streams. Each worker
@@ -227,6 +244,35 @@ void fail(const std::string &why, const std::string &pat,
     std::printf("[INVARIANT] %s : /%s/ on \"%s\"\n", why.c_str(), pat.c_str(),
                 subj.c_str());
   }
+}
+
+// The reference the differentials compare against: `pat` on the Pike VM,
+// forced there by a transformation no accelerated tier can see through. An
+// always-true LOOKAHEAD — the next cluster is anything, or the text ends —
+// matches at every position and consumes nothing, so the wrapped pattern has
+// exactly the bare pattern's matches and groups, and a lookaround is a
+// construct neither DFA family compiles.
+//
+// It used to be `(?:PAT)(?:\b|\B)`, from before the assert tiers existed.
+// They serve `\b` and `\B`, so that wrap had come to run on the assert DFAs
+// whenever a subject passed their gates — the tiers under test, sharing their
+// gates with the code it was supposed to check (`t[^.]+[^q]+\.` matched
+// "t\r\n." on both sides). Nothing noticed, because nothing asked; this
+// does. A reference that is not Pike-only is a failure of the run.
+reg::Regex *pike_reference(const std::string &pat, unsigned flags,
+                           reg::MatchUnit unit) {
+  reg::Regex *pike = nullptr;
+  try {
+    pike = new reg::Regex("(?:" + pat + ")(?=[\\s\\S]|$)", flags, unit);
+  } catch (...) {
+    return nullptr; // wrapping may hit a limit; the caller skips the compare
+  }
+  if (!reg::detail::PlanProbe::pike_only(*pike))
+    fail("reference is not Pike-only", pat, "");
+  return pike;
+}
+reg::Regex *pike_reference(const std::string &pat, unsigned flags = 0) {
+  return pike_reference(pat, flags, reg::MatchUnit::Grapheme);
 }
 
 // Oracle-free self-consistency checks on a single match.
@@ -581,18 +627,10 @@ void check_pattern(const std::string &pat,
     fail("non-RegexError thrown at construction", pat, "");
     return;
   }
-  // Appending an always-true zero-width assertion forces the full Pike VM:
-  // the assertion makes the program non-DFA-able (so the tier-1/tier-2 DFA
-  // paths bow out), while `(?:\b|\B)` matches at every position and consumes
-  // nothing, so the whole match is identical to the bare pattern. This is an
-  // oracle-free DFA-vs-Pike reference — search/find_all take the DFA path for
-  // DFA-able patterns, this forces the Pike path for the same matches.
-  reg::Regex *pike = nullptr;
-  try {
-    pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)");
-  } catch (...) {
-    pike = nullptr; // wrapping may hit a limit; skip the differential then
-  }
+  // The DFA-vs-Pike reference (see pike_reference): search/find_all take the
+  // accelerated tiers for the bare pattern, this takes the Pike for the same
+  // matches. Null when the wrap hit a limit; the differential is skipped.
+  reg::Regex *pike = pike_reference(pat);
   reg::Regex::FindCache cache; // reused across this pattern's subjects
   for (const std::string &subj : subjects) {
     reg::MatchResult m;
@@ -651,7 +689,7 @@ void check_pattern(const std::string &pat,
         fail("find_all count != Pike", pat, subj);
       else
         // Whole spans AND capture groups must equal the Pike. The
-        // (?:PAT)(?:\b|\B) wrap is non-capturing, so the reference keeps
+        // reference's wrap is non-capturing, so it keeps
         // PAT's own groups — this validates the leftmost-first capture
         // tiers (S3) against the Pike.
         for (size_t i = 0; i < all.size(); i++)
@@ -747,11 +785,13 @@ void check_us_vs_pike(const std::string &pat,
   reg::Regex *us = nullptr, *pike = nullptr;
   try {
     us = new reg::Regex(pat, 0u, reg::MatchUnit::CodePoint);
-    pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)");
   } catch (...) {
+    return; // rejected pattern: nothing to compare
+  }
+  pike = pike_reference(pat);
+  if (!pike) {
     delete us;
-    delete pike;
-    return; // rejected pattern / wrap limit: nothing to compare
+    return; // wrap limit
   }
   for (const std::string &subj : subjects) {
     std::vector<reg::MatchResult> all, ref;
@@ -791,8 +831,8 @@ void check_us_vs_pike(const std::string &pat,
 // out: search()/match() build one way, find_all widens its rows, find_iter
 // its single row. A non-capturing wrapper `(?:\w+)` is peeled the same way
 // and reports no groups. The reference keeps the groups REAL: the forced-Pike
-// wrap `(?:PAT)(?:\b|\B)` puts the wrappers below the root, so its Save
-// slots are computed, not aliased.
+// wrap (pike_reference) puts the wrappers below the root, so its Save slots
+// are computed, not aliased.
 //
 // gen_alt wraps a whole pattern in a group only when the top-level concat
 // happens to be a single unquantified group atom. This generator draws only
@@ -1195,14 +1235,15 @@ void invariant_fuzz_literal(int iters) {
     std::string pat;
     for (int i = 0; i < m; i++) pat += LITCH[U(0, 5)];
     reg::Regex re(pat);
-    reg::Regex pike("(?:" + pat + ")(?:\\b|\\B)");
+    reg::Regex *pike = pike_reference(pat);
+    if (!pike) continue;
     reg::Regex::FindCache cache;
     for (int s = 0; s < 6; s++) {
       int k = U(0, 14);
       std::string subj;
       for (int i = 0; i < k; i++) subj += UNITS[U(0, 11)];
       auto all = find_all(re, subj);
-      auto ref = find_all(pike, subj);
+      auto ref = find_all(*pike, subj);
       reg::MatchResult sm = re.search(subj);
       if (re.test(subj) != sm.matched())
         fail("literal: test() != search().matched()", pat, subj);
@@ -1217,6 +1258,7 @@ void invariant_fuzz_literal(int iters) {
       check_scan(re, subj, all, pat);
       check_cache(re, subj, all, cache, pat);
     }
+    delete pike;
   }
 }
 
@@ -1226,7 +1268,7 @@ void invariant_fuzz_literal(int iters) {
 // single-code-point non-ASCII (é ñ α 日), and an occasional multi-code-point
 // cluster (e+combining, which disqualifies the byte tier). On a non-ASCII
 // subject the bare pattern runs the cached code-point-aware byte assert DFA;
-// the `(?:PAT)(?:\b|\B)` wrap forces the grapheme Pike. They must agree on
+// pike_reference() puts the same pattern on the Pike. They must agree on
 // every find_all span, plus search()/test() consistency. Runs with and without
 // Multiline (multiline ^/$ line-break logic is part of the byte tier; the
 // ASCII-only differential never set the flag).
@@ -1277,9 +1319,8 @@ void invariant_fuzz_assert_suffix(int iters) {
     try {
       re = new reg::Regex(pat, ml);
     } catch (...) { continue; }
-    try {
-      pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)", ml);
-    } catch (...) {
+    pike = pike_reference(pat, ml);
+    if (!pike) {
       delete re;
       continue;
     }
@@ -1331,10 +1372,7 @@ void invariant_fuzz_assert_unicode(int iters) {
       fail("non-RegexError at construction (assert-uni)", pat, "");
       continue;
     }
-    reg::Regex *pike = nullptr;
-    try {
-      pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)", flags, unit);
-    } catch (...) { pike = nullptr; }
+    reg::Regex *pike = pike_reference(pat, flags, unit);
     for (int s = 0; s < 6; s++) {
       std::string subj = gen_au_subject();
       std::vector<reg::MatchResult> all;

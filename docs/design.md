@@ -1160,17 +1160,31 @@ ASan/UBSan) is layered:
   **forced** by a transformation the accelerator cannot see through:
 
   ```cpp
-  pike = Regex("(?:" + pat + ")(?:\\b|\\B)");
+  pike = Regex("(?:" + pat + ")(?=[\\s\\S]|$)");
   ```
 
-  The always-true zero-width `(?:\b|\B)` matches at every position and consumes
-  nothing, making the program non-DFA-able (`dfa_ok_`/`dfa_assert_ok_` bow out) so
-  this `Regex` runs the Pike — while matching the exact same whole spans. The
-  scan's full sequence is compared span-for-span **and capture-for-capture**
-  against the forced-Pike result. This is the check that caught the CRLF
-  soundness bugs: `gen_subject` deliberately emits `\r` and `\n`, and only a
-  grapheme engine that *does* treat CR-LF as one cluster can expose a byte path
-  that wrongly treats it as two.
+  The always-true lookahead — the next cluster is anything, or the text ends —
+  matches at every position and consumes nothing, and a lookaround is a
+  construct neither DFA family compiles (`dfa_ok_`/`dfa_assert_ok_` bow out),
+  so this `Regex` runs the Pike — while matching the exact same whole spans.
+  The scan's full sequence is compared span-for-span **and
+  capture-for-capture** against the forced-Pike result. This is the check
+  that caught the CRLF soundness bugs: `gen_subject` deliberately emits `\r`
+  and `\n`, and only a grapheme engine that *does* treat CR-LF as one cluster
+  can expose a byte path that wrongly treats it as two.
+
+  **The forcing is itself checked** (`pike_reference` in the fuzzer,
+  `pike_twin` in the unit tests, both through `PlanProbe`): a reference whose
+  plan holds any accelerated tier fails the run. It was not always. The wrap
+  used to be `(?:PAT)(?:\b|\B)`, chosen when an assertion meant "not
+  DFA-able"; then the assert tiers were built to serve exactly `\b` and `\B`,
+  and the reference quietly moved onto them — the tiers under test, behind the
+  same gates. Two wrong answers sat behind it for as long: a CRLF gate both
+  sides shared (`t[^.]+[^q]+\.` matching `t\r\n.`), and CodePoint-mode
+  multiline anchors inside a CR-LF pair, which no layer compared against a
+  Pike at all. A transformation "the accelerator cannot see through" is a
+  claim about the accelerators as they are today; the only way to keep it
+  true is to ask the plan.
 - **Layer 3 — US-vs-EGC.** UnicodeScalar is a separate byte automaton; the
   reference it is checked against is the proven EGC engine, valid because on a
   subject of **single-code-point, single-grapheme** characters
