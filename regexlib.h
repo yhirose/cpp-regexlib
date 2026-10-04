@@ -11405,8 +11405,11 @@ private:
   // byte/code-point fast paths (which count units, not clusters) diverge from
   // the grapheme engine.
   static bool contains_crlf(std::string_view text) {
+    // `q != end` first: memchr's pointer argument must be non-null even for
+    // a zero length, and an empty string_view's data() may be null.
     const char *d = text.data();
     for (const char *q = d, *end = d + text.size();
+         q != end &&
          (q = static_cast<const char *>(memchr(q, '\r', end - q))) != nullptr;
          ++q)
       if (q + 1 < end && q[1] == '\n') return true;
