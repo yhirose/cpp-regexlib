@@ -200,7 +200,7 @@ Three tiers, picked structurally from the pattern:
 | Tier | When | What runs |
 | --- | --- | --- |
 | **1** | capture-free ∧ DFA-able | Forward ordered+cut DFA finds the leftmost-first end `e`; the reverse scan finds the start `s`; return `[s, e)`. **No Pike.** Covers the ASCII grapheme tier, the UTF-8 byte tier (§4/§5), and `^ $ \b \A \z` via an assertion-aware DFA. Targets `\w+`, `[a-z]+`, literals, general alternation (`a\|ab`, `(?m)^…\|…$`). |
-| **2** | captures ∧ DFA-able | The lf DFA locates `[s, e)`, then a capture engine resolves groups *bounded by `e`* (§6). Whole-match captures (every group == the whole match, e.g. `(\w+)`) skip the engine entirely. |
+| **2** | captures ∧ DFA-able | The lf DFA locates `[s, e)`, then a capture engine resolves groups *bounded by `e`* (§6). A pattern whose every group wraps the whole match (`(\w+)`) never reaches this tier: it is planned as its capture-free twin (§3, *Root groups*). |
 | **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the grapheme assert DFA (ASCII subject) or the **byte** assert DFA (`ByteAssertDfa`: a non-ASCII EGC subject, or **US mode on any subject** — see below). |
 | **3** | DFA-ineligible (lookaround / nested empty-loop) or state-cap overflow | Pike VM over the whole subject, with the §7 prefilters. The fallback. |
 
@@ -249,7 +249,7 @@ carries a `[Tier: …]` label in the source, with one canonical name per
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — u16 rows, accept byte off the dependency chain; a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. Bails to the chain on a non-ASCII byte, and `fill_matches` / `MatchIter` resume it from the bail point rather than redoing the subject |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next, in `fill_matches` and in `MatchIter` alike (§2, Linearity) |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); `+cap` as above |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa` (start recovery via the cached `AssertRevDfa`) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
@@ -304,7 +304,37 @@ candidate walks overlap in the pipeline, unlike the chain's one dependency
 chain) — and the driver bails as soon as the charge exceeds the distance
 scanned, after a `kMinScan` proving window so short subjects keep the
 one-walk latency shape. The callers resume the chain from the bail point,
-so the loss is bounded by that window, not a subject's worth. Two exact
+so the loss is bounded by that window, not a subject's worth.
+
+That bail is **global** — the driver is done for the caller's loop
+(`kWalkBail`). A non-ASCII byte in a walk's way is a different event and gets
+a different code, `kWalkLocal`: the one-pass table has no transition for the
+byte, which says nothing about the bytes after it. So it is **local**: the
+located-span chain serves that ONE find and the driver is asked again for the
+next. Both loops do it the same way — `fill_matches` through `onepass_fill`'s
+chain step, `MatchIter` by falling through to its chain rungs for one match —
+and they share the step itself (`dfa_chain_step` / `assert_chain_step`). It
+used to be one code, so a single `é` handed the rest of the subject to the
+chain: `\w+` in CodePoint mode over 512 KB of ASCII words with one `é` in the
+middle ran at ~270 MB/s against ~410 without it, and runs at ~410 now (with an
+`é` in one word of fifty: ~205 → ~390). A local bail is charged like a failed
+walk plus `kBailCost` for the call that produced nothing, against the distance
+the *driver* covered — what the chain covers after a bail is not the driver's
+doing — so a subject where most finds bail (every word beginning with a
+non-ASCII letter) trips the same rule and the bail turns global. It draws
+nothing from the linearity allowance: the chain step that follows reads every
+byte the bailing walk read, which bounds it by work the chain does anyway.
+
+Where the driver sits among the rungs follows from the same accounting. A
+capture-free find takes the suffix / ReverseInner prefilters (§7) *before*
+it — they answer from a memmem hit, while the driver would walk candidates
+until the rule gives it up — and a capture find takes the driver first (its
+one walk yields the groups; the prefilter rungs need a capture pass). All
+three loops order them this way; `MatchIter` once had the driver first for
+both, which on `[a-q][^u-z]{13}x` in CodePoint mode spent half the find in
+the driver's proving window (~17 → ~33 GB/s with the suffix scan first).
+
+Two exact
 refinements keep the driver's own work down first: a failed walk reports
 the end of its first restartable run (`CpOnePass::State::restart_ok`: every
 looping byte also takes the start state there, so a walk begun inside the
@@ -324,6 +354,33 @@ needs 2¹⁸ states) from exhausting memory.
 The compiler lowers the AST to an NFA `Program`. Two pressures shaped it —
 **compile time** and **program memory** — both dominated by Unicode classes
 (`\w`, `\p{L}`), which expand to hundreds of UTF-8 byte-range sequences.
+
+### Root groups
+
+Before anything reads the AST, the groups that wrap the *whole* pattern are
+peeled off its root (`peel_root_groups`). A group there adds nothing to what
+the pattern matches:
+
+- a non-capturing one — `(?:\w+ing)` — is pure syntax and always comes off;
+- a capturing one records a span that is, by position, the match's own. It
+  comes off only when *every* group of the pattern is such a wrapper —
+  `(\w+)`, `((x))`, `(?:(\w+))`, `(?<n>\w+)` — and then `ncap_` is 0 and
+  `alias_groups_` holds the count: the pattern is planned and run as its
+  **capture-free twin**, and each group is reported as the whole match where a
+  result is handed out (`finish_result` for a single result, `alias_rows` for
+  `find_all`'s rows, one widened row per step in `MatchIter`). With any other
+  group in the pattern the wrappers' slots are real work, and they stay.
+
+It has to happen on the AST, ahead of every analysis, because the analyses
+read the root's *shape* — a `Concat` ending in a literal, a bare literal run —
+and a wrapper that survives to the plan hides it. Before this a wrapped pattern
+was a different pattern to the planner: `([a-zA-Z]+ing)` and `(?:[a-zA-Z]+ing)`
+ran at ~350 MB/s where `[a-zA-Z]+ing` runs at ~2700, `(Sherlock)` at half the
+literal tier's speed, and `([a-q][^u-z]{13}x)` fell to the grapheme Pike on
+CRLF text (the collapse path is capture-free only) at 9 MB/s against ~20000.
+All of them now run at the twin's speed, in `find_iter` exactly; `find_all`
+pays the widening pass over its rows (dense `(\w+)`: ~330 MB/s against ~395
+for `\w+`).
 
 ### The instruction (`Inst`) — 16 bytes, trivially relocatable
 
@@ -618,9 +675,10 @@ The ordered+cut DFA locates the leftmost-first `[s, e)`; groups are then resolve
 | **BitState** (`bitstate_bytes`) | not one-pass; span ≤ `kBitStateCap` | Bounded leftmost-first backtracking over `cp_prog_` on the located span, decoding code points on the fly (no segmentation), with a visited bitmap over `(pc, byte-pos)` so it stays O(prog × span); capture writes undo on backtrack. |
 | **code-point Pike** (`run_saves` on `cp_prog_` + `segment_cp`) | span overflow, or a DFA state-cap that drops the whole pattern | The universal fallback. |
 
-Whole-match captures (every group == the whole match, e.g. `(\w+)`) skip all
-three: each group's span *is* `[s, e)`. All engines are leftmost-first over the
-same NFA, so they agree with the grapheme engine.
+All engines are leftmost-first over the same NFA, so they agree with the
+grapheme engine. (A whole-match capture — every group == the whole match,
+e.g. `(\w+)` — needs none of them: it has no groups by the time it is planned;
+§3, *Root groups*.)
 
 **Unbounded one-pass find (`cp_onepass_find`, `onepass_unbounded_`).** The
 bounded chain walks each match three times (forward DFA for `e`, reverse DFA

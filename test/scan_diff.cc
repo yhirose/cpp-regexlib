@@ -226,6 +226,55 @@ int main() {
       {"[a-z]+", kUS},
       {"//[^\\n]*", 0},
       {"/users/\\d+", kUS},
+      // Whole-match captures: every group IS the match. The pattern runs as
+      // its capture-free twin (root groups peeled off the AST) and the groups
+      // are written back at three different places — search()'s result,
+      // find_all's rows, find_iter's row — which is exactly what this file
+      // compares. Bodies that put the twin on different tiers (the one-walk
+      // drivers, the chain for lazy / alternating / nullable ones, the
+      // literal, suffix and assert tiers), nested / non-capturing / named
+      // wrappers, both units.
+      {"(\\w+)", 0},
+      {"([^\\n]+)", 0},
+      {"([^\\n]+)", kUS},
+      {"([a-z]+)", 0},
+      {"((\\w+))", 0},
+      {"((\\w+))", kUS},
+      {"(?:(\\d+))", 0},
+      {"(\\w+\\s+\\w+)", 0},
+      {"(\\w+\\s+\\w+)", kUS},
+      {"(/users/\\d+)", 0},
+      {"(/users/\\d+)", kUS},
+      {"(a+b?)", 0},
+      {"(\\w+?)", 0},
+      {"(\\w+?)", kUS},
+      {"(a|ab)", 0},
+      {"(a|ab)", kUS},
+      {"(x*)", 0},
+      {"(holmes)", Flag::IgnoreCase},
+      {"(\\w+)", Flag::IgnoreCase},
+      {"(Holmes)", 0},
+      {"(abc|line2)", 0},
+      {"([a-z]+ing)", 0},
+      {"([a-z]+ne\\d)", kUS},
+      {"(\\b\\w+\\b)", 0},
+      {"(^\\w+)", Flag::Multiline},
+      {"(\\w+$)", kUS},
+      {"(?<w>\\w+)", 0},
+      {"((?<w>\\d+))", kUS},
+      {"(?:[a-z]+)", 0},
+      {"(?:(?:\\w+\\s+\\w+))", kUS},
+      {"()", 0},
+      // US one-walk drivers over subjects that put non-ASCII bytes in their
+      // way (the "local bail" subjects below): each such find is served by
+      // the chain and the driver resumes, in find_all's loop and in
+      // find_iter's separately — the two must still agree row for row.
+      {"(\\w+)=(\\w+)", kUS},
+      {"(\\w+)=(\\S+)", kUS},
+      {"(\\d+)\\s+(\\w+)", kUS},
+      {"/users/(\\d+)", kUS},
+      {"[a-z]+\\d?", kUS},
+      {"(\\w+) (\\w+)$", kUS},
   };
   const std::string subjects[] = {
       "",
@@ -253,6 +302,12 @@ int main() {
       "aaaaaaaa",  // the overlapping-alternation validators' matching input
       "aaaaaaaab", // and the one that fails only at the trailing anchor
       std::string(1000, 'a') + "\n" + std::string(999, 'b'), // long matches
+      "GET /users/42 then /users/7x and /users/ alone", // literal-prefix hits
+      // Local bails: a non-ASCII byte inside, right after, right before a
+      // match, at both ends of the subject, and in every other token.
+      "ab c\xC3\xA9" "d ef \xC3\xA9 gh a=b \xC3\xA9=c d=\xC3\xA9 e=f",
+      "\xC3\xA9 ab\xC2\xA1" "cd \xC2\xA1" "ef 12 gh /users/7 \xC3\xA9",
+      "k=v \xC3\xA9 12 ab \xC3\xA9=w 34 cd x=y \xC3\xA9 56 ef z=\xC3\xA9 /users/1",
   };
 
   for (const auto &c : cases)

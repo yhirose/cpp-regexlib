@@ -736,6 +736,214 @@ void invariant_fuzz_onepass_repeat(int iters) {
   }
 }
 
+// US (CodePoint) differential against the EGC forced Pike: find_all, search
+// and find_iter of `pat` built in CodePoint mode must give the spans and
+// groups the grapheme Pike gives. The oracle is valid on subjects whose every
+// cluster is ONE code point and that hold no `\r` (US never fuses CR-LF, EGC
+// does) — the callers' job. It is the EGC engine on purpose: the code-point
+// Pike shares its program with the one-walk tables it would be checking.
+void check_us_vs_pike(const std::string &pat,
+                      const std::vector<std::string> &subjects) {
+  reg::Regex *us = nullptr, *pike = nullptr;
+  try {
+    us = new reg::Regex(pat, 0u, reg::MatchUnit::CodePoint);
+    pike = new reg::Regex("(?:" + pat + ")(?:\\b|\\B)");
+  } catch (...) {
+    delete us;
+    delete pike;
+    return; // rejected pattern / wrap limit: nothing to compare
+  }
+  for (const std::string &subj : subjects) {
+    std::vector<reg::MatchResult> all, ref;
+    reg::MatchResult one;
+    try {
+      all = find_all(*us, subj);
+      ref = find_all(*pike, subj);
+      one = us->search(subj);
+    } catch (...) {
+      fail("US vs Pike: matcher threw", pat, subj);
+      continue;
+    }
+    if (all.size() != ref.size()) {
+      fail("US vs Pike: find_all count", pat, subj);
+      continue;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < all.size() && ok; i++)
+      ok = compare_groups(all[i], ref[i], "US find_all vs Pike", pat, subj);
+    if (!ok) continue;
+    if (one.matched() != !all.empty())
+      fail("US vs Pike: search matched != find_all", pat, subj);
+    else if (one.matched())
+      compare_groups(one, all[0], "US search vs find_all[0]", pat, subj);
+    check_scan(*us, subj, all, pat);
+  }
+  delete us;
+  delete pike;
+}
+
+// --- Whole-match capture shapes: every group wraps the entire pattern. ---
+//
+// `(\w+)`, `((x))`, `(?:(\w+))`, `(?<n>\w+)`. Such a pattern is planned and
+// run as its capture-free twin — the groups at the root are peeled off the
+// AST, so every tier, prefilter and walk the twin gets is what runs — and the
+// groups are written back, each as the whole match, where a result is handed
+// out: search()/match() build one way, find_all widens its rows, find_iter
+// its single row. A non-capturing wrapper `(?:\w+)` is peeled the same way
+// and reports no groups. The reference keeps the groups REAL: the forced-Pike
+// wrap `(?:PAT)(?:\b|\B)` puts the wrappers below the root, so its Save
+// slots are computed, not aliased.
+//
+// gen_alt wraps a whole pattern in a group only when the top-level concat
+// happens to be a single unquantified group atom. This generator draws only
+// the shape, over bodies that land the twin on different tiers.
+std::string gen_whole_match_capture() {
+  std::string body;
+  switch (U(0, 3)) {
+  case 0:
+  case 1: {
+    // One-walk bodies: Alt-free, greedy-only, no group under a repeat. An
+    // optional literal head (the prefix candidate driver) and one piece that
+    // is never optional, so the body cannot match empty.
+    static const char *HEAD[] = {"", "", "a", "ab", "_", "1"};
+    static const char *ATOM[] = {"[a-c]",  "\\w", "\\d",          "\\s",
+                                 "[^\\n]", "a",   "[a-cA-C1-3]", "[^ ]"};
+    static const char *Q1[] = {"+", "+", "", "{1,3}", "{2}", "{2,}"};
+    static const char *Q0[] = {"*", "?", "{0,2}", "+", ""};
+    body = HEAD[U(0, 5)];
+    int k = U(1, 3), solid = U(0, k - 1);
+    for (int i = 0; i < k; i++) {
+      body += ATOM[U(0, 7)];
+      body += (i == solid) ? Q1[U(0, 5)] : Q0[U(0, 4)];
+    }
+    break;
+  }
+  case 2:
+    // Refused by the walk's cut rules (a variable-width body under a repeat
+    // that can run more than once): gen_onepass_repeat's family, which must
+    // stay on the chain.
+    body = "(?:[a-c]" + std::string(U(0, 1) ? ".{0,4}" : "x?") + ")" +
+           (U(0, 1) ? "+" : "{1,3}");
+    break;
+  default:
+    // Anything: alternation, laziness, nullability, anchors (the assert
+    // tiers), inner groups (which make it NOT whole-match — the neighbouring
+    // shape, where the wrappers must stay real).
+    body = gen_alt(1);
+    break;
+  }
+  switch (U(0, 5)) {
+  case 0: return "((" + body + "))";
+  case 1: return "(?:(" + body + "))";
+  case 2: return "(?<n>" + body + ")";
+  case 3: return "(?:" + body + ")";
+  default: return "(" + body + ")";
+  }
+}
+
+void invariant_fuzz_whole_match_capture(int iters) {
+  for (int it = 0; it < iters; it++) {
+    const std::string pat = gen_whole_match_capture();
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 3; s++)
+      subjects.push_back(gen_subject());
+    // Padded, for the reason invariant_fuzz_onepass_repeat pads: the walk
+    // budget is seeded from the subject length, and a short subject hands the
+    // find back to the chain after a couple of failed candidates.
+    subjects.push_back(gen_subject() + std::string(2048, '\n') +
+                       gen_subject());
+    // One long match (the walk's SIMD run skip).
+    subjects.push_back(gen_subject() + std::string(600, 'a') + gen_subject());
+    // EGC: the full battery, groups included, against the forced Pike.
+    check_pattern(pat, subjects);
+
+    // US (CodePoint): the same walk behind a different ladder (see
+    // check_us_vs_pike for the oracle and what it asks of a subject). A
+    // stray `é` puts a non-ASCII byte in the walk's way: it bails there and
+    // the chain serves that match.
+    static const char *UNITS[] = {"a", "b", "c",  "A", "C",
+                                  " ", "1", "_",  "\n", "\xC3\xA9"};
+    std::vector<std::string> us_subjects;
+    for (int s = 0; s < 4; s++) {
+      std::string subj;
+      int n = U(0, 14), top = (s == 0) ? 9 : 8; // subject 0 may hold an é
+      for (int i = 0; i < n; i++)
+        subj += UNITS[U(0, top)];
+      if (s == 3) subj += std::string(600, 'a') + " 1a";
+      us_subjects.push_back(std::move(subj));
+    }
+    check_us_vs_pike(pat, us_subjects);
+  }
+}
+
+// --- One-walk drivers across non-ASCII bytes (US). ---
+//
+// The unbounded one-pass walk and the scalar capture chain step ASCII bytes
+// only. In CodePoint mode they run on any subject, so a non-ASCII byte in a
+// walk's way is routine, and it is LOCAL: the located-span chain serves that
+// one find and the driver is asked again for the next (kWalkLocal). One
+// subject therefore alternates between the two engines match by match, in
+// find_all and in find_iter through different loops, and a subject where
+// most finds bail makes the driver give up for good partway (the
+// profitability rule) — a third regime on the same subject. All of it must
+// be invisible in the results.
+//
+// invariant_fuzz_us reaches this only thinly: its patterns are mostly not
+// one-walk admissible, its subjects are a dozen units long (the rule needs
+// kilobytes before it can trip), and it does not check find_iter.
+std::string gen_us_onewalk() {
+  // Pieces a one-walk table admits (Alt-free, greedy-only), captured or not,
+  // joined by literals that give the prefix / inner-literal / scalar-chain
+  // drivers something to anchor on; a trailing `$` is the `body$` shape.
+  static const char *HEAD[] = {"", "", "", "a", "_", "k"};
+  static const char *ATOM[] = {"\\w", "\\d", "[a-c]", "[^ =:\\n]",
+                               "\\s", "[a-c1-3]"};
+  static const char *Q[] = {"+", "+", "+", "{1,3}", "*", "?", ""};
+  static const char *SEP[] = {"", "", "=", ":", " ", "-", "\\s+"};
+  static const char *TAIL[] = {"", "", "", "$"};
+  std::string pat = HEAD[U(0, 5)];
+  int k = U(1, 3), solid = U(0, k - 1);
+  for (int i = 0; i < k; i++) {
+    if (i) pat += SEP[U(0, 6)];
+    std::string piece = ATOM[U(0, 5)];
+    piece += (i == solid) ? Q[U(0, 3)] : Q[U(0, 6)];
+    pat += (U(0, 2) == 0) ? "(" + piece + ")" : piece;
+  }
+  return pat + TAIL[U(0, 3)];
+}
+
+void invariant_fuzz_us_onewalk(int iters) {
+  // Single-code-point clusters only, no `\r` (see check_us_vs_pike). The
+  // last three are the non-ASCII ones: é (a word character), 日 (likewise)
+  // and ¡ (punctuation — a non-ASCII byte that ENDS a word).
+  static const char *UNITS[] = {"a", "b",          "c",          "1",
+                                "2", "_",          " ",          "=",
+                                ":", "-",          "\n",        "k",
+                                "\xC3\xA9", "\xE6\x97\xA5", "\xC2\xA1"};
+  for (int it = 0; it < iters; it++) {
+    const std::string pat = gen_us_onewalk();
+    std::vector<std::string> subjects;
+    // Non-ASCII density per subject: none, sparse, about a fifth, about
+    // half of the units.
+    static const int NA_PER_20[] = {0, 1, 4, 10};
+    auto gen = [&](int units, int na) {
+      std::string subj;
+      for (int i = 0; i < units; i++)
+        subj += (U(0, 19) < na) ? UNITS[U(12, 14)] : UNITS[U(0, 11)];
+      return subj;
+    };
+    for (int s = 0; s < 4; s++)
+      subjects.push_back(gen(U(0, 40), NA_PER_20[s]));
+    // Long enough for the regimes to change inside one subject: kilobytes of
+    // mostly-ASCII (the driver keeps coming back), and — one pattern in four,
+    // the Pike reference being what it costs — kilobytes where most finds
+    // bail, so the profitability rule trips partway.
+    subjects.push_back(gen(3000, 1));
+    if (it % 4 == 0) subjects.push_back(gen(4000, 12));
+    check_us_vs_pike(pat, subjects);
+  }
+}
+
 // Pure printable-ASCII literal fast-path differential. The literal tier
 // (literal_only_: memmem + O(1) grapheme-boundary check, no subject
 // classification) must agree with the forced Pike on EVERY surface, especially
@@ -1108,6 +1316,14 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   invariant_fuzz_us(share(inv));
   parser_fuzz(share(parser_it));
   differential_info(share(diff_it));
+  // Appended LAST so every layer above keeps the RNG stream — and so the
+  // exact patterns and subjects — it had before this one existed. A fifth of
+  // the budget: 2 KB padded subjects, and each pattern is checked twice (the
+  // EGC battery plus the US differential).
+  invariant_fuzz_whole_match_capture(share(inv / 5));
+  // A tenth: one 3 KB subject per pattern (and a 4 KB one for every fourth)
+  // through the Pike reference.
+  invariant_fuzz_us_onewalk(share(inv / 10));
 }
 
 int main(int argc, char **argv) {

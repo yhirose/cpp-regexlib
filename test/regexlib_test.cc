@@ -535,6 +535,257 @@ void test_matches() {
   }
 }
 
+// Whole-match captures: every group wraps the entire pattern, so each group's
+// span is the match span. Such a pattern is planned and run as its
+// capture-free twin (the root groups are peeled off the AST) and the groups
+// are written back where a result is handed out — a different place for
+// search()/match(), for find_all's rows and for find_iter's row. So: every
+// entry point, both units, and bodies that land on different tiers (the
+// one-walk driver, the chain, the literal and suffix prefilters, the assert
+// tier, the Pike).
+void test_whole_match_capture() {
+  struct Row {
+    size_t b, e;
+  };
+  auto rows = [](const Regex &re, std::string_view subj,
+                 std::initializer_list<Row> want) {
+    // find_all, find_iter and search must each give `want`, with every group
+    // equal to the whole match.
+    auto all = re.find_all(subj);
+    bool ok = all.size() == want.size();
+    size_t i = 0;
+    for (const Row &w : want) {
+      if (!ok) break;
+      ok = all[i].begin() == w.b && all[i].end() == w.e;
+      for (size_t g = 1; ok && g <= re.group_count(); g++)
+        ok = all[i].group(g).matched() && all[i].group(g).begin() == w.b &&
+             all[i].group(g).end() == w.e;
+      i++;
+    }
+    i = 0;
+    for (auto m : re.find_iter(subj)) {
+      if (!ok || i >= want.size()) {
+        ok = false;
+        break;
+      }
+      const Row &w = *(want.begin() + static_cast<long>(i));
+      ok = m.begin() == w.b && m.end() == w.e;
+      for (size_t g = 1; ok && g <= re.group_count(); g++)
+        ok = m.group(g).matched() && m.group(g).begin() == w.b &&
+             m.group(g).end() == w.e;
+      i++;
+    }
+    ok = ok && i == want.size();
+    auto one = re.search(subj);
+    ok = ok && one.matched() == (want.size() != 0);
+    if (ok && one.matched()) {
+      const Row &w = *want.begin();
+      ok = one.begin() == w.b && one.end() == w.e;
+      for (size_t g = 1; ok && g <= re.group_count(); g++)
+        ok = one.group(g).matched() && one.group(g).begin() == w.b &&
+             one.group(g).end() == w.e;
+    }
+    return ok;
+  };
+
+  for (bool us : {false, true}) {
+    auto mk = [&](const std::string &pat, unsigned flags = 0) {
+      return us ? make_us(pat, flags) : make_egc(pat, flags);
+    };
+    // One-walk bodies: the position scan, a nested and a non-capturing
+    // wrapper, the literal-prefix driver.
+    CHECK(rows(mk(R"((\w+))"), "foo bar_1  baz", {{0, 3}, {4, 9}, {11, 14}}));
+    CHECK(rows(mk(R"(((\w+)))"), "foo bar", {{0, 3}, {4, 7}}));
+    CHECK(rows(mk(R"((?:(\d+)))"), "a12 b 345", {{1, 3}, {6, 9}}));
+    CHECK(rows(mk(R"((/users/\d+))"), "GET /users/42 /users/x /users/7",
+               {{4, 13}, {23, 31}}));
+    CHECK(rows(mk(R"((\w+))"), "", {}));
+    CHECK(rows(mk(R"((\w+))"), " \n ", {}));
+    // A match long enough that the walk crosses it with its run skip.
+    {
+      std::string longs = std::string(700, 'x') + " " + std::string(900, 'y');
+      CHECK(rows(mk(R"((\w+))"), longs, {{0, 700}, {701, 1601}}));
+      CHECK(rows(mk(R"(([^\n]+))"), longs, {{0, 1601}}));
+    }
+    // Bodies the walk refuses (lazy, alternation, case-insensitive).
+    CHECK(rows(mk(R"((\w+?))"), "ab c", {{0, 1}, {1, 2}, {3, 4}}));
+    CHECK(rows(mk(R"((a|ab))"), "ab a", {{0, 1}, {3, 4}}));
+    CHECK(rows(mk(R"((holmes))", IgnoreCase), "Holmes HOLMES", {{0, 6}, {7, 13}}));
+    // A non-ASCII byte mid-subject (é is 2 bytes).
+    CHECK(rows(mk(R"((\w+))"), "ab cd h\xC3\xA9llo ef gh",
+               {{0, 2}, {3, 5}, {6, 12}, {13, 15}, {16, 18}}));
+    // Bodies whose twin takes a prefilter tier: a pure literal, a literal
+    // alternation, a required suffix.
+    CHECK(rows(mk(R"((Holmes))"), "Holmes and Holmes", {{0, 6}, {11, 17}}));
+    CHECK(rows(mk(R"((fox|dog))"), "a fox, a dog", {{2, 5}, {9, 12}}));
+    CHECK(rows(mk(R"(([a-z]+ing))"), "sing a ringing thing",
+               {{0, 4}, {7, 14}, {15, 20}}));
+    // Assertions and a lookahead inside the wrapper (assert tier / Pike).
+    CHECK(rows(mk(R"((\b\w+n\b))"), "on a train in rain", {{0, 2}, {5, 10}, {11, 13}, {14, 18}}));
+    CHECK(rows(mk(R"((^\w+))", Multiline), "ab cd\nef", {{0, 2}, {6, 8}}));
+    CHECK(rows(mk(R"((a(?=b)))"), "ab ac ab", {{0, 1}, {6, 7}}));
+    // A wrapper that can match empty: the groups are empty spans too.
+    CHECK(rows(mk(R"((x*))"), "ax", {{0, 0}, {1, 2}, {2, 2}}));
+    CHECK(rows(mk(R"(())"), "ab", {{0, 0}, {1, 1}, {2, 2}}));
+  }
+  // The group count and names are the pattern's, not the twin's.
+  {
+    Regex named(R"((?<word>\w+))");
+    CHECK(named.group_count() == 1 && named.named_groups().size() == 1);
+    auto m = named.search("  hello ");
+    CHECK(m.matched() && m.group_count() == 1 &&
+          m.group("word").str() == "hello" && m.group(1).begin() == 2);
+    auto all = named.find_all("ab cd");
+    CHECK(all.size() == 2 && all.group_count() == 1 &&
+          all[1].group("word").str() == "cd");
+    const std::string abcd = "ab cd";
+    for (auto it : named.find_iter(abcd))
+      CHECK(it.group("word").str() == it.str() && it.group_count() == 1);
+    Regex nested(R"(((?<in>\d+)))");
+    CHECK(nested.group_count() == 2);
+    auto n2 = nested.search("x42");
+    CHECK(n2.group(1).str() == "42" && n2.group(2).str() == "42" &&
+          n2.group("in").str() == "42" && !n2.group(3).matched());
+    CHECK(Regex(R"(\w+)").group_count() == 0);
+    CHECK(Regex(R"((?:\w+))").group_count() == 0);
+    // Not whole-match (a second group beside the first): real captures.
+    auto two = Regex(R"((a)(b)?)").search("a");
+    CHECK(two.group_count() == 2 && two.group(1).matched() &&
+          !two.group(2).matched());
+    // A capturing wrapper AROUND other groups stays a real group (only a
+    // non-capturing one comes off there): all three spans are distinct work.
+    for (const char *pat : {R"(((a)(b)))", R"((?:((a)(b))))"}) {
+      auto m3 = Regex(pat).search("xab");
+      CHECK(m3.group_count() == 3 && m3.group(1).begin() == 1 &&
+            m3.group(1).end() == 3 && m3.group(2).begin() == 1 &&
+            m3.group(2).end() == 2 && m3.group(3).begin() == 2 &&
+            m3.group(3).end() == 3);
+    }
+    auto inner = Regex(R"((?:(a)(b)))").search("xab");
+    CHECK(inner.group_count() == 2 && inner.group(1).str() == "a" &&
+          inner.group(2).str() == "b");
+  }
+  // Every consumer of the groups: replace, split, find_at, to_owned.
+  {
+    Regex re(R"((\d+))");
+    CHECK(re.replace_all("a1 b22", "<$1>") == "a<1> b<22>");
+    CHECK(Regex(R"((?<n>\d+))").replace_all("a1 b22", "[$<n>]") ==
+          "a[1] b[22]");
+    std::vector<std::string> pieces;
+    const std::string split_subj = "a1b22c";
+    for (auto p : re.split(split_subj))
+      pieces.emplace_back(p);
+    CHECK(pieces.size() == 3 && pieces[0] == "a" && pieces[2] == "c");
+    auto fa = re.find_at("a1 b22", 2);
+    CHECK(fa.m.matched() && fa.m.group(1).str() == "22" && fa.next_pos == 6);
+    std::string subj = "x7";
+    reg::MatchResult owned;
+    for (auto m : re.find_iter(subj))
+      owned = m.to_owned();
+    CHECK(owned.matched() && owned.group_count() == 1 &&
+          owned.group(1).str() == "7" && owned.group(1).begin() == 1);
+  }
+  // A non-capturing wrapper is transparent too: same matches as the bare
+  // pattern (it used to hide the pattern's shape from the prefilter
+  // analyses).
+  for (const char *body : {R"([a-z]+ing)", R"(\w+)", R"(Holmes)", R"(a|ab)"}) {
+    const std::string subj = "sing Holmes ab a ringing";
+    auto a = find_all(Regex(body), subj);
+    auto b = find_all(Regex(std::string("(?:") + body + ")"), subj);
+    bool same = a.size() == b.size();
+    for (size_t i = 0; same && i < a.size(); i++)
+      same = a[i].begin() == b[i].begin() && a[i].end() == b[i].end();
+    CHECK(same);
+  }
+  // match(): anchored at 0, groups filled the same way.
+  {
+    auto m = Regex(R"((\w+))").match("foo bar");
+    CHECK(m.matched() && m.end() == 3 && m.group(1).begin() == 0 &&
+          m.group(1).end() == 3);
+    CHECK(!Regex(R"((\w+))").match(" foo").matched());
+  }
+}
+
+// A non-ASCII byte in a one-walk driver's way is LOCAL: the located-span chain
+// serves that one find and the driver is asked again for the next. So one
+// subject alternates between the two engines match by match — and, when most
+// finds bail, the driver gives up for good partway (the profitability rule).
+// None of it may show in the results, on any entry point. CodePoint mode: it
+// is where the drivers meet non-ASCII bytes at all.
+void test_onewalk_local_bail() {
+  // spans of find_all and of find_iter, flattened (every group, per match)
+  auto spans_of = [](const Regex &re, std::string_view subj, bool lazy) {
+    std::vector<size_t> out;
+    auto add = [&](const reg::Match &m) {
+      for (size_t g = 0; g <= m.group_count(); g++) {
+        out.push_back(m.group(g).begin());
+        out.push_back(m.group(g).end());
+      }
+    };
+    if (lazy)
+      for (auto m : re.find_iter(subj))
+        add(m);
+    else
+      for (auto m : re.find_all(subj))
+        add(m);
+    return out;
+  };
+  auto both = [&](const Regex &re, std::string_view subj,
+                  const std::vector<size_t> &want) {
+    return spans_of(re, subj, false) == want && spans_of(re, subj, true) == want;
+  };
+
+  // é is 2 bytes (\xC3\xA9) and a word character; ¡ (\xC2\xA1) is not.
+  // Walk, chain, walk, chain, walk: the é-bearing words come from the chain.
+  CHECK(both(make_us(R"(\w+)"), "ab c\xC3\xA9" "d ef \xC3\xA9 gh",
+             {0, 2, 3, 7, 8, 10, 11, 13, 14, 16}));
+  // A non-ASCII byte right AFTER a match (the walk cannot tell it does not
+  // extend the word) and right before one.
+  CHECK(both(make_us(R"(\w+)"), "ab\xC2\xA1" "cd \xC2\xA1" "ef", {0, 2, 4, 6, 9, 11}));
+  // At the very start and the very end of the subject.
+  CHECK(both(make_us(R"(\w+)"), "\xC3\xA9 ab \xC3\xA9", {0, 2, 3, 5, 6, 8}));
+  // Captures through the scalar chain and the one-pass drivers: groups of
+  // the chain-served matches are resolved by the capture engine.
+  CHECK(both(make_us(R"((\w+)=(\w+))"), "a=b \xC3\xA9=c d=\xC3\xA9 e=f",
+             {0, 3,   0, 1,  2, 3,    4, 8,   4, 6,  7, 8,
+              9, 13,  9, 10, 11, 13,  14, 17, 14, 15, 16, 17}));
+  CHECK(both(make_us(R"(/users/(\d+))"), "/users/1 \xC3\xA9 /users/22",
+             {0, 8, 7, 8, 12, 21, 19, 21}));
+  // `body$` on the assert tier: the only match is the last word.
+  CHECK(both(make_us(R"((\w+)$)"), "ab \xC3\xA9 cd", {6, 8, 6, 8}));
+  CHECK(both(make_us(R"((\w+)$)"), "ab cd\xC3\xA9", {3, 7, 3, 7}));
+
+  // Regime changes inside one subject. 1200 words that each begin with é
+  // (every find bails, so the driver is given up partway), then 1200 plain
+  // words; and the reverse order, where the driver serves the first half.
+  // Every word must be found exactly once either way.
+  {
+    std::string na, plain;
+    std::vector<size_t> want_na_first, want_plain_first;
+    for (int i = 0; i < 1200; i++) {
+      na += "\xC3\xA9xy ";
+      plain += "abc ";
+    }
+    for (size_t i = 0; i < 1200; i++) { // "éxy " is 5 bytes, "abc " is 4
+      want_na_first.push_back(i * 5);
+      want_na_first.push_back(i * 5 + 4);
+      want_plain_first.push_back(i * 4);
+      want_plain_first.push_back(i * 4 + 3);
+    }
+    for (size_t i = 0; i < 1200; i++) {
+      want_na_first.push_back(6000 + i * 4);
+      want_na_first.push_back(6000 + i * 4 + 3);
+      want_plain_first.push_back(4800 + i * 5);
+      want_plain_first.push_back(4800 + i * 5 + 4);
+    }
+    CHECK(both(make_us(R"(\w+)"), na + plain, want_na_first));
+    CHECK(both(make_us(R"(\w+)"), plain + na, want_plain_first));
+    // The whole-match capture twin takes the same road.
+    auto all = make_us(R"((\w+))").find_all(na + plain);
+    CHECK(all.size() == 2400 && all[2399].group(1).begin() == 6000 + 1199 * 4);
+  }
+}
+
 // UnicodeScalar mode (phase 1): literal patterns compile to a UTF-8 byte
 // automaton and run on the byte DFA over non-ASCII subjects with no cliff.
 // Code-point (not grapheme) semantics; byte offsets. Non-literal constructs are
@@ -2842,6 +3093,8 @@ int main() {
   test_literal_alternation();
   test_teddy_prefilter();
   test_matches();
+  test_whole_match_capture();
+  test_onewalk_local_bail();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

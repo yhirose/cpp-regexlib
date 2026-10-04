@@ -190,7 +190,7 @@ DFA 状態は占有するプログラムカウンタの*集合*で、「どこ�
 | tier | 条件 | 動作 |
 | --- | --- | --- |
 | **1** | キャプチャなし ∧ DFA 可能 | 前進順序付き+cut DFA が leftmost-first 終端 `e` を、逆スキャンが開始 `s` を見つけ `[s, e)` を返す。**Pike なし。** ASCII 書記素 tier・UTF-8 バイト tier（§4/§5）・assert 対応 DFA 経由の `^ $ \b \A \z` を担当。対象：`\w+`、`[a-z]+`、リテラル、一般選択（`a\|ab`、`(?m)^…\|…$`）。 |
-| **2** | キャプチャ ∧ DFA 可能 | lf DFA が `[s, e)` を特定し、キャプチャエンジンが群を `e` で**境界付けて**解決（§6）。whole-match キャプチャ（全群=全体マッチ、例 `(\w+)`）はエンジンを完全にスキップ。 |
+| **2** | キャプチャ ∧ DFA 可能 | lf DFA が `[s, e)` を特定し、キャプチャエンジンが群を `e` で**境界付けて**解決（§6）。全群がマッチ全体を囲むパターン（`(\w+)`）はこの tier に来ません：capture-free の双子として計画されます（§3「ルートのグループ」）。 |
 | **2a** | キャプチャ ∧ assert-DFA 可能（`^ $ \b \A \z` + 群、例 `(\w+)$`、`\.([a-z]+)$`） | **assert 対応** DFA が `[s, e)` を特定（capture を剥がした版）、bounded バックトラッカ（`bitstate_bytes`、assert op を `empty_flags_cp` で評価）が群を解決 ―― これらを支配していた Pike を置換（`(\w+)$`: 5300→700 ns）。特定は書記素 assert DFA（ASCII subject）または**バイト** assert DFA（`ByteAssertDfa`：非ASCII EGC subject、または**US モードの任意 subject**――下記）で行う。 |
 | **3** | DFA 不可（後読み/入れ子空ループ）または状態上限超過 | subject 全体の Pike VM ＋ §7 プレフィルタ。フォールバック。 |
 
@@ -236,7 +236,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——u16 行、accept バイトは依存チェーン外。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。非ASCII バイトで chain へ bail し、`fill_matches` / `MatchIter` は subject をやり直さず bail 位置から再開 |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る。`fill_matches` と `MatchIter` で同じ（§2「線形性」） |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；`+cap` 同上 |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa`（開始復元はキャッシュ済 `AssertRevDfa`）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |
@@ -286,6 +286,34 @@ chain の 1 本の依存連鎖とは違う）——そして課金が走査済�
 ドライバは bail します。ただし `kMinScan` 分の実証ウィンドウを先に与えるので、
 短い subject は 1 歩行のレイテンシ形状を保ちます。呼び出し側は bail 位置から chain を
 再開するため、損失はそのウィンドウ分で頭打ち、subject 1 本分にはなりません。
+
+この bail は**大域的**です——呼び出し側のループにとってドライバは終わり
+（`kWalkBail`）。歩行の途中にある非ASCII バイトは別の出来事で、別のコード
+`kWalkLocal` を返します：one-pass テーブルにそのバイトの遷移が無いだけで、その先の
+バイトについては何も言っていません。だから**局所的**です：located-span chain がその
+**1 件**だけを処理し、次の find ではまたドライバに尋ねます。2 つのループは同じやり方
+をとります——`fill_matches` は `onepass_fill` の chain step を通じて、`MatchIter` は
+1 マッチぶんだけ chain の段へ落ちて——そして step そのもの（`dfa_chain_step` /
+`assert_chain_step`）を共有します。以前はコードが 1 つだったので、`é` が 1 個あるだけ
+で subject の残り全部が chain に渡っていました：CodePoint モードの `\w+` は、中央に
+`é` を 1 個含む 512 KB の ASCII 語列で ~270 MB/s（`é` 無しなら ~410）でしたが、今は
+~410 です（50 語に 1 語が `é` を含む場合：~205 → ~390）。局所 bail は失敗歩行と同じ
+課金に、何も生まなかった呼び出しぶんの `kBailCost` を足したものを、**ドライバが**
+進んだ距離に対して課します——bail のあと chain が進んだ距離はドライバの手柄では
+ない——ので、ほとんどの find が bail する subject（全語が非ASCII 文字で始まる）は
+同じ規則に引っかかり、bail は大域に変わります。線形性の予算は使いません：続く
+chain step は bail した歩行が読んだバイトをすべて読むので、局所 bail は chain が
+どのみち行う仕事で抑えられます。
+
+段の並びのなかでドライバが置かれる位置も、同じ勘定から決まります。capture-free の
+find は suffix / ReverseInner プレフィルタ（§7）をドライバより**先に**使います——
+プレフィルタは memmem のヒットから答えを出すのに対し、ドライバは規則に見切られる
+まで候補を歩くからです。capture のある find はドライバが先です（1 回の歩行で群まで
+得られる。プレフィルタの段は capture の走査が別に要る）。3 つのループすべてがこの
+順です。`MatchIter` はかつてどちらの場合もドライバが先で、CodePoint モードの
+`[a-q][^u-z]{13}x` では find の半分がドライバの実証ウィンドウに費やされていました
+（suffix スキャンを先にして ~17 → ~33 GB/s）。
+
 その前段として、ドライバ自身の仕事を減らす厳密な工夫が 2 つあります：失敗歩行は
 最初の restartable な run の終端を報告し（`CpOnePass::State::restart_ok`：ループ
 する全バイトが開始状態からもその状態に入るので、run の途中から始めた歩行は run に
@@ -304,6 +332,30 @@ intern する状態は上限付き。超過時は DFA を諦め Pike VM（無影
 コンパイラは AST を NFA `Program` に下げます。形を決めた2つの圧力——**コンパイル
 時間**と**プログラムメモリ**——はどちらも Unicode クラス（`\w`、`\p{L}`、数百の
 UTF-8 バイト範囲列に展開）が支配します。
+
+### ルートのグループ
+
+AST を誰かが読む前に、パターン**全体**を包むグループをルートから剥がします
+（`peel_root_groups`）。ルートにあるグループは、パターンが何にマッチするかに
+何も足しません：
+
+- 非キャプチャのもの——`(?:\w+ing)`——は純粋な構文で、常に剥がします。
+- キャプチャするものが記録する span は、位置からしてマッチそのものです。剥がすのは
+  パターンの**全ての**群がそういう包みであるとき——`(\w+)`、`((x))`、`(?:(\w+))`、
+  `(?<n>\w+)`——だけで、そのとき `ncap_` は 0、`alias_groups_` が群の数を持ちます：
+  パターンは **capture-free の双子**として計画・実行され、結果を渡すところで各群を
+  マッチ全体として報告します（単発の結果は `finish_result`、`find_all` の行は
+  `alias_rows`、`MatchIter` は 1 ステップごとに 1 行を広げる）。ほかに群があるなら
+  包みのスロットは実際の仕事なので、残します。
+
+これを AST の上で、どの解析よりも前に行うのは、解析がルートの**形**——リテラルで
+終わる `Concat`、裸のリテラル列——を読むからで、プランまで残った包みはそれを
+隠します。以前は、包まれたパターンはプランナにとって別のパターンでした：
+`([a-zA-Z]+ing)` と `(?:[a-zA-Z]+ing)` は ~350 MB/s（`[a-zA-Z]+ing` は ~2700）、
+`(Sherlock)` はリテラル tier の半分の速度、`([a-q][^u-z]{13}x)` は CRLF テキストで
+書記素 Pike に落ちて 9 MB/s（collapse 経路が capture-free 限定のため。双子は
+~20000）。今はどれも双子の速度で走ります。`find_iter` では完全に同じ、`find_all`
+は行を広げる 1 パスぶんを払います（密な `(\w+)`：~330 MB/s、`\w+` は ~395）。
 
 ### 命令（`Inst`）——16 バイト・自由に再配置可能
 
@@ -577,9 +629,9 @@ DFA ベースのエンジン（バイト DFA、one-pass）は US（任意 subjec
 | **BitState**（`bitstate_bytes`） | one-pass でない・span ≤ `kBitStateCap` | 特定 span 上の `cp_prog_` を bounded leftmost-first バックトラック。コードポイントを逐次デコード（分割なし）、`(pc, バイト位置)` の visited ビットマップで O(prog × span) を保ち、キャプチャ書き込みは巻き戻す。 |
 | **コードポイント Pike**（`cp_prog_` + `segment_cp` 上の `run_saves`） | span 超過、または DFA 状態上限でパターン全体が落ちたとき | 万能フォールバック。 |
 
-whole-match キャプチャ（全群=全体マッチ、例 `(\w+)`）は3つすべてをスキップ：各群の
-span が `[s, e)`。全エンジンが同じ NFA 上で leftmost-first なので書記素エンジンと
-一致します。
+全エンジンが同じ NFA 上で leftmost-first なので書記素エンジンと一致します。
+（whole-match キャプチャ——全群=全体マッチ、例 `(\w+)`——はどれも使いません：
+計画される時点で群がありません。§3「ルートのグループ」。）
 
 **unbounded one-pass find（`cp_onepass_find`、`onepass_unbounded_`）。**
 bounded 連鎖はマッチ毎に 3 回歩きます（前方 DFA で `e`、逆 DFA で `s`、その上で
