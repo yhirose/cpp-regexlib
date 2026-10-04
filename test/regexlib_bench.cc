@@ -731,6 +731,28 @@ static void run_sherlock_bench(int iters) {
       {"letters \\p{L}+", "\\p{L}+", false, {text}},
       {"quoted span", "[\"'][^\"']{0,30}[?!.][\"']", false, {text}},
       {"no match (rare literal)", "zqj", true, {text}},
+      // 16 literals: past the Teddy tier's 8 distinct fingerprints (cf. the
+      // 7-name row above, which fits).
+      {"names alternation, 16",
+       "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London|Moriarty|"
+       "Lestrade|Hudson|Mycroft|Gregson|Hopkins|Stamford",
+       false,
+       {text}},
+      // A COMMON literal prefix and a RARE literal suffix: which end anchors
+      // the scan decides the candidate count by orders of magnitude (`e` is
+      // the most frequent letter in English prose, `q` one of the rarest). The
+      // rows differ in what sits between the two — a bounded class repeat, a
+      // fixed-width gap, an unbounded negated class, a nullable repeat — and
+      // the last carries a trailing `\b`, so it runs on the assert tier.
+      {"common prefix, rare suffix", "e[a-z]{3,}q", false, {text}},
+      {"common prefix, fixed gap, rare suffix", "a.{16}z", false, {text}},
+      {"common prefix, negated run, rare suffix", "a[^.]*\\!", false, {text}},
+      {"common prefix, nullable run, rare suffix", "s[a-z]*\\?", false, {text}},
+      {"common prefix, rare suffix, \\b", "t[a-z]+ly\\b", false, {text}},
+      // A gap wide enough that the DFA's state count grows with it (each
+      // live `a` is its own position in the window): the state-cap / cache
+      // behavior under a pattern that is regular but not small.
+      {"wide fixed gap (DFA state growth)", "a.{20}z", false, {text}},
   };
   for (auto &c : cases)
     run_case(c, iters);
@@ -758,6 +780,12 @@ static void run_sherlock_bench(int iters) {
       {"negated-class repeat", "[a-q][^u-z]{13}x", false, {ascii}},
       {"quoted span", "[\"'][^\"']{0,30}[?!.][\"']", false, {ascii}},
       {"no match (rare literal)", "zqj", true, {ascii}},
+      // Dense matches on an ASCII subject that still has CR-LF line endings
+      // (the fold above keeps them): the tier these take is decided by the
+      // CR-LF, not by the bytes being ASCII. Compare with the pure-ASCII
+      // synthetic rows ("dense \w+", "(\w+) whole-match capture").
+      {"words (\\w+) capture", "(\\w+)", false, {ascii}},
+      {"letters \\p{L}+", "\\p{L}+", false, {ascii}},
   };
   for (auto &c : ascii_cases)
     run_case(c, iters);
@@ -1067,8 +1095,9 @@ static vector<LPat> redos_pats() {
   };
 }
 
-// Log parsing: a Combined-Log-Format access-log line parse (multi-capture) and
-// a bare IPv4 extraction, run over a synthetic log blob with find_all.
+// Log parsing: a Combined-Log-Format access-log line parse (multi-capture), a
+// bare IPv4 extraction and a whitespace field tokenizer, run over a synthetic
+// log blob with find_all.
 static vector<Case> log_cases() {
   static string corpus = make_logs(256 * 1024);
   return {
@@ -1078,6 +1107,9 @@ static vector<Case> log_cases() {
        {corpus}},
       {"IPv4 extraction", R"(\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)", false,
        {corpus}},
+      // Field tokenizer: every whitespace-delimited field as a whole-match
+      // capture (the split-on-space shape), dense over mixed token lengths.
+      {"field tokens (\\S+)", R"((\S+))", false, {corpus}},
   };
 }
 
@@ -1501,6 +1533,29 @@ int main(int argc, char *argv[]) {
   cases.push_back(
       {"(\\w+)=(\\w+) capture", "(\\w+)=(\\w+)", false, {make_kv_pairs(MB)}});
 
+  // Whole-match capture on a PURE-ASCII subject, dense and long-match. The
+  // two (\w+) rows above carry a non-ASCII byte, which hides the tier this
+  // shape takes on ASCII: every group is the whole match, so the row should
+  // cost what its capture-free twin costs ("dense \w+", "long-match \w+").
+  // Any gap between the pair is capture-tier overhead, not capture work.
+  cases.push_back(
+      {"(\\w+) whole-match capture", "(\\w+)", false, {make_words(MB)}});
+  cases.push_back({"long-match (\\w+) whole-match capture",
+                   "(\\w+)",
+                   false,
+                   {make_long_lines(MB)}});
+
+  // Literal alternation too wide for one Teddy bucket per fingerprint (16
+  // literals; the tier's limit is 8 distinct fingerprints). The common
+  // keyword-set / dictionary shape — a lexer's reserved words, a log's
+  // severity names. Random words, so matches are rare and the row measures
+  // the multi-literal scan itself.
+  cases.push_back({"literal-alt, 16 keywords",
+                   "return|while|for|if|else|switch|case|break|continue|struct|"
+                   "class|static|const|void|int|char",
+                   false,
+                   {make_words(MB)}});
+
   // In markdown mode, silence the verbose human-readable log during the run so
   // stdout carries only the GitHub-flavored tables. The log mixes printf and
   // cout, so redirect the underlying fd (not just cout's buffer) to /dev/null,
@@ -1555,7 +1610,8 @@ int main(int argc, char *argv[]) {
 
   run_throughput_group(
       "Log parsing throughput  (Combined-Log-Format corpus, find_all)",
-      "structured access-log line parse + IPv4 extraction over a log blob",
+      "structured access-log line parse, IPv4 extraction and field "
+      "tokenizing over a log blob",
       log_cases(), iters, &g_md_log);
   run_throughput_group(
       "Templates / config / markup throughput  (find_all)",
