@@ -797,8 +797,12 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
 
 - **Literal-prefix substring search (`find_substr`)** — the **rare-byte trick**.
   `memmem` is not reliably fast (macOS floors at ~1.3 GB/s), so instead `memchr`
-  the **rarest** byte of the literal (chosen by an English-prose frequency table:
-  space common, punctuation/digits/non-ASCII rare → good probes), then `memcmp`
+  the **rarest** byte of the literal (chosen by an English-prose frequency table,
+  `byte_commonness`: space and the common lowercase letters high, capitals low,
+  digits / non-ASCII / most punctuation rare → good probes; the punctuation
+  prose is full of — `,` `.` `"` `'` `-` and the line break — has its own
+  entries, since the same table prices anchors against each other below), then
+  `memcmp`
   to verify (both legs ride `scan64_visit`; zero dependencies). An all-ASCII
   prefix (`prefix_.ascii`) is `memmem`-skippable on *any* UTF-8 subject. When
   the rarest byte is itself **common** (per-mille frequency ≥ 16 — the
@@ -895,9 +899,10 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   `prefix_skip_nonascii` runs `find_substr` over raw UTF-8 with a
   grapheme-boundary guard (part of removing the `/Sherlock/` cliff).
 - **Required-suffix-literal scan (`suffix_find`)** — the mirror of the literal
-  prefix, for patterns that *begin* with a class/`.` (so the DFA's own first-byte
-  skip is dense and useless) but *end* with a fixed ASCII literal after a
-  fixed-length body — e.g. `[a-q][^u-z]{13}x`, whose trailing `x` is rare. The
+  prefix, for patterns whose best handle is their END: a fixed ASCII literal
+  after a fixed-length body — e.g. `[a-q][^u-z]{13}x`, which begins with a
+  class (the DFA's own first-byte skip is dense and useless) and whose trailing
+  `x` is rare. The
   forward DFA would otherwise walk every byte; instead `find_substr` the rare
   suffix. The literal is a **seed, not the answer**: a hit recovers a *floor* for
   the start (a reverse-DFA scan from the suffix, floored at the non-overlap bound),
@@ -914,8 +919,9 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   earlier suffix hit yet end at a later one (the fuzzer caught `(?:[^a-c].\w+)?b`
   taking `[1,2)` over the correct `[0,4)`), so those fall back to the plain DFA.
   Unlike the others this runs *on* the DFA tiers (find_all / matches / scan /
-  search), capture-free, and is gated off when a literal prefix already exists (the
-  prefix memmem is then optimal). Lifted `[a-q][^u-z]{13}x` ~57 → ~1650 MB/s
+  search), capture-free. A pattern that also begins with a literal offers both
+  anchors, and which one drives is the *anchor choice* below. Lifted
+  `[a-q][^u-z]{13}x` ~57 → ~1650 MB/s
   (RE2 ~260; rure ~12000 via a flatter verify) and `[a-zA-Z]+ing` ~258 → ~1640
   (past RE2 ~389). Two refinements close the rest of that gap. (1) A **scalar
   forced-parse verifier** (`Verify::Scalar`, `analyze_suffix_scalar_verify`):
@@ -938,17 +944,17 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   admission is chain-or-nothing — the scalar verifier's conditions must hold,
   the DFA serving only the per-candidate bails. Quoted strings on the CRLF
   corpus ~1.25 → ~2.5 GB/s.
-- **Rare interior literal (`ReverseInner`)** — for a class-led pattern with **no**
-  literal prefix *or* suffix but a rare fixed literal in the **middle**
-  (`\w+ Holmes \w+`, `\w+@\w+`): with nothing at either end the DFA has no skip and
-  walks every byte. `find_substr` the interior literal, recover a start floor with a
+- **Rare interior literal (`ReverseInner`)** — for a pattern whose rare fixed
+  literal sits in the **middle** (`\w+ Holmes \w+`, `\w+@\w+`): with nothing
+  usable at either end the DFA has no skip and walks every byte.
+  `find_substr` the interior literal, recover a start floor with a
   reverse DFA over the prefix, then run the normal lf forward + reverse from there.
   Same **seed-not-answer** discipline as the suffix scan: the end is retaken by a
   full forward pass from the floor, because a greedy prefix can swallow the interior
   literal (`.{2,}c\d?`) and reading the span off the literal would be wrong (the
   inner analogue of the *singing* bug — the fuzzer caught it). A pre that can
   absorb the literal must also be step-1 prefix-closed, the suffix scan's own
-  gate (`analyze_byte_inner`): the floor comes from the *first* occurrence whose
+  gate (`find_inner_run`): the floor comes from the *first* occurrence whose
   reverse(pre) succeeds, and with gaps in the pre's lengths that occurrence
   can be an absorbed one with a floor right of the leftmost match —
   `(?:..)*=x*` over `a==` took `[1,2)` over `[0,3)`. Lifted
@@ -961,6 +967,43 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   on dense matches (the 7-group access-log pattern regressed before this
   gate). Lifted `(\w+)=(\S+)` over a config corpus ~285 → ~830 MB/s (past RE2
   ~310).
+- **Anchor choice (`plan_anchor`, `AnchorChoice`)** — a pattern can offer up to
+  three literal anchors (its required prefix, its required suffix, an interior
+  literal), and exactly one drives the find. The three used to be taken by
+  position — a prefix switched the other two off — which is right for
+  `Sherlock\s+Holmes` and 23-90× wrong for a common letter in front of a rare
+  one: `e[a-z]{3,}q` verified every `e` in the subject (~0.4 GB/s) while its
+  class-led twin `[eE][a-z]{3,}q` scanned for `q` (~34 GB/s). The choice is
+  now by **estimated cost**: each anchor the pattern offers is priced from
+  `byte_commonness` as *stops × the cost of a stop + occurrences × the cost
+  of the verify that anchor needs* (`literal_cost`; ns per MB of prose — a
+  single probe stops at every occurrence of the rarest byte, a pair probe
+  where the two rarest sit at their distance), and:
+  - the prefix is the incumbent — its occurrences are the match starts
+    themselves — and keeps the find unless another anchor is at least twice
+    as cheap (`kPrefixBias`);
+  - a **dense** prefix (estimated ≥ 1 ns per byte, `kDenseNs`) has nothing to
+    protect: any cheaper anchor takes over, and with none the fused prefix
+    tier is skipped for the scan — the unanchored DFA meets every occurrence
+    in one pass where an anchored verify per occurrence re-walks what the
+    previous one read (`a[^.]*!`-shaped bodies ran 2× behind the scan);
+  - a class-led pattern weighs the suffix / interior literal against its own
+    start set, and takes the scan when the set is the rarer event
+    (`[A-Z][a-z]+s`: a capital is rarer than an `s`, ~0.55 → ~1.4 GB/s);
+  - with captures the order stays prefix-first: the one-pass capture drivers
+    take the prefix as their candidate source and yield the groups in the
+    same walk.
+
+  `suffix_` / `inner_` stay set only for the anchor chosen, so every ladder's
+  rung reads the choice without knowing there was one; the record keeps each
+  anchor's cost, and the tests pin choices through it (`PlanProbe`). The
+  **assert tiers** choose the same way between their leading and trailing
+  literal (`plan_assert_anchor`; there the order used to be suffix-first, so
+  `Sherlock [a-z]+e\b` scanned for `e`: ~0.35 → ~30 GB/s), and order the word
+  scan against the anchor chosen (`wop_after_anchor_`: `\bq[a-z]+e\b` is a
+  memchr for `q`, ~3.3 → ~23 GB/s). Lifted, Sherlock corpus: `e[a-z]{3,}q`
+  ~0.4 → ~34 GB/s, `a.{16}z` ~0.4 → ~35, `a[^.]*!` ~0.33 → ~9.3, `s[a-z]*\?`
+  ~0.67 → ~16 — each within a few percent of its class-led twin.
 - **Assertion-tier fixed-text literal** — an assertion pattern (`(?m)^X`, `X$`,
   `^X$`, `\bX\b`) is served by the assertion DFA, which otherwise scans every
   position. When stripping the zero-width assertions leaves a single **fixed
@@ -968,12 +1011,14 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   literal and confirms each hit with the anchored assertion DFA, shared through
   `assert_find_span` / `assert_byte_find_span`. Lifted
   `(?m)^Sherlock Holmes|Sherlock Holmes$` ~229 → ~12700 MB/s (≈ rure ~8000; RE2
-  ~455). An assertion body that *ends* in a literal is caught by the
-  required-suffix prefilter below; one with no usable literal anchor keeps the
-  full scan.
+  ~455). An assertion body that *ends* or *begins* in a literal is caught by
+  the two prefilters below (which of them, when it does both, is the anchor
+  choice above); one with no usable literal anchor keeps the full scan.
 - **Assertion-tier required-suffix literal** (`assert_.suffix`,
   `analyze_assert_suffix`) — the suffix analogue of the leading-literal prefilter,
-  for an assertion pattern that *ends* in a fixed ASCII literal after a
+  for an assertion pattern that *ends* in a fixed ASCII literal (the whole
+  trailing run of literal characters: `t[a-z]+ly\b` scans for `ly`, not for
+  every `y` — ~1.7 → ~5.2 GB/s) after a
   fixed-length / one-code-point-repeat body. The assertion DFA would scan every
   position; instead `assert_suffix_find` `memmem`s the trailing literal and
   confirms each occurrence with the anchored assertion scan, recovering the
@@ -987,9 +1032,10 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   so the walk reproduces the regex. Lifted `\b\w+n\b` ~190 → ~776 MB/s (past
   rure/RE2).
 - **Assertion-tier leading literal** (`assert_.prefix`) — when the assertion
-  pattern is *not* a fixed text but its **first consuming atom** is a fixed ASCII
-  literal (only zero-width assertions before it: `\.([a-z]+)$`, `^foo(\w+)`,
-  `\bID(\d+)`), every match begins with that literal, so a `memmem` of it yields
+  pattern is *not* a fixed text but its **first consuming atoms** are a fixed
+  ASCII literal (only zero-width assertions before it: `\.([a-z]+)$`,
+  `^foo(\w+)`, `\bID(\d+)`; the whole leading run of literal characters is
+  taken), every match begins with that literal, so a `memmem` of it yields
   every candidate start; an **anchored** assert forward scan then verifies the
   whole match (leading + trailing assertions) and gives the variable end. Unlike
   the fixed-text and trailing-literal prefilters this is **not** gated

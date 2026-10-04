@@ -4619,7 +4619,17 @@ inline MatchUnit default_match_unit() {
   return default_match_unit_storage().load(std::memory_order_relaxed);
 }
 
+namespace detail {
+// Test access to a Regex's plan. The header only declares it: the test suite
+// defines it to read what a plan decided (which anchor drives the find, and
+// at what estimated cost — Plan::AnchorChoice), so a choice can be pinned
+// without becoming public surface.
+struct PlanProbe;
+} // namespace detail
+
 class Regex {
+  friend struct detail::PlanProbe;
+
   // Forward declarations: the assert DFA types are defined later in the class,
   // but the assert-scan overloads below take them by reference.
   struct AssertDfa;
@@ -5538,7 +5548,12 @@ private:
     bool egc_fused_ok() const {
       return ncap_ == 0 && byte_path_ && crlf_byte_safe_ &&
              !can_match_empty_ && !icase_ &&
-             (byte_prefix_.ascii || suffix_.active());
+             (prefix_fused() || suffix_.active());
+    }
+    // The fused tier's prefix variant: the prefix is the anchor chosen
+    // (plan_anchor) and the fused scan can take it (all ASCII, no CR/LF).
+    bool prefix_fused() const {
+      return anchor_.kind == AnchorChoice::Kind::Prefix && byte_prefix_.ascii;
     }
     // [Tier: Dfa/EgcByte] fused-collapse tier: the CRLF-collapse analogue of
     // egc_fused_ok. The collapsed byte programs reproduce the grapheme engine
@@ -5741,8 +5756,7 @@ private:
         compile_byte_trio(fwd, lf, byte_lf_prog_);
         byte_path_ = true;
         analyze_byte_prefilter(byte_prog_.prog); // byte-level dead-skip (any UTF-8)
-        analyze_byte_suffix(root); // required trailing literal -> suffix prefilter
-        analyze_byte_inner(root);  // rare interior literal -> ReverseInner prefilter
+        plan_anchor(root); // prefix / suffix / interior literal: which one drives
         analyze_byte_icase_prefix(); // (?i) clean-prefix rare-byte prefilter
         // Teddy vs the first-byte skip: use Teddy when there is no first-byte skip
         // to fall back on (non-sparse set), or when the first-byte set is common
@@ -5774,13 +5788,10 @@ private:
       // Soundness is simpler than EGC: US matches code points, ASCII/UTF-8
       // literals memmem only at code-point boundaries (UTF-8 self-delimiting), and
       // there is no grapheme cluster to gate on — so the prefilter applies to ANY
-      // subject. Mutual exclusion with a literal prefix is handled inside the
-      // analyses (they bail when byte_prefix_.text, set by analyze_byte_prefilter above
-      // for US, is non-empty), so a prefix-led pattern keeps its start-state skip.
-      if (us_ && dfa_find_free()) {
-        analyze_byte_suffix(root);
-        analyze_byte_inner(root);
-      }
+      // subject. Which anchor drives — the literal prefix
+      // (analyze_byte_prefilter has set byte_prefix_ for US above), the
+      // suffix or an interior literal — is plan_anchor's choice, as on EGC.
+      if (us_ && dfa_find_free()) plan_anchor(root);
     }
 
     // Assertion tiers: the byte assert programs + assert prefilters, then the
@@ -5807,6 +5818,7 @@ private:
         analyze_assert_literal(root); // fixed matched-text literal -> prefilter
         analyze_assert_suffix(root);  // required trailing literal -> prefilter
         analyze_assert_prefix(root);  // required leading literal -> prefilter
+        plan_assert_anchor();         // ... and which of the two drives
       }
 
       // Assertion tier leftmost-first program: the unanchored `(?s:.)*?`+pattern
@@ -6247,6 +6259,25 @@ private:
             wop_.next[wop_.start][b] != AnchoredOnePass::kDeadState;
       wop_trail_wb_ = trail;
       wop_.ok = true;
+      // Price the word scan as the anchors were priced (plan_assert_anchor
+      // has run): its byte-at-a-time candidate loop, plus a walk wherever a
+      // start byte follows a non-word byte — about one occurrence in
+      // kWordEdgeThin. A literal anchor estimated cheaper than that goes
+      // first (assert_find_span): `\bq[a-z]+e\b` is a memchr for `q`, not a
+      // look at every byte.
+      int set = 0;
+      for (int b = 0; b < 128; b++)
+        if (wop_start_[b]) set += byte_commonness(static_cast<unsigned char>(b));
+      anchor_.scan_cost =
+          AnchorChoice::kWordScanNs +
+          set * 1000 / AnchorChoice::kWordEdgeThin *
+              (AnchorChoice::kStopNs + AnchorChoice::kVerifyFwdNs);
+      const int anchor_cost =
+          anchor_.kind == AnchorChoice::Kind::Prefix   ? anchor_.prefix_cost
+          : anchor_.kind == AnchorChoice::Kind::Suffix ? anchor_.suffix_cost
+                                                       : AnchorChoice::kNone;
+      wop_after_anchor_ = anchor_cost != AnchorChoice::kNone &&
+                          anchor_cost < anchor_.scan_cost;
     }
 
     // The extra rule for a table built with the leftmost-first CUT, whose
@@ -6601,21 +6632,27 @@ private:
     // begins with it at the match-start position, so a memmem of it covers every
     // candidate start. The rest of the pattern is unconstrained: the anchored
     // assert verify re-matches the whole pattern per hit. Built for capture and
-    // capture-free patterns alike (no ncap_ gate). Skipped when a more specific
-    // prefilter (fixed text / trailing literal / word-suffix) already applies.
+    // capture-free patterns alike (no ncap_ gate). Skipped when a shape that is
+    // the whole find (fixed text / word-suffix) already applies; against a
+    // trailing literal it is plan_assert_anchor's choice.
     void analyze_assert_prefix(const detail::Node &root) {
       using K = detail::Node::Kind;
       assert_.prefix.clear();
       if (icase_ || !dfa_assert_ok_ || dfa_ok_ || !assert_.lit.empty() ||
-          !assert_.suffix.empty() || assert_.word_suffix || root.kind != K::Concat)
+          assert_.word_suffix || root.kind != K::Concat)
         return;
       int nk = static_cast<int>(root.kids.size());
       int i = 0;
       while (i < nk && is_zero_width(root.kids[i])) i++;
-      if (i >= nk) return;
-      const detail::Node &lit = root.kids[i];
-      if (lit.kind != K::Lit || lit.lit.empty()) return;
-      if (!append_ascii_nocrlf(lit.lit, assert_.prefix)) return;
+      // The maximal run of literal kids from there (the parser emits one Lit
+      // per character): `Sherlock [a-z]+e\b` scans for `Sherlock `, not `S`.
+      for (; i < nk; i++) {
+        const detail::Node &lit = root.kids[i];
+        if (lit.kind != K::Lit || lit.lit.empty() ||
+            !append_ascii_nocrlf(lit.lit, assert_.prefix))
+          break;
+      }
+      if (assert_.prefix.empty()) return;
       set_probes(assert_.prefix, assert_.prefix_probe, assert_.prefix_probe2);
     }
 
@@ -6652,14 +6689,25 @@ private:
       if (icase_ || ncap_ != 0 || !dfa_assert_ok_ || dfa_ok_ ||
           !assert_.lit.empty() || root.kind != K::Concat)
         return;
-      int last = static_cast<int>(root.kids.size()) - 1;
+      const int nk = static_cast<int>(root.kids.size());
+      int last = nk - 1;
       while (last >= 0 && is_zero_width(root.kids[last])) last--;
       if (last < 0) return;
-      const detail::Node &lit = root.kids[last];
-      if (lit.kind != K::Lit || lit.lit.empty()) return;
+      // The maximal run of literal kids ending there, as analyze_byte_suffix
+      // takes it (the parser emits one Lit per character): `t[a-z]+ly\b`
+      // scans for `ly`, not for every `y`. `lo` is the run's first kid.
+      int lo = last + 1;
       std::string sfx;
-      if (!append_ascii_nocrlf(lit.lit, sfx)) return;
-      for (int i = 0; i < last; i++) {
+      while (lo > 0) {
+        const detail::Node &lit = root.kids[lo - 1];
+        if (lit.kind != K::Lit || lit.lit.empty()) break;
+        std::string part;
+        if (!append_ascii_nocrlf(lit.lit, part)) break;
+        sfx = part + sfx;
+        lo--;
+      }
+      if (sfx.empty()) return;
+      for (int i = 0; i < lo; i++) {
         const detail::Node &k = root.kids[i];
         if (node_fixed(k) || is_zero_width(k)) continue;
         if (!(k.kind == K::Repeat && one_cp_atom(k.kids[0]))) return;
@@ -6667,8 +6715,7 @@ private:
       assert_.suffix += sfx;
       set_probes(assert_.suffix, assert_.suffix_probe, assert_.suffix_probe2);
       assert_.suffix_wb =
-          last + 1 < static_cast<int>(root.kids.size()) &&
-          root.kids[last + 1].kind == K::WordBoundary &&
+          last + 1 < nk && root.kids[last + 1].kind == K::WordBoundary &&
           is_word_byte(static_cast<unsigned char>(assert_.suffix.back()));
 
       // Word-suffix fast shape: exactly `\b \w{rmin,rmax} <lit> \b` — leading and
@@ -6678,7 +6725,7 @@ private:
       // DFA (assert_word_find). `\w` is a CharClass that is just the Word
       // predicate (no ranges/uprops, not negated), so the walked run is exactly
       // what `\w` matches — the word-scan reproduces the regex semantics.
-      if (assert_.suffix_wb && root.kids.size() == 4 &&
+      if (assert_.suffix_wb && lo == 2 && last + 2 == nk &&
           root.kids[0].kind == K::WordBoundary && root.kids[1].kind == K::Repeat &&
           root.kids[1].kids[0].kind == K::Class) {
         const CharClass &c = root.kids[1].kids[0].cls;
@@ -6947,12 +6994,10 @@ private:
       suffix_.var_pre = false;
       if (icase_ || ncap_ != 0 || root.kind != K::Concat || root.kids.empty())
         return;
-      // Only when there is no literal PREFIX to skip on: a prefix memmem already
-      // lands on candidate starts optimally (and needs no per-candidate reverse
-      // verify), so a suffix prefilter would only add overhead. The suffix path is
-      // for patterns that begin with a class/`.` (no prefix), e.g. `[a-q]…x`.
-      // (analyze_byte_prefilter has already run, so byte_prefix_.text is set.)
-      if (byte_prefix_.active()) return;
+      // Whether the pattern ALSO has a literal prefix is not this analysis's
+      // business: it reports the suffix anchor the pattern offers, and
+      // plan_anchor weighs it against the prefix (`e[a-z]{3,}q` is driven
+      // from its `q`, `Sherlock\s+Holmes` from its `Sherlock`).
       // Coalesce the MAXIMAL trailing run of ASCII literal kids into the suffix
       // needle. The parser emits one Lit node per character, so a literal "Holmes"
       // suffix is six kids; taking only the last kid (`s`) would memmem a single
@@ -7295,37 +7340,40 @@ private:
       }
     }
 
-    // ReverseInner extraction (rure): when a Concat has no usable literal prefix
-    // (byte_prefix_.text) or suffix (suffix_.lit) but contains a rare literal STRICTLY
-    // inside, split the pattern at that literal into pre / L / post and build a
-    // reverse byte DFA of `pre` to recover the match start from a literal hit. The
-    // end then comes from the normal unanchored forward DFA seeded at that start
-    // (see inner_find — a greedy pre can absorb the literal, so the literal is only
-    // a seed). memmem of L drives the scan instead of walking the forward DFA over
-    // the whole subject. !icase only; captures are fine (the prefilter locates
+    // ReverseInner extraction (rure): a rare literal STRICTLY inside a Concat
+    // splits the pattern into pre / L / post; a reverse byte DFA of `pre`
+    // recovers the match start from a literal hit, and the end then comes from
+    // the normal unanchored forward DFA seeded at that start (see inner_find —
+    // a greedy pre can absorb the literal, so the literal is only a seed).
+    // memmem of L drives the scan instead of walking the forward DFA over the
+    // whole subject. !icase only; captures are fine (the prefilter locates
     // the span, the capture engine resolves groups on it).
-    void analyze_byte_inner(const detail::Node &root) {
+    //
+    // In two steps, so that a plan driven from another anchor never compiles
+    // the reverse(pre) program: find_inner_run reports the interior literal
+    // the pattern offers (plan_anchor weighs it against the prefix and the
+    // suffix), build_inner commits to it.
+    struct InnerRun {
+      std::string lit;           // the interior literal run (empty = none)
+      int lo = -1;               // its first kid; pre = root.kids[0, lo)
+      bool nonabsorbing = false; // InnerPrefilter::pre_nonabsorbing
+    };
+    InnerRun find_inner_run(const detail::Node &root) const {
       using K = detail::Node::Kind;
-      inner_.lit.clear();
-      inner_.pre_nonabsorbing = false;
+      InnerRun best;
       // byte_path_ marks the EGC byte tier; US runs the same byte automaton
       // (prog_) without that flag, so admit it too (inner_.pre_rev is a us=true
       // compile, valid for both). Capture patterns are admitted: inner_find
-      // locates the SPAN only (pre_rev is compiled capture-stripped below),
-      // and the capture engine resolves groups on the located span — e.g.
+      // locates the SPAN only (pre_rev is compiled capture-stripped), and the
+      // capture engine resolves groups on the located span — e.g.
       // `(\w+)=(\S+)`, whose `=` is the only prefilter handle.
       if ((!byte_path_ && !us_) || icase_ || root.kind != K::Concat)
-        return;
-      // Exclusive with the prefix / suffix prefilters: those land on the match
-      // edge directly and are cheaper. ReverseInner is the fallback when neither
-      // exists (a class-led, class-tailed pattern).
-      if (byte_prefix_.active() || suffix_.active()) return;
-      // Find every maximal run of ASCII (no \r/\n) literal kids; pick the rarest
-      // by its probe byte's commonness (longer run breaks ties — more selective
-      // memcmp). A usable run is strictly interior (kid 0 and the last kid are
-      // non-literal here, since byte_prefix_.text/suffix_.lit are empty).
-      int best_lo = -1, best_c = 256;
-      std::string best;
+        return best;
+      // Every maximal run of ASCII (no \r/\n) literal kids that is strictly
+      // interior — a run touching kid 0 or the final kid is the prefix or the
+      // suffix, a different anchor. The cheapest by the shared estimate wins
+      // (a longer run breaks ties: a more selective memcmp).
+      int best_cost = 0;
       size_t i = 0, nk = root.kids.size();
       while (i < nk) {
         if (root.kids[i].kind != K::Lit) {
@@ -7342,34 +7390,34 @@ private:
           }
           j++;
         }
-        // Interior only: a run touching kid 0 or the final kid would be a
-        // prefix/suffix (already excluded above), but guard anyway.
         if (ok && !run.empty() && i > 0 && j < nk) {
-          int comm = byte_commonness(
-              static_cast<unsigned char>(run[rarest_byte_offset(run)]));
-          if (comm < best_c || (comm == best_c && run.size() > best.size())) {
-            best_c = comm;
-            best = run;
-            best_lo = static_cast<int>(i);
+          size_t probe, probe2;
+          set_probes(run, probe, probe2);
+          int cost = literal_cost(run, probe, probe2, 0);
+          if (best.lit.empty() || cost < best_cost ||
+              (cost == best_cost && run.size() > best.lit.size())) {
+            best_cost = cost;
+            best.lit = run;
+            best.lo = static_cast<int>(i);
           }
         }
         i = (j > i) ? j : i + 1;
       }
-      if (best.empty()) return;
+      if (best.lit.empty()) return best;
       // Capture patterns: admit only a single-node pre (e.g. the `(\w+)` of
       // `(\w+)=(\S+)`). The capture chain re-walks the located span anyway
       // (anchored forward + capture resolution), so with a long pre-part the
       // prefilter's extra reverse(pre) pass is a net LOSS when matches are
       // dense (the access-log pattern regressed 13%); a one-atom pre keeps the
       // reverse scan short and the memmem gap-skip dominant.
-      if (ncap_ != 0 && best_lo != 1) return;
+      if (ncap_ != 0 && best.lo != 1) return InnerRun{};
       // If the pre part cannot consume the literal's first byte, it can never
       // extend across the literal, so the reverse-pre floor is the exact start.
-      bool nonabsorbing = true;
-      for (int k = 0; k < best_lo; k++)
+      best.nonabsorbing = true;
+      for (int k = 0; k < best.lo; k++)
         if (node_can_consume_byte(root.kids[static_cast<size_t>(k)],
-                                  static_cast<unsigned char>(best[0]))) {
-          nonabsorbing = false;
+                                  static_cast<unsigned char>(best.lit[0]))) {
+          best.nonabsorbing = false;
           break;
         }
       // A pre that CAN absorb the literal puts occurrences inside a match's
@@ -7382,31 +7430,241 @@ private:
       // and reverse(pre) from the FIRST `=` succeeds with the empty pre, floor
       // 1 — the scan from there reported [1,2). (Capture wrappers are peeled:
       // the gate is about the language, and a capture pre is one group.)
-      if (!nonabsorbing) {
-        for (int k = 0; k < best_lo; k++) {
+      if (!best.nonabsorbing) {
+        for (int k = 0; k < best.lo; k++) {
           const detail::Node *kid = &root.kids[static_cast<size_t>(k)];
           while ((kid->kind == K::Group || kid->kind == K::Concat) &&
                  kid->kids.size() == 1)
             kid = &kid->kids[0];
           if (node_fixed(*kid)) continue;
-          if (!(kid->kind == K::Repeat && one_cp_atom(kid->kids[0]))) return;
+          if (!(kid->kind == K::Repeat && one_cp_atom(kid->kids[0])))
+            return InnerRun{};
         }
       }
-      // Split: pre = kids[0, best_lo). Build its reverse byte program (the post
-      // part is not needed — the end comes from the full forward DFA in
-      // inner_find).
+      return best;
+    }
+
+    // Split at the run: pre = kids[0, lo). Build its reverse byte program (the
+    // post part is not needed — the end comes from the full forward DFA in
+    // inner_find).
+    void build_inner(const detail::Node &root, InnerRun run) {
+      using K = detail::Node::Kind;
       detail::Node pre;
       pre.kind = K::Concat;
-      pre.kids.assign(root.kids.begin(), root.kids.begin() + best_lo);
+      pre.kids.assign(root.kids.begin(), root.kids.begin() + run.lo);
       // Capture-stripped: the reverse(pre) DFA recovers the floor START only;
       // Save ops would just bloat the ordered closure (see strip_captures).
       pre = detail::strip_captures(pre);
       inner_.pre_rev.prog = detail::Compiler::compile(
           detail::reverse_ast(pre), /*ncap=*/0, /*us=*/true, /*reverse=*/true,
           dotall_, /*cp=*/false, /*icase=*/false);
-      inner_.pre_nonabsorbing = nonabsorbing;
-      inner_.lit = std::move(best);
+      inner_.pre_nonabsorbing = run.nonabsorbing;
+      inner_.lit = std::move(run.lit);
       set_probes(inner_.lit, inner_.probe, inner_.probe2);
+    }
+
+    // Which literal anchor drives this plan's candidate + verify find, and
+    // what each anchor the pattern offers was estimated to cost (plan_anchor).
+    // A pattern can offer three: its required prefix (byte_prefix_), its
+    // required suffix (suffix_) and a required interior literal (inner_).
+    // They used to be taken in that order — a prefix switched the other two
+    // off — which is right when the prefix is rare (`Sherlock\s+Holmes`) and
+    // 23-90x wrong when it is a common letter in front of a rare suffix
+    // (`e[a-z]{3,}q`: every `e` was a candidate, where `q` almost never
+    // occurs). The order is now by estimated cost.
+    struct AnchorChoice {
+      enum class Kind : unsigned char {
+        Scan,   // none: the unanchored DFA scan (with its start-state skip)
+        Prefix, // byte_prefix_: occurrences are the candidate starts
+        Suffix, // suffix_: occurrences are the candidate ends
+        Inner,  // inner_: occurrences seed the reverse(pre) floor
+      };
+      Kind kind = Kind::Scan;
+      static constexpr int kNone = -1; // the pattern does not offer the anchor
+      int prefix_cost = kNone, suffix_cost = kNone, inner_cost = kNone;
+      int scan_cost = kNone; // priced where the scan has a skip to price: a
+                             // sparse first-byte set (DFA tiers), the word
+                             // scan (assert tier, plan_word_onepass)
+      // The model's constants, in ns. A stop is a probe hit the scan has to
+      // look at; a verify is what one literal occurrence then costs, by what
+      // the anchor has to run to decide it.
+      static constexpr int kStopNs = 2;
+      static constexpr int kVerifyFwdNs = 25;    // anchored forward DFA
+      static constexpr int kVerifyScalarNs = 25; // forced-parse byte walks
+      static constexpr int kVerifyRevNs = 40;    // reverse DFA to the start
+      static constexpr int kVerifyRevFwdNs = 65; // ... plus the forward retake
+      static constexpr int kVerifyInnerNs = 100; // reverse(pre) + unanchored
+                                                 // forward + full reverse
+      static constexpr int kPrefixBias = 2; // the factor another anchor must
+                                            // beat the prefix by
+      static constexpr int kWordEdgeThin = 3; // a letter is at a word's edge
+                                              // about one time in three
+      static constexpr int kWordScanNs = 300000; // WordOnePass's scalar
+                                                 // candidate loop, per MB
+      // A prefix estimated at 1 ns per byte or more is dense: the DFA scan
+      // costs about that whatever the subject holds.
+      static constexpr int kDenseNs = 1000000;
+    };
+
+    // Estimated cost, in ns per MB of prose, of driving a find from the
+    // literal `lit`: what its scan's stops cost plus what verifying its
+    // occurrences costs. The estimate is byte_commonness's per-mille table —
+    // a single probe stops at every occurrence of the rarest byte, a pair
+    // probe only where the two rarest sit at their distance, and a literal of
+    // two or more bytes occurs about as often as its two rarest bytes
+    // coincide. Independence understates real text (`ing` is one unit, not
+    // three letters), by a factor that does not matter here: the anchors a
+    // choice hangs on differ by orders of magnitude (`e` 127 per KB, `q` 1).
+    static int literal_cost(const std::string &lit, size_t probe,
+                            size_t probe2, int verify_ns) {
+      const int c1 = byte_commonness(static_cast<unsigned char>(lit[probe]));
+      int c2 = 1000; // the second-rarest byte's per-mille (none: every stop)
+      for (size_t i = 0; i < lit.size(); i++)
+        if (i != probe)
+          c2 = std::min(c2,
+                        byte_commonness(static_cast<unsigned char>(lit[i])));
+      const int stops =
+          probe2 == probe
+              ? c1 * 1000
+              : c1 * byte_commonness(static_cast<unsigned char>(lit[probe2]));
+      return stops * AnchorChoice::kStopNs + c1 * c2 * verify_ns;
+    }
+
+    // The suffix anchor's cost: a literal's as above, or — for a class
+    // anchor — the adjacency of its two byte sets (a stop IS an occurrence).
+    int suffix_cost() const {
+      const int verify =
+          suffix_.verify == SuffixPrefilter::Verify::Scalar
+              ? AnchorChoice::kVerifyScalarNs
+              : suffix_.var_pre ? AnchorChoice::kVerifyRevFwdNs
+                                : AnchorChoice::kVerifyRevNs;
+      if (!suffix_.lit.empty())
+        return literal_cost(suffix_.lit, suffix_.probe, suffix_.probe2, verify);
+      int set[2] = {0, 0};
+      for (int k = 0; k < 2; k++)
+        for (int i = 0; i < suffix_.cls[static_cast<size_t>(k)].cnt; i++)
+          set[k] += byte_commonness(
+              suffix_.cls[static_cast<size_t>(k)].list[static_cast<size_t>(i)]);
+      return set[0] * set[1] * (AnchorChoice::kStopNs + verify);
+    }
+
+    // The choice among priced anchors, shared by the DFA tiers (plan_anchor)
+    // and the assert tiers (plan_assert_anchor).
+    AnchorChoice::Kind pick_anchor(const AnchorChoice &c,
+                                   bool dense_scans) const {
+      using Kind = AnchorChoice::Kind;
+      const int kNone = AnchorChoice::kNone;
+      // The cheaper of the two anchors that need a start recovery; the suffix
+      // on a tie (it lands on the match end, the interior literal on a seed).
+      Kind alt = Kind::Scan;
+      int alt_cost = kNone;
+      if (c.suffix_cost != kNone) {
+        alt = Kind::Suffix;
+        alt_cost = c.suffix_cost;
+      }
+      if (c.inner_cost != kNone &&
+          (alt == Kind::Scan || c.inner_cost < alt_cost)) {
+        alt = Kind::Inner;
+        alt_cost = c.inner_cost;
+      }
+      // Captures: the one-pass capture drivers pick their own candidate
+      // source (onepass_driver_find: the prefix, else a non-absorbing
+      // interior literal, else the position scan) and yield the groups in
+      // the same walk, so the anchors keep the order those drivers assume.
+      if (ncap_ != 0) return c.prefix_cost != kNone ? Kind::Prefix : alt;
+      if (c.prefix_cost != kNone) {
+        // The prefix is the incumbent — its occurrences are the match starts
+        // themselves, no start to recover — and while it is sparse it keeps
+        // the find unless another anchor is clearly cheaper (kPrefixBias). A
+        // dense prefix has nothing to protect: any cheaper anchor takes over,
+        // and with none the DFA tiers leave it to the scan (`dense_scans`) —
+        // the unanchored DFA meets every occurrence in ONE pass, where an
+        // anchored verify per occurrence re-walks what the previous one read.
+        const bool dense = c.prefix_cost >= AnchorChoice::kDenseNs;
+        const int bias = dense ? 1 : AnchorChoice::kPrefixBias;
+        if (alt != Kind::Scan &&
+            static_cast<int64_t>(alt_cost) * bias <= c.prefix_cost)
+          return alt;
+        return dense && dense_scans ? Kind::Scan : Kind::Prefix;
+      }
+      // Class-led: the suffix / interior literal, unless the start set is the
+      // rarer event (`[A-Z][a-z]+s`: a capital is rarer than an `s`).
+      if (c.scan_cost != kNone && alt != Kind::Scan && c.scan_cost < alt_cost)
+        return Kind::Scan;
+      return alt;
+    }
+
+    // The assert tiers' anchors: the leading literal (assert_.prefix) and the
+    // trailing one (assert_.suffix), priced and chosen as plan_anchor does —
+    // `Sherlock [a-z]+e\b` is driven from `Sherlock`, `t[a-z]+ly\b` from
+    // `ly`. The fixed-text and word-suffix shapes are not anchors to choose
+    // between: each is the whole find, and both analyses defer to them.
+    void plan_assert_anchor() {
+      using Kind = AnchorChoice::Kind;
+      AnchorChoice c;
+      if (!assert_.prefix.empty())
+        c.prefix_cost =
+            literal_cost(assert_.prefix, assert_.prefix_probe,
+                         assert_.prefix_probe2, AnchorChoice::kVerifyFwdNs);
+      // A trailing `\b` after a word-ending literal rejects an occurrence on
+      // its next byte (assert_suffix_find), and most occurrences of a letter
+      // are inside a word: only about one in kWordEdgeThin reaches the verify.
+      if (!assert_.suffix.empty() && !assert_.word_suffix)
+        c.suffix_cost = literal_cost(
+            assert_.suffix, assert_.suffix_probe, assert_.suffix_probe2,
+            assert_.suffix_wb ? AnchorChoice::kVerifyRevFwdNs /
+                                    AnchorChoice::kWordEdgeThin
+                              : AnchorChoice::kVerifyRevFwdNs);
+      // No scan for a dense prefix here: the assert DFA has no start-state
+      // skip, and its unfiltered scan measured slower than the dense prefix
+      // (`\bt[a-z]+` over prose: 430 MB/s driven from `t`, 310 scanned).
+      c.kind = assert_.word_suffix ? Kind::Suffix
+                                   : pick_anchor(c, /*dense_scans=*/false);
+      if (c.kind != Kind::Prefix) assert_.prefix.clear();
+      if (c.kind != Kind::Suffix) {
+        assert_.suffix.clear();
+        assert_.suffix_wb = false;
+      }
+      anchor_ = c;
+    }
+
+    // Which literal anchor drives the find (see AnchorChoice). Runs the
+    // suffix and interior analyses, prices the anchors the pattern offers and
+    // keeps one: suffix_ / inner_ stay set only for the anchor chosen, so
+    // every ladder's `suffix_.active()` / `inner_.active()` rung reads the
+    // choice without knowing there was one.
+    void plan_anchor(const detail::Node &root) {
+      using Kind = AnchorChoice::Kind;
+      analyze_byte_suffix(root);
+      InnerRun inner = find_inner_run(root);
+      AnchorChoice c;
+      if (byte_prefix_.active())
+        c.prefix_cost =
+            literal_cost(byte_prefix_.text, byte_prefix_.probe,
+                         byte_prefix_.probe2, AnchorChoice::kVerifyFwdNs);
+      if (suffix_.active()) c.suffix_cost = suffix_cost();
+      if (!inner.lit.empty()) {
+        size_t probe, probe2;
+        set_probes(inner.lit, probe, probe2);
+        c.inner_cost = literal_cost(inner.lit, probe, probe2,
+                                    inner.nonabsorbing
+                                        ? AnchorChoice::kVerifyRevFwdNs
+                                        : AnchorChoice::kVerifyInnerNs);
+      }
+      // The scan's own skip when there is no literal prefix: a sparse
+      // first-byte set, each member byte a place the DFA leaves its start
+      // state.
+      if (!byte_prefix_.active() && byte_first_bytes_.sparse) {
+        int set = 0;
+        for (unsigned char b : byte_first_bytes_.list)
+          set += byte_commonness(b);
+        c.scan_cost =
+            set * 1000 * (AnchorChoice::kStopNs + AnchorChoice::kVerifyFwdNs);
+      }
+      c.kind = pick_anchor(c, /*dense_scans=*/true);
+      if (c.kind != Kind::Suffix) suffix_ = SuffixPrefilter{};
+      if (c.kind == Kind::Inner) build_inner(root, std::move(inner));
+      anchor_ = c;
     }
 
     // (?i) pure printable-ASCII literal with a small, CLEAN case orbit:
@@ -7879,8 +8137,11 @@ private:
     // pick the rarest byte of a literal as the memchr probe (find_substr):
     // scanning for a rare byte yields far fewer false candidates than the common
     // first byte. Space and frequent lowercase letters score high; uppercase,
-    // digits, punctuation and non-ASCII bytes are rare in prose and make good
-    // probes.
+    // digits, most punctuation and non-ASCII bytes are rare in prose and make
+    // good probes. The same table prices a plan's anchors against each other
+    // (plan_anchor), which is why the punctuation prose is full of has its own
+    // entries: at "rare" a trailing `.` would look cheaper to scan for than a
+    // leading capital, and it is five times as common.
     static int byte_commonness(unsigned char c) {
       static const unsigned char freq[26] = {// a..z, approx per-mille
                                              82, 15, 28, 43, 127, 22, 20, 61, 70,
@@ -7893,7 +8154,15 @@ private:
       // the probe AND stays below the pair_probe threshold (a capital probe
       // is rare enough that the single-byte scan wins).
       if (c >= 'A' && c <= 'Z') return (freq[c - 'A'] >> 5) + 1;
-      return 1; // digits / punctuation / non-ASCII: rare in prose
+      switch (c) {
+      case '\n': return 20; // a line break every ~50 bytes
+      case ',': return 12;
+      case '.': return 11;
+      case '"': return 6;
+      case '\'': return 4;
+      case '-': return 3;
+      default: return 1; // digits / other punctuation / non-ASCII: rare in prose
+      }
     }
 
     // Offset of the rarest byte in `s` (the probe for find_substr), 0 if empty.
@@ -8194,6 +8463,9 @@ private:
     AnchoredOnePass wop_;            // compact body automaton (reused type)
     std::array<bool, 128> wop_start_{}; // bytes the body can start on
     bool wop_trail_wb_ = false;
+    bool wop_after_anchor_ = false; // the assert literal anchor is estimated
+                                    // cheaper than the word scan and runs
+                                    // first (plan_word_onepass)
     // Capture groups the ENGINES resolve. 0 for a pattern whose every group
     // wraps the whole match: that one is planned as its capture-free twin
     // (detail::peel_root_groups) and alias_groups_ holds how many groups a
@@ -8706,6 +8978,10 @@ private:
     // EGC-only (gated on teddy_.ok, which implies !us_); the per-match
     // literal_boundary_ok keeps it grapheme-sound on any subject.
     std::vector<std::string> literal_alt_;
+    // The anchor this plan's finds are driven from (see AnchorChoice). Read
+    // at plan time and by the dispatch gates only, so it sits behind the
+    // fields the per-match loops read.
+    AnchorChoice anchor_;
   };
 
   // The shared, immutable execution plan (see intern_plan): written only by
@@ -11194,8 +11470,10 @@ private:
     WalkBudget local_budget(text.size());
     WalkBudget &budget = walk_budget ? *walk_budget : local_budget;
     // [Tier: WordOnePass] one walk per candidate replaces the assert DFA's
-    // forward scan + per-match reverse start recovery.
-    if (plan_->wop_.ok) {
+    // forward scan + per-match reverse start recovery. It looks at every
+    // byte, so a literal anchor the plan priced below it goes first
+    // (wop_after_anchor_) and the word scan is what its budget bail falls to.
+    if (plan_->wop_.ok && !plan_->wop_after_anchor_) {
       int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
       // budget / non-ASCII -> the assert chain below
@@ -11206,6 +11484,10 @@ private:
       // budget hit -> the unfiltered scan below
     } else if (!plan_->assert_.prefix.empty()) {
       int r = assert_prefix_find(fc, text, from, s, e, /*byte=*/false, budget);
+      if (r != kWalkBail) return r > 0;
+    }
+    if (plan_->wop_.ok && plan_->wop_after_anchor_) {
+      int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
     }
     int e0 = assert_fwd_scan_lf(fc, text, from, /*anchored=*/false);
@@ -14629,8 +14911,15 @@ private:
   // followed by a word byte and can never pass `\b` itself). Returns 1
   // (found, s/e set), 0 (none), kWalkBail (budget / non-ASCII — the caller
   // falls back to the assert DFA chain). ASCII-tier callers only.
-  int word_onepass_find(std::string_view t, int from, int &s_out, int &e_out,
-                        WalkBudget &budget) const {
+  //
+  // Out of line on purpose. Inlined into assert_find_span — which it was
+  // while that had one call to it — the candidate loop shared the caller's
+  // registers with every other rung and ran a quarter slower: IPv4
+  // extraction over a log, 640 MB/s inlined and 850 as its own function
+  // (the same at every heap and code placement tried).
+  REGEXLIB_NOINLINE int word_onepass_find(std::string_view t, int from,
+                                          int &s_out, int &e_out,
+                                          WalkBudget &budget) const {
     const Plan::AnchoredOnePass &a = plan_->wop_;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const int n = static_cast<int>(t.size());
@@ -15494,7 +15783,7 @@ inline void Regex::fill_rows(std::string_view bytes, FindCache *cache,
   // the rationale). Prefix and suffix are mutually exclusive (suffix
   // extraction requires no prefix).
   if (plan_->egc_fused_ok() && fna < bytes.size()) {
-    if (plan_->byte_prefix_.ascii) {
+    if (plan_->prefix_fused()) {
       if (prefix_egc_fill(bytes, c.blfa(*this), plan_->byte_prefix_.text,
                           plan_->byte_prefix_.probe, plan_->byte_prefix_.probe2,
                           out.spans_))
@@ -16008,7 +16297,7 @@ inline void Regex::MatchIter::step(bool &chain_once) {
       // gap is EGC-eligible (one pass, no upfront gate). A bad cluster (gap or
       // match interior/end) downgrades to the Pike from pos_ — already-yielded
       // matches end at or before pos_, whose region the scan verified clean.
-      if (egc_fused_ && re_->plan_->byte_prefix_.ascii) {
+      if (egc_fused_ && re_->plan_->prefix_fused()) {
         bool bad = false;
         int s2 = re_->egc_literal_fused_find(text_, pos_, re_->plan_->byte_prefix_.text,
                                             re_->plan_->byte_prefix_.probe,

@@ -275,6 +275,43 @@ int main() {
       {"/users/(\\d+)", kUS},
       {"[a-z]+\\d?", kUS},
       {"(\\w+) (\\w+)$", kUS},
+      // The anchor a find is driven from is chosen by estimated cost, so a
+      // pattern with a literal at BOTH ends takes a rung per entry point that
+      // none of the rows above reached: the suffix or the interior literal
+      // from behind a literal prefix (search, find_all and find_iter each
+      // order their rungs separately, and test() skips them), the scan in
+      // place of a dense prefix, and on the assert tiers the leading literal
+      // in front of a trailing one, with the word scan before or behind it.
+      {"e[a-z]{3,}q", 0},
+      {"e[a-z]{3,}q", kUS},
+      {"a[^.]*!", 0},
+      {"a[^.]*!", kUS},
+      {"s[a-z]*\\?", 0},
+      {"a.{4}z", 0},
+      {"a.{4}z", kUS},
+      {"t[a-z]+ing", 0},
+      {"a\\w+@\\w+", 0},
+      {"a\\w+@\\w+", kUS},
+      {"\\w+@\\w+e", 0},
+      {"e[a-z]+s", 0},
+      {"e[a-z]+s", kUS},
+      {"[A-Z][a-z]+s", 0},
+      {"[A-Z][a-z]+s", kUS},
+      {"H[a-z]+s", 0},
+      {"H[a-z]+s\\b", 0},
+      {"H[a-z]+s\\b", kUS},
+      {"\\bH[a-z]+s\\b", 0},
+      {"Sherlock [a-z]+e\\b", 0},
+      {"t[a-z]+ly\\b", 0},
+      {"t[a-z]+ly\\b", kUS},
+      {"\\bthe [a-z]+q\\b", 0},
+      {"\\bq[a-z]+e\\b", 0},
+      {"\\b\\w+ing\\b", 0},
+      {"\\b\\w+ing\\b", kUS},
+      {"\\be[a-z]+s\\b", 0},
+      {"z[a-z]*e$", 0},
+      {"^The [a-z]+ of", Flag::Multiline},
+      {"e[a-z]+\\.$", Flag::Multiline},
   };
   const std::string subjects[] = {
       "",
@@ -308,6 +345,17 @@ int main() {
       "ab c\xC3\xA9" "d ef \xC3\xA9 gh a=b \xC3\xA9=c d=\xC3\xA9 e=f",
       "\xC3\xA9 ab\xC2\xA1" "cd \xC2\xA1" "ef 12 gh /users/7 \xC3\xA9",
       "k=v \xC3\xA9 12 ab \xC3\xA9=w 34 cd x=y \xC3\xA9 56 ef z=\xC3\xA9 /users/1",
+      // Both ends of the anchor-choice rows: prefix bytes with no suffix
+      // behind them and suffixes with no prefix in front, a body that absorbs
+      // either, on ASCII, CRLF and non-ASCII text.
+      "The eeeelq eq Holmes hates the singing tasting; a no! a yes! is? sss?\n"
+      "The zone of ua@be a@b Sherlock spoke truly, thely quaq quote azzzz.\n"
+      "Homes Hs testing the easiest eases zebra ze aaaaaz a1234z yes.",
+      "The easy eelq! ends.\r\nHis as? a@host abcdz singing tally.\r\n"
+      "Sherlock rode the quaq truly\r\nThe house of Holmes is.\r\n",
+      "\xC3\xA9 eeeelq a yes! is? Holmes \xC3\xA9 tasting a@be truly the quaq "
+      "quote Hs \xC3\xA9s. Sherlock spoke\r\nThe end of eases.\r\n",
+      std::string(3000, 'e') + "q " + std::string(3000, 'a') + "! Hs truly",
   };
 
   for (const auto &c : cases)

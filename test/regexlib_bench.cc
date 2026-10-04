@@ -749,6 +749,12 @@ static void run_sherlock_bench(int iters) {
       {"common prefix, negated run, rare suffix", "a[^.]*\\!", false, {text}},
       {"common prefix, nullable run, rare suffix", "s[a-z]*\\?", false, {text}},
       {"common prefix, rare suffix, \\b", "t[a-z]+ly\\b", false, {text}},
+      // The other way round — a RARE prefix in front of a common suffix — on
+      // the assert tier, where the trailing literal used to be the anchor
+      // whenever there was one; and a class-led pattern whose start set is
+      // the rarer of its two handles.
+      {"rare prefix, common suffix, \\b", "H[a-z]+s\\b", false, {text}},
+      {"rare start class, common suffix", "[A-Z][a-z]+s", false, {text}},
       // A gap wide enough that the DFA's state count grows with it (each
       // live `a` is its own position in the window): the state-cap / cache
       // behavior under a pattern that is regular but not small.

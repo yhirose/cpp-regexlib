@@ -33,6 +33,36 @@ void check(bool cond, const char *expr, int line) {
 
 #define CHECK(cond) check(static_cast<bool>(cond), #cond, __LINE__)
 
+} // namespace
+
+// The test suite's view into a Regex's plan (the header declares the peer and
+// befriends it): which anchor the plan chose to drive the find from, and what
+// it estimated each anchor to cost.
+namespace reg {
+namespace detail {
+struct PlanProbe {
+  using Choice = Regex::Plan::AnchorChoice;
+  static const Choice &choice(const Regex &re) { return re.plan_->anchor_; }
+  // 'P' prefix, 'S' suffix, 'I' interior literal, '-' none (the scan).
+  static char anchor(const Regex &re) {
+    switch (choice(re).kind) {
+    case Choice::Kind::Prefix: return 'P';
+    case Choice::Kind::Suffix: return 'S';
+    case Choice::Kind::Inner: return 'I';
+    default: return '-';
+    }
+  }
+  static bool word_scan_after_anchor(const Regex &re) {
+    return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
+  }
+};
+} // namespace detail
+} // namespace reg
+
+namespace {
+
+using reg::detail::PlanProbe;
+
 using reg::DotAll;
 using reg::IgnoreCase;
 using reg::Multiline;
@@ -1793,10 +1823,10 @@ void test_suffix_prefilter() {
       "singing stringing aaaaing bing ing endend 22end singinging zzz";
   for (const char *p : {"[a-zA-Z]+ing", "[a-z]*ing", "[0-9]*end", "[a-z]+x"})
     CHECK(ok(greedy, p));
-  // Patterns that keep the literal-PREFIX memmem instead (prefix path), still
-  // equal to the Pike.
-  CHECK(ok(ascii, "fox[a-z]{2}"));      // literal prefix -> prefix path
-  CHECK(ok(acrlf, "the[^z]{0,9}zone")); // literal prefix -> prefix path
+  // A literal prefix in front of the suffix (which of the two drives is
+  // test_anchor_choice's subject), still equal to the Pike.
+  CHECK(ok(ascii, "fox[a-z]{2}"));
+  CHECK(ok(acrlf, "the[^z]{0,9}zone"));
   // search() on a CRLF-collapse plan: its suffix rung runs the COLLAPSED byte
   // programs, whose classes count a CR-LF pair as one element, and the scalar
   // verifier counted bytes — so a pair inside the fixed-width body shifted
@@ -1892,6 +1922,186 @@ void test_inner_prefilter() {
       CHECK(ok(s, "(?:.[a-z])*-[a-z]"));
       CHECK(ok(s, ".{2,}-c\\d?"));             // step-1 pre: still driven
     }
+  }
+}
+
+// Which literal anchor drives the find is chosen by estimated cost, not by
+// position (Plan::AnchorChoice). Two halves: the choice itself, pinned
+// through the plan; and the results of every pattern whose driving anchor is
+// one it could not have had before — a suffix or an interior literal behind a
+// literal prefix, a prefix in front of an assert-tier suffix — against the
+// grapheme Pike, on ASCII / CRLF / non-ASCII subjects and in CodePoint mode.
+void test_anchor_choice() {
+  auto anchor = [](const char *pat) { return PlanProbe::anchor(Regex(pat)); };
+
+  // --- DFA tiers: prefix vs suffix ---
+  // A common letter in front of a rare suffix: the suffix drives.
+  CHECK(anchor("e[a-z]{3,}q") == 'S');
+  CHECK(anchor("a.{16}z") == 'S');
+  CHECK(anchor("a[^.]*\\!") == 'S');
+  CHECK(anchor("s[a-z]*\\?") == 'S');
+  CHECK(anchor("t[a-z]+ing") == 'S');
+  CHECK(anchor("the\\s+\\w+ly") == 'S');
+  // A rare prefix keeps the find, whatever follows.
+  CHECK(anchor("Sherlock\\s+Holmes") == 'P');
+  CHECK(anchor("S[a-z]+\\.") == 'P'); // `.` is five times as common as `S`
+  CHECK(anchor("H[a-z]+s") == 'P');
+  CHECK(anchor("z[a-z]+e") == 'P');
+  CHECK(anchor("T[a-z]+k") == 'P'); // both sparse: the incumbent stays
+  // Both dense: no anchor is worth a verify per occurrence.
+  CHECK(anchor("e[a-z]+s") == '-');
+  CHECK(anchor("a[a-z]*e") == '-');
+  // --- class-led: suffix / interior literal vs the start set ---
+  CHECK(anchor("[a-q][^u-z]{13}x") == 'S');
+  CHECK(anchor("[a-zA-Z]+ing") == 'S');
+  CHECK(anchor("[a-z]+e") == 'S');      // dense, but so is the start set
+  CHECK(anchor("[A-Z]\\w+ the") == 'S');
+  CHECK(anchor("[A-Z][a-z]+s") == '-'); // a capital is rarer than an `s`
+  CHECK(anchor("\\w+ Holmes \\w+") == 'I');
+  CHECK(anchor("\\w+@\\w+") == 'I');
+  // --- the interior literal against the other two ---
+  CHECK(anchor("a\\w+@\\w+") == 'I');  // behind a dense prefix
+  CHECK(anchor("\\w+@\\w+e") == 'I');  // in front of a dense suffix
+  CHECK(anchor("\\w+e\\w+@") == 'S');  // ... and behind a rare one
+  CHECK(anchor("Mr\\w+e\\w+") == 'P'); // a rare prefix beats a dense interior
+  // --- captures keep the order the capture drivers assume ---
+  CHECK(anchor("e(\\w+)q") == 'P');
+  CHECK(anchor("(\\w+)=(\\S+)") == 'I');
+  // --- CodePoint mode chooses the same way ---
+  CHECK(PlanProbe::anchor(make_us("e[a-z]{3,}q")) == 'S');
+  CHECK(PlanProbe::anchor(make_us("Sherlock\\s+Holmes")) == 'P');
+  CHECK(PlanProbe::anchor(make_us("a\\w+@\\w+")) == 'I');
+  // --- assert tiers: leading vs trailing literal ---
+  CHECK(anchor("Sherlock [a-z]+e\\b") == 'P');
+  CHECK(anchor("H[a-z]+s\\b") == 'P');
+  CHECK(anchor("z[a-z]*e$") == 'P');
+  CHECK(anchor("(?m)^The [a-z]+ of") == 'P');
+  CHECK(anchor("t[a-z]+ly\\b") == 'S');
+  CHECK(anchor("\\bthe [a-z]+q\\b") == 'S');
+  CHECK(anchor("(?m)e[a-z]+\\.$") == 'S');
+  CHECK(anchor("\\b\\w+ing\\b") == 'S'); // the word-suffix shape
+  CHECK(anchor("\\bt[a-z]+") == 'P'); // dense, and the assert scan has no skip
+  // The word scan runs behind an anchor priced below it, in front otherwise.
+  CHECK(PlanProbe::word_scan_after_anchor(Regex("\\bq[a-z]+e\\b")));
+  CHECK(PlanProbe::word_scan_after_anchor(Regex("\\bthe [a-z]+q\\b")));
+  CHECK(!PlanProbe::word_scan_after_anchor(Regex("\\be[a-z]+s\\b")));
+  CHECK(!PlanProbe::word_scan_after_anchor(
+      Regex("\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b")));
+
+  // The record says why: each anchor the pattern offers has a cost, the one
+  // chosen is the cheapest by the rule, and an anchor not offered has none.
+  {
+    const auto &c = PlanProbe::choice(Regex("e[a-z]{3,}q"));
+    CHECK(c.prefix_cost > 0 && c.suffix_cost > 0);
+    CHECK(c.suffix_cost * 2 <= c.prefix_cost);
+    CHECK(c.inner_cost == PlanProbe::Choice::kNone);
+    const auto &d = PlanProbe::choice(Regex("Sherlock\\s+Holmes"));
+    CHECK(d.prefix_cost > 0 && d.suffix_cost > 0);
+    CHECK(d.suffix_cost * 2 > d.prefix_cost);
+    const auto &e = PlanProbe::choice(Regex("[A-Z][a-z]+s"));
+    CHECK(e.prefix_cost == PlanProbe::Choice::kNone);
+    CHECK(e.scan_cost > 0 && e.scan_cost < e.suffix_cost);
+  }
+
+  // --- results ---
+  auto ok = [](const std::string &subj, const std::string &pat) {
+    Regex bare(pat);
+    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    auto a = find_all(bare, subj), b = find_all(pike, subj);
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+      if (a[i].begin() != b[i].begin() || a[i].end() != b[i].end())
+        return false;
+    std::vector<std::pair<size_t, size_t>> sc;
+    for (auto m : bare.find_iter(subj)) sc.emplace_back(m.begin(), m.end());
+    if (sc.size() != a.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+      if (sc[i].first != a[i].begin() || sc[i].second != a[i].end())
+        return false;
+    auto sr = bare.search(subj);
+    if (sr.matched() != (!a.empty())) return false;
+    if (!a.empty() && (sr.begin() != a[0].begin() || sr.end() != a[0].end()))
+      return false;
+    return bare.test(subj) == !a.empty();
+  };
+  auto ok_us = [](const std::string &subj, const std::string &pat) {
+    Regex us = make_us(pat);
+    auto a = us.find_all(subj);
+    auto ref = make_us("(?:" + pat + ")(?=[\\s\\S]|$)").find_all(subj);
+    if (a.size() != ref.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+      if (a[i].begin() != ref[i].begin() || a[i].end() != ref[i].end())
+        return false;
+    size_t k = 0;
+    for (auto m : us.find_iter(subj)) {
+      if (k >= a.size() || m.begin() != a[k].begin() || m.end() != a[k].end())
+        return false;
+      k++;
+    }
+    if (k != a.size()) return false;
+    auto sr = us.search(subj);
+    if (sr.matched() != (!a.empty())) return false;
+    if (!a.empty() && (sr.begin() != a[0].begin() || sr.end() != a[0].end()))
+      return false;
+    return us.test(subj) == !a.empty();
+  };
+  // Every line holds candidates for both ends of the patterns below: prefix
+  // letters that complete no match, suffixes with no prefix behind them,
+  // prefix bytes the body absorbs (`eeeelq`, `aaaz`), suffixes inside a
+  // match (`singing`), and the assert shapes' word and line edges.
+  const std::string base =
+      "The end of it: xeeeelq eq eelq, a0123456789abcdefz az aaaz.\n"
+      "a b c! and a. no! a yes! is? yes? s? sss? singing string tasting the\n"
+      "Sherlock spoke slowly; Holmes hates truly ugly quartz, Mr Jones the\n"
+      "user@host.net ua@b a@b.net the  quickly zone ze zzze\n"
+      "untie the quaq quote; Sherlock side tally thely unlit zebraq\n";
+  std::string ascii, acrlf, nonascii = "\xc3\xb1"; // ñ: the egc byte path
+  for (int i = 0; i < 40; i++) {
+    ascii += base;
+    for (char ch : base) {
+      if (ch == '\n') acrlf += '\r', nonascii += '\r';
+      acrlf += ch;
+      nonascii += ch;
+    }
+  }
+  const char *dfa_pats[] = {
+      // suffix-driven behind a literal prefix
+      "e[a-z]{3,}q", "a.{16}z", "a[^.]*\\!", "s[a-z]*\\?", "t[a-z]+ing",
+      "the\\s+\\w+ly", "a[a-z]+z", "e[a-z]*e[a-z]*q", "q[a-z]*a[a-z]*q",
+      "s[a-z]+ing", "a[^!]{2,}z",
+      // interior-literal-driven behind a literal prefix / before a suffix
+      "a\\w+@\\w+", "u[a-z]*@[a-z]+\\.net", "\\w+@\\w+e", "\\w+e\\w+@",
+      // the prefix stays
+      "Sherlock\\s+\\w+", "S[a-z]+\\.", "H[a-z]+s", "z[a-z]+e", "T[a-z]+k",
+      "Mr\\w+e\\w+",
+      // nothing drives: the scan
+      "e[a-z]+s", "a[a-z]*e", "[A-Z][a-z]+s", "t[a-z]*e",
+  };
+  const char *assert_pats[] = {
+      "Sherlock [a-z]+e\\b", "H[a-z]+s\\b", "\\bH[a-z]+s\\b", "z[a-z]*e$",
+      "(?m)z[a-z]*e$", "(?m)^The [a-z]+ of", "(?m)^[A-Z][a-z]+ the$",
+      "t[a-z]+ly\\b", "\\bthe [a-z]+q\\b", "\\bq[a-z]+e\\b",
+      "(?m)e[a-z]+\\.$", "\\b\\w+ing\\b", "\\b\\w+ly\\b", "[a-z]+ing\\b",
+      "\\bun\\w+\\b", "\\bt[a-z]+", "\\be[a-z]+s\\b", "a[a-z]+d\\b",
+      "\\bs[a-z]*ing\\b", "\\b\\w{2,4}ly\\b", "\\Bly\\b", "the\\b [a-z]+q\\b",
+  };
+  for (const std::string &s : {ascii, acrlf, nonascii}) {
+    for (const char *pat : dfa_pats) CHECK(ok(s, pat));
+    for (const char *pat : assert_pats) CHECK(ok(s, pat));
+  }
+  for (const std::string &s : {ascii, nonascii}) {
+    for (const char *pat : dfa_pats) CHECK(ok_us(s, pat));
+    for (const char *pat : assert_pats) CHECK(ok_us(s, pat));
+  }
+  // A prefix byte the body absorbs, in front of a suffix that never comes:
+  // the failed-walk budget must hand the find back (linear), and what it is
+  // handed back to must still be right.
+  {
+    std::string run(6000, 'a');
+    CHECK(ok(run + "z", "a[a-z]+z"));
+    CHECK(ok(run + "\xc3\xb1z " + run + "z", "a[a-z]+z"));
+    CHECK(ok(run, "a[a-z]+z"));
+    CHECK(ok(run + "q" + run + "q", "a[a-z]*q"));
   }
 }
 
@@ -2448,10 +2658,22 @@ void test_walk_budget_linearity() {
     size_t want;
   };
   std::vector<Case> cases;
-  { // fused EGC prefix tier (capture-free, non-ASCII subject)
-    std::string s(200000, 'a');
+  { // fused EGC prefix tier (capture-free, non-ASCII subject). The prefix
+    // has to be one the plan keeps the find on — rare by the table, however
+    // dense this subject makes it — or the suffix would drive instead.
+    std::string s(200000, 'Z');
     s += "\xc3\xa9";
-    cases.push_back({"fused-prefix", "a[a-z]+0", s, 0});
+    CHECK(PlanProbe::anchor(Regex("Z[A-Z]+0")) == 'P');
+    cases.push_back({"fused-prefix", "Z[A-Z]+0", s, 0});
+  }
+  { // the suffix driving from behind a literal prefix: the body absorbs the
+    // suffix byte, so every failing reverse verify re-walks to the floor
+    std::string s(1000, 'b');
+    s += std::string(100000, '0');
+    CHECK(PlanProbe::anchor(Regex("a[a-z0]+0")) == 'S');
+    cases.push_back({"suffix-behind-prefix", "a[a-z0]+0", s + "\xc3\xa9", 0});
+    cases.push_back({"suffix-bail-match", "a[a-z0]+0", s + " ab0\xc3\xa9", 1});
+    cases.push_back({"suffix-bail-ascii", "a[a-z0]+0", s + " ab0", 1});
   }
   { // ReverseInner non-absorbing verify (the post part absorbs '=')
     std::string s;
@@ -2478,9 +2700,9 @@ void test_walk_budget_linearity() {
   }
   { // budget exhaustion mid-subject must still find the later real match via
     // the linear fallback (correctness through the bail path)
-    std::string s(100000, 'a');
-    s += "9ab0\xc3\xa9";
-    cases.push_back({"bail-then-match", "a[a-z]+0", s, 1});
+    std::string s(100000, 'Z');
+    s += "9ZB0\xc3\xa9";
+    cases.push_back({"bail-then-match", "Z[A-Z]+0", s, 1});
   }
   { // capture chain: the right-side \S+ absorbs every later '=' anchor, so
     // each failed candidate re-walks the tail without the chain's budget
@@ -3314,6 +3536,7 @@ int main() {
   test_crlf_adjacent_runs();
   test_suffix_prefilter();
   test_inner_prefilter();
+  test_anchor_choice();
   test_assert_literal_prefilter();
   test_ascii_literal_prefilter();
   test_ascii_icase_prefilter();

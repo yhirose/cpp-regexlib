@@ -944,6 +944,234 @@ void invariant_fuzz_us_onewalk(int iters) {
   }
 }
 
+// --- Anchor choice: a literal at both ends of the pattern. ---
+//
+// A find is driven from ONE literal anchor — the pattern's required prefix,
+// its required suffix or an interior literal — and which one is decided by
+// estimated cost (Plan::AnchorChoice), not by position. So the suffix scan
+// and the ReverseInner scan now run on patterns that begin with a literal,
+// the assert tiers' leading literal runs on patterns that end with one, and a
+// dense prefix is left to the plain scan. Each of those is an engine meeting
+// a shape it was never asked to serve: the suffix scan's leftmost-first
+// argument with a literal in the pre-part (which the body may absorb, or
+// which may repeat inside the match), the reverse(pre) floor with a literal
+// at its far end, the assert tiers' multi-character literal runs and the
+// word-suffix shape `\b\w+ing\b`.
+//
+// gen_alt gets here only through `a`, `b` and `c`: three letters, all common,
+// so its patterns sit on one side of every comparison the choice makes. This
+// generator draws the head and the tail from both sides of the table — a
+// common letter in front of a rare one, the reverse, both common, both rare,
+// with and without an interior literal — and wraps half of the results in the
+// assertions that move a pattern onto the assert tiers. The subjects are
+// built from the same letters, so both ends occur densely, alone and
+// together.
+std::string gen_anchor_choice() {
+  // Common by the table (a dense prefix), rare (a prefix that keeps the
+  // find), or none / a class (class-led: the suffix against the start set).
+  static const char *HEAD[] = {"e", "a",  "t",  "s",  "th", "ea",    "e",
+                               "a", "q",  "z",  "Z",  "x1", "Zq",    "",
+                               "",  "[A-Z]", "[a-c]"};
+  static const char *ATOM[] = {"[a-z]", ".",   "\\w",    "[^.]",
+                               "[a-c]", "[^q]", "\\s",   "a",
+                               "[a-z ]", "[^\\n]", "e",  "[eq]"};
+  static const char *Q[] = {"+", "*", "{3,}", "{2}", "{0,3}",
+                            "?", "",  "{1,2}", "+",  "*"};
+  static const char *MID[] = {"@", "-", " ", "q", "=", "e", "zq"};
+  // Rare, common, one that ends on a non-word byte, none, a class-pair
+  // anchor, a single class.
+  static const char *TAIL[] = {"q",  "z",  "!",  "\\?", "x",  "ly",
+                               "ing", "qz", "e",  "s",   "t",  "\\.",
+                               ",",  "e!", "",   "[?!.][\"']", "[qz]"};
+  auto atom_q = [&] { return std::string(ATOM[U(0, 11)]) + Q[U(0, 9)]; };
+  if (U(0, 9) == 0) {
+    // The word-suffix shape `\b\w{n,m}<literal>\b` with a literal of any
+    // length — and its near misses, one time in four each: something in
+    // front of the `\w` repeat, something between it and the literal,
+    // something after the trailing `\b`. Each of those is a different
+    // pattern that the shape's test must NOT take for the shape.
+    static const char *WQ[] = {"+", "*", "{2,}", "{1,3}", "{0,2}"};
+    static const char *WL[] = {"ing", "ly", "e", "qz", "s", "eq"};
+    std::string pat = "\\b";
+    if (U(0, 3) == 0) pat += U(0, 1) ? std::string(HEAD[U(0, 12)]) : atom_q();
+    pat += std::string("\\w") + WQ[U(0, 4)];
+    if (U(0, 3) == 0) pat += U(0, 1) ? std::string(MID[U(0, 6)]) : atom_q();
+    pat += std::string(WL[U(0, 5)]) + "\\b";
+    if (U(0, 3) == 0) pat += U(0, 1) ? std::string(MID[U(0, 6)]) : "$";
+    return pat;
+  }
+  // Three families this generator found wrong on the released engine while
+  // looking for something else, each drawn on purpose from here on.
+  switch (U(0, 15)) {
+  case 0: {
+    // A skippable (or looping) group of several atoms behind a
+    // variable-width atom, with something required after it: the one-walk
+    // tables read their last accept as the leftmost-first end, and here a
+    // thread that reached the group EARLIER — the lower-priority one — is
+    // still inside it when a later arrival skips past
+    // (`[a-z]{3,}(?:\w{2}-)?s` over "hssys-s", `x(?:ab)?(?:abc)?[a-z]`).
+    static const char *VQ[] = {"+", "*", "{3,}", "{0,3}", "?", "{1,2}"};
+    static const char *GQ[] = {"?", "?", "+", "*", "{1,2}", "{0,2}"};
+    static const char *END[] = {"s", "q", "[a-z]", "\\w", "-", ""};
+    return std::string(HEAD[U(0, 16)]) + ATOM[U(0, 11)] + VQ[U(0, 5)] +
+           "(?:" + ATOM[U(0, 11)] + (U(0, 1) ? "{2}" : "") + ATOM[U(0, 11)] +
+           ")" + GQ[U(0, 5)] + END[U(0, 5)];
+  }
+  case 1: {
+    // A BOUNDED class that can consume CR and LF, in front of a literal:
+    // on a CR-LF subject it runs on the collapsed byte programs, where the
+    // pair is ONE element of the class — and the suffix scan's byte-walking
+    // verifier has to be told, at every entry point (`[a-c][^q]{2}q` over
+    // "a \r\nq": search() alone lost the match).
+    static const char *LEAD[] = {"", "", "[a-c]", "e", "a", "[^q]"};
+    static const char *NEG[] = {"[^q]", "[^.]", "[^z]", "[^e]"};
+    static const char *BQ[] = {"{2}", "{1}", "{3}", "{1,2}", "{0,2}", "{2,3}"};
+    static const char *LIT[] = {"q", "z", "\\.", "x", "e", "qz"};
+    return std::string(LEAD[U(0, 5)]) + NEG[U(0, 3)] + BQ[U(0, 5)] +
+           LIT[U(0, 5)];
+  }
+  case 2: {
+    // Two unbounded class repeats that both consume CR and LF, side by
+    // side, a group around one of them: a byte program can end the first on
+    // the `\r` and begin the second on the `\n`, which no grapheme parse
+    // does (`([^.]*)[^.]+,` over "Z\r\n," closed its group inside the pair).
+    static const char *RUN[] = {"[^.]+", "[^q]*", "\\s+", "[^.]*", "\\s*", "[^q]+"};
+    static const char *END[] = {",", "\\.", "q", "", "x?", "[qz]"};
+    const bool first = U(0, 1);
+    return std::string(HEAD[U(0, 16)]) +
+           (first ? "(" : "") + RUN[U(0, 5)] + (first ? ")" : "") +
+           (U(0, 3) ? "" : "x?") +
+           (first ? "" : "(") + RUN[U(0, 5)] + (first ? "" : ")") +
+           END[U(0, 5)];
+  }
+  default: break;
+  }
+  // Half of the patterns move to the assert tiers.
+  auto decorate = [&](const std::string &pat) {
+    switch (U(0, 11)) {
+    case 0: return "\\b" + pat + "\\b";
+    case 1: return pat + "\\b";
+    case 2: return pat + "$";
+    case 3: return "(?m)^" + pat;
+    case 4: return "\\b" + pat;
+    case 5: return "(?m)" + pat + "$";
+    default: return pat;
+    }
+  };
+  if (U(0, 9) == 0) {
+    // A pre-part with gaps in its lengths directly in front of the literal a
+    // scan would be driven from: the shape both the suffix scans and
+    // ReverseInner must refuse (`(?:..)*q`, `(?:..)*=x*`), drawn bare so the
+    // literal is next to it rather than three pieces away.
+    static const char *GQ[] = {"*", "?", "+", "{0,3}", "*", "?"};
+    static const char *LIT[] = {"q", "=", "ly", "z", "e", "-"};
+    std::string pat = std::string(U(0, 2) ? "" : HEAD[U(0, 16)]) + "(?:" +
+                      atom_q() + atom_q() + ")" + GQ[U(0, 5)] + LIT[U(0, 5)];
+    if (U(0, 1)) pat += atom_q(); // ... which makes the literal interior
+    return decorate(pat);
+  }
+  std::string pat = HEAD[U(0, 16)];
+  int k = U(1, 3), cap = U(0, 5) == 0 ? U(0, k - 1) : -1;
+  for (int i = 0; i < k; i++) {
+    if (i && U(0, 2) == 0) pat += MID[U(0, 6)];
+    std::string piece;
+    switch (U(0, 9)) {
+    case 0:
+    case 1:
+      // A repeat whose body is more than one code point: its lengths have
+      // gaps, so a match that starts later can end earlier — the shape the
+      // suffix scans' pre-part gate must refuse, literal prefix or not
+      // (`e(?:..)*q` over "eeqq": the first `q` ends a match from the second
+      // `e`, and the leftmost match is the one from the first). The same
+      // piece, optional and behind a variable-width one, is the shape the
+      // one-walk tables must refuse (`[a-z]{3,}(?:\\w{2}-)?s`), and in front
+      // of an interior literal the one ReverseInner must
+      // (`(?:..)*=x*`).
+      piece = "(?:" + atom_q() + atom_q() + ")" + Q[U(0, 9)];
+      break;
+    case 2: piece = "(?:a|bc)"; break;
+    default: piece = atom_q(); break;
+    }
+    pat += (i == cap) ? "(" + piece + ")" : piece;
+  }
+  pat += TAIL[U(0, 16)];
+  return decorate(pat);
+}
+
+void invariant_fuzz_anchor_choice(int iters) {
+  // The generator's own letters and punctuation, a few bystanders, and a
+  // line break. [0, kPlain) is plain ASCII, one byte each; the three after it
+  // are a CR-LF pair, a non-ASCII letter (the EGC byte path and its fused
+  // tiers) and a letter with a combining mark (a cluster the fused tiers
+  // must bail on).
+  static const char *UNITS[] = {
+      "e", "a", "t", "s",  "q",  "z", "!", "?", "x", "l", "y",  "i",
+      "n", "g", "b", "c",  "h",  " ", " ", ".", ",", "@", "-",  "=",
+      "Z", "1", "\"", "\n", "\r\n", "\xC3\xA9", "e\xCC\x81"};
+  const int kPlain = 28;
+  for (int it = 0; it < iters; it++) {
+    const std::string pat = gen_anchor_choice();
+    // Half of a subject is drawn from the bytes the pattern itself spells
+    // (its head, its tail, what stands between), so the two ends crowd each
+    // other: `e(?:..)*q` needs "eeqq" to tell a leftmost match from a
+    // later-starting one that ends first, and uniform draws produce that
+    // once in a hundred subjects.
+    std::string hot;
+    for (char ch : pat)
+      for (int u = 0; u < kPlain; u++)
+        if (UNITS[u][0] == ch) {
+          hot += ch;
+          break;
+        }
+    // `top` is the last unit index a subject may draw; one unit in `special`
+    // comes from the specials up to it (0: none).
+    auto gen = [&](int units, int top, int special) {
+      std::string subj;
+      for (int i = 0; i < units; i++) {
+        if (special && U(0, special - 1) == 0)
+          subj += UNITS[U(kPlain, top)];
+        else if (!hot.empty() && U(0, 1))
+          subj += hot[static_cast<size_t>(U(0, static_cast<int>(hot.size()) - 1))];
+        else
+          subj += UNITS[U(0, kPlain - 1)];
+      }
+      return subj;
+    };
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 10; s++)
+      subjects.push_back(gen(U(0, 24), 0, 0)); // ASCII, `\n` lines
+    // CR-LF and é, sparse and dense: a CR-LF pair has to land INSIDE a
+    // match for the tiers that count it as one element to differ from the
+    // ones that count two.
+    for (int s = 0; s < 4; s++)
+      subjects.push_back(gen(U(0, 30), kPlain + 1, s < 2 ? 6 : 3));
+    // Past the failed-walk budgets (they are seeded from the subject length,
+    // and a short subject hands the find back to the chain after a couple of
+    // failed candidates): an ASCII one for the ASCII tiers and the word
+    // scan, one with CR-LF and é for the byte tiers, and — one pattern in
+    // eight — one holding a combining mark.
+    subjects.push_back(gen(600, 0, 0));
+    subjects.push_back(gen(600, kPlain + 1, 12));
+    if (it % 8 == 0) subjects.push_back(gen(300, kPlain + 2, 30));
+    check_pattern(pat, subjects);
+
+    // CodePoint: the same choice in front of a different ladder. Single-code-
+    // point clusters and no `\r` (see check_us_vs_pike), so é is the one
+    // special allowed.
+    std::vector<std::string> us_subjects;
+    for (int s = 0; s < 6; s++) {
+      std::string subj = gen(U(0, 24), 0, 0);
+      if (s >= 4) subj.insert(subj.size() / 2, UNITS[kPlain + 1]);
+      us_subjects.push_back(std::move(subj));
+    }
+    {
+      std::string subj = gen(300, 0, 0);
+      us_subjects.push_back(subj + UNITS[kPlain + 1] + gen(300, 0, 0));
+    }
+    check_us_vs_pike(pat, us_subjects);
+  }
+}
+
 // Pure printable-ASCII literal fast-path differential. The literal tier
 // (literal_only_: memmem + O(1) grapheme-boundary check, no subject
 // classification) must agree with the forced Pike on EVERY surface, especially
@@ -1324,6 +1552,9 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A tenth: one 3 KB subject per pattern (and a 4 KB one for every fourth)
   // through the Pike reference.
   invariant_fuzz_us_onewalk(share(inv / 10));
+  // A quarter: some twenty subjects per pattern, two of them 600 units, and
+  // each pattern checked twice (the EGC battery plus the US differential).
+  invariant_fuzz_anchor_choice(share(inv / 4));
 }
 
 int main(int argc, char **argv) {
