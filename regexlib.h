@@ -3881,9 +3881,12 @@ struct Compiler {
 //    an unbounded walk's LAST accept is the exact leftmost-first end (NOT
 //    merely the longest: x(?:ab)?(?:abc)? on "xabc" commits at 3, and the
 //    cut prunes the lower-priority thread that would accept at 4). Only
-//    sound for Alt-free greedy-only programs (onepass_unbounded_ast_ok):
-//    there every Split prefers its lower-pc arm, so priority order IS
-//    ascending pc order — which the sorted entry sets walk below.
+//    sound where priority order IS ascending pc order — which the sorted
+//    entry sets walk below. In an Alt-free greedy-only program
+//    (onepass_unbounded_ast_ok) every Split prefers its lower-pc arm, which
+//    gives that order among threads that forked in the same step;
+//    onepass_cut_ast_ok bars the shapes where threads from different steps
+//    would break it.
 //------------------------------------------------------------------------------
 
 struct CpOnePass {
@@ -4804,7 +4807,8 @@ public:
         // they produced the answer (match or proven no-match); false only on a
         // DFA state-cap, where we fall through to the unfiltered scan.
         if (plan_->suffix_.active()) {
-          if (suffix_search(cache.lfa(*this), cache.rv(*this), text, r))
+          if (suffix_search(cache.lfa(*this), cache.rv(*this), text, r,
+                            /*collapse=*/false))
             return r;
         } else if (plan_->inner_.active()) {
           if (inner_search(cache.lfu(*this), cache.lfa(*this), cache.rv(*this),
@@ -4896,8 +4900,13 @@ public:
       MatchResult r;
       if (plan_->icase_prefix_.active() && icase_prefix_search(cache.blfa(*this), text, r))
         return r;
+      // The byte programs are the COLLAPSED ones on a collapse plan, and the
+      // suffix scan's scalar verifier has to know: it counts bytes, where a
+      // collapsed class counts a CR-LF pair as one element (see
+      // suffix_scalar_verify — `[a-c][^q]{2}q` over "a \r\nq").
       if (plan_->suffix_.active() &&
-          suffix_search(cache.blfa(*this), cache.brv(*this), text, r))
+          suffix_search(cache.blfa(*this), cache.brv(*this), text, r,
+                        plan_->byte_crlf_collapse_))
         return r;
       // ReverseInner is skipped on the CRLF-collapse byte path: inner_.pre_rev
       // is a non-collapsed program (shared with the ASCII / US tiers), so its
@@ -4920,7 +4929,8 @@ public:
     if (plan_->dfa_find_free() && ascii_grapheme_ok(text, fna)) {
       MatchResult r;
       if (plan_->suffix_.active() &&
-          suffix_search(cache.lfa(*this), cache.rv(*this), text, r))
+          suffix_search(cache.lfa(*this), cache.rv(*this), text, r,
+                        /*collapse=*/false))
         return r;
       if (plan_->inner_.active() &&
           inner_search(cache.lfu(*this), cache.lfa(*this), cache.rv(*this),
@@ -6250,9 +6260,9 @@ private:
     // accepts at 5 (one iteration, `.{0,4}` greedy) and again at 7 (a shorter
     // first iteration letting a second run), where leftmost-first is 5. The
     // cut does not save this: it orders threads, and both accepts lie on one
-    // thread's path. A `?` / `{n,n}` repeat is exempt — running at most once,
-    // it cannot re-enter at a new offset (the adjacent-nullable shape
-    // `(x)(?:ab)?(?:abc)?` IS what the cut handles).
+    // thread's path. A `?` / `{n,n}` repeat is exempt from THIS rule — running
+    // at most once, it cannot re-enter at a new offset — and answers to the
+    // second one (onepass_cut_scan).
     //
     // The tiers whose table is built UNCUT neither need this nor may pay for
     // it: `body$` / `^body$` (the accept must land at n, so a longer parse is
@@ -6262,13 +6272,142 @@ private:
     // `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`, whose `{3}` body is
     // variable-width — 613 -> 264 MB/s.
     static bool onepass_cut_ast_ok(const detail::Node &n) {
+      CutScan cs;
+      return onepass_cut_scan(n, cs, /*tail_nullable=*/true);
+    }
+
+    // The second rule the cut needs, about a repeat that can be SKIPPED. The
+    // build explores a state's entries in ascending pc order and truncates at
+    // the first Match, which is the leftmost-first cut only while pc order is
+    // priority order. A thread inside a skippable construct of several
+    // instructions breaks that: a later arrival — one that stayed longer in an
+    // earlier repeat, so the higher-priority thread — skips the construct and
+    // lands at a HIGHER pc than the older, lower-priority thread still inside
+    // it, whose later accept then survives the cut. `[a-z]{3,}(?:\w{2}-)?s`
+    // over "hssys-s": leftmost-first is [0,5) (`hssy`, no group, `s`), and
+    // the thread that left the class after three letters and is two bytes
+    // into the group goes on to accept at 7. Likewise
+    // `x(?:ab)?(?:abc)?[a-z]` over "xabcd" ([0,4), reported [0,5)).
+    //
+    // Such a repeat is admitted in three cases, and refused otherwise:
+    //  - Its body is ONE code-point atom. The late arrival's own enter-child
+    //    then stands at the same pc as the thread inside (a loop), or can
+    //    still do everything it can (the optional copies of a `{m,n}`), so no
+    //    accept is the older thread's alone.
+    //  - It runs at most once and nothing but nullable constructs follows it
+    //    (`tail_nullable`). The late arrival's skip then reaches Match in the
+    //    very closure that brought it to the repeat, from an entry pc below
+    //    the repeat's own instructions — the cut drops the thread inside on
+    //    the spot. This is `x(?:ab)?(?:abc)?`, where the last accept is 3 on
+    //    "xabc". (Not a loop: its exit sits AFTER its body, so the thread
+    //    still inside is the one at the lower pc —
+    //    `a[^.]{0,3}(?:[^q]{2}[^\n]{2})+` reported the longer parse.)
+    //  - Its first bytes are disjoint from every atom between the first
+    //    variable-width construct and itself (`seen`). Two threads reach the
+    //    repeat at different times only if, when the first entered it, the
+    //    other was consuming the same byte somewhere earlier —
+    //    `\d+(?:\.\d+)?x` cannot: no thread reads a `.` as a digit.
+    struct CutScan {
+      bool var_seen = false;          // a variable-width construct lies behind
+      std::array<bool, 128> seen{};   // ASCII atoms since the first one began
+    };
+    static bool onepass_cut_scan(const detail::Node &n, CutScan &cs,
+                                 bool tail_nullable) {
       using K = detail::Node::Kind;
-      if (n.kind == K::Repeat && (n.rmax < 0 || n.rmax > 1) &&
-          !n.kids.empty() && !node_fixed(n.kids[0]))
-        return false;
-      for (const auto &k : n.kids)
-        if (!onepass_cut_ast_ok(k)) return false;
+      if (n.kind == K::Repeat && !n.kids.empty()) {
+        const detail::Node &body = n.kids[0];
+        const bool many = n.rmax < 0 || n.rmax > 1;
+        if (many && !node_fixed(body)) return false;
+        const bool variable = n.rmax < 0 || n.rmax > n.rmin;
+        if (variable && cs.var_seen && !(tail_nullable && !many) &&
+            !one_cp_atom(body)) {
+          std::array<bool, 128> first{};
+          node_first_ascii(body, first);
+          if (!tables_disjoint(first, cs.seen)) return false;
+        }
+        // A body that runs at most once ends where the repeat ends; one that
+        // loops is fixed-width (above) and holds no repeat to ask about.
+        if (!onepass_cut_scan(body, cs, !many && tail_nullable)) return false;
+        if (variable) {
+          cs.var_seen = true;
+          node_ascii_all(body, cs.seen);
+        }
+        return true;
+      }
+      if (n.kids.empty()) {
+        if (cs.var_seen) node_ascii_all(n, cs.seen);
+        return true;
+      }
+      // What follows kid i: the kids after it, then whatever follows `n`.
+      std::vector<char> rest_nullable(n.kids.size(), tail_nullable);
+      for (size_t i = n.kids.size(); i-- > 1;) {
+        std::array<bool, 128> ignored{};
+        rest_nullable[i - 1] =
+            rest_nullable[i] && node_first_ascii(n.kids[i], ignored);
+      }
+      for (size_t i = 0; i < n.kids.size(); i++)
+        if (!onepass_cut_scan(n.kids[i], cs, rest_nullable[i])) return false;
       return true;
+    }
+
+    // The ASCII bytes one atom can consume, either case of a letter included
+    // (a superset under any flags, which is the safe direction for the two
+    // set builders below).
+    static void atom_ascii(const detail::Node &n, char32_t cp,
+                           std::array<bool, 128> &out) {
+      using K = detail::Node::Kind;
+      if (n.kind == K::AnyChar) {
+        out.fill(true);
+      } else if (n.kind == K::Class) {
+        for (int b = 0; b < 128; b++)
+          if (n.cls.matches_cp(static_cast<char32_t>(b), false) ||
+              n.cls.matches_cp(static_cast<char32_t>(b), true))
+            out[static_cast<size_t>(b)] = true;
+      } else if (n.kind == K::Lit && cp < 0x80) {
+        const unsigned char c = static_cast<unsigned char>(cp);
+        out[c] = out[ascii_tolower(c)] = out[ascii_toupper(c)] = true;
+      }
+    }
+    // Every ASCII byte some atom under `n` can consume.
+    static void node_ascii_all(const detail::Node &n,
+                               std::array<bool, 128> &out) {
+      using K = detail::Node::Kind;
+      if (n.kind == K::Lit)
+        for (char32_t cp : n.lit) atom_ascii(n, cp, out);
+      else
+        atom_ascii(n, 0, out);
+      for (const auto &k : n.kids) node_ascii_all(k, out);
+    }
+    // The ASCII bytes a match of `n` can BEGIN with; returns whether `n` can
+    // match empty (the caller then looks past it).
+    static bool node_first_ascii(const detail::Node &n,
+                                 std::array<bool, 128> &out) {
+      using K = detail::Node::Kind;
+      switch (n.kind) {
+      case K::Lit:
+        if (n.lit.empty()) return true;
+        atom_ascii(n, n.lit[0], out);
+        return false;
+      case K::AnyChar:
+      case K::Class:
+        atom_ascii(n, 0, out);
+        return false;
+      case K::Repeat:
+        return n.kids.empty() || node_first_ascii(n.kids[0], out) ||
+               n.rmin == 0;
+      case K::Concat:
+      case K::Group:
+        for (const auto &k : n.kids)
+          if (!node_first_ascii(k, out)) return false;
+        return true;
+      case K::Alt: {
+        bool nullable = false;
+        for (const auto &k : n.kids)
+          if (node_first_ascii(k, out)) nullable = true;
+        return nullable;
+      }
+      default: return true; // Empty / zero-width
+      }
     }
 
     // See onepass_unbounded_: no Alt anywhere, every Repeat greedy, and no
@@ -7224,6 +7363,35 @@ private:
       // dense (the access-log pattern regressed 13%); a one-atom pre keeps the
       // reverse scan short and the memmem gap-skip dominant.
       if (ncap_ != 0 && best_lo != 1) return;
+      // If the pre part cannot consume the literal's first byte, it can never
+      // extend across the literal, so the reverse-pre floor is the exact start.
+      bool nonabsorbing = true;
+      for (int k = 0; k < best_lo; k++)
+        if (node_can_consume_byte(root.kids[static_cast<size_t>(k)],
+                                  static_cast<unsigned char>(best[0]))) {
+          nonabsorbing = false;
+          break;
+        }
+      // A pre that CAN absorb the literal puts occurrences inside a match's
+      // own pre part, and inner_find takes the floor of the first occurrence
+      // whose reverse(pre) succeeds. That floor is at or left of the leftmost
+      // match's start only if `pre . literal` is a pattern the suffix scan
+      // could drive — the same lemma, so the same gate as pre_step1_ok. A pre
+      // with gaps in its lengths fails it: `(?:..)*=x*` over "a==" has its
+      // leftmost match at [0,3) (`a=` absorbed, the second `=` the literal),
+      // and reverse(pre) from the FIRST `=` succeeds with the empty pre, floor
+      // 1 — the scan from there reported [1,2). (Capture wrappers are peeled:
+      // the gate is about the language, and a capture pre is one group.)
+      if (!nonabsorbing) {
+        for (int k = 0; k < best_lo; k++) {
+          const detail::Node *kid = &root.kids[static_cast<size_t>(k)];
+          while ((kid->kind == K::Group || kid->kind == K::Concat) &&
+                 kid->kids.size() == 1)
+            kid = &kid->kids[0];
+          if (node_fixed(*kid)) continue;
+          if (!(kid->kind == K::Repeat && one_cp_atom(kid->kids[0]))) return;
+        }
+      }
       // Split: pre = kids[0, best_lo). Build its reverse byte program (the post
       // part is not needed — the end comes from the full forward DFA in
       // inner_find).
@@ -7236,10 +7404,7 @@ private:
       inner_.pre_rev.prog = detail::Compiler::compile(
           detail::reverse_ast(pre), /*ncap=*/0, /*us=*/true, /*reverse=*/true,
           dotall_, /*cp=*/false, /*icase=*/false);
-      // If the pre part cannot consume the literal's first byte, it can never
-      // extend across the literal, so the reverse-pre floor is the exact start.
-      inner_.pre_nonabsorbing =
-          !node_can_consume_byte(pre, static_cast<unsigned char>(best[0]));
+      inner_.pre_nonabsorbing = nonabsorbing;
       inner_.lit = std::move(best);
       set_probes(inner_.lit, inner_.probe, inner_.probe2);
     }
@@ -7543,6 +7708,76 @@ private:
       return true;
     }
 
+    // crlf_byte_safe judges each consumer of `\r` / `\n` on its own, and one
+    // shape passes it that is safe only alone: the CR-LF RUN, an unbounded
+    // greedy repeat (rmin <= 1) of a bare class / `.` matching both bytes. A
+    // cluster inside one run is two of its iterations or one, which no count
+    // can tell apart. Between TWO runs it is a boundary the grapheme engine
+    // does not have: the byte programs can end the first run on the `\r` and
+    // begin the second on the `\n`. `t[^.]+[^q]+\.` then matches "t\r\n."
+    // (one cluster cannot feed two `+`), and `([^.]*)[^.]+,` over "Z\r\n,"
+    // closes its group between the two bytes. So two runs must never be
+    // adjacent — directly, or across elements that can match empty.
+    //
+    // crlf_run_ends reports whether a match of `n` can begin / end inside a
+    // run (and whether `n` can match empty), and sets `split` where two runs
+    // meet.
+    struct CrlfRunEnds {
+      bool nullable = false, first = false, last = false;
+    };
+    CrlfRunEnds crlf_run_ends(const detail::Node &n, bool &split) const {
+      using K = detail::Node::Kind;
+      CrlfRunEnds e;
+      switch (n.kind) {
+      case K::Lit: e.nullable = n.lit.empty(); return e;
+      case K::Class:
+      case K::AnyChar: return e;
+      case K::Repeat: {
+        const detail::Node &body = n.kids[0];
+        const bool both =
+            body.kind == K::Class
+                ? body.cls.matches_cp(U'\r', icase_) &&
+                      body.cls.matches_cp(U'\n', icase_)
+                : body.kind == K::AnyChar && dotall_;
+        if (both && n.rmax == -1 && n.greedy && n.rmin <= 1) {
+          e.first = e.last = true;
+          e.nullable = n.rmin == 0;
+          return e;
+        }
+        e = crlf_run_ends(body, split);
+        // Two iterations put the body's last run against its first.
+        if ((n.rmax < 0 || n.rmax > 1) && e.first && e.last) split = true;
+        e.nullable = e.nullable || n.rmin == 0;
+        return e;
+      }
+      case K::Concat:
+      case K::Group: {
+        e.nullable = true;
+        bool open = false; // what has been read so far can end inside a run
+        for (const auto &k : n.kids) {
+          const CrlfRunEnds x = crlf_run_ends(k, split);
+          if (open && x.first) split = true;
+          if (e.nullable && x.first) e.first = true;
+          open = x.last || (x.nullable && open);
+          e.nullable = e.nullable && x.nullable;
+        }
+        e.last = open;
+        return e;
+      }
+      case K::Alt:
+        for (const auto &k : n.kids) {
+          const CrlfRunEnds x = crlf_run_ends(k, split);
+          e.nullable = e.nullable || x.nullable;
+          e.first = e.first || x.first;
+          e.last = e.last || x.last;
+        }
+        return e;
+      default: // zero-width: an assertion or a lookaround consumes nothing
+        e.nullable = true;
+        return e;
+      }
+    }
+
     // Can NO element of `n` consume a `\r` or a `\n`? Then no match can touch
     // the interior of a CR-LF cluster, which is what lets a multiline anchor
     // keep CRLF byte safety above. A literal `\r\n` PAIR is deliberately not
@@ -7632,6 +7867,11 @@ private:
       // for the extra walk.
       crlf_inert_ = multiline_ && crlf_inert(root);
       crlf_byte_safe_ = crlf_byte_safe(root, false, /*inside_repeat=*/false);
+      if (crlf_byte_safe_) {
+        bool split = false;
+        crlf_run_ends(root, split);
+        crlf_byte_safe_ = !split;
+      }
       crlf_fused_lit_ = has_crlf_literal(root);
     }
 
@@ -9654,12 +9894,15 @@ private:
   // right=context. Multiline ^/$ fire on any line-break code point, EXCEPT the
   // interior of a CR-LF cluster: on a non-ASCII subject detail::segment() fuses
   // CR-LF into one grapheme, so the boundary between the \r and the \n
-  // begins/ends no grapheme.
+  // begins/ends no grapheme. That is a GRAPHEME rule. In CodePoint mode a
+  // CR-LF is two characters and the boundary between them is a line end and a
+  // line start like any other — the byte assert tier serves both units, and
+  // applied the exception to both (`(?m)$` over "a\r\nb" skipped offset 2).
   REGEXLIB_ALWAYS_INLINE int bflags(bool l_start, bool l_word, bool l_lb,
                                     bool l_cr, bool r_end, bool r_word,
                                     bool r_lb, bool r_lf) const {
-    bool crlf_interior =
-        l_cr && r_lf; // left \r, right \n: one cluster's interior
+    bool crlf_interior = l_cr && r_lf &&
+                         !plan_->us_; // left \r, right \n: one cluster's interior
     int f = (l_word != r_word) ? kWB : kNWB;
     if (l_start)
       f |= kBOT | kBOL;
@@ -12306,7 +12549,7 @@ private:
   }
 
   int suffix_find(LazyDfa &fwd, LazyDfa &rv, std::string_view text, int from,
-                  int &s_out, WalkBudget &budget) const {
+                  int &s_out, WalkBudget &budget, bool collapse) const {
     const auto &sf = plan_->suffix_;
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -12332,8 +12575,8 @@ private:
         lpos = static_cast<int>(h - p);
       }
       int s, e, reach, next;
-      int r = suffix_candidate(fwd, rv, text, lpos, from, /*collapse=*/false,
-                               budget, s, e, reach, next);
+      int r = suffix_candidate(fwd, rv, text, lpos, from, collapse, budget, s,
+                               e, reach, next);
       if (r == LazyDfa::kCap || r == kWalkBail) return r;
       if (r == 1) {
         s_out = s;
@@ -12348,11 +12591,11 @@ private:
   // suffix_find. Returns true if it ran to completion; false on a DFA state-cap
   // (the caller clears `spans` and falls back to the full scan / Pike).
   bool suffix_fill(std::string_view text, LazyDfa &fwd, LazyDfa &rv,
-                   std::vector<uint32_t> &spans) const {
+                   std::vector<uint32_t> &spans, bool collapse) const {
     int from = 0, s = -1;
     WalkBudget budget(text.size()); // failed-verify allowance for the loop
     for (;;) {
-      int e = suffix_find(fwd, rv, text, from, s, budget);
+      int e = suffix_find(fwd, rv, text, from, s, budget, collapse);
       if (e == LazyDfa::kCap || e == kWalkBail) return false;
       if (e < 0) return true;
       push_span(spans, s, e);
@@ -12363,10 +12606,10 @@ private:
   // First suffix-prefiltered match (from offset 0) into `out`. Returns false on a
   // DFA state-cap (caller falls back); true with an empty MatchResult on no match.
   bool suffix_search(LazyDfa &fwd, LazyDfa &rv, std::string_view text,
-                     MatchResult &out) const {
+                     MatchResult &out, bool collapse) const {
     int s = -1;
     WalkBudget budget(text.size());
-    int e = suffix_find(fwd, rv, text, 0, s, budget);
+    int e = suffix_find(fwd, rv, text, 0, s, budget, collapse);
     if (e == LazyDfa::kCap || e == kWalkBail) return false;
     out = (e < 0) ? MatchResult{} : build_dfa_result(text, s, e);
     return true;
@@ -15152,7 +15395,9 @@ inline void Regex::fill_rows(std::string_view bytes, FindCache *cache,
       // EGC's ASCII path uses; see suffix_fill / inner_fill). false = state cap,
       // clear and fall through to the full scan below.
       if (plan_->suffix_.active()) {
-        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_)) return;
+        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_,
+                        /*collapse=*/false))
+          return;
         out.spans_.clear();
       } else if (plan_->inner_.active()) {
         if (inner_fill(bytes, lfu, c.lfa(*this), rv, c.inrev(*this), out.spans_))
@@ -15293,7 +15538,9 @@ inline void Regex::fill_rows(std::string_view bytes, FindCache *cache,
     // candidate by a reverse byte-DFA scan (see suffix_find). blfa = anchored
     // forward DFA for the variable-length re-expansion.
     if (plan_->suffix_.active()) {
-      if (suffix_fill(bytes, c.blfa(*this), rv, out.spans_)) return;
+      if (suffix_fill(bytes, c.blfa(*this), rv, out.spans_,
+                      plan_->byte_crlf_collapse_))
+        return;
       out.spans_.clear(); // cap — fall through to the full DFA loop / Pike
     }
     // ReverseInner prefilter: memmem the rare interior literal, recover each
@@ -15336,7 +15583,9 @@ inline void Regex::fill_rows(std::string_view bytes, FindCache *cache,
       // (byte == code point on ASCII), so the same suffix scan applies. lfa =
       // anchored forward DFA for the variable-length re-expansion.
       if (plan_->suffix_.active()) {
-        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_)) return;
+        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_,
+                        /*collapse=*/false))
+          return;
         out.spans_.clear();
       }
       // ReverseInner (ASCII tier): the inner pre program is a UTF-8 byte program,
@@ -15930,8 +16179,10 @@ inline void Regex::MatchIter::step(bool &chain_once) {
         int s2 = -1;
         LazyDfa &fwd_anchored =
             (fwd_kind_ == kBlfu) ? cache_->blfa(*re_) : cache_->lfa(*re_);
-        int e2 = re_->suffix_find(fwd_anchored, dfa(rev_kind_), text_, pos_,
-                                  s2, walk_budget_);
+        int e2 = re_->suffix_find(
+            fwd_anchored, dfa(rev_kind_), text_, pos_, s2, walk_budget_,
+            /*collapse=*/fwd_kind_ == kBlfu &&
+                re_->plan_->byte_crlf_collapse_);
         if (e2 == Regex::kWalkBail) {
           suffix_off_ = true; // budget hit -> the generic DFA scan below
           break;

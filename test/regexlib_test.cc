@@ -243,6 +243,56 @@ void test_assert_us_unified() {
   CHECK(make_us(R"(\.([\w]+)$)").search("dir.naïve").group(1).str() ==
         make_egc(R"(\.([\w]+)$)").search("dir.naïve").group(1).str());
 
+  // Multiline anchors and CR-LF, where the two units part by definition: to
+  // the grapheme engine the pair is one cluster and one line break, with no
+  // position inside it; in CodePoint mode it is two characters, and the
+  // position between them ends one (empty) line and starts the next. The byte
+  // assert tier serves both units and kept the grapheme rule for both, so
+  // CodePoint `(?m)$` over "a\r\nb" skipped offset 2 — on the released
+  // engine, and unseen: the `(?:\b|\B)` reference ran the same tier. The
+  // spans are asserted outright, and against a lookahead-forced Pike.
+  {
+    using V = std::vector<std::pair<size_t, size_t>>;
+    auto spans = [](const Regex &re, const std::string &subj) {
+      V v;
+      for (auto &m : find_all(re, subj)) v.emplace_back(m.begin(), m.end());
+      return v;
+    };
+    auto iter_spans = [](const Regex &re, const std::string &subj) {
+      V v;
+      for (auto m : re.find_iter(subj)) v.emplace_back(m.begin(), m.end());
+      return v;
+    };
+    const std::string e = "\xc3\xa9";
+    struct { const char *pat; std::string subj; V us, egc; } cases[] = {
+        {"$", "a\r\nb", {{1, 1}, {2, 2}, {4, 4}}, {{1, 1}, {4, 4}}},
+        {"^", "a\r\nb", {{0, 0}, {2, 2}, {3, 3}}, {{0, 0}, {3, 3}}},
+        {"$", e + "a\r\nb", {{3, 3}, {4, 4}, {6, 6}}, {{3, 3}, {6, 6}}},
+        {"^", e + "a\r\nb", {{0, 0}, {4, 4}, {5, 5}}, {{0, 0}, {5, 5}}},
+        {"^\\w?", "\r\nb1", {{0, 0}, {1, 1}, {2, 3}}, {{0, 0}, {2, 3}}},
+        {"\\w*$", "ab\r\n", {{0, 2}, {2, 2}, {3, 3}, {4, 4}},
+         {{0, 2}, {2, 2}, {4, 4}}},
+        // A lone CR and a lone LF are line breaks in both units.
+        {"^", "a\rb\nc", {{0, 0}, {2, 2}, {4, 4}}, {{0, 0}, {2, 2}, {4, 4}}},
+        {"$", "a\rb\nc", {{1, 1}, {3, 3}, {5, 5}}, {{1, 1}, {3, 3}, {5, 5}}},
+    };
+    const std::string la = ")(?=[\\s\\S]|$)";
+    for (auto &c : cases) {
+      Regex us = make_us(c.pat, reg::Multiline);
+      Regex egc = make_egc(c.pat, reg::Multiline);
+      CHECK(spans(us, c.subj) == c.us);
+      CHECK(iter_spans(us, c.subj) == c.us);
+      CHECK(spans(egc, c.subj) == c.egc);
+      CHECK(iter_spans(egc, c.subj) == c.egc);
+      CHECK(spans(make_us("(?:" + std::string(c.pat) + la, reg::Multiline),
+                  c.subj) == c.us);
+      CHECK(spans(make_egc("(?:" + std::string(c.pat) + la, reg::Multiline),
+                  c.subj) == c.egc);
+      CHECK(us.test(c.subj) == !c.us.empty());
+      CHECK(us.search(c.subj).begin() == c.us[0].first);
+    }
+  }
+
   // One-pass capture resolution over a boundary-assert-stripped program: a
   // leading/trailing anchor is zero-width on the located span, so `\.([a-z]+)$`
   // / `^(\w+)` / `(\d{3})$` resolve groups in one forward pass. The captures
@@ -1593,6 +1643,70 @@ void test_crlf_byte_path() {
   CHECK(same_la("a\xcc\x81\r\nb\xd8\x80\r\n", "\\r\\n"));
 }
 
+// Two CR-LF RUNS side by side (an unbounded greedy class repeat that matches
+// both `\r` and `\n` is the one consumer the byte tiers let touch a CR-LF
+// pair): a byte program can end the first on the `\r` and begin the second on
+// the `\n`, a boundary the grapheme engine does not have. Such a pattern is
+// not CRLF-byte-safe. All of these were wrong on the released engine — a
+// match that needs the pair twice, a group that closes inside it — on ASCII
+// subjects too, where a `(?:\b|\B)` reference runs on an assert tier behind
+// the same gate; the reference here is a lookahead, which nothing but the
+// Pike serves, and the spans are asserted outright.
+void test_crlf_adjacent_runs() {
+  using Row = std::vector<std::pair<long, long>>; // every group of every match
+  auto rows = [](const Regex &re, const std::string &subj) {
+    Row v;
+    for (auto &m : find_all(re, subj))
+      for (size_t g = 0; g <= m.group_count(); g++) {
+        auto c = m.group(g);
+        v.emplace_back(c.matched() ? static_cast<long>(c.begin()) : -1,
+                       c.matched() ? static_cast<long>(c.end()) : -1);
+      }
+    return v;
+  };
+  auto iter_rows = [](const Regex &re, const std::string &subj) {
+    Row v;
+    for (auto m : re.find_iter(subj))
+      for (size_t g = 0; g <= m.group_count(); g++) {
+        auto c = m.group(g);
+        v.emplace_back(c.matched() ? static_cast<long>(c.begin()) : -1,
+                       c.matched() ? static_cast<long>(c.end()) : -1);
+      }
+    return v;
+  };
+  const std::string e = "\xc3\xa9"; // é: the non-ASCII byte tiers
+  struct { const char *pat; std::string subj; Row want; } cases[] = {
+      // One cluster cannot feed two `+` (was [0,4) on both subjects).
+      {"t[^.]+[^q]+\\.", "t\r\n.", {}},
+      {"t[^.]+[^q]+\\.", "t\r\n." + e, {}},
+      {"t([^.]+)[^q]+\\.", "t\r\n." + e, {}},
+      {"t[^.]+[^q]+\\.", "t\r\n\r\n.", {{0, 6}}},
+      // The group closes on a cluster boundary (was [1,2) / [3,4)).
+      {"[A-Z]([^.]*)[^.]+,", "Z\r\n,", {{0, 4}, {1, 1}}},
+      {"[A-Z]([^.]*)[^.]+,", e + "Z\r\n,", {{2, 6}, {3, 3}}},
+      {"s\\s+(\\s+)[^.]*q", "s \r\n\r\nq " + e, {{0, 7}, {4, 6}}},
+      {"([^.]*)\\s+\\.", "a\r\n. b \r\n.", {{0, 4}, {0, 1}, {4, 10}, {4, 7}}},
+      // Across an element that can match empty.
+      {"t[^.]+x?[^q]+\\.", "t\r\n.", {}},
+      // A single run is still byte-safe, and still right.
+      {"t[^.]+x", "t\r\nx t\r\n\r\nx", {{0, 11}}},
+      {"\\w+(\\s+)Holmes", "a\r\n\r\nHolmes", {{0, 11}, {1, 5}}},
+  };
+  for (auto &c : cases) {
+    Regex re(c.pat);
+    Regex pike(std::string("(?:") + c.pat + ")(?=[\\s\\S]|$)");
+    CHECK(rows(re, c.subj) == c.want);
+    CHECK(iter_rows(re, c.subj) == c.want);
+    CHECK(rows(pike, c.subj) == c.want);
+    auto m = re.search(c.subj);
+    CHECK(m.matched() == !c.want.empty());
+    if (m.matched() && !c.want.empty())
+      CHECK(static_cast<long>(m.begin()) == c.want[0].first &&
+            static_cast<long>(m.end()) == c.want[0].second);
+    CHECK(re.test(c.subj) == !c.want.empty());
+  }
+}
+
 // Required-suffix-literal prefilter: a pattern that begins with a class/`.` (no
 // literal prefix to skip on) but ends with a fixed ASCII literal after a
 // fixed-length body is found by memmem-ing the rare suffix and reverse-DFA
@@ -1683,6 +1797,29 @@ void test_suffix_prefilter() {
   // equal to the Pike.
   CHECK(ok(ascii, "fox[a-z]{2}"));      // literal prefix -> prefix path
   CHECK(ok(acrlf, "the[^z]{0,9}zone")); // literal prefix -> prefix path
+  // search() on a CRLF-collapse plan: its suffix rung runs the COLLAPSED byte
+  // programs, whose classes count a CR-LF pair as one element, and the scalar
+  // verifier counted bytes — so a pair inside the fixed-width body shifted
+  // the start (or lost the match), in search() alone: find_all and find_iter
+  // take the fused tier, which told the verifier. Wrong on the released
+  // engine (`none` and `[2,5)`).
+  {
+    auto first = [](const char *pat, const std::string &subj) {
+      auto m = Regex(pat).search(subj);
+      return m.matched() ? std::make_pair(m.begin(), m.end())
+                         : std::make_pair(size_t(0), size_t(0));
+    };
+    CHECK(first("[a-c][^q]{2}q", "a\r\naa \r\nq") == std::make_pair(size_t(4), size_t(9)));
+    CHECK(first("[^.]{2}\\.", "\r\n\r\n.@") == std::make_pair(size_t(0), size_t(5)));
+    CHECK(first("[^.]{2}\\.", "\xc3\xa9 \r\n\r\n.") ==
+          std::make_pair(size_t(3), size_t(8)));
+    for (const char *pat : {"[a-c][^q]{2}q", "[^.]{2}\\.", "[^z]{3}x",
+                            "[a-q][^u-z]{3}x", "e[^q]{2}q"})
+      for (const std::string &subj :
+           {std::string("a\r\naa \r\nq e\r\n\r\nq x\r\n.\r\n\r\n.ab\r\nx"),
+            std::string("\xc3\xb1 a \r\nq\r\n\r\n.e \r\nq ab\r\n\r\nx")})
+        CHECK(ok(subj, pat));
+  }
 }
 
 // ReverseInner prefilter (rure): a rare literal strictly inside a class-led /
@@ -1730,6 +1867,31 @@ void test_inner_prefilter() {
     CHECK(ok(s, ".{2,}t"));              // `.` greedy + 't' (recurs in the text)
     CHECK(ok(s, ".{2,}at[a-z]*"));       // absorbable interior + greedy tail
     CHECK(ok(s, "[a-z]{2,}o[a-z]+"));    // interior 'o' inside greedy classes
+  }
+  // A pre that can absorb the literal AND has gaps in its lengths (a repeat
+  // of more than one code point, an optional group): an absorbed occurrence's
+  // reverse(pre) can succeed from a floor RIGHT of the leftmost match's start
+  // — with the empty pre, here — and the scan from that floor never sees the
+  // match. Such a pre is not driven from its interior literal. Both were
+  // wrong on the released engine (`[1,2) [2,3)` and `[1,4)`).
+  {
+    auto spans = [](const Regex &re, const std::string &subj) {
+      std::vector<std::pair<size_t, size_t>> v;
+      for (auto &m : find_all(re, subj)) v.emplace_back(m.begin(), m.end());
+      return v;
+    };
+    using V = std::vector<std::pair<size_t, size_t>>;
+    CHECK(spans(Regex("(?:..)*=x*"), "a==") == (V{{0, 3}}));
+    CHECK(spans(make_us("(?:..)*=x*"), "a==") == (V{{0, 3}}));
+    CHECK(spans(Regex("(?:[^\\n]+[a-z]{1,2})?=(e{0,3})"), "@=n=") ==
+          (V{{0, 4}}));
+    CHECK(Regex("(?:..)*=x*").search("a==").end() == 3);
+    for (const std::string &s : {ascii, acrlf, nonascii}) {
+      CHECK(ok(s, "(?:..)*@x*"));              // multi-code-point repeat pre
+      CHECK(ok(s, "(?:[^\\n]+[a-z]{1,2})?-(c?)")); // optional group pre
+      CHECK(ok(s, "(?:.[a-z])*-[a-z]"));
+      CHECK(ok(s, ".{2,}-c\\d?"));             // step-1 pre: still driven
+    }
   }
 }
 
@@ -2486,6 +2648,49 @@ void test_onepass_leftmost_first() {
         CHECK(!all.empty() && all[0].begin() == c.b && all[0].end() == c.e);
       }
     }
+    // A repeat that can be SKIPPED, of several instructions, behind a
+    // variable-width one: a thread that left the earlier repeat sooner sits
+    // inside it at a LOWER pc than the higher-priority thread that stayed,
+    // skipped it and moved on, so the cut (which walks entries in pc order)
+    // keeps it, and its later accept wins. All three were wrong on the
+    // released engine, on every find surface, and agreed with one another —
+    // the spans are asserted outright.
+    {
+      struct { const char *pat, *subj; size_t b, e; } skip[] = {
+          {R"([a-z]{3,}(?:\w{2}-)?s)", "hssys-s", 0, 5},          // was [0,7)
+          {R"(s[a-z]{3,}(?:\w{2}[^\n]*)?s)", "shssys-s", 0, 6},   // was [0,8)
+          {R"(x(?:ab)?(?:abc)?[a-z])", "xabcd", 0, 4},            // was [0,5)
+          {R"(\bx(?:ab)?(?:abc)?[a-z])", "xabcd", 0, 4},          // WordOnePass
+          {R"(^x(?:ab)?(?:abc)?[a-z])", "xabcd", 0, 4},           // AnchoredOnePass
+          // Still admitted, and still right: nothing but nullable constructs
+          // follows the repeat, or no earlier atom can read its first byte.
+          {R"(x(?:ab)?(?:abc)?)", "xabc", 0, 3},
+          {R"([a-z]+(?:ing)?)", "singing ", 0, 7},
+          {R"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?x)", "3.14e-10x", 0, 9},
+          {R"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?x)", "3.1x", 0, 4},
+      };
+      for (auto &c : skip)
+        for (int us = 0; us < 2; us++)
+          for (int padded = 0; padded < 2; padded++) {
+            Regex re = us ? make_us(c.pat) : make_egc(c.pat);
+            // Padded past the walk budget, as above: on a short subject a
+            // couple of failed candidates hand the find to the chain. (Not
+            // for the `^` row: the pad would move the only candidate.)
+            if (padded && c.pat[0] == '^') continue;
+            const std::string subj =
+                std::string(c.subj) + (padded ? "\n" + pad : "");
+            auto m = re.search(subj);
+            CHECK(m.matched() && m.begin() == c.b && m.end() == c.e);
+            auto all = find_all(re, subj);
+            CHECK(!all.empty() && all[0].begin() == c.b &&
+                  all[0].end() == c.e);
+            size_t k = 0;
+            for (auto it : re.find_iter(subj)) {
+              if (k++ == 0) CHECK(it.begin() == c.b && it.end() == c.e);
+            }
+            CHECK(k == all.size());
+          }
+    }
     // Fixed-width bodies stay admitted (the wins this guard must not undo).
     CHECK(make_us(R"([A-Za-z_]\w*)").search("  getElementById").end() == 16);
     CHECK(make_us(R"(//[^\n]*)").search("x // c").end() == 6);
@@ -3106,6 +3311,7 @@ int main() {
   test_grapheme_aware();
   test_find_at();
   test_crlf_byte_path();
+  test_crlf_adjacent_runs();
   test_suffix_prefilter();
   test_inner_prefilter();
   test_assert_literal_prefilter();

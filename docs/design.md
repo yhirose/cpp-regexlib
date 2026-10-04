@@ -559,7 +559,12 @@ Together with the §7 prefilters this took `/Sherlock/` from ~24 to ~13000 MB/s.
 
 ### `crlf_collapse` — bounded `\r\n`-class repeats
 
-`crlf_byte_safe` admits a both-`\r\n` class only as an *unbounded-greedy* atom; a
+`crlf_byte_safe` admits a both-`\r\n` class only as an *unbounded-greedy* atom
+(a CR-LF *run*), and only one at a time: two runs side by side — directly, or
+across elements that can match empty — give the byte programs a boundary
+*inside* a pair that the grapheme engine does not have (`crlf_run_ends`;
+`t[^.]+[^q]+\.` matched `t\r\n.`, and `([^.]*)[^.]+,` closed its group between
+the two bytes), so such a pattern is not byte-safe either. A
 **bounded or lazy** repeat (`[^"']{0,30}`, `[^u-z]{13}`) counts a CR-LF as one
 cluster but two bytes and is rejected — exactly the patterns that lost worst on
 the (CRLF) Sherlock corpus (`["'][^"']{0,30}[?!.]["']` at ~15 MB/s). For a
@@ -591,7 +596,10 @@ window (`crlf_pairs_ok_window` — the DFA reverse scan reports its examined
 floor, the forward re-expansion its reach, and the window is widened one byte
 so a pair straddling its edge is judged by its real neighbor). Gaps between
 candidates can hold lone CR/LF harmlessly, the gap scan stays on the cheap
-plain predicate, and the subject is read once. A disqualifying window (a lone
+plain predicate, and the subject is read once. (Every suffix rung that runs
+the collapsed programs passes `collapse` to the candidate verify, the gated
+one in `search()` included: the scalar verifier counts bytes and must leave a
+candidate whose walk meets a CR or LF to the DFA.) A disqualifying window (a lone
 CR/LF — i.e. ordinary Unix-newline text — near a match) or a fusing cluster
 bails to the non-fused ladder; the iterator re-primes it (`reprime_unfused`)
 rather than downgrading to the Pike, so plain LF text still lands on the ASCII
@@ -606,7 +614,12 @@ it (exact ends, no forward re-expansion past the vetted window). Took
 `\b`/`^$`/`\A\z` patterns are `dfa_assert_ok_` (not `dfa_ok_`), served by an
 assertion-aware DFA. The same EGC-byte-path idea is built for them: a
 code-point-aware `ByteAssertDfa` runs a non-ASCII subject through the assert DFA,
-reusing the `crlf_byte_safe_` / `can_match_empty_` gate.
+reusing the `crlf_byte_safe_` / `can_match_empty_` gate. The same DFA serves
+CodePoint mode on any subject, and one of its rules is the grapheme engine's
+alone: a multiline `^` / `$` does not fire *between* the `\r` and the `\n` of a
+CR-LF (the pair is one cluster, with no position inside). In CodePoint mode the
+pair is two characters and that position ends one line and starts the next, so
+the exception is keyed on the unit (`bflags`).
 
 ### What stays on the grapheme Pike
 
@@ -689,7 +702,15 @@ accept from a fixed start *is* the leftmost-first end (greediness alone is
 not enough: adjacent nullable repeats like `x(?:ab)?(?:abc)?` commit before
 the longest accept) and no capture slot is written after the final accepting
 position — so, given the match START from a candidate source, ONE unbounded
-one-pass walk yields the end and every capture. Two candidate
+one-pass walk yields the end and every capture. The cut prunes in pc order,
+which is priority order only among threads that forked in the same step, so
+two shapes are barred (`onepass_cut_ast_ok`): a repeat that can run more than
+once over a variable-width body (both accepts lie on one thread's path), and
+a skippable repeat of several instructions that threads can reach at
+different times with something required after it — the earlier, lower-priority
+arrival sits inside it at a *lower* pc than the later one that skipped it
+(`[a-z]{3,}(?:\w{2}-)?s` over `hssys-s` reported `[0,7)` for `[0,5)`). Two
+candidate
 sources drive it on the ASCII tier: a required ASCII literal prefix
 (`\{\{\s*(\w+)\s*\}\}`, `/users/(\d+)`; every match begins with it, so the
 first completing candidate is leftmost) and a non-absorbing ReverseInner
@@ -925,7 +946,12 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   Same **seed-not-answer** discipline as the suffix scan: the end is retaken by a
   full forward pass from the floor, because a greedy prefix can swallow the interior
   literal (`.{2,}c\d?`) and reading the span off the literal would be wrong (the
-  inner analogue of the *singing* bug — the fuzzer caught it). Lifted
+  inner analogue of the *singing* bug — the fuzzer caught it). A pre that can
+  absorb the literal must also be step-1 prefix-closed, the suffix scan's own
+  gate (`analyze_byte_inner`): the floor comes from the *first* occurrence whose
+  reverse(pre) succeeds, and with gaps in the pre's lengths that occurrence
+  can be an absorbed one with a floor right of the leftmost match —
+  `(?:..)*=x*` over `a==` took `[1,2)` over `[0,3)`. Lifted
   `\w+ Holmes \w+` ~386 → ~10300 MB/s, `\w+@\w+` ~275 → ~21400. (An interior-gap
   literal *alternation*, `Holmes.{0,25}Watson`, is left to Teddy, which already
   fires.) Capture patterns are admitted too — the prefilter only *locates* the
