@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <string>
 
 #include "regexlib.h"
@@ -55,14 +56,46 @@ struct PlanProbe {
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
-  // Served by the Pike VM and by nothing else (no literal, DFA or assert
-  // tier planned): what a reference Regex has to be.
+  // Served by the Pike VM and by nothing else — no literal, DFA or assert
+  // tier planned, and none of the Pike rung's own accelerators either (the
+  // start filters, the bounded backtracker): what a reference Regex has to
+  // be.
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
-           !p.aop_.ok && !p.wop_.ok;
+           !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
+           !p.first_bytes_.ok && !p.cap_bitstate_;
+  }
+  // The rung a scan starts on, for a caller that wants matches (`test`
+  // false) or only whether there is one. One letter per rung:
+  //   L literal   A literal alternation   a assert-literal anchor
+  //   ^ the walk from 0   ? the subject decides
+  //   i (?i) prefix   S suffix   I interior literal   W the walk
+  //   C the chain   c the assert chain   B the boolean scan   P the Pike
+  //   F / f the fused prefix / suffix scans (never a start: the subject
+  //   has to be looked at first)
+  static char start(const Regex &re, bool test) {
+    using R = Regex::Rung;
+    switch (re.plan_->start_[test ? 1 : 0].rung) {
+    case R::Literal: return 'L';
+    case R::LiteralAlt: return 'A';
+    case R::AssertAnchor: return 'a';
+    case R::TextAnchor: return '^';
+    case R::Classify: return '?';
+    case R::FusedPrefix: return 'F';
+    case R::FusedSuffix: return 'f';
+    case R::IcasePrefix: return 'i';
+    case R::Suffix: return 'S';
+    case R::Inner: return 'I';
+    case R::Walk: return 'W';
+    case R::Chain: return 'C';
+    case R::AssertChain: return 'c';
+    case R::Bool: return 'B';
+    case R::Pike: return 'P';
+    }
+    return '!';
   }
 };
 } // namespace detail
@@ -78,8 +111,11 @@ using reg::detail::PlanProbe;
 // wrap these tests used to use, `(?:PAT)(?:\b|\B)`, predates the assert
 // tiers, which serve it — so it had come to compare a tier with itself. The
 // plan is asked, so a reference cannot drift off the Pike unnoticed again.
+// The same lookahead in front keeps the Pike rung's own accelerators off it
+// (a literal prefix, Teddy or first-byte set to skip to): the twin is the
+// VM started at every position, and shares nothing with what it checks.
 inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0) {
-  reg::Regex re("(?:" + pat + ")(?=[\\s\\S]|$)", flags);
+  reg::Regex re("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)", flags);
   check(PlanProbe::pike_only(re), "pike_twin: reference is Pike-only",
         __LINE__);
   return re;
@@ -119,6 +155,47 @@ inline std::vector<reg::MatchResult> find_all(const Regex &re,
   for (auto m : re.find_all(s))
     v.push_back(m.to_owned());
   return v;
+}
+
+// Byte spans of every group of every match, flattened — from find_all, or
+// (`lazy`) from find_iter. A group that did not participate reads as a pair
+// of size_t(-1).
+inline std::vector<size_t> flat_spans(const Regex &re, std::string_view subj,
+                                      bool lazy) {
+  std::vector<size_t> out;
+  auto add = [&](const reg::Match &m) {
+    for (size_t g = 0; g <= m.group_count(); g++) {
+      out.push_back(m.group(g).matched() ? m.group(g).begin() : size_t(-1));
+      out.push_back(m.group(g).matched() ? m.group(g).end() : size_t(-1));
+    }
+  };
+  if (lazy)
+    for (auto m : re.find_iter(subj))
+      add(m);
+  else
+    for (auto m : re.find_all(subj))
+      add(m);
+  return out;
+}
+
+// find_at parity: step find_at from 0 by next_pos and compare the visited
+// (begin, end) spans against find_iter over the same subject.
+inline bool same_as_iter(const Regex &re, std::string_view s) {
+  std::vector<std::pair<size_t, size_t>> want;
+  for (auto m : re.find_iter(s)) want.emplace_back(m.begin(), m.end());
+  std::vector<std::pair<size_t, size_t>> got;
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    auto r = re.find_at(s, pos);
+    if (!r.m.matched()) {
+      if (r.next_pos != s.size() + 1) return false; // done sentinel
+      break;
+    }
+    got.emplace_back(r.m.begin(), r.m.end());
+    if (r.next_pos <= pos) return false; // a step must always progress
+    pos = r.next_pos;
+  }
+  return got == want;
 }
 
 // Returns true if constructing the pattern throws RegexError.
@@ -521,7 +598,7 @@ void test_literal_alternation() {
   // ASCII and on subjects with a combining mark (Extend), a Prepend, and CRLF —
   // a literal must not match across a grapheme boundary.
   auto egc_ok = [](const std::string &subj, const std::string &pat) {
-    Regex bare(pat), pike("(?:" + pat + ")(?=[\\s\\S]|$)");
+    Regex bare(pat), pike = pike_twin(pat);
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -807,6 +884,239 @@ void test_whole_match_capture() {
   }
 }
 
+// The find ladder: search, test, find_all, find_iter and find_at climb the
+// same rungs in the same order. These pin where a scan STARTS (so a fast path
+// cannot quietly stop being taken) and what the rungs that only some callers
+// reach hand back.
+void test_find_ladder() {
+  auto rows = [](const Regex &re) { return PlanProbe::start(re, false); };
+  auto test = [](const Regex &re) { return PlanProbe::start(re, true); };
+
+  // --- where a scan starts ---
+  // A plan that is its own locate, for every caller.
+  CHECK(rows(Regex("Sherlock")) == 'L' && test(Regex("Sherlock")) == 'L');
+  CHECK(rows(Regex("fox|dog|cat")) == 'A' && test(Regex("fox|dog|cat")) == 'A');
+  // A text-anchored pattern: one walk from 0, before the subject is looked
+  // at or the cache fetched — for test() always, for a find when there are
+  // no groups to hand out (with groups, the capture walk of the family is
+  // the one walk to take).
+  CHECK(rows(Regex("^#[0-9a-fA-F]{6}$")) == '^');
+  CHECK(test(Regex("^#[0-9a-fA-F]{6}$")) == '^');
+  CHECK(rows(make_us("^#[0-9a-fA-F]{6}$")) == '^');
+  CHECK(test(make_us("^(\\d+)-(\\d+)$")) == '^');
+  CHECK(rows(make_us("^(\\d+)-(\\d+)$")) == 'W');
+  CHECK(rows(Regex("^(\\d+)-(\\d+)$")) == '?');
+  // CodePoint: the family does not depend on the subject, so the scan
+  // starts on its first rung outright.
+  CHECK(rows(make_us("\\w+")) == 'W' && test(make_us("\\w+")) == 'B');
+  CHECK(rows(make_us("(\\w+)=(\\w+)")) == 'W');
+  CHECK(rows(make_us("e[a-z]{3,}q")) == 'S');
+  CHECK(rows(make_us("[a-z]+@[a-z]+")) == 'I');
+  CHECK(rows(make_us("(?=a)\\w")) == 'P');
+  // Grapheme: the subject chooses the family.
+  CHECK(rows(Regex("\\w+")) == '?' && test(Regex("\\w+")) == '?');
+  // A boolean takes the find's prefilter rungs (each stops at the first
+  // accepting state it reaches) and, where the find would walk or chain,
+  // the boolean scan.
+  CHECK(test(make_us("e[a-z]{3,}q")) == 'S');
+  CHECK(test(make_us("[a-z]+@[a-z]+")) == 'I');
+  CHECK(test(make_us("(\\w+)=(\\w+)")) == 'B');
+
+  // --- every entry point, against the bare VM ---
+  // (The loops below run one pattern over many subjects: its reference and
+  // its two units are compiled once.)
+  struct Compiled {
+    std::string pat;
+    std::optional<Regex> pike, unit[2];
+  } last;
+  auto agree = [&](const std::string &pat, const std::string &subj) {
+    if (!last.pike || last.pat != pat) {
+      last.pat = pat;
+      last.pike.emplace(pike_twin(pat));
+      last.unit[0].emplace(pat, 0u, reg::MatchUnit::Grapheme);
+      last.unit[1].emplace(pat, 0u, reg::MatchUnit::CodePoint);
+    }
+    const std::vector<size_t> want = flat_spans(*last.pike, subj, false);
+    for (int u = 0; u < 2; u++) {
+      // The twin is a Grapheme regex: a CodePoint one agrees with it on a
+      // subject with no CR-LF pair and no combining mark.
+      if (u == 1 && (subj.find('\r') != std::string::npos ||
+                     subj.find("\xCC") != std::string::npos))
+        continue;
+      const Regex &re = *last.unit[u];
+      if (flat_spans(re, subj, false) != want) return false;
+      if (flat_spans(re, subj, true) != want) return false;
+      auto m = re.search(subj);
+      if (m.matched() != !want.empty()) return false;
+      if (m.matched() && (m.begin() != want[0] || m.end() != want[1]))
+        return false;
+      if (re.test(subj) != !want.empty()) return false;
+      // find_at stepped from 0: the scan find_iter just took.
+      if (!same_as_iter(re, subj)) return false;
+    }
+    return true;
+  };
+
+  // The two answers a first, naive walk on the byte tier got wrong: a class
+  // that counts a CR-LF pair as one element where the walk's table counts
+  // two, and a class of non-ASCII characters only, whose candidates the walk
+  // skipped as bytes no match can start with.
+  CHECK(agree("[^c-za]a?", "c\r\n3"));
+  CHECK(agree("[\xF0\x9F\x98\x80\xE6\xBC\xA2]{1,}", " \xF0\x9F\x98\x80"));
+  CHECK(Regex("[^c-za]a?").search("c\r\n3").str() == "\r\n");
+  CHECK(Regex("[\xF0\x9F\x98\x80\xE6\xBC\xA2]{1,}")
+            .search(" \xF0\x9F\x98\x80")
+            .begin() == 1);
+
+  // The walk and the chain taking turns on the byte tier: the é-bearing
+  // words come from the chain, the rest from the walk, for every caller.
+  CHECK(agree("\\w+", "ab c\xC3\xA9" "d ef \xC3\xA9 gh"));
+  CHECK(agree("(\\w+)", "ab c\xC3\xA9" "d ef \xC3\xA9 gh"));
+  CHECK(agree("(\\w+)=(\\w+)", "a=b \xC3\xA9=c d=\xC3\xA9 e=f\r\ng=h"));
+  CHECK(agree("\\p{L}+", "ab\r\ncd \xE6\x97\xA5 ef"));
+  CHECK(agree("\\w+", "ab\r\ncd\r\n"));
+
+  // A text-anchored find: the match at 0 and nothing after it, an empty
+  // match at 0 that does not come back, a byte the walk has no transition
+  // for (the families then answer), with and without groups.
+  for (const char *pat : {"^ab", "^[a-c]*", "\\Aab", "^[a-c]+$", "^(a)(b)",
+                          "^(?:ab)+", "^([a-c]+)-(\\d+)$", "^", "^$", "^a*b?"})
+    for (const char *subj :
+         {"", "ab", "abab", "ab\nab", "xab", "abc-12", "ab\xC3\xA9",
+          "\xC3\xA9" "ab", "a\r\nb", "b", "aab"})
+      CHECK(agree(pat, subj));
+  CHECK(Regex("^ab").find_all("abab").size() == 1);
+  CHECK(Regex("^[a-c]*").find_all("xyz").size() == 1); // the empty match at 0
+  CHECK(!Regex("^ab").find_at("abab", 2).m.matched());
+  CHECK(!Regex("^").find_at("ab", 1).m.matched());
+
+  // test() through the prefilter rungs, on subjects long enough for their
+  // budgets: one without the literal the find is driven from, one that holds
+  // it and matches, one that holds it and does not, one that holds it in
+  // the other case, one whose only match ends the subject.
+  for (size_t pad : {size_t(120), size_t(127), size_t(128), size_t(400)}) {
+    const std::string filler(pad, 'e'), tail(pad, 'a');
+    for (const char *pat : {"e[a-z]{3,}q", "[a-z]+@[a-z]+", "\\w+ly\\b",
+                            "x[a-z]+q|\\d\\d", "(?i)e[a-z]{3,}q", "t\\w+ing$"}) {
+      CHECK(agree(pat, filler + tail));                 // no literal
+      CHECK(agree(pat, filler + "q" + tail));           // literal, match
+      CHECK(agree(pat, filler + " q@ly " + tail));      // literal, mostly none
+      CHECK(agree(pat, filler + " EABCQ 12 " + tail));  // the other case
+      CHECK(agree(pat, filler + tail + " testing"));    // at the very end
+    }
+  }
+  // The interior-literal rung as a boolean looks back 32 bytes for where a
+  // match through the literal could start, and leaves the subject to the
+  // scan when the pre-part is still alive there; and it is left out for a
+  // subject under 64 bytes. Pre-parts shorter and longer than the look,
+  // subjects on both sides of the threshold, the literal absent, first,
+  // last, and in a place that completes no match.
+  {
+    const std::string run40(40, 'a'), run20(20, 'a'), words =
+        "the lazy dog jumps over; the lazy dog jumps over; the lazy dog; ";
+    for (const char *pat : {"[^?]+\\?.*", "[a-z]+@[a-z]+", "\\w+=\\w+x",
+                            "[a-z]+-[0-9]{4}", "([a-z]+)@([a-z]+)"})
+      for (const std::string &subj :
+           {run20 + "?b", run40 + "?b", run40 + "@b", run20 + "@b",
+            words + run40 + "@b " + words, words + run20 + "=bx " + words,
+            words + "@" + words, words + "ab@ " + run40 + "@cd",
+            words + words + "a-1234", "?" + words, words + "?", std::string("a@"),
+            words + words, std::string("x=") + run40 + "x"})
+        CHECK(agree(pat, subj));
+  }
+  // ... and a pre-part that needs more characters than the look holds: no
+  // start inside it, one before it. The boolean has to leave such a subject
+  // to the scan, not conclude the literal is in no match.
+  {
+    const std::string run34(34, 'a'), run36(36, 'a'), run90(90, 'a');
+    for (const char *pat : {"[a-z]{35,}@x", "[a-z]{35}@x", "\\w{33,40}=[a-z]",
+                            "[^?]{35,}\\?"})
+      for (const std::string &tail : {"@x", "=c", "?"})
+        for (const std::string &run : {run34, run36, run90})
+          for (const std::string &lead : {"", " ", "words and words; "}) {
+            CHECK(agree(pat, lead + run + tail));
+            CHECK(agree(pat, lead + run34 + tail + " " + run + tail + " end"));
+          }
+    CHECK(Regex("[a-z]{35,}@x").test(" " + run36 + "@x"));
+    CHECK(!Regex("[a-z]{35,}@x").test(" " + run34 + "@x"));
+    CHECK(make_us("[a-z]{35,}@x").test(" " + run36 + "@x"));
+    CHECK(!make_us("[a-z]{35,}@x").test(" " + run34 + "@x"));
+  }
+  // The fused prefix scan verifies a candidate with the byte DFA, over bytes
+  // its eligibility scan has not reached yet. A failed verify that touched
+  // a cluster is not "no match here" — the byte engine cannot see the
+  // match the cluster is part of. Passed over, the candidate was lost in two
+  // ways (both the iterator's alone before the ladder was shared, found by
+  // the fuzzer at ten times its default count): the failed-verify budget
+  // ran out on a short subject and the scan resumed past it; and a later
+  // candidate matched in front of the cluster and was reported.
+  {
+    const std::string mark = "\xCC\x81", e_acute = "\xC3\xA9";
+    for (const char *pat : {"q\\w*\\.", "q[a-z]*\\.", "q\\w+x", "Z\\w{3,},"})
+      for (const std::string &subj :
+           {"qqqq" + mark + ".", e_acute + " qqqq" + mark + ".",
+            e_acute + " qqqqqqqq" + mark + ".", " qqqq" + mark + "qx",
+            e_acute + " Z,Z,,ZZZZZ" + mark + "ZZ,Z,,", "q" + mark + ".",
+            "qq" + mark + ". qq."})
+        CHECK(agree(pat, subj));
+    for (const char *pat : {"q(?:a[a-z]+z|b)", "q(?:a\\w+z|b)", "qa[a-z]+z|qb"})
+      for (const std::string &subj :
+           {"qaqbcd" + mark + "z", e_acute + " qaqbcd" + mark + "z",
+            "qaqbcd" + mark + "z and then qb and qaz",
+            std::string(200, ' ') + "qaqbcd" + mark + "z" + std::string(200, ' '),
+            "qaqb cd" + mark + "z", "qaqbcd" + mark + "y qb"})
+        CHECK(agree(pat, subj));
+    Regex re("q(?:a[a-z]+z|b)");
+    auto m = re.search("qaqbcd" + mark + "z");
+    CHECK(m.matched() && m.begin() == 0 && m.end() == 9);
+    m = Regex("q\\w*\\.").search("qqqq" + mark + ".");
+    CHECK(m.matched() && m.begin() == 0 && m.end() == 7);
+  }
+  // A literal is its bytes in either unit, but a match of it is a cluster:
+  // `q` followed by a combining mark is in the subject and is not a `q`.
+  {
+    const std::string pad(300, ' ');
+    CHECK(!Regex("e[a-z]{3,}q").test(pad + "eabcq\xCC\x81" + pad));
+    CHECK(Regex("e[a-z]{3,}q").test(pad + "eabcq" + pad));
+    CHECK(agree("e[a-z]{3,}q", pad + "eabcq\xCC\x81 eabcq" + pad));
+  }
+
+  // The Pike rung skips to a candidate before it runs, at every entry point
+  // (it used to at search() only): a literal prefix in either case, the
+  // literals of an alternation, the bytes a match can begin with.
+  for (const char *pat : {"abc(?=d)", "(?i)abc(?=d)", "(?:foo|bar)(?=\\d)",
+                          "[xy]\\w(?!z)", "(a)(?=b)\\w", "(\\w)\\1"})
+    for (const char *subj :
+         {"", "abcd abce ABCD", "foo1 bar barz bar2", "xa ybz yc", "ab ac ab",
+          "aa bb ab", "abcd\xC3\xA9 ABCD abcd", "x\r\nabcd"})
+      CHECK(agree(pat, subj));
+
+  // A caller's FindCache shared by two Regexes is re-bound by every step
+  // that can reach a rung reading its DFAs. That includes the step that
+  // starts on the walk from 0 and leaves it for the families: a
+  // text-anchored, capture-free pattern over a subject with a non-ASCII
+  // byte in it. (Bound only once the scan stood past that rung, it ran the
+  // other Regex's DFAs — and found nothing.)
+  {
+    Regex::FindCache cache;
+    Regex digits("^\\w+ \\d+$"), words("^\\w+ \\w+$");
+    const std::string sd = "ab\xC3\xA9 12", sw = "abc d\xC3\xA9" "f";
+    for (int round = 0; round < 2; round++) {
+      size_t nd = 0, nw = 0, ni = 0;
+      for (auto m : digits.find_all(std::string_view(sd), cache))
+        nd += m.begin() == 0 && m.end() == sd.size();
+      for (auto m : words.find_all(std::string_view(sw), cache))
+        nw += m.begin() == 0 && m.end() == sw.size();
+      for (auto m : words.find_iter(sw, cache))
+        ni += m.begin() == 0 && m.end() == sw.size();
+      CHECK(nd == 1 && nw == 1 && ni == 1);
+      CHECK(digits.find_at(sd, 0, cache).m.matched());
+      CHECK(words.find_at(sw, 0, cache).m.matched());
+      CHECK(!digits.find_at(sw, 0, cache).m.matched());
+    }
+  }
+}
+
 // A non-ASCII byte in a one-walk driver's way is LOCAL: the located-span chain
 // serves that one find and the driver is asked again for the next. So one
 // subject alternates between the two engines match by match — and, when most
@@ -814,26 +1124,10 @@ void test_whole_match_capture() {
 // None of it may show in the results, on any entry point. CodePoint mode: it
 // is where the drivers meet non-ASCII bytes at all.
 void test_onewalk_local_bail() {
-  // spans of find_all and of find_iter, flattened (every group, per match)
-  auto spans_of = [](const Regex &re, std::string_view subj, bool lazy) {
-    std::vector<size_t> out;
-    auto add = [&](const reg::Match &m) {
-      for (size_t g = 0; g <= m.group_count(); g++) {
-        out.push_back(m.group(g).begin());
-        out.push_back(m.group(g).end());
-      }
-    };
-    if (lazy)
-      for (auto m : re.find_iter(subj))
-        add(m);
-    else
-      for (auto m : re.find_all(subj))
-        add(m);
-    return out;
-  };
   auto both = [&](const Regex &re, std::string_view subj,
                   const std::vector<size_t> &want) {
-    return spans_of(re, subj, false) == want && spans_of(re, subj, true) == want;
+    return flat_spans(re, subj, false) == want &&
+           flat_spans(re, subj, true) == want;
   };
 
   // é is 2 bytes (\xC3\xA9) and a word character; ¡ (\xC2\xA1) is not.
@@ -885,43 +1179,6 @@ void test_onewalk_local_bail() {
     auto all = make_us(R"((\w+))").find_all(na + plain);
     CHECK(all.size() == 2400 && all[2399].group(1).begin() == 6000 + 1199 * 4);
   }
-}
-
-// The fused prefix scan (find_iter over a non-ASCII subject, a literal
-// prefix) verifies a candidate with the byte DFA, over bytes its eligibility
-// scan has not reached yet. A failed verify that touched a cluster is not
-// "no match here" — the byte engine cannot see the match the cluster is part
-// of. Passed over, the candidate was lost in two ways: the failed-verify
-// budget ran out on a short subject and the scan resumed past it; and a
-// later candidate matched in front of the cluster and was reported.
-void test_fused_prefix_failed_verify() {
-  auto iter_spans = [](const Regex &re, std::string_view subj) {
-    std::vector<size_t> out;
-    for (auto m : re.find_iter(subj)) {
-      out.push_back(m.begin());
-      out.push_back(m.end());
-    }
-    return out;
-  };
-  auto ok = [&](const std::string &pat, const std::string &subj) {
-    Regex bare(pat), pike = pike_twin(pat);
-    return iter_spans(bare, subj) == iter_spans(pike, subj);
-  };
-  const std::string mark = "\xCC\x81", e_acute = "\xC3\xA9";
-  for (const char *pat : {"q\\w*\\.", "q[a-z]*\\.", "q\\w+x", "Z\\w{3,},"})
-    for (const std::string &subj :
-         {"qqqq" + mark + ".", e_acute + " qqqq" + mark + ".",
-          e_acute + " qqqqqqqq" + mark + ".", " qqqq" + mark + "qx",
-          e_acute + " Z,Z,,ZZZZZ" + mark + "ZZ,Z,,", "q" + mark + ".",
-          "qq" + mark + ". qq."})
-      CHECK(ok(pat, subj));
-  for (const char *pat : {"q(?:a[a-z]+z|b)", "q(?:a\\w+z|b)", "qa[a-z]+z|qb"})
-    for (const std::string &subj :
-         {"qaqbcd" + mark + "z", e_acute + " qaqbcd" + mark + "z",
-          "qaqbcd" + mark + "z and then qb and qaz",
-          std::string(200, ' ') + "qaqbcd" + mark + "z" + std::string(200, ' '),
-          "qaqb cd" + mark + "z", "qaqbcd" + mark + "y qb"})
-      CHECK(ok(pat, subj));
 }
 
 // UnicodeScalar mode (phase 1): literal patterns compile to a UTF-8 byte
@@ -1425,25 +1682,6 @@ void test_grapheme_aware() {
 // point in CodePoint mode) so an external stepper always progresses and never
 // resumes mid-cluster.
 void test_find_at() {
-  // Parity harness: step find_at from 0 and compare the visited (begin, end)
-  // spans against find_iter over the same subject.
-  auto same_as_iter = [](const Regex &re, std::string_view s) {
-    std::vector<std::pair<size_t, size_t>> want;
-    for (auto m : re.find_iter(s)) want.emplace_back(m.begin(), m.end());
-    std::vector<std::pair<size_t, size_t>> got;
-    size_t pos = 0;
-    while (pos <= s.size()) {
-      auto r = re.find_at(s, pos);
-      if (!r.m.matched()) {
-        if (r.next_pos != s.size() + 1) return false; // done sentinel
-        break;
-      }
-      got.emplace_back(r.m.begin(), r.m.end());
-      if (r.next_pos <= pos) return false; // a step must always progress
-      pos = r.next_pos;
-    }
-    return got == want;
-  };
 
   // Non-empty match: next_pos == match end.
   {
@@ -1661,7 +1899,7 @@ void test_crlf_byte_path() {
   // Oracle = trailing always-true lookahead (grapheme Pike). ASCII (byte path
   // via contains_crlf) and non-ASCII subjects both covered.
   auto same_la2 = [&](const std::string &subj, const std::string &pat) {
-    Regex bare(pat), pike("(?:" + pat + ")(?=[\\s\\S]|$)");
+    Regex bare(pat), pike = pike_twin(pat);
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -1689,7 +1927,7 @@ void test_crlf_byte_path() {
   // CRLF-safe; only nullable / dotall-bounded patterns defer to the Pike).
   auto same_la = [&](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> Pike VM
+    Regex pike = pike_twin(pat); // lookahead -> Pike VM
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -1782,7 +2020,7 @@ void test_crlf_adjacent_runs() {
   };
   for (auto &c : cases) {
     Regex re(c.pat);
-    Regex pike(std::string("(?:") + c.pat + ")(?=[\\s\\S]|$)");
+    Regex pike = pike_twin(c.pat);
     CHECK(rows(re, c.subj) == c.want);
     CHECK(iter_rows(re, c.subj) == c.want);
     CHECK(rows(pike, c.subj) == c.want);
@@ -1804,7 +2042,7 @@ void test_crlf_adjacent_runs() {
 void test_suffix_prefilter() {
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -1919,7 +2157,7 @@ void test_suffix_prefilter() {
 void test_inner_prefilter() {
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2064,7 +2302,7 @@ void test_anchor_choice() {
   // --- results ---
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2171,7 +2409,7 @@ void test_anchor_choice() {
 void test_assert_literal_prefilter() {
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2249,7 +2487,7 @@ void test_assert_literal_prefilter() {
 void test_ascii_literal_prefilter() {
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)"); // lookahead -> grapheme Pike
+    Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2299,7 +2537,7 @@ void test_ascii_icase_prefilter() {
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat, reg::IgnoreCase);
     // Lookahead makes the program non-DFA-able -> grapheme Pike oracle.
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)", reg::IgnoreCase);
+    Regex pike = pike_twin(pat, reg::IgnoreCase);
     auto a = find_all(bare, subj), b = find_all(pike, subj);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
@@ -2828,7 +3066,7 @@ void test_scalar_chain_soundness() {
   };
   auto ok = [&](const std::string &pat, const std::string &subj) {
     Regex bare(pat);
-    Regex pike("(?:" + pat + ")(?=[\\s\\S]|$)");
+    Regex pike = pike_twin(pat);
     return spans_agree(bare, pike, subj);
   };
   const std::string pad(4096, 'q');
@@ -3580,7 +3818,7 @@ int main() {
   test_matches();
   test_whole_match_capture();
   test_onewalk_local_bail();
-  test_fused_prefix_failed_verify();
+  test_find_ladder();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

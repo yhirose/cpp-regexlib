@@ -22,8 +22,11 @@ static void check(bool c, const std::string &msg) {
   }
 }
 
-// Independent oracle: the eager matches() (a different code path from scan())
-// collected as owning results — what find_all() used to return.
+// The eager find_all(), collected as owning results. It climbs the same
+// ladder as the lazy scan but runs it to the end in one call — each rung
+// goes on to its next match in place, and the walk has a loop of its own —
+// where the scan re-enters the ladder once per match: the two ways of driving
+// the rungs are what this file compares.
 static std::vector<MatchResult> find_all(const Regex &re, std::string_view s) {
   std::vector<MatchResult> v;
   for (auto m : re.find_all(s))
@@ -284,6 +287,19 @@ int main() {
       // in front of a trailing one, with the word scan before or behind it.
       {"e[a-z]{3,}q", 0},
       {"e[a-z]{3,}q", kUS},
+      // The walk from 0: a text-anchored, capture-free pattern is one walk
+      // and nothing after it, whether the ladder is stepped or run to its
+      // end — including an empty match at 0, which must not come back.
+      {"^[a-z]+", 0},
+      {"^[a-z]+", kUS},
+      {"^[a-z]*", 0},
+      {"^\\w+ \\w+$", 0},
+      {"^(\\w+) (\\w+)$", kUS},
+      // The walk on the byte tier (Grapheme, a subject that is not plain
+      // ASCII): candidate + one walk per match, the chain for the one find
+      // whose walk meets a non-ASCII byte. (`\\w+`, `(\\w+)` and
+      // `(\\w+)=(\\w+)` above take it too.)
+      {"\\p{L}+", 0},
       {"a[^.]*!", 0},
       {"a[^.]*!", kUS},
       {"s[a-z]*\\?", 0},

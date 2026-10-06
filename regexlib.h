@@ -1578,6 +1578,22 @@ constexpr long kBitStateCap = 1 << 20; // prog_size * span entries
 // the Pike.
 constexpr size_t kUnfilteredBitStateBytes = 1 << 12; // 4 KiB
 
+// Where a boolean (test()) starts to use what skips ahead. Two things that
+// make a long subject cheap cost a short one more than they save, by about
+// the same amount — some 10-30 ns of set-up against a scan of ~1 ns a byte:
+// the interior-literal rung (a memmem, a reverse scan for the floor, a
+// forward scan from it: `[^?]+\?.*` over a 23-byte path took 48 ns that way
+// and 15 scanned), and the boolean DFA's start-state skip in CodePoint mode
+// (`//.*` over 20 bytes: 22 ns against 11).
+// Below this many bytes the boolean just scans.
+constexpr int kBoolSkipBytes = 64;
+// ... and how far back the interior-literal rung looks for its floor on a
+// boolean's behalf before it leaves the subject to the scan (see
+// inner_find): a pre-part that runs back further is walked twice, once each
+// way, where the scan walks it once. What the look costs when it comes back
+// with nothing is the look itself: ~50 ns at 32 bytes, ~110 at 64.
+constexpr int kBoolFloorBytes = 32;
+
 } // namespace limits
 
 //------------------------------------------------------------------------------
@@ -4641,8 +4657,8 @@ class Regex {
   // candidate byte (`a[a-z]+0` over "aaaa…"), FAILED verifies re-walk
   // overlapping tails — O(n²) unguarded. Protocol, written once here so every
   // site shares it:
-  //   - One budget (≈ the subject's length) is owned by the OUTERMOST find
-  //     loop — one per fill_matches call / per iterator — and threaded by
+  //   - One budget (≈ the subject's length) is owned by the scan — one per
+  //     find, per find_all call, per iterator — and threaded by
   //     reference into the candidate finders. A per-call budget would reset
   //     at every match and still admit O(matches × n).
   //   - spend() charges FAILED verifies only (a successful verify advances
@@ -4824,278 +4840,13 @@ public:
     return plan_->named_;
   }
 
-  // Search anywhere in `text`.
+  // Search anywhere in `text`: the first step of the find ladder (see
+  // find_once), then the result built from what it found.
   MatchResult search(std::string_view text) const {
-    // [Tier: Literal] Pure printable-ASCII literal: one memmem pass, no
-    // subject classification (the RE2/rure literal scan). Sound on any UTF-8 —
-    // see literal_locate.
-    if (plan_->literal_only_) {
-      int s, e;
-      if (literal_locate(text, 0, s, e)) return build_dfa_result(text, s, e);
-      return MatchResult{};
-    }
-    // [Tier: LiteralAlt] Pure literal alternation: Teddy / first-byte scan.
-    if (plan_->literal_alt_ok()) {
-      int s, e;
-      if (literal_alt_locate(text, 0, s, e)) return build_dfa_result(text, s, e);
-      return MatchResult{};
-    }
-
-    // Reuse this thread's persistent lazy DFAs (built once, reused across
-    // calls) instead of rebuilding them on every search — the dominant per-call
-    // cost.
-    FindCache &cache = thread_cache();
-    Scratch &sc = cache.sc_;
-
-    // UnicodeScalar mode: capture-free DFA-eligible patterns run on the byte
-    // DFA (any UTF-8, no is_ascii gate); everything else runs on the code-point
-    // Pike over a code-point segmentation (no grapheme breaking) — never EGC.
-    if (plan_->us_) {
-      // [Tier: Dfa/US] capture-free byte DFA over byte_prog_.
-      if (plan_->dfa_find_free()) {
-        MatchResult r;
-        // Rare-literal prefilter (memmem-skip to candidates) instead of a full
-        // byte-by-byte DFA scan. suffix_search/inner_search return true when
-        // they produced the answer (match or proven no-match); false only on a
-        // DFA state-cap, where we fall through to the unfiltered scan.
-        if (plan_->suffix_.active()) {
-          if (suffix_search(cache.lfa(*this), cache.rv(*this), text, r,
-                            /*collapse=*/false))
-            return r;
-        } else if (plan_->inner_.active()) {
-          if (inner_search(cache.lfu(*this), cache.lfa(*this), cache.rv(*this),
-                           cache.inrev(*this), text, r))
-            return r;
-        }
-        // [Tier: Dfa/US+onepass] Candidate + UNBOUNDED one-pass walk, the
-        // capture tier's driver run for its SPAN (saves 0/1) rather than its
-        // groups: one pass where dfa_search_lf below needs two (unanchored
-        // forward DFA for the end, then the reverse DFA for the start). The
-        // prefilter rungs above stay in front — they answer from a memmem hit
-        // without walking at all. -1 is a definitive no-match; a bail
-        // (kWalkLocal / kWalkBail) or kCap falls through to the chain. (Gated on onepass_unbounded_ rather
-        // than capture_scan_ok(): the scalar chain is a CAPTURE engine and is
-        // never planned at ncap == 0, so here the two coincide and the
-        // narrower name states what actually runs.)
-        if (plan_->onepass_unbounded_) {
-          WalkBudget budget(text.size());
-          int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-          if (e >= 0) return build_dfa_result(text, sc.saves[0], e);
-          if (e == -1) return MatchResult{};
-        }
-        if (dfa_search_lf(cache.lfu(*this), cache.rv(*this), text, 0, r))
-          return r;
-        // state cap tripped — fall through to the code-point Pike VM.
-      } else if (plan_->dfa_find_caps()) {
-        // [Tier: Dfa/US+cap] Candidate + UNBOUNDED one-pass first, exactly as
-        // the EGC ASCII tier: one walk over the match yields end + captures
-        // (see cp_onepass_find), replacing the forward + reverse + bounded
-        // capture chain below — which was this tier's whole cost on a short
-        // subject (`/users/(\d+)`: ~131 ns vs the EGC tier's ~56 ns on the
-        // same pattern and subject). Sound on any subject: the walk bails on a
-        // non-ASCII byte (US has no grapheme fusion to gate on), and the
-        // byte_prefix_ memmem candidates are UTF-8 self-delimiting. -1 is a
-        // definitive no-match; a bail (either kind) / kCap falls through
-        // to the chain.
-        if (plan_->capture_scan_ok()) {
-          WalkBudget budget(text.size());
-          int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-          if (e >= 0) return build_result_bytes(text, sc.saves);
-          if (e == -1) return MatchResult{};
-        }
-        // Located-span chain: the leftmost-first byte DFA locates the span;
-        // the code-point backtracker (run_captures_bytes, bounded by the lf
-        // end) resolves groups. No byte prefilters here: plan_us_prefilters
-        // only analyzes capture-FREE US patterns, so suffix_/inner_ are never
-        // planned on this path.
-        int e = dfa_forward_lf(cache.lfu(*this), text, 0);
-        if (e != LazyDfa::kCap) {
-          if (e < 0) return MatchResult{};
-          int s = dfa_reverse_scan(cache.rv(*this), text, e, /*floor=*/0);
-          if (s != LazyDfa::kCap) return run_captures_bytes(text, s, e, sc);
-        }
-        // state cap tripped — fall through to the code-point Pike VM.
-      }
-      // [Tier: Assert/Byte] shared byte assert engine: an `^ $ \b \A \z`
-      // pattern — with or without captures — located by the code-point-aware
-      // byte assert DFA (assert_.prefix/literal prefilters apply), groups
-      // resolved by the assert-aware bitstate. Replaces the code-point Pike
-      // for US assert patterns, the same tier EGC uses on a non-ASCII subject.
-      if (assert_byte_path_ok(text)) {
-        // `body$` one-pass find first (sound on any subject: the drivers
-        // bail to the assert chain on a non-ASCII byte).
-        if (plan_->capture_scan_ok()) {
-          WalkBudget budget(text.size());
-          int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-          if (e >= 0) return build_result_bytes(text, sc.saves);
-          if (e == -1) return MatchResult{};
-        }
-        int s = 0, e = 0;
-        if (!assert_byte_find_span(cache, text, 0, s, e)) return MatchResult{};
-        return plan_->byte_assert_cap_ ? run_captures_bytes(text, s, e, sc)
-                                : build_dfa_result(text, s, e);
-      }
-      // [Tier: Pike/cp] the US baseline: code-point Pike VM.
-      auto seg = detail::segment_cp(text);
-      return run(plan_->cp_prog_, seg, 0, /*anchored=*/false, sc);
-    }
-
-    // Classify the subject once (first non-ASCII byte) and share it across the
-    // byte-path / ASCII-tier gates below, instead of a fresh O(n) SIMD pass per
-    // gate (which dominates a fast literal find).
-    const size_t fna = first_nonascii(text);
-
-    // [Tier: Dfa/EgcByte] EGC byte path (non-ASCII, no multi-code-point
-    // cluster): capture-free DFA over the UTF-8 byte programs — same result as
-    // the grapheme Pike, no full-subject segmentation.
-    if (plan_->ncap_ == 0 && egc_byte_path(text, fna)) {
-      MatchResult r;
-      if (plan_->icase_prefix_.active() && icase_prefix_search(cache.blfa(*this), text, r))
-        return r;
-      // The byte programs are the COLLAPSED ones on a collapse plan, and the
-      // suffix scan's scalar verifier has to know: it counts bytes, where a
-      // collapsed class counts a CR-LF pair as one element (see
-      // suffix_scalar_verify — `[a-c][^q]{2}q` over "a \r\nq").
-      if (plan_->suffix_.active() &&
-          suffix_search(cache.blfa(*this), cache.brv(*this), text, r,
-                        plan_->byte_crlf_collapse_))
-        return r;
-      // ReverseInner is skipped on the CRLF-collapse byte path: inner_.pre_rev
-      // is a non-collapsed program (shared with the ASCII / US tiers), so its
-      // reverse recovers a floor mid-CR-LF-cluster (the lone LF) that the
-      // collapsed forward DFA cannot enter, dropping a match that begins on the
-      // cluster. The unfiltered collapsed scan below is correct.
-      if (plan_->inner_.active() && !plan_->byte_crlf_collapse_ &&
-          inner_search(cache.blfu(*this), cache.blfa(*this), cache.brv(*this),
-                       cache.inrev(*this), text, r))
-        return r;
-      if (dfa_search_lf(cache.blfu(*this), cache.brv(*this), text, 0, r))
-        return r;
-      // state cap tripped — fall through to the grapheme Pike VM below.
-    }
-
-    // [Tier: Dfa/Ascii] capture-free ∧ DFA-able ∧ ASCII subject:
-    // leftmost-first DFA, no segmentation, no longest-safe predicate (the
-    // ordered+cut scan is correct for alternations and optional prefixes the
-    // old longest path mishandled).
-    if (plan_->dfa_find_free() && ascii_grapheme_ok(text, fna)) {
-      MatchResult r;
-      if (plan_->suffix_.active() &&
-          suffix_search(cache.lfa(*this), cache.rv(*this), text, r,
-                        /*collapse=*/false))
-        return r;
-      if (plan_->inner_.active() &&
-          inner_search(cache.lfu(*this), cache.lfa(*this), cache.rv(*this),
-                       cache.inrev(*this), text, r))
-        return r;
-      // [Tier: Dfa/Ascii+onepass] the span from one walk, as the US tier does
-      // (see there): the ASCII subject makes byte offset == grapheme index, so
-      // the code-point walk's span IS the grapheme engine's, and the walk bails
-      // on a non-ASCII byte and on `\r` where a CR-LF cluster could split.
-      if (plan_->onepass_unbounded_) {
-        WalkBudget budget(text.size());
-        int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-        if (e >= 0) return build_dfa_result(text, sc.saves[0], e);
-        if (e == -1) return MatchResult{};
-      }
-      if (dfa_search_lf(cache.lfu(*this), cache.rv(*this), text, 0, r))
-        return r;
-      // state cap tripped — fall through to the Pike VM.
-    }
-    // [Tier: Dfa/EgcByte+cap] EGC byte path with captures (non-ASCII, no
-    // multi-code-point cluster): byte DFA locates the start, the one-pass /
-    // backtracker engine resolves captures.
-    if (plan_->ncap_ > 0 && egc_byte_path(text, fna)) {
-      // ReverseInner locate, skipped on the CRLF-collapse byte path (the same
-      // mid-cluster-floor caveat as the capture-free tier above).
-      if (plan_->inner_.active() && !plan_->byte_crlf_collapse_) {
-        MatchResult r;
-        if (inner_search_capture(cache.blfu(*this), cache.blfa(*this),
-                                 cache.brv(*this), cache.inrev(*this), text,
-                                 sc, r))
-          return r;
-      }
-      int e = dfa_forward_lf(cache.blfu(*this), text, 0);
-      if (e != LazyDfa::kCap) {
-        if (e < 0) return MatchResult{};
-        int s = dfa_reverse_scan(cache.brv(*this), text, e, /*floor=*/0);
-        if (s != LazyDfa::kCap)
-          return run_captures_bytes(text, s, e, sc); // bounded, leftmost-first
-      }
-      // cap — fall through to the grapheme Pike VM below.
-    }
-
-    // [Tier: Dfa/Ascii+cap] captures ∧ DFA-able ∧ ASCII subject: the
-    // leftmost-first DFA locates the span, the byte backtracker resolves
-    // captures on it (correct for any dfa_ok_ pattern). ReverseInner (rare
-    // interior literal) replaces the full forward scan when planned.
-    if (plan_->dfa_find_caps() && ascii_grapheme_ok(text, fna)) {
-      // Candidate + UNBOUNDED one-pass first (one walk over the match yields
-      // end + captures; see cp_onepass_find). -1 is a definitive no-match;
-      // a bail (either kind) / kCap falls through to the located-span chain.
-      if (plan_->capture_scan_ok()) {
-        WalkBudget budget(text.size());
-        int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-        if (e >= 0) return build_result_bytes(text, sc.saves);
-        if (e == -1) return MatchResult{};
-        // kCap / a bail -> the located-span chain below
-      }
-      if (plan_->inner_.active()) {
-        MatchResult r;
-        if (inner_search_capture(cache.lfu(*this), cache.lfa(*this),
-                                 cache.rv(*this), cache.inrev(*this), text, sc,
-                                 r))
-          return r;
-      }
-      MatchResult r;
-      if (dfa_search_capture(cache.lfu(*this), cache.rv(*this), text, 0, sc, r))
-        return r;
-    }
-
-    // [Tier: AssertAnchor] gate-free assert-literal (line/text anchors only):
-    // memmem + per-match grapheme-boundary + flag verify, no eligibility scan,
-    // on any subject.
-    if (plan_->assert_.anchor_gatefree) {
-      int s = 0, e = 0;
-      if (assert_anchor_locate(text, 0, s, e)) return build_dfa_result(text, s, e);
-      return MatchResult{};
-    }
-    // [Tier: Assert/Ascii+cap] the assertion-aware DFA locates the span; the
-    // assertion-aware bitstate over cp_prog_ resolves groups on it — replacing
-    // the grapheme Pike for `$`/`^`/`\b`-anchored capture patterns.
-    if (plan_->assert_cap_ && assert_find_ok(text, fna)) {
-      // `body$` one-pass find first (see onepass_require_end_).
-      if (plan_->capture_scan_ok()) {
-        WalkBudget budget(text.size());
-        int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
-        if (e >= 0) return build_result_bytes(text, sc.saves);
-        if (e == -1) return MatchResult{};
-      }
-      int s = 0, e = 0;
-      if (assert_find_span(cache, text, 0, s, e))
-        return run_captures_bytes(text, s, e, sc);
-      return MatchResult{};
-    }
-
-    // [Tier: Assert/Ascii] capture-free: the assertion-aware DFA find.
-    if (plan_->ncap_ == 0 && assert_find_ok(text, fna)) {
-      int s = 0, e = 0;
-      if (assert_find_span(cache, text, 0, s, e))
-        return build_dfa_result(text, s, e);
-      return MatchResult{};
-    }
-
-    // [Tier: Assert/Byte] capture-free (EGC), non-ASCII simple subject.
-    if (assert_byte_path_ok(text)) {
-      int s = 0, e = 0;
-      if (assert_byte_find_span(cache, text, 0, s, e))
-        return build_dfa_result(text, s, e);
-      return MatchResult{};
-    }
-
-    // [Tier: Pike] the proven baseline: grapheme Pike VM.
-    auto seg = detail::segment(text);
-    return search_at_or_after(seg, 0, sc);
+    MatchResult r;
+    ResultSink out{r};
+    find_once(text, out);
+    return r;
   }
 
   // Match anchored at the start of `text` (need not reach the end).
@@ -5156,13 +4907,14 @@ public:
     // [Tier: AnchoredOnePass+cap] `^body$` with captures: the one-pass walk
     // from the single candidate 0 yields the end AND the groups (see
     // onepass_anchored_start_) — the same gates AND the same front door as
-    // search()'s `body$` dispatch (assert_byte_path_ok / assert_find_ok, then
-    // capture_find_dispatch), which is where the walk's soundness on the
-    // subject is decided; a bail falls to the ladder.
+    // the find ladder's walk on the assert families (assert_byte_path_ok /
+    // assert_find_ok, then capture_find_dispatch), which is where the walk's
+    // soundness on the subject is decided; a bail falls to the ladder.
     if (plan_->onepass_anchored_start_ &&
         (plan_->us_ ? assert_byte_path_ok(text) : assert_find_ok(text, fna))) {
       WalkBudget budget(text.size()); // unread: the anchored driver walks once
-      int e = capture_find_dispatch(cache, text, 0, sc.saves, budget);
+      int e = capture_find_dispatch(&cache, text, 0, sc.saves, budget,
+                                    /*byte=*/plan_->us_);
       if (e >= 0) return build_result_bytes(text, sc.saves);
       if (e == -1) return MatchResult{};
     }
@@ -5286,69 +5038,14 @@ public:
     return run(plan_->prog_, seg, 0, /*anchored=*/true, sc);
   }
 
+  // Whether `text` contains a match: the first step of the find ladder
+  // with nothing to hand the match to (see find_once, NoSink). The rungs are
+  // search()'s — the prefilters among them, which is the point: a boolean
+  // over a long subject is as often a rare literal away as a find is — and
+  // the last one stops at the first accepting state (Rung::Bool).
   bool test(std::string_view text) const {
-    // [Tier: Literal] pure printable-ASCII literal: one memmem pass, no
-    // subject classification.
-    if (plan_->literal_only_) {
-      int s, e;
-      return literal_locate(text, 0, s, e);
-    }
-    // [Tier: LiteralAlt]
-    if (plan_->literal_alt_ok()) {
-      int s, e;
-      return literal_alt_locate(text, 0, s, e);
-    }
-    // [Tier: AssertAnchor] (EGC; US is already gate-free)
-    if (plan_->assert_anchor_egc()) {
-      int s, e;
-      return assert_anchor_locate(text, 0, s, e);
-    }
-    // [Tier: AnchoredOnePass] a text-anchored pattern matches at 0 or
-    // nowhere, so the same one walk answers the boolean find — before the
-    // classification pass and the cache fetch.
-    if (plan_->aop_.ok) {
-      int e0 = 0;
-      int r = anchored_onepass_try(text, e0);
-      if (r >= 0) return r > 0;
-    }
-    // Boolean match is the same under leftmost-first and POSIX semantics, so a
-    // lazy DFA can answer it when the program is "regular" and the subject is
-    // ASCII (or any UTF-8 in US byte mode). Everything else uses the Pike VM.
-    // EGC byte path: a non-ASCII, single-code-point-cluster subject runs the
-    // boolean byte DFA (the matched bytes are identical to the grapheme
-    // engine).
-    const size_t fna = first_nonascii(text); // classify once; share across gates
-    FindCache &cache = thread_cache();       // fetch the TLS cache once
-    // [Tier: Dfa/EgcByte] boolean scan on the forward byte DFA.
-    if (egc_byte_path(text, fna)) {
-      LazyDfa &d = cache.bfu(*this); // forward byte DFA, reused per call
-      int e = dfa_forward_scan(d, text, 0);
-      if (e != LazyDfa::kCap) return e >= 0;
-      // cap — fall through to the Pike VM via search().
-    }
-    // [Tier: Dfa/US | Dfa/Ascii] boolean DFA scan.
-    if (plan_->dfa_ok_ && (plan_->us_ || ascii_grapheme_ok(text, fna)))
-      return dfa_test(cache, text);
-
-    // [Tier: Assert/Ascii] assertion patterns (\b ^ $ \A \z ...; no
-    // lookaround/loop) on an ASCII subject: the assertion-aware DFA scan,
-    // instead of the Pike VM.
-    if (plan_->dfa_assert_ok_ && !plan_->us_ && ascii_grapheme_ok(text, fna))
-      return assert_test_ascii(cache, text);
-
-    // [Tier: Assert/Byte] non-ASCII simple subject, or US on any subject.
-    if (assert_byte_path_ok(text)) {
-      // Capture-free EGC non-ASCII: the original fast reseed boolean scan over
-      // the (capture-free) byte_prog_ is correct and proven.
-      if (!plan_->us_ && !plan_->byte_assert_cap_)
-        return assert_byte_fwd_scan(cache, text, 0) >= 0;
-      // US, or a capture pattern (byte_prog_ carries Save ops): defer to
-      // search() so test() and search() cannot diverge — a separate scan can
-      // disagree under the DFA state cap (the fuzzer caught exactly that).
-      return search(text).matched();
-    }
-    // [Tier: Pike] via search()'s own ladder.
-    return search(text).matched();
+    NoSink out;
+    return find_once(text, out);
   }
 
   // Reusable per-thread cache of DFA state, persisted across find_iter()/find_all()
@@ -5419,6 +5116,12 @@ public:
   };
   FindAt find_at(std::string_view text, size_t pos) const;
   FindAt find_at(std::string_view text, size_t pos, FindCache &cache) const;
+
+private:
+  FindAt find_at_step(std::string_view text, size_t pos,
+                      FindCache *cache) const;
+
+public:
 
   // Lazy split: a range over the substrings between matches (see SplitIter).
   // Like find_iter, a temporary std::string subject is rejected (the pieces
@@ -5514,6 +5217,114 @@ private:
     return c;
   }
 
+  // The find ladder. Every entry point that finds climbs this one ladder —
+  // find_iter steps it, find_all runs it to the end, search() takes one step,
+  // test() takes one step and reads only whether there was one — so a rung
+  // exists at all of them or at none, and in one order (ladder_pick).
+  //
+  // The subject's class (first non-ASCII byte, CR-LF, grapheme clusters) only
+  // decides which engine family the scan STARTS on. A rung that cannot go on
+  // says why: locally (a byte it does not handle — this one match comes from
+  // the rung below, and the next step asks it again) or globally (its
+  // budget, a DFA state cap — the rung is given up for the rest of the scan).
+  //
+  // The rungs. Coarser than the canonical [Tier: ...] labels (see design.md
+  // "Tier dispatch"): the DFA family's rungs serve Dfa/US, Dfa/EgcByte and
+  // Dfa/Ascii alike (Ladder::kByteDfas selects the DFAs, ncap_ the capture
+  // resolution), the assert family's serve Assert/Ascii and Assert/Byte
+  // (Ladder::kAssertByte), Pike is Pike and Pike/cp (the plan's unit). The
+  // order they are tried in is ladder_pick's, not this declaration's —
+  // except that the ones up to TextAnchor need nothing of a scan but its
+  // cursor (see ladder_shallow).
+  enum class Rung : uint8_t {
+    // A plan that is its own locate; these never fall.
+    Literal,      // pure printable-ASCII literal: memmem, no classification
+    LiteralAlt,   // pure literal alternation: Teddy + ordered memcmp
+    AssertAnchor, // gate-free assert-literal: memmem + boundary + flag verify
+    // A text-anchored pattern matches at 0 or nowhere, so one walk from 0
+    // answers before the subject is even classified. For a caller that
+    // reads no groups (a capture-free plan, or Want::Test).
+    TextAnchor,
+    // Look at the subject and stand on the family that serves it
+    // (ladder_classify). Where a Grapheme plan's scan starts unless one of
+    // the rungs above is the whole plan, and the only rung that reads the
+    // subject's class.
+    Classify,
+    // DFA family.
+    FusedPrefix, // EGC, non-ASCII subject: literal prefix scan that vets
+    FusedSuffix, // the clusters it passes (no upfront classification)
+    IcasePrefix, // (?i) literal prefix: pair probe + anchored verify
+    Suffix,      // rare trailing literal + reverse verify
+    Inner,       // rare interior literal + reverse(pre) floor
+    Walk,        // candidate + one-pass walk: end and groups in one pass
+    Chain,       // forward DFA to the end, reverse to the start, groups
+    // Assert family (Walk above serves it too).
+    AssertChain, // the assert find: its literal anchors, then its DFAs
+    // Want::Test only, either family: the boolean forward scan.
+    Bool,
+    Pike
+  };
+  // What the caller wants of the scan. The rungs and their order are the
+  // same; a caller that only asks WHETHER there is a match lets the last
+  // rung stop at the first accepting state instead of locating a span
+  // (Rung::Bool), and resolves no groups.
+  enum class Want : uint8_t { Rows, Test };
+
+  // Where a scan stands on the ladder: the family serving this subject, the
+  // rung, and what the scan has given up. A VALUE, and small enough to
+  // travel in registers: every transition takes one and returns one.
+  // That is what lets a one-step find (search, test) keep its whole scan in
+  // its own frame, where the compiler dissolves it — as an object the rungs
+  // reached through a pointer it cost search() ~100 instructions a call, a
+  // fifth of a short validator's time. A scan that outlives the call
+  // (find_iter) stores the same value in a Finder.
+  struct Ladder {
+    Rung rung = Rung::Pike;
+    Rung below = Rung::Pike; // what a local bail of the walk steps down to
+    Want want = Want::Rows;
+    // (One word of flags, set and tested with has() / set(): a dozen bools
+    // were a dozen stores on every call, and bit-fields were worse — each
+    // copy of the value unpacked and repacked them one by one.)
+    enum Flag : uint16_t {
+      kAssert = 1 << 0,     // the assert family (else the DFA family)
+      kAssertByte = 1 << 1, // assert family: byte (non-ASCII) vs ASCII find
+      kByteDfas = 1 << 2,   // DFA family: the byte programs' DFAs (EGC
+                            // byte) rather than the code-point ones
+      kFindOk = 1 << 3, // the family can locate a span (Want::Test admits
+                        // plans that can only answer the boolean)
+      kWalkByte = 1 << 4, // the walk reads the byte programs' first-byte
+                          // sets (US, EGC byte) rather than the ASCII ones
+      // Rungs the family has until they bail GLOBALLY (budget,
+      // profitability). Cleared then and not set again by anything that
+      // bail leads to: that is the linearity guarantee. A local bail clears
+      // nothing.
+      kIpOn = 1 << 5,   // IcasePrefix (a probe applies)
+      kWalkOn = 1 << 6, // Walk
+      // Rungs the scan has given up, whatever family it lands on next.
+      kSuffixOff = 1 << 7,
+      kInnerOff = 1 << 8,
+    };
+    uint16_t flags = kFindOk;
+    bool has(Flag f) const { return (flags & f) != 0; }
+    void set(Flag f, bool on = true) {
+      flags = static_cast<uint16_t>(on ? flags | f : flags & ~f);
+    }
+  };
+  // The engine families a ladder runs on (see ladder_family). Which one
+  // serves a scan is the only thing the SUBJECT decides; everything else
+  // about a family's ladder is the pattern's, and worked out when the plan
+  // is built (Plan::family_).
+  enum Family : uint8_t {
+    kFamUsDfa,       // [Tier: Dfa/US]
+    kFamUsAssert,    // [Tier: Assert/Byte], CodePoint
+    kFamEgcByte,     // [Tier: Dfa/EgcByte]
+    kFamEgcByteIp,   //   ... with the (?i) prefix probe applying
+    kFamAscii,       // [Tier: Dfa/Ascii]
+    kFamAssertAscii, // [Tier: Assert/Ascii]
+    kFamAssertByte,  // [Tier: Assert/Byte], Grapheme
+    kFamilyCount
+  };
+
   // ===== Plan: the immutable execution plan =====
   // Everything decided once at construction from (pattern, flags, unit):
   // compiled programs, tier-eligibility flags, and prefilter state. Built
@@ -5554,19 +5365,55 @@ private:
       plan_capture_onepass(root);
       plan_anchored_onepass(root);
       plan_word_onepass(root);
+      // The unbounded one-pass walk's candidate source, best first (see
+      // WalkDriver and Regex::onepass_driver_find).
+      if (!onepass_unbounded_) {
+        // WalkDriver::None
+      } else if (onepass_anchored_start_) {
+        walk_driver_ = WalkDriver::AnchoredStart;
+      } else if (prefix_.active() && prefix_.ascii && !prefix_.icase) {
+        // The grapheme program's prefix.
+        walk_driver_ = WalkDriver::Prefix;
+        walk_prefix_ = prefix_;
+      } else if (byte_prefix_.active()) {
+        // The byte program's (US plans): possibly multi-byte UTF-8 — still a
+        // sound memmem needle, and the walk itself bails on any non-ASCII
+        // byte before consuming one.
+        walk_driver_ = WalkDriver::Prefix;
+        walk_prefix_ = byte_prefix_;
+      } else if (!assert_.prefix.empty()) {
+        // Assert (`body$`) patterns: the byte prefilters are not analyzed
+        // for them, but the assert tier's own leading-literal analysis is —
+        // the same required prefix, so the same memmem candidates.
+        walk_driver_ = WalkDriver::Prefix;
+        walk_prefix_.text = assert_.prefix;
+        walk_prefix_.probe = assert_.prefix_probe;
+        walk_prefix_.probe2 = assert_.prefix_probe2;
+      } else if (inner_.active() && inner_.pre_nonabsorbing) {
+        walk_driver_ = WalkDriver::Inner;
+      } else {
+        walk_driver_ = WalkDriver::Scan;
+      }
+      Regex::ladder_plan(*this);
     }
 
     // --- Tier-eligibility predicates (pattern shape only; per-subject gates
     // like ascii_grapheme_ok / egc_byte_path stay at the dispatch sites).
-    // One name per gate, shared by the search / match / test / fill_matches /
-    // find_iter ladders, so the unanchored and anchored copies of a rung
-    // cannot drift apart.
+    // One name per gate, shared by the find ladder (search / test /
+    // find_all / find_iter) and match()'s anchored one, so the unanchored
+    // and anchored copies of a rung cannot drift apart.
 
     // [Tier: Dfa/US | Dfa/Ascii] unanchored find: the forward lf scan plus
     // the reverse program that recovers the match start.
     bool dfa_find_ok() const { return dfa_ok_ && rev_prog_.ok(); }
+    // ... as the find ladder admits a plan to the family. A boolean needs
+    // no span, so it admits a plan whose find the family cannot serve (no
+    // reverse program) and runs it on Rung::Bool alone; Ladder::kFindOk
+    // says which it is.
+    bool dfa_family_ok(bool boolean) const {
+      return boolean ? dfa_ok_ : dfa_find_ok();
+    }
     bool dfa_find_free() const { return dfa_find_ok() && ncap_ == 0; }
-    bool dfa_find_caps() const { return dfa_find_ok() && ncap_ > 0; }
     // [Tier: Dfa/US | Dfa/Ascii] anchored-at-0 match: the forward scan alone
     // gives the leftmost-first end (no reverse program needed).
     bool dfa_match_free() const { return dfa_ok_ && ncap_ == 0; }
@@ -5585,8 +5432,7 @@ private:
     // like `Sherlock\s+Holmes`. Optimistic: an ineligible subject (a
     // non-CR-LF multi-code-point cluster) bails to the gated tiers / Pike.
     // The subject side of the gate (fna < n; pure ASCII is the cheaper ASCII
-    // tiers' territory) stays at the two dispatch sites (fill_matches and
-    // the MatchIter constructor).
+    // tiers' territory) is ladder_classify's.
     bool egc_fused_ok() const {
       return ncap_ == 0 && byte_path_ && crlf_byte_safe_ &&
              !can_match_empty_ && !icase_ &&
@@ -8465,6 +8311,14 @@ private:
     // planned only at ncap > 0, so for a capture-free plan this is exactly
     // onepass_unbounded_.
     bool capture_scan_ok() const { return onepass_unbounded_ || chain_.ok; }
+    // ... on the EGC byte tier. The walk steps ASCII bytes off a table built
+    // from the code-point program; on a subject the byte tier admits that is
+    // the byte program's own answer for every ASCII byte — EXCEPT under the
+    // CRLF collapse, whose byte programs take a CR-LF pair as one element
+    // where the table takes two.
+    bool byte_walk_ok() const {
+      return capture_scan_ok() && !byte_crlf_collapse_;
+    }
     // With onepass_unbounded_: the pattern carries a trailing text-end anchor
     // (`body$`), stripped from the one-pass program — a candidate's walk
     // matches only when its (greedy) accept lands exactly at n. Same argument
@@ -8478,6 +8332,36 @@ private:
     // memmem / position scan, and a find from any later floor is a definitive
     // no-match.
     bool onepass_anchored_start_ = false;
+    // Where the unbounded one-pass walk takes its candidates from, best
+    // first: position 0 alone, a literal prefix (walk_prefix_ — whichever of
+    // the plan's prefix analyses has one, see the constructor), a
+    // non-absorbing interior literal, or every position (pruned by the
+    // first-byte set). Inner is the one driver that reads the FindCache (its
+    // cached reverse(pre) DFA), so a one-step find on any other runs
+    // without fetching it (see Regex::scr_walk).
+    enum class WalkDriver : uint8_t {
+      None, // no unbounded one-pass table
+      AnchoredStart,
+      Prefix,
+      Inner,
+      Scan,
+    };
+    WalkDriver walk_driver_ = WalkDriver::None;
+    // The ladders, per caller ([0] Want::Rows, [1] Want::Test, [2] Want::Test
+    // over a short subject — see Regex::ladder_caller); see
+    // Regex::ladder_plan.
+    //   start_: where a scan starts — a plan that is its own locate, a
+    //     walk from 0, a CodePoint plan's family, or Rung::Classify.
+    //   us_ladder_: the family of a CodePoint plan (what start_ is, past
+    //     the literal and text-anchor rungs).
+    //   family_: each family's ladder, for the subject to choose among.
+    //   fused_: which fused EGC scan the plan has (egc_fused_ok /
+    //     egc_fused_collapse_ok, asked once).
+    enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
+    Fused fused_ = Fused::None;
+    Ladder start_[3];
+    Ladder us_ladder_[3];
+    Ladder family_[kFamilyCount][3];
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
@@ -8544,6 +8428,9 @@ private:
                           // non-ASCII fold-equivalents)
     };
     LiteralPrefix prefix_;
+    // WalkDriver::Prefix's needle: whichever of the plan's prefix analyses
+    // the constructor took it from (text and probes; the rest is unread).
+    LiteralPrefix walk_prefix_;
 
     // First-byte prefilter: the bytes a match can begin with, for when the
     // literal prefix is empty. N = 128 for the grapheme program (ASCII only),
@@ -9812,15 +9699,6 @@ private:
       scan = pos + 1; // fingerprint false positive / boundary fail -> advance
     }
     return false;
-  }
-
-  // Append every literal-alternation match (begin,end byte rows) to `spans`.
-  void literal_alt_fill(std::string_view t, std::vector<uint32_t> &spans) const {
-    int from = 0, s = 0, e = 0;
-    while (literal_alt_locate(t, from, s, e)) {
-      push_span(spans, s, e);
-      from = e; // non-overlapping (every literal is non-empty)
-    }
   }
 
   // Substring search: locate `needle` (length m) in hay[0,n). scan64 finds the
@@ -11243,16 +11121,6 @@ private:
     return false;
   }
 
-  // Append every gate-free assert-literal match to `spans`.
-  void assert_anchor_fill(std::string_view text,
-                          std::vector<uint32_t> &spans) const {
-    int from = 0, s = 0, e = 0;
-    while (assert_anchor_locate(text, from, s, e)) {
-      push_span(spans, s, e);
-      from = e; // non-overlapping (the literal is non-empty)
-    }
-  }
-
   // Fixed-text assert prefilter: memmem the literal; confirm the assertions with
   // an anchored assert-DFA verify at each hit (the matched text is exactly the
   // literal, so a verified match spans [ls, ls + |lit|)). `byte` selects the
@@ -11540,14 +11408,6 @@ private:
     return true;
   }
 
-  bool assert_test_ascii(FindCache &fc, std::string_view text) const {
-    // Boolean match is identical under leftmost-first and longest semantics, so
-    // the longest reseed scan over prog_ (afu) answers it — and unlike the lf
-    // scan it works for any dfa_assert_ok_ pattern (incl. captures, where
-    // assert_lf_prog_ is not built).
-    return assert_fwd_scan(fc, text, 0) >= 0;
-  }
-
   // Whether the assertion-aware DFA find serves this (pattern, subject): a
   // capture-free assertion pattern with an lf program (dfa_assert_ok_, not
   // dfa_ok_, !us_), on an ASCII subject. The non-ASCII byte tier is a later
@@ -11763,7 +11623,8 @@ private:
   // with no multi-code-point grapheme cluster (so code-point == grapheme). The
   // CRLF gate matches the regular byte path (a CR-LF interior carries no match
   // boundary when the pattern is CRLF-byte-safe and non-empty).
-  bool assert_byte_path_ok(std::string_view text) const {
+  bool assert_byte_path_ok(std::string_view text,
+                           size_t fna = kUnclassified) const {
     if (!plan_->byte_assert_path_) return false;
     // US mode: the byte assert DFA reproduces code-point matching, which IS US
     // semantics, on ANY subject — no grapheme/CRLF concern (US never fuses
@@ -11772,18 +11633,17 @@ private:
     // EGC mode: capture-free only. assert_cap_ compiles cp_prog_ for an ASCII
     // subject (assert_find_ok gates on ascii_grapheme_ok), so an EGC capture
     // pattern on a non-ASCII subject belongs to the grapheme Pike. This lives
-    // here rather than at the call sites because it drifted: search / match /
-    // fill_matches each spelled it out and find_iter did not, and `([^ ]+)$`
-    // over a subject ending in a lone UTF-8 lead byte then had two answers.
+    // here rather than at the call sites because it drifted, back when each
+    // entry point had its own ladder: search / match / find_all each spelled
+    // it out and find_iter did not, and `([^ ]+)$` over a subject ending in
+    // a lone UTF-8 lead byte then had two answers.
     if (plan_->ncap_ > 0) return false;
     // EGC mode: only a non-ASCII subject with no multi-code-point grapheme
     // cluster (so byte == grapheme); a pure-ASCII subject uses the grapheme
     // assert tier, and the CRLF gate matches the regular byte path.
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    size_t n = text.size(), i = 0;
-    while (i < n && p[i] < 0x80)
-      i++;
+    // (`fna`: the subject's first non-ASCII byte, if the caller has it.)
+    size_t n = text.size();
+    size_t i = fna != kUnclassified ? fna : first_nonascii(text);
     if (i == n)
       // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT when that
       // tier has just refused a fused CR-LF literal on a CR-LF-bearing subject
@@ -12025,17 +11885,6 @@ private:
       return nxt;
     }
   };
-
-  bool dfa_test(FindCache &fc, std::string_view text) const {
-    LazyDfa &d = fc.fu(*this); // forward reseed DFA, reused per call
-    int e = dfa_forward_scan(d, text, 0);
-
-    // State cap: a regular pattern can still need exponentially many DFA
-    // states. Abandon the DFA and let the Pike VM answer — the boolean result
-    // is identical and the VM is unaffected by this blowup.
-    if (e == LazyDfa::kCap) return search(text).matched();
-    return e >= 0;
-  }
 
   // --- Subject classification: ASCII / simple-grapheme / CRLF gates ---
 
@@ -12362,44 +12211,6 @@ private:
       if (bad) return -1;
     }
     return -1;
-  }
-
-  // Append every match of a fixed-ASCII-prefix, crlf_byte_safe_ pattern, using
-  // the fused prefix-scan-plus-eligibility (egc_literal_fused_find) instead of
-  // the upfront simple_from_crlf_ok gate + separate prefilter scan. `afwd` is the
-  // anchored forward byte DFA (blfa). Returns true on completion; false on a DFA
-  // cap OR an EGC-ineligible subject — the caller clears spans and falls back to
-  // the gate / Pike (rare: only non-CR-LF multi-code-point subjects).
-  bool prefix_egc_fill(std::string_view text, LazyDfa &afwd,
-                       const std::string &needle, size_t probe, size_t probe2,
-                       std::vector<uint32_t> &spans) const {
-    int from = 0;
-    WalkBudget budget(text.size()); // exhaustion -> gated tiers / Pike
-    for (;;) {
-      bool bad = false;
-      int hit = egc_literal_fused_find(text, from, needle, probe, probe2, bad);
-      if (bad)
-        return false; // ineligible subject -> Pike
-      if (hit < 0)
-        return true; // scanned clean to the end
-      int reach = 0;
-      int e = dfa_forward_lf(afwd, text, hit, &reach); // anchored verify
-      if (e == LazyDfa::kCap)
-        return false;
-      if (e > hit) {
-        // Check eligibility over the region the DFA EXAMINED (reach >= e):
-        // a greedy match touches code points past `e` while backtracking.
-        if (!egc_match_clean(text, static_cast<size_t>(hit),
-                             static_cast<size_t>(reach)))
-          return false; // match interior/end holds a fusing cluster -> Pike
-        push_span(spans, hit, e);
-        from = e;
-      } else {
-        if (!budget.spend(reach - hit))
-          return false; // adversarial overlap -> linear fallback
-        from = hit + 1; // the prefix here completes no match
-      }
-    }
   }
 
   // Index of the first non-ASCII (>= 0x80) byte, or text.size() if all ASCII.
@@ -12815,8 +12626,8 @@ private:
   // past their end and stay outside the budget.
   int suffix_candidate(LazyDfa &fwd, LazyDfa &rv, std::string_view text,
                        int occ, int from, bool collapse, WalkBudget &budget,
-                       int &s_out, int &e_out, int &reach_out,
-                       int &next_out) const {
+                       int &s_out, int &e_out, int &reach_out, int &next_out,
+                       bool span) const {
     const auto &sf = plan_->suffix_;
     int m = sf.width();
     int e_lit = occ + m;
@@ -12851,7 +12662,9 @@ private:
     if (s < 0 || s >= e_lit)
       return budget.spend(spent) ? 0 : kWalkBail;
     int e = e_lit, reach = e_lit;
-    if (sf.var_pre) {
+    // (A boolean caller has its answer: [s, e_lit) matches. The forward walk
+    // below only moves the END to where a find reports it.)
+    if (sf.var_pre && span) {
       int fr = 0;
       e = dfa_forward_lf(fwd, text, s, &fr); // greedy leftmost-first end
       if (e == LazyDfa::kCap) return LazyDfa::kCap;
@@ -12873,7 +12686,8 @@ private:
   }
 
   int suffix_find(LazyDfa &fwd, LazyDfa &rv, std::string_view text, int from,
-                  int &s_out, WalkBudget &budget, bool collapse) const {
+                  int &s_out, WalkBudget &budget, bool collapse,
+                  bool span) const {
     const auto &sf = plan_->suffix_;
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -12900,7 +12714,7 @@ private:
       }
       int s, e, reach, next;
       int r = suffix_candidate(fwd, rv, text, lpos, from, collapse, budget, s,
-                               e, reach, next);
+                               e, reach, next, span);
       if (r == LazyDfa::kCap || r == kWalkBail) return r;
       if (r == 1) {
         s_out = s;
@@ -12911,34 +12725,6 @@ private:
     return -1;
   }
 
-  // Append every suffix-prefiltered match (begin,end byte rows) to `spans` via
-  // suffix_find. Returns true if it ran to completion; false on a DFA state-cap
-  // (the caller clears `spans` and falls back to the full scan / Pike).
-  bool suffix_fill(std::string_view text, LazyDfa &fwd, LazyDfa &rv,
-                   std::vector<uint32_t> &spans, bool collapse) const {
-    int from = 0, s = -1;
-    WalkBudget budget(text.size()); // failed-verify allowance for the loop
-    for (;;) {
-      int e = suffix_find(fwd, rv, text, from, s, budget, collapse);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
-      if (e < 0) return true;
-      push_span(spans, s, e);
-      from = e; // the real (re-expanded) end -> skips suffixes inside the match
-    }
-  }
-
-  // First suffix-prefiltered match (from offset 0) into `out`. Returns false on a
-  // DFA state-cap (caller falls back); true with an empty MatchResult on no match.
-  bool suffix_search(LazyDfa &fwd, LazyDfa &rv, std::string_view text,
-                     MatchResult &out, bool collapse) const {
-    int s = -1;
-    WalkBudget budget(text.size());
-    int e = suffix_find(fwd, rv, text, 0, s, budget, collapse);
-    if (e == LazyDfa::kCap || e == kWalkBail) return false;
-    out = (e < 0) ? MatchResult{} : build_dfa_result(text, s, e);
-    return true;
-  }
-
   // Fused-eligibility variant of suffix_find (crlf_byte_safe_ patterns only):
   // the suffix memmem scan also verifies the scanned gap is EGC-eligible
   // (egc_literal_fused_find), and each match is checked by egc_match_clean, so
@@ -12947,8 +12733,8 @@ private:
   // subject (caller falls back to the gate + Pike). The candidate loop is
   // internal, so the caller's cursor is never advanced past an unverified match.
   int suffix_egc_find(LazyDfa &fwd, LazyDfa &rv, std::string_view text, int from,
-                      int &s_out, WalkBudget &budget,
-                      bool collapse = false) const {
+                      int &s_out, WalkBudget &budget, bool collapse,
+                      bool span) const {
     const auto &sf = plan_->suffix_;
     int n = static_cast<int>(text.size());
     const bool class_anchor = !sf.cls.empty();
@@ -12964,7 +12750,7 @@ private:
       if (occ < 0) return -1;
       int s, e, reach, next;
       int r = suffix_candidate(fwd, rv, text, occ, from, collapse, budget, s,
-                               e, reach, next);
+                               e, reach, next, span);
       if (r == LazyDfa::kCap || r == kWalkBail) return r;
       if (r == 1) {
         if (!egc_match_clean(text, static_cast<size_t>(s),
@@ -12976,22 +12762,6 @@ private:
       scan = next; // no match ends here; the floor (`from`) is unchanged
     }
     return -1;
-  }
-
-  // Append every suffix-fused match to `spans`; false on a DFA cap or ineligible
-  // subject (caller clears spans and falls back to the gate / Pike).
-  bool suffix_egc_fill(std::string_view text, LazyDfa &fwd, LazyDfa &rv,
-                       std::vector<uint32_t> &spans,
-                       bool collapse = false) const {
-    int from = 0, s = -1;
-    WalkBudget budget(text.size()); // failed-verify allowance for the loop
-    for (;;) {
-      int e = suffix_egc_find(fwd, rv, text, from, s, budget, collapse);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
-      if (e < 0) return true;
-      push_span(spans, s, e);
-      from = e;
-    }
   }
 
   // ReverseInner find: locate the leftmost-first match with start >= `from` via
@@ -13020,9 +12790,13 @@ private:
   // reverse(pre) scan is bounded by the previous literal occurrence (the pre
   // cannot consume the literal's first byte) and the absorbing path runs at
   // most one unanchored walk per call. Exhaustion returns kWalkBail.
+  //
+  // `span` false is the boolean caller (test()): the forward scans stop at
+  // the first accepting state (dfa_forward_first) and the exact start is not
+  // recovered — what comes back is only whether, as a value >= 0 or -1.
   int inner_find(LazyDfa &lfu, LazyDfa &lfa, LazyDfa &rv, LazyDfa &pre_rev,
                  std::string_view text, int from, int &s_out,
-                 WalkBudget &budget) const {
+                 WalkBudget &budget, bool span) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
@@ -13036,8 +12810,19 @@ private:
                       plan_->inner_.probe2);
       if (!h) return -1;
       int ls = static_cast<int>(h - p);
-      int s_floor = dfa_reverse_scan(pre_rev, text, ls, /*floor=*/from);
+      // A boolean looks back kBoolFloorBytes for the floor and no further: a
+      // pre-part still alive there (`[^?]+` in front of the first `?` of a
+      // long line) would be walked back to its start and then forward again,
+      // twice what the boolean scan costs. kWalkBail gives the rung up for
+      // the scan, which is where it goes.
+      const int window =
+          !span && ls - from > limits::kBoolFloorBytes
+              ? ls - limits::kBoolFloorBytes
+              : from;
+      int low = ls;
+      int s_floor = dfa_reverse_scan(pre_rev, text, ls, /*floor=*/window, &low);
       if (s_floor == LazyDfa::kCap) return LazyDfa::kCap;
+      if (window > from && low <= window) return kWalkBail;
       if (s_floor < 0) { // pre cannot reach this literal from >= from -> skip
         scan = ls + 1;
         continue;
@@ -13050,7 +12835,7 @@ private:
       // on failure the occurrence is in no match, so advance to the next literal.
       if (plan_->inner_.pre_nonabsorbing) {
         int reach = 0;
-        int e = dfa_forward_lf(lfa, text, s_floor, &reach); // anchored verify
+        int e = dfa_forward_end(lfa, text, s_floor, span, &reach);
         if (e == LazyDfa::kCap) return LazyDfa::kCap;
         if (e < 0) { // this literal anchors no match -> try the next one
           if (!budget.spend(reach - s_floor))
@@ -13061,75 +12846,20 @@ private:
         s_out = s_floor;
         return e;
       }
-      int e = dfa_forward_lf(lfu, text, s_floor); // leftmost match >= s_floor
+      // leftmost match >= s_floor
+      int e = dfa_forward_end(lfu, text, s_floor, span);
       if (e == LazyDfa::kCap) return LazyDfa::kCap;
       if (e < 0) return -1; // no match in [s_floor, n] -> none remain
+      if (!span) {
+        s_out = s_floor;
+        return e;
+      }
       int s = dfa_reverse_scan(rv, text, e, /*floor=*/s_floor);
       if (s == LazyDfa::kCap) return LazyDfa::kCap;
       s_out = s;
       return e;
     }
     return -1;
-  }
-
-  // Append every ReverseInner-prefiltered match to `spans`. Returns true on
-  // completion; false on a DFA state-cap (caller clears `spans` and falls back).
-  bool inner_fill(std::string_view text, LazyDfa &lfu, LazyDfa &lfa, LazyDfa &rv,
-                  LazyDfa &pre_rev, std::vector<uint32_t> &spans) const {
-    int from = 0, s = -1;
-    WalkBudget budget(text.size());
-    for (;;) {
-      int e = inner_find(lfu, lfa, rv, pre_rev, text, from, s, budget);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
-      if (e < 0) return true;
-      push_span(spans, s, e);
-      from = (e > s) ? e : us_step_byte(text, e); // empty match -> step one
-    }
-  }
-
-  // First ReverseInner-prefiltered match (from offset 0) into `out`. False on cap.
-  bool inner_search(LazyDfa &lfu, LazyDfa &lfa, LazyDfa &rv, LazyDfa &pre_rev,
-                    std::string_view text, MatchResult &out) const {
-    int s = -1;
-    WalkBudget budget(text.size());
-    int e = inner_find(lfu, lfa, rv, pre_rev, text, 0, s, budget);
-    if (e == LazyDfa::kCap || e == kWalkBail) return false;
-    out = (e < 0) ? MatchResult{} : build_dfa_result(text, s, e);
-    return true;
-  }
-
-  // Capture twin of inner_search: the prefilter locates the leftmost-first
-  // span, the bounded capture engine resolves groups on it (the same
-  // span-then-captures split as dfa_search_capture). False on a DFA cap.
-  bool inner_search_capture(LazyDfa &lfu, LazyDfa &lfa, LazyDfa &rv,
-                            LazyDfa &pre_rev, std::string_view text,
-                            Scratch &sc, MatchResult &out) const {
-    int s = -1;
-    WalkBudget budget(text.size());
-    int e = inner_find(lfu, lfa, rv, pre_rev, text, 0, s, budget);
-    if (e == LazyDfa::kCap || e == kWalkBail) return false;
-    out = (e < 0) ? MatchResult{} : run_captures_bytes(text, s, e, sc);
-    return true;
-  }
-
-  // Capture twin of inner_fill: ReverseInner locate per match + columnar
-  // capture rows (the byte_fill_capture_lf layout), from `from`. False on a
-  // DFA state-cap or a capture-engine bail (caller drops the rows this call
-  // added and falls back).
-  bool inner_fill_capture(std::string_view text, int from, LazyDfa &lfu,
-                          LazyDfa &lfa, LazyDfa &rv, LazyDfa &pre_rev,
-                          Scratch &sc, std::vector<uint32_t> &spans) const {
-    std::vector<int> saves;
-    int s = -1;
-    WalkBudget budget(text.size());
-    for (;;) {
-      int e = inner_find(lfu, lfa, rv, pre_rev, text, from, s, budget);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
-      if (e < 0) return true;
-      if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
-      append_match_spans_bytes(saves, spans);
-      from = (e > s) ? e : us_step_byte(text, e); // empty match -> step one
-    }
   }
 
   // Is `text` free of every pre-image lead byte of the fast probe? If so, a byte
@@ -13196,7 +12926,7 @@ private:
   // (linear) byte-DFA loop.
   int icase_prefix_find(LazyDfa &blfa, std::string_view text, int from,
                         const Plan::IcaseScan &sc, int &s_out,
-                        WalkBudget &budget) const {
+                        WalkBudget &budget, bool span) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     int n = static_cast<int>(text.size());
@@ -13222,7 +12952,8 @@ private:
         int s = static_cast<int>(hp) - j1;
         if (plan_->byte_first_bytes_.set[p[s]]) {
           int reach = 0;
-          int e = dfa_forward_lf(blfa, text, s, &reach); // anchored verify
+          // anchored verify (a boolean caller: to its first accept)
+          int e = dfa_forward_end(blfa, text, s, span, &reach);
           if (e == LazyDfa::kCap) return LazyDfa::kCap;
           if (e > s) {
             s_out = s;
@@ -13255,7 +12986,8 @@ private:
         // paying the per-candidate DFA-walk overhead.
         if (!plan_->byte_first_bytes_.set[p[s]]) continue;
         int reach = 0;
-        int e = dfa_forward_lf(blfa, text, s, &reach); // anchored verify
+        // anchored verify (a boolean caller: to its first accept)
+        int e = dfa_forward_end(blfa, text, s, span, &reach);
         if (e == LazyDfa::kCap) return LazyDfa::kCap;
         if (e > s) {
           s_out = s;
@@ -13267,40 +12999,6 @@ private:
       scan = hp + 1; // no match at this probe; the floor (`from`) is unchanged
     }
     return -1;
-  }
-
-  // Append every (?i)-prefix-prefiltered match (begin,end byte rows) to `spans`.
-  // Returns true on completion; false on a DFA state-cap OR when no probe applies
-  // (caller clears `spans` and falls back to the byte DFA loop). Mirror of
-  // suffix_fill.
-  bool icase_prefix_fill(std::string_view text, LazyDfa &blfa,
-                         std::vector<uint32_t> &spans) const {
-    Plan::IcaseScan sc;
-    if (!icase_choose_probe(text, sc)) return false;
-    int from = 0, s = -1;
-    WalkBudget budget(text.size());
-    for (;;) {
-      int e = icase_prefix_find(blfa, text, from, sc, s, budget);
-      if (e == LazyDfa::kCap || e == kWalkBail) return false;
-      if (e < 0) return true;
-      push_span(spans, s, e);
-      from = e; // non-empty match (literal prefix) -> e > s, progress guaranteed
-    }
-  }
-
-  // First (?i)-prefix-prefiltered match (from offset 0) into `out`. Returns false
-  // on a DFA state-cap or when no probe applies (caller falls back). Mirror of
-  // suffix_search.
-  bool icase_prefix_search(LazyDfa &blfa, std::string_view text,
-                           MatchResult &out) const {
-    Plan::IcaseScan sc;
-    if (!icase_choose_probe(text, sc)) return false;
-    int s = -1;
-    WalkBudget budget(text.size());
-    int e = icase_prefix_find(blfa, text, 0, sc, s, budget);
-    if (e == LazyDfa::kCap || e == kWalkBail) return false;
-    out = (e < 0) ? MatchResult{} : build_dfa_result(text, s, e);
-    return true;
   }
 
   // --- Leftmost-first DFA find (no longest-safe predicate) ---
@@ -13325,11 +13023,34 @@ private:
   int dfa_forward_lf(LazyDfa &d, std::string_view text, int from,
                      int *reach_out = nullptr) const {
     int reach = from;
-    int e = dfa_forward_lf_scan(d, text, from, reach);
+    int e = dfa_forward_lf_scan<false>(d, text, from, reach);
     if (reach_out) *reach_out = reach;
     return e;
   }
 
+  // The same scan for a caller that only asks WHETHER `d` matches from
+  // `from` (test(), through the prefilter rungs): the end of the first
+  // accepting state reached, not the leftmost-first end. An accept is a
+  // match; which of them a find would report does not matter to a boolean,
+  // and getting to that one can mean walking a greedy tail to the end of
+  // the line (`[^?]+\?.*`: the answer is at the `?`).
+  int dfa_forward_first(LazyDfa &d, std::string_view text, int from,
+                        int *reach_out = nullptr) const {
+    int reach = from;
+    int e = dfa_forward_lf_scan<true>(d, text, from, reach);
+    if (reach_out) *reach_out = reach;
+    return e;
+  }
+
+  // The verify of a candidate, for either caller: the leftmost-first end
+  // for one that reports a span, the first accept for a boolean.
+  int dfa_forward_end(LazyDfa &d, std::string_view text, int from, bool span,
+                      int *reach_out = nullptr) const {
+    return span ? dfa_forward_lf(d, text, from, reach_out)
+                : dfa_forward_first(d, text, from, reach_out);
+  }
+
+  template <bool First>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
                           int &reach) const {
     int s = d.start();
@@ -13337,6 +13058,7 @@ private:
         reinterpret_cast<const unsigned char *>(text.data());
     int n = static_cast<int>(text.size());
     int e = d.is_accept(s) ? from : -1;
+    if (First && e >= 0) return e;
     if (d.front_is_match(s)) return e; // committed at `from` (e.g. lazy empty)
     for (int i = from; i < n; i++) {
       if (d.is_dead(s)) break; // no thread (prefix cut + pattern died) -> done
@@ -13357,53 +13079,14 @@ private:
       s = d.step(s, p[i]);
       if (s == LazyDfa::kCap) return LazyDfa::kCap;
       reach = i + 1; // consumed p[i]
-      if (d.is_accept(s)) e = i + 1;
+      if (d.is_accept(s)) {
+        e = i + 1;
+        if (First) return e;
+      }
       if (d.front_is_match(s))
         return e; // match is highest priority -> committed
     }
     return e;
-  }
-
-  // Leftmost-first match at or after `from`: ordered+cut forward finds the end,
-  // the (unordered) reverse DFA recovers the leftmost start. Returns true and
-  // writes `out`; false only on a DFA state-cap (caller falls back to the
-  // Pike).
-  bool dfa_search_lf(LazyDfa &lfu, LazyDfa &rv, std::string_view text, int from,
-                     MatchResult &out) const {
-    int e = dfa_forward_lf(lfu, text, from);
-    if (e == LazyDfa::kCap) return false;
-    if (e < 0) {
-      out = MatchResult{};
-      return true;
-    }
-    int s = dfa_reverse_scan(rv, text, e, /*floor=*/from);
-    if (s == LazyDfa::kCap) return false;
-    out = build_dfa_result(text, s, e);
-    return true;
-  }
-
-  // Shared loop for the leftmost-first find_all family: locate each match span
-  // [s, e) (ordered+cut forward DFA for the end, reverse DFA for the leftmost
-  // start), invoke emit(s, e), then advance past the match. emit returns false
-  // to stop the scan early at a definitive end (e.g. a capture engine declining
-  // the located span). Returns false only on a DFA state-cap, so the caller
-  // falls back to the Pike. Inlined per call site, so each variant compiles to
-  // the same code as its open-coded loop. `from` lets a caller resume where a
-  // faster loop bailed (see onepass_fill).
-  template <class Emit>
-  bool dfa_locate_all_lf(std::string_view text, int from, LazyDfa &lfu,
-                         LazyDfa &rv, Emit emit) const {
-    int n = static_cast<int>(text.size());
-    int start = from;
-    while (start <= n) {
-      int s, e;
-      int r = dfa_locate_one_lf(text, start, lfu, rv, s, e);
-      if (r == LazyDfa::kCap) return false;
-      if (r == 0) break;
-      if (!emit(s, e)) break;
-      start = (e > s) ? e : us_step_byte(text, e); // advance past empty match
-    }
-    return true;
   }
 
   // ONE step of the located-span chain: the leftmost-first match at or after
@@ -13421,69 +13104,44 @@ private:
     return 1;
   }
 
-  // One located-span chain match appended as a columnar row: the span alone
-  // for a capture-free plan, the resolved groups otherwise. Returns the
-  // position to continue from, -1 when no match remains (or the capture
-  // engine declined the span — a definitive end, as in the loops), or
-  // LazyDfa::kCap. This is the chain's whole per-match step, shared by the
-  // eager loops' local-bail fallback (onepass_fill) and by MatchIter, so the
-  // two cannot disagree about what "one chain match" is. Always inlined, with
-  // the locate above: this is MatchIter's per-match hot path on the chain
-  // tiers, and as plain calls the pair cost dense `\w+` over non-ASCII prose
-  // ~5% (measured against the open-coded tail it replaced).
+  // A located span [s, e) handed to `out`: the span alone for a capture-free
+  // plan or a caller that reads no groups, else the groups resolved within
+  // it (group 0 == [s, e)). False when the capture engine declines the span
+  // — a definitive end of the scan. What the located-span rungs (Chain,
+  // AssertChain, Inner) do with what they locate.
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE bool emit_located(std::string_view text, int s, int e,
+                                           Scratch &sc,
+                                           std::vector<int> &saves,
+                                           Out &out) const {
+    if (plan_->ncap_ == 0 || !Out::kGroups) {
+      out.span(*this, text, s, e);
+      return true;
+    }
+    if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
+    out.groups(*this, text, saves);
+    return true;
+  }
+
+  // One located-span chain match handed to `out` (see emit_located). Returns
+  // the position to continue from, -1 when no match remains (or the capture
+  // engine declined the span), or LazyDfa::kCap. This is the chain's whole
+  // per-match step (Rung::Chain).
+  // Always inlined, with the locate above: it is the per-match hot path of
+  // a scan on the chain, and as plain calls the pair cost dense `\w+` over
+  // non-ASCII prose ~5% (measured against the open-coded tail it replaced).
+  template <class Out>
   REGEXLIB_ALWAYS_INLINE int dfa_chain_step(std::string_view text, int from,
                                             LazyDfa &lfu, LazyDfa &rv,
                                             Scratch &sc,
                                             std::vector<int> &saves,
-                                            std::vector<uint32_t> &spans) const {
+                                            Out &out) const {
     int s, e;
     int r = dfa_locate_one_lf(text, from, lfu, rv, s, e);
     if (r == LazyDfa::kCap) return LazyDfa::kCap;
     if (r == 0) return -1;
-    if (plan_->ncap_ == 0) { // capture-free: the located span is the only row
-      push_span(spans, s, e);
-    } else { // resolve groups within [s, e) (group 0 == [s, e))
-      if (!capture_saves_bytes(text, s, e, sc, saves)) return -1;
-      append_match_spans_bytes(saves, spans);
-    }
+    if (!emit_located(text, s, e, sc, saves, out)) return -1;
     return (e > s) ? e : us_step_byte(text, e); // advance past empty match
-  }
-
-  // Leftmost-first capture find (tier 2): the ordered+cut forward DFA (lfu,
-  // over lf_prog_) locates the leftmost-first END, the reverse DFA the leftmost
-  // START, then the byte capture engine (one-pass / bounded backtracker, via
-  // run_captures_bytes) resolves the groups on the located [s, e). Uses lf so
-  // it is correct for any dfa_ok_ pattern (no longest-safe predicate).
-  bool dfa_search_capture(LazyDfa &lfu, LazyDfa &rv, std::string_view text,
-                          int from, Scratch &sc, MatchResult &out) const {
-    int e = dfa_forward_lf(lfu, text, from);
-    if (e == LazyDfa::kCap) return false;
-    if (e < 0) {
-      out = MatchResult{};
-      return true; // no match — definitive
-    }
-    int s = dfa_reverse_scan(rv, text, e, /*floor=*/from);
-    if (s == LazyDfa::kCap) return false;
-
-    // ASCII subject: byte offset == grapheme index, so the byte capture engine
-    // over the code-point program resolves the same captures as the grapheme
-    // Pike, with no full-subject grapheme segmentation.
-    out = run_captures_bytes(text, s, e, sc);
-    return true;
-  }
-
-  // Leftmost-first columnar byte-tier capture fill: lf locate + bounded
-  // code-point capture resolution (capture_saves_bytes). Byte-offset rows.
-  // Correct for any dfa_ok_ pattern.
-  bool byte_fill_capture_lf(std::string_view text, int from, LazyDfa &lfu,
-                            LazyDfa &rv, Scratch &sc,
-                            std::vector<uint32_t> &spans) const {
-    std::vector<int> saves;
-    return dfa_locate_all_lf(text, from, lfu, rv, [&](int s, int e) {
-      if (!capture_saves_bytes(text, s, e, sc, saves)) return false;
-      append_match_spans_bytes(saves, spans);
-      return true;
-    });
   }
 
   // Build the result for a capture-free DFA match over an ASCII byte range
@@ -13491,11 +13149,18 @@ private:
   // segmentation is needed.
   MatchResult build_dfa_result(std::string_view text, int b, int e) const {
     MatchResult r;
+    set_dfa_result(r, text, b, e);
+    return r;
+  }
+  // The same into a fresh result the caller holds (ResultSink): built in
+  // place, where returning it by value would be a second, moved-from one
+  // (+7-11 ns per search() on the httplib latency set when that was tried).
+  void set_dfa_result(MatchResult &r, std::string_view text, int b,
+                      int e) const {
     // group 0 only (ncap_ == 0); _init sets the whole-match span.
     r._init(static_cast<size_t>(b), static_cast<size_t>(e), text.data() + b,
             static_cast<size_t>(e - b), /*ncap=*/0);
     finish_result(r);
-    return r;
   }
 
   // Every MatchResult builder ends here. It is the delivery half of
@@ -13689,17 +13354,6 @@ public:
         balfa_;                            // leftmost-first byte assert DFA
     std::optional<ByteAssertRevDfa> barv_; // cached reverse assertion DFA
     Scratch sc_;                           // reused Pike / backtracker buffers
-    // find_at()'s scan buffers. A find_at call runs one scan step through a
-    // throwaway MatchIter, whose own buffers are empty and grow on first
-    // touch — two allocations (the capture-slot vector and the one-row span
-    // vector) that a real iteration amortizes over its whole scan and a
-    // stateless step pays every call. find_at swaps these in for the step and
-    // back out before the iterator dies, so a stepping loop allocates once
-    // rather than twice per position. Not usable by a LIVE MatchIter, which
-    // keeps its own (two scans may interleave on one cache); safe here
-    // because the step begins and ends inside find_at.
-    std::vector<int> step_saves_;
-    std::vector<uint32_t> step_spans_;
     friend class Regex;
     friend class MatchIter;
 
@@ -13709,6 +13363,10 @@ public:
     // by a new one has a different cache_gen_, so the stale DFAs are dropped.
     void bind(const Regex &re) {
       if (owner_ == &re && owner_gen_ == re.cache_gen_) return;
+      rebind(re);
+    }
+
+    REGEXLIB_NOINLINE void rebind(const Regex &re) {
       owner_ = &re;
       owner_gen_ = re.cache_gen_;
       fu_.reset();
@@ -13730,8 +13388,16 @@ public:
       barv_.reset();
     }
 
+    // The boolean reseed DFA (test()). Its start-state skip follows lfu's
+    // rule below: the grapheme program's in Grapheme mode, the byte
+    // program's in CodePoint mode — where it had none, and a boolean over a
+    // literal-led pattern stepped the DFA through every byte the find's
+    // memmem jumps (`zqj` over 595 KB of prose: 0.67 GB/s, the find 89).
+    // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
     LazyDfa &fu(const Regex &re) {
-      if (!fu_) fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true);
+      if (!fu_)
+        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
+                    /*pf=*/!re.plan_->us_);
       return *fu_;
     }
 
@@ -13952,17 +13618,375 @@ public:
     iterator end() const { return iterator(this, size()); }
   };
 
+  // What a find hands its match to. The ladder's rungs and the engines under
+  // them write through one of these, so each entry point gets its match in
+  // the form it returns — and none of them pays for another's: search()
+  // building its result out of a row it had just written cost it a failed
+  // store-to-load forward (~3 ns on a 20 ns call).
+  //   span(re, text, s, e)    a capture-free match, byte offsets
+  //   groups(re, text, saves) byte-offset saves, ncap_ + 1 pairs
+  //   groups(re, seg, saves)  grapheme / code-point index saves (the Pike)
+  //   kGroups                 whether the caller reads groups at all
+  // RowSink appends one columnar row per match (find_all, find_iter).
+  struct RowSink {
+    static constexpr bool kGroups = true;
+    std::vector<uint32_t> &rows;
+    void span(const Regex &, std::string_view, int s, int e) {
+      push_span(rows, s, e);
+    }
+    void groups(const Regex &re, std::string_view,
+                const std::vector<int> &saves) {
+      re.append_match_spans_bytes(saves, rows);
+    }
+    void groups(const Regex &re, const detail::Segmented &seg,
+                const std::vector<int> &saves) {
+      re.append_match_spans(seg, saves, rows);
+    }
+  };
+  // ResultSink builds the one MatchResult, in place (search). (Before the
+  // find rather than after it: noting the match and building afterwards put
+  // nothing ahead of the engine, and was still the slower of the two on the
+  // validators — the result's set-up overlaps the walk, its tail does not.)
+  struct ResultSink {
+    static constexpr bool kGroups = true;
+    MatchResult &r;
+    void span(const Regex &re, std::string_view text, int s, int e) {
+      re.set_dfa_result(r, text, s, e);
+    }
+    void groups(const Regex &re, std::string_view text,
+                const std::vector<int> &saves) {
+      re.set_result_bytes(r, text, saves);
+    }
+    void groups(const Regex &re, const detail::Segmented &seg,
+                const std::vector<int> &saves) {
+      re.set_result(r, seg, saves);
+    }
+  };
+  // NoSink keeps nothing: the caller wants to know whether, not where (test).
+  struct NoSink {
+    static constexpr bool kGroups = false;
+    void span(const Regex &, std::string_view, int, int) {}
+    void groups(const Regex &, std::string_view, const std::vector<int> &) {}
+    void groups(const Regex &, const detail::Segmented &,
+                const std::vector<int> &) {}
+  };
+
+  // The find ladder's steps (Rung, Want and Ladder are declared ahead of
+  // Plan, which holds the ladders it works out once per pattern).
+  // The cursor of a scan. Separate from what its rungs are handed by
+  // reference (the budget, the segmentation), so that it too dissolves in a
+  // one-step find.
+  struct Cursor {
+    int pos = 0;        // byte cursor (every rung but the Pike)
+    int gpos = 0;       // grapheme/code-point cursor (Pike)
+  };
+  // The cache and scratch a step works with. A one-step find fetches them
+  // only when the rung it lands on reads them (see find_once).
+  struct Scr {
+    FindCache *cache = nullptr;
+    Scratch *sc = nullptr;
+    std::vector<int> *saves = nullptr; // sc's, or the cache-less walk's
+    // `fc`, and its own scratch: for a scan that begins and ends inside
+    // one call (a live iterator keeps a scratch of its own — two scans may
+    // interleave on one cache).
+    void over(FindCache &fc) {
+      cache = &fc;
+      sc = &fc.sc_;
+      saves = &fc.sc_.saves;
+    }
+  };
+  static constexpr size_t kUnclassified = static_cast<size_t>(-1);
+  // The Pike's segmentation, built by the first Pike step. (A pointer and
+  // not a std::optional: a default-constructed optional zero-fills its whole
+  // payload — 80 bytes on every find, nearly all of which never segment.)
+  using SegPtr = std::unique_ptr<detail::Segmented>;
+
+  // The order of the rungs: the first one, top down, that this plan has,
+  // this scan has not given up, and this caller can use. `below_walk`
+  // asks for the first rung under the walk (a local bail's one match).
+  static Rung ladder_pick(const Plan &p, const Ladder &l, bool below_walk);
+  // Stand on the rung ladder_pick says, and remember the one a local bail
+  // of the walk steps down to (asked for once per such match).
+  static void ladder_repick(const Plan &p, Ladder &l) {
+    l.rung = ladder_pick(p, l, /*below_walk=*/false);
+    l.below = l.rung == Rung::Walk ? ladder_pick(p, l, /*below_walk=*/true)
+                                   : l.rung;
+  }
+  REGEXLIB_NOINLINE Ladder ladder_repicked(Ladder l) const {
+    ladder_repick(*plan_, l);
+    return l;
+  }
+  // A family's ladder for a caller: what the family has, and the rung that
+  // leads it. The one place a family is defined.
+  static Ladder ladder_family(const Plan &p, Family f, Want want);
+  // Work out the plan's ladders (Plan::start_, us_ladder_, family_).
+  // Everything a scan's set-up does not need the subject for happens here,
+  // once: a short search() is mostly its set-up, and picking the rungs on
+  // every call was half of that.
+  static void ladder_plan(Plan &p);
+  // Which of the plan's ladders a scan on `l` reads: a find's, a boolean's,
+  // or — the interior-literal rung given up — a boolean's over a short
+  // subject (which is also where a boolean that gave the rung up for its
+  // budget ends up; the two are the same ladder).
+  static int ladder_caller(const Ladder &l) {
+    return l.want == Want::Rows ? 0 : l.has(Ladder::kInnerOff) ? 2 : 1;
+  }
+  // `n`, for a scan that was on `old`: the rungs the scan has given up stay
+  // given up.
+  Ladder ladder_adopt(Ladder n, Ladder old) const {
+    const uint16_t off =
+        old.flags & (Ladder::kSuffixOff | Ladder::kInnerOff) & ~n.flags;
+    if (off) {
+      n.flags |= off;
+      ladder_repick(*plan_, n);
+    }
+    return n;
+  }
+  // Rung::Classify: which engine family serves this subject (a scan on `l`,
+  // past its literal and text-anchor rungs). `fna` caches the subject's
+  // first non-ASCII byte once something computes it; `probe` receives the
+  // (?i) prefix scan if the family has that rung. Inlined, with
+  // ladder_gated: a Grapheme scan passes through here on its first step,
+  // and as two calls handing a Ladder back and forth it was 230
+  // instructions of a 20 ns test().
+  REGEXLIB_ALWAYS_INLINE Ladder ladder_classify(std::string_view text,
+                                                Ladder l, size_t &fna,
+                                                Plan::IcaseScan &probe) const;
+  // The same out of line, for the step's own Classify case: a scan that is
+  // stored (Finder) passes through it once, and a one-step find only after
+  // a bail (find_once classifies inline).
+  REGEXLIB_NOINLINE Ladder ladder_reclassify(std::string_view text, Ladder l,
+                                             size_t &fna,
+                                             Plan::IcaseScan &probe) const {
+    return ladder_classify(text, l, fna, probe);
+  }
+  // The families that need the subject classified up front (everything
+  // the fused rungs are not).
+  REGEXLIB_ALWAYS_INLINE Ladder ladder_gated(std::string_view text, Ladder l,
+                                             size_t &fna,
+                                             Plan::IcaseScan &probe) const;
+  // ... and where a fused rung lands when its lazy eligibility scan finds
+  // the subject ineligible for the COLLAPSED byte path (a lone CR/LF — e.g.
+  // plain Unix-newline text — or a fusing cluster), or runs out of budget:
+  // unlike a bad cluster on the crlf-safe fused rung (where the Pike is the
+  // only correct fallback), such a subject is usually served by the gated
+  // byte / ASCII DFA families. Out of line: a bail.
+  REGEXLIB_NOINLINE Ladder ladder_unfused(std::string_view text, Ladder l,
+                                          size_t &fna,
+                                          Plan::IcaseScan &probe) const {
+    return ladder_gated(text, l, fna, probe);
+  }
+  // Segment for a Pike step; returns the Pike cursor for byte offset `pos`
+  // (0 at the start; the mapped cursor after a downgrade or a seek).
+  REGEXLIB_NOINLINE int ladder_segment(SegPtr &seg, std::string_view text,
+                                       int pos) const {
+    seg = std::make_unique<detail::Segmented>(
+        plan_->us_ ? detail::segment_cp(text) : detail::segment(text));
+    return byte_to_cp(*seg, pos);
+  }
+  // DFA state cap mid-scan: continue on the Pike VM from the current byte
+  // cursor (the Pike rung segments, and maps the cursor, on its first
+  // step). US patterns drop to the code-point Pike, the rest to the
+  // grapheme Pike. The Pike locates and resolves, so a boolean caller gets
+  // its answer from the same step.
+  REGEXLIB_ALWAYS_INLINE static void ladder_downgrade(Ladder &l) {
+    l.rung = l.below = Rung::Pike;
+  }
+  // The DFAs of a DFA-family scan, by role: unanchored leftmost-first;
+  // anchored (verifies a candidate from its start); reverse (recovers the
+  // start).
+  LazyDfa &ladder_fwd(FindCache &fc, const Ladder &l) const {
+    return l.has(Ladder::kByteDfas) ? fc.blfu(*this) : fc.lfu(*this);
+  }
+  LazyDfa &ladder_fwda(FindCache &fc, const Ladder &l) const {
+    return l.has(Ladder::kByteDfas) ? fc.blfa(*this) : fc.lfa(*this);
+  }
+  LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
+    return l.has(Ladder::kByteDfas) ? fc.brv(*this) : fc.rv(*this);
+  }
+  // A rung below the walk has yielded the one match the walk bailed on
+  // locally: tell the budget how far it got (`pos` is the byte cursor of
+  // every family that runs the walk). True when that is what happened — the
+  // scan goes back to the walk.
+  REGEXLIB_ALWAYS_INLINE static bool
+  ladder_served(bool &chain_once, WalkBudget &budget, int pos) {
+    if (!chain_once) return false;
+    budget.resumed_at(pos);
+    chain_once = false;
+    return true;
+  }
+  // This thread's cache (bound to this Regex) and its warm scratch.
+  REGEXLIB_ALWAYS_INLINE void scr_fetch(Scr &scr) const {
+    scr.over(thread_cache());
+  }
+  // The walk's save slots when it runs without the cache.
+  static std::vector<int> &walk_saves() {
+    static thread_local std::vector<int> v;
+    return v;
+  }
+  // What the walk works with, for a find that came without it (find_once):
+  // the save slots alone when its driver reads no DFA, else this thread's
+  // cache. Fetching that cache is some 35 instructions, a tenth of a short
+  // call, and it sits in front of the engine: hence on demand.
+  REGEXLIB_ALWAYS_INLINE void scr_walk(Scr &scr) const {
+    if (plan_->walk_driver_ == Plan::WalkDriver::Inner)
+      scr_fetch(scr);
+    else
+      scr.saves = &walk_saves();
+  }
+  // What only the rungs past the walk read: the deep part of a scan.
+  struct Deep {
+    size_t fna = kUnclassified; // first non-ASCII byte, once computed
+    Plan::IcaseScan probe;      // (?i) byte-prefix scan (chosen once)
+    SegPtr seg;                 // Pike segmentation (lazy)
+  };
+  // What one dispatch of a rung comes back with: a match handed to the sink
+  // (Yield — never under `All`, where a rung goes on to the next in place),
+  // the scan over (Over), or the ladder to be consulted again (Again: the
+  // rung changed it, or set chain_once).
+  enum class Step : uint8_t { Again, Yield, Over };
+  // The rungs that need nothing of a scan but its cursor: a plan that is
+  // its own locate, and the walk from 0. Again when the walk from 0 met a
+  // byte it does not handle — the ladder is then on Rung::Classify, and
+  // nothing else has changed. `InlineWalk` inlines that walk: for a
+  // one-step find, which tries these rungs before anything the others work
+  // with exists (find_once).
+  template <bool All, bool InlineWalk, class Out>
+  REGEXLIB_ALWAYS_INLINE Step ladder_shallow(std::string_view text, Ladder &l,
+                                             Cursor &c, Out &out) const;
+  // Rung::Walk (ladder_walk), and the deep rungs (ladder_deep, one dispatch
+  // of rung `r`).
+  template <bool All, class Out>
+  REGEXLIB_ALWAYS_INLINE Step
+  ladder_walk(std::string_view text, Scr &scr, Ladder &l, Cursor &c,
+              WalkBudget &budget, bool &chain_once, Out &out) const;
+  template <bool All, class Out>
+  REGEXLIB_ALWAYS_INLINE Step
+  ladder_deep(Rung r, std::string_view text, Scr &scr, Ladder &l, Cursor &c,
+              WalkBudget &budget, Deep &d, bool &chain_once, Out &out) const;
+  // The step: one match handed to `out` (`All` false; true when there was
+  // one), or every match until none remains (`All` true; false).
+  //
+  // `chain_once` is set when the walk bails LOCALLY (kWalkLocal): this one
+  // match comes from the rung below it, and the walk stays on.
+  //
+  // Always inlined into its callers: as a call it cost every rung ~5% per
+  // match, and a one-step find its registers.
+  template <bool All, class Out>
+  REGEXLIB_ALWAYS_INLINE bool
+  ladder_step(std::string_view text, Scr &scr, Ladder &l, Cursor &c,
+              WalkBudget &budget, Deep &d, bool &chain_once, Out &out) const;
+  // One find over `text`: the ladder's first match handed to `out`; false
+  // when there is none. The scan lives in this frame, and what runs ahead of
+  // the engine delays it — the set-up of a whole scan was most of a short
+  // search() or test() — so each part is set up only once the rungs before
+  // it could not answer: find_once tries the shallow rungs with a cursor
+  // alone; find_rest tries the walk (its budget, its save slots), and only
+  // then fetches the cache for the rest.
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE bool find_once(std::string_view text, Out &out) const;
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
+                                        Out &out) const;
+
+  // A scan that outlives the call that started it (find_iter, find_all,
+  // find_at): the ladder, the cursor and what the rungs keep between
+  // matches, stored. The steps are the ones find_once takes.
+  class Finder {
+  public:
+    // `cache` null: this thread's, fetched by the first step that needs one.
+    Finder(const Regex &re, std::string_view text, FindCache *cache)
+        : re_(&re), text_(text), cache_(cache), l_(re.plan_->start_[0]),
+          budget_(text.size()) {}
+
+    // The next match, handed to `out`; false when none remains. Over the
+    // caller's scratch (the iterator's own, which lives as long as the scan
+    // does), or — for a call that ends before it returns — the cache's.
+    REGEXLIB_ALWAYS_INLINE bool next(Scratch &sc, RowSink &out) {
+      Scr scr = scratch(&sc);
+      return step<false>(scr, out);
+    }
+    bool next(ResultSink &out) {
+      Scr scr = scratch(nullptr);
+      return step<false>(scr, out);
+    }
+
+    // Every remaining match, one row each: what next() would yield until it
+    // says no. The same step, told not to come back between matches — a
+    // rung goes on to its next match in place, with its DFAs and the cursor
+    // at hand, and the ladder is consulted again only when a rung stops.
+    void drain(RowSink &out) {
+      Scr scr = scratch(nullptr);
+      step<true>(scr, out);
+    }
+
+    // find_at() support: position this scan at byte offset `pos` (a valid
+    // scan position — 0 or a previously returned resume position) before the
+    // first step. The Pike cursor is mapped from it when the first Pike
+    // step segments.
+    void seek(size_t pos) { c_.pos = static_cast<int>(pos); }
+
+    // find_at() support: the byte-offset resume cursor after a yielded match.
+    // The byte rungs keep it in pos directly; the Pike's grapheme /
+    // code-point cursor maps back through the segmentation (byte_begin[gn] ==
+    // text size; gpos == gn + 1 means no scan positions remain).
+    size_t resume_byte() const {
+      if (l_.rung != Rung::Pike) return static_cast<size_t>(c_.pos);
+      size_t gn = deep_.seg->graphemes.size();
+      return static_cast<size_t>(c_.gpos) <= gn
+                 ? deep_.seg->byte_begin[c_.gpos]
+                 : text_.size() + 1;
+    }
+
+  private:
+    template <bool All, class Out>
+    REGEXLIB_ALWAYS_INLINE bool step(Scr &scr, Out &out) {
+      bool chain_once = false;
+      return re_->ladder_step<All>(text_, scr, l_, c_, budget_, deep_,
+                                   chain_once, out);
+    }
+    // What a step works over. A scan on a rung that is the whole plan (the
+    // literal ones: they never leave themselves) reads none of it and gets
+    // nothing — this thread's cache is not even fetched. Any other gets the
+    // cache BOUND TO THIS REGEX: here, on every step, and nowhere else. A
+    // user-supplied FindCache may be shared across Regexes (or across
+    // interleaved iterators), and its DFAs are only valid for the Regex
+    // they were built for; a step that starts on a rung reading none (the
+    // walk from 0, the Pike) can leave it for one that does, so no rung is
+    // excepted. `sc`: the caller's scratch, null for the cache's own.
+    Scr scratch(Scratch *sc) {
+      Scr scr;
+      if (l_.rung < Rung::TextAnchor) return scr;
+      if (!cache_)
+        cache_ = &re_->thread_cache(); // (comes bound)
+      else
+        cache_->bind(*re_);
+      scr.over(*cache_);
+      if (sc) {
+        scr.sc = sc;
+        scr.saves = &sc->saves;
+      }
+      return scr;
+    }
+
+    const Regex *re_ = nullptr;
+    std::string_view text_;
+    FindCache *cache_ = nullptr;
+    Ladder l_;
+    Cursor c_;
+    WalkBudget budget_; // shared by every candidate+verify rung of this scan
+    Deep deep_;
+  };
+
   // Lazy single-pass scan over the non-overlapping matches (see Regex::find_iter).
-  // Holds a byte/grapheme cursor plus this scan's private Pike scratch, and
-  // steps the engine one match per ++ via the same per-tier primitives the
-  // eager find_all/matches use. The chosen tier is fixed at construction; a DFA
-  // tier that hits the state cap mid-scan downgrades to the Pike VM and
-  // continues from the current cursor (see downgrade()). Move-only; the
-  // iterator is a handle into this object, so do not move a MatchIter after
-  // begin().
+  // Holds the scan (a Finder) plus its private Pike scratch and the one row
+  // the yielded view reads, and steps the ladder one match per ++. Move-only;
+  // the iterator is a handle into this object, so do not move a MatchIter
+  // after begin().
   class MatchIter {
   public:
-    MatchIter(const Regex &re, std::string_view text, FindCache &cache);
+    MatchIter(const Regex &re, std::string_view text, FindCache &cache)
+        : MatchIter(re, text, &cache) {}
     MatchIter(MatchIter &&) = default;
     MatchIter(const MatchIter &) = delete;
     MatchIter &operator=(const MatchIter &) = delete;
@@ -14008,116 +14032,16 @@ public:
   private:
     friend class Regex;
 
-    enum { kLfu, kRv, kBlfu, kBrv }; // which cached DFA the current tier uses
-    // The streaming tier states. Coarser than the canonical [Tier: ...] labels
-    // (see design.md "Tier dispatch"): Dfa covers Dfa/US, Dfa/EgcByte and
-    // Dfa/Ascii (fwd_kind_/rev_kind_ select the DFAs, ncap_ the capture
-    // resolution); Assert covers Assert/Ascii and Assert/Byte (assert_byte_);
-    // Pike covers Pike and Pike/cp (cp_mode_).
-    enum class Tier {
-      Literal,    // pure printable-ASCII literal: memmem, no classification
-      LiteralAlt,   // pure literal alternation: Teddy + ordered memcmp
-      AssertAnchor, // gate-free assert-literal: memmem + boundary + flag verify
-      Dfa,
-      Assert,
-      Pike
-    }; // captures branch on ncap_ within Dfa
+    // `cache` null: this thread's (see Finder).
+    MatchIter(const Regex &re, std::string_view text, FindCache *cache);
+    void advance(); // step to the next match (or set done_)
 
-    void advance();   // step to the next match (or set done_)
-    // advance()'s tier dispatch. `chain_once` is set when the one-pass driver
-    // bailed LOCALLY on this step (kWalkLocal) and the match came from the
-    // tier's chain instead; op_unb_ is untouched, so the next step asks the
-    // driver again. Always inlined into advance(), its only caller: as a
-    // call it cost every tier ~5% per match.
-    REGEXLIB_ALWAYS_INLINE void step(bool &chain_once);
-
-    // find_at() support: position this scan at byte offset `pos` (a valid
-    // scan position — 0 or a previously returned resume position) before the
-    // first advance(). resume_pos_ moves with it: nothing has been yielded by
-    // THIS scan, so a fused-tier downgrade must not re-walk before `pos`.
-    // The Pike cursor is remapped only if the segmentation was already built
-    // at construction; otherwise build_seg() maps pos_ on the first step.
-    void seek(size_t pos) {
-      pos_ = static_cast<int>(pos);
-      resume_pos_ = pos_;
-      if (seg_ready_) gpos_ = Regex::byte_to_cp(seg_, pos_);
-    }
-
-    // find_at() support: the byte-offset resume cursor after a yielded match.
-    // The byte tiers keep it in pos_ directly; the Pike tier's grapheme /
-    // code-point cursor maps back through the segmentation (byte_begin[gn] ==
-    // text size; gpos_ == gn + 1 means no scan positions remain).
-    size_t resume_byte() const {
-      if (tier_ != Tier::Pike || !seg_ready_) return static_cast<size_t>(pos_);
-      size_t gn = seg_.graphemes.size();
-      return static_cast<size_t>(gpos_) <= gn ? seg_.byte_begin[gpos_]
-                                              : text_.size() + 1;
-    }
-
-    // One match from this tier's located-span chain, at pos_: the row is
-    // appended and pos_ advanced, or done_ set when none remains. The Dfa
-    // form returns false when the DFA hit its state cap — the scan has been
-    // downgraded and advance() re-dispatches; the assert chain has no cap.
-    REGEXLIB_ALWAYS_INLINE bool dfa_chain_match();
-    void assert_chain_match();
-    void build_seg(); // lazily segment for a Pike step / cap downgrade
-    void downgrade(); // DFA state cap -> continue on the Pike VM
-    // Fused-collapse bail: the lazy eligibility scan found the subject
-    // ineligible for the COLLAPSED byte path (a lone CR/LF — e.g. plain
-    // Unix-newline text — or a fusing cluster). Unlike a bad cluster on the
-    // crlf-safe fused tier (where the Pike is the only correct fallback),
-    // such a subject is usually served by the gated byte / ASCII DFA tiers,
-    // so re-run the non-fused tier ladder from the current cursor instead of
-    // downgrading to the Pike.
-    void reprime_unfused();
-    LazyDfa &dfa(int kind) const;
-
-    const Regex *re_ = nullptr;
-    std::string_view text_;
-    FindCache *cache_ = nullptr;
+    Finder f_;    // the scan: tier, cursor, rung state
     Scratch sc_;  // private to this scan (own Pike/backtracker state)
     MatchList one_; // single-row buffer backing the yielded view
-    std::vector<int> saves_; // reused capture/Pike save slots
-    detail::Segmented seg_;  // Pike-tier segmentation (lazy)
-    Tier tier_ = Tier::Pike;
-    int fwd_kind_ = kLfu, rev_kind_ = kRv;
-    Plan::IcaseScan ip_probe_;        // (?i) byte-prefix scan (chosen once at prime)
-    bool ip_active_ = false;    // the (?i) prefix prefilter drives the Dfa tier
-    int pos_ = 0;              // byte cursor (DFA / assert tiers)
-    int gpos_ = 0;             // grapheme/code-point cursor (Pike tier)
-    bool cp_mode_ = false;     // Pike over cp_prog_/segment_cp vs prog_/segment
-    bool assert_byte_ = false; // Assert tier: byte (non-ASCII) vs ASCII find
-    bool egc_fused_ = false; // Dfa tier drives the fused EGC-prefix scan
-                                    // (lazy eligibility; downgrade() on a bad
-                                    // cluster, from the last-yielded match end)
-    bool fused_collapse_ = false; // the fused scan is the CRLF-collapse
-                                  // variant (also rejects lone CR/LF; a bail
-                                  // re-primes the unfused ladder instead of
-                                  // downgrading to the Pike)
     int alias_groups_ = 0; // > 0: a whole-match capture running as its
                            // capture-free twin; each yielded row is widened
                            // to this many groups (see advance())
-    bool op_unb_ = false; // Dfa tier (EGC ASCII / US): candidate + UNBOUNDED
-                          // one-pass drives the find (one walk per match,
-                          // yielding the groups where there are any and the
-                          // span where there are not); cleared on a budget
-                          // bail -> located-span chain. A non-ASCII byte
-                          // (a local bail) costs one chain match and does
-                          // NOT clear it — see advance()
-    bool inner_off_ = false; // ReverseInner branch hit its walk budget ->
-                             // permanently use the located-span chain
-    bool suffix_off_ = false; // suffix branch hit its walk budget ->
-                              // permanently use the generic DFA scan
-    WalkBudget walk_budget_{0}; // shared by every candidate+verify branch
-                                // of this iterator (re-seeded from the
-                                // subject length at construction)
-    int resume_pos_ = 0; // fused-prefix: byte end of the last YIELDED match; a
-                         // downgrade resumes the Pike here, not pos_ (which may
-                         // have advanced past a candidate whose anchored verify
-                         // failed only because a cluster made the byte engine
-                         // miss a grapheme match starting before pos_)
-    bool pike_skip_prefix_ = false;
-    bool seg_ready_ = false;
     bool primed_ = false;
     bool done_ = false;
   };
@@ -14720,8 +14644,8 @@ private:
   //    (WalkBudget::spend_local keeps the count: a subject that bails at
   //    every match turns the local code into the global one).
   //
-  // A caller with a single find to make (search(), match()) treats the two
-  // alike. The other candidate drivers return kWalkBail for both reasons:
+  // match(), with its single candidate, treats the two alike. The other
+  // candidate drivers return kWalkBail for both reasons:
   // their callers already retry them per find, so there is nothing for the
   // distinction to change. Both are distinct from LazyDfa::kCap (-2), which
   // some callers also propagate.
@@ -14934,6 +14858,14 @@ private:
   // demands the accept land exactly at n), -1 = not decided (table absent,
   // or a non-ASCII byte bailed; the caller falls to its own chain).
   int anchored_onepass_try(std::string_view text, int &e_out) const {
+    return anchored_onepass_once(text, e_out);
+  }
+  // The same, inlined: for the one-step find, where a validator's whole call
+  // is this walk and a call to it was 30 instructions of 13 ns
+  // (`^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$` as a boolean: 14.2 ns called, 13.7
+  // inlined).
+  REGEXLIB_ALWAYS_INLINE int anchored_onepass_once(std::string_view text,
+                                                   int &e_out) const {
     if (!plan_->aop_.ok) return -1;
     int e0 = anchored_onepass_walk(text);
     if (e0 == kWalkBail) return -1;
@@ -15009,6 +14941,7 @@ private:
   // its own prefix byte (`a([a-z]+)0` over "aaaa…") would re-walk overlapping
   // tails from every candidate — O(n²). Successful walks advance the caller's
   // cursor past their end, so they cannot overlap and stay outside the budget.
+  REGEXLIB_ALWAYS_INLINE
   int prefix_onepass_find(std::string_view t, int from, std::vector<int> &saves,
                           WalkBudget &budget, const std::string &lit,
                           size_t probe, size_t probe2) const {
@@ -15051,25 +14984,28 @@ private:
   // to the located-span chain. Returns the match end (saves filled), -1 when
   // none remain, kWalkLocal (a non-ASCII byte: this find goes to the chain)
   // or kWalkBail.
+  REGEXLIB_ALWAYS_INLINE
   int scan_onepass_find(std::string_view t, int from, std::vector<int> &saves,
-                        WalkBudget &budget) const {
+                        WalkBudget &budget, bool byte) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int n = static_cast<int>(t.size());
     // The first-byte prune is usable only when the set was computed
     // (first_bytes_.ok; a `.`-led pattern has none — every position is then a
     // real candidate, and its walk dies wherever the pattern disagrees).
     const bool sparse =
-        plan_->first_bytes_.ok && plan_->first_bytes_.sparse;
-    // US plans never compute first_bytes_ (analyze_first_bytes is ASCII-only);
-    // their 256-wide byte_first_bytes_ (from the byte program) is the prune
-    // there, sound on any UTF-8: a non-ASCII lead byte that can start a match
-    // is a member, and the walk then bails on it. Without this the US walk
-    // started at EVERY position, which on a sparse-start pattern lost to the
-    // located-span chain it replaced (`(\d+)\s+(\w+)` over ASCII prose,
+        !byte && plan_->first_bytes_.ok && plan_->first_bytes_.sparse;
+    // `byte` — a US plan, or a Grapheme one on its byte family: first_bytes_
+    // is not the set to read there (analyze_first_bytes is ASCII-only, and
+    // US plans never compute it). The 256-wide byte_first_bytes_ (from the
+    // byte program) is the prune, sound on any UTF-8: a non-ASCII lead byte
+    // that can start a match is a member, and the walk then bails on it.
+    // Without this the US walk started at EVERY position, which on a
+    // sparse-start pattern lost to the located-span chain it replaced
+    // (`(\d+)\s+(\w+)` over ASCII prose,
     // find_all: 2834 MB/s chain alone, 250 unpruned, 2940 pruned). Only the
     // sparse form is usable: `.sparse` is set once the set was filled, while
     // a non-sparse set is indistinguishable from the unfilled early return.
-    const bool bsparse = plan_->us_ && plan_->byte_first_bytes_.sparse;
+    const bool bsparse = byte && plan_->byte_first_bytes_.sparse;
     for (int pos = from; pos < n; pos++) {
       if (sparse) {
         pos = static_cast<int>(skip_to_first_byte(p, static_cast<size_t>(n),
@@ -15136,57 +15072,58 @@ private:
   // position scan). Returns the match end (saves filled), -1 (definitive
   // no-match), LazyDfa::kCap, kWalkLocal or kWalkBail — callers fall back to
   // their located-span chain on the last three, for this one find
-  // (kWalkLocal) or for the rest of their loop. Shared by the dfa_find_caps
-  // and assert_cap_ (`body$`) dispatchers in search / fill_matches /
-  // MatchIter.
-  int onepass_driver_find(FindCache &fc, std::string_view t, int from,
-                          std::vector<int> &saves, WalkBudget &budget) const {
+  // (kWalkLocal) or for the rest of their loop. Rung::Walk's engine, in
+  // every family.
+  REGEXLIB_ALWAYS_INLINE
+  int onepass_driver_find(FindCache *fc, std::string_view t, int from,
+                          std::vector<int> &saves, WalkBudget &budget,
+                          bool byte) const {
+    switch (plan_->walk_driver_) {
     // `^body$`: position 0 is the only candidate (a text-begin anchor), so a
     // find from any later floor is a definitive no-match and the whole find
     // is one walk — no scan, no budget (nothing to re-walk). A bail (non-
     // ASCII byte) falls back to the assert chain as the other drivers do.
-    if (plan_->onepass_anchored_start_) {
+    case Plan::WalkDriver::AnchoredStart: {
       if (from > 0) return -1;
       OnePassWalk w;
       int e = cp_onepass_find(t, 0, saves, w);
       if (e == kWalkLocal) return kWalkLocal; // one candidate: nothing to count
       return (e > 0 && onepass_end_ok(e, t)) ? e : -1;
     }
-    // The grapheme-program prefix (EGC plans) or the byte-program prefix (US
-    // plans; possibly multi-byte UTF-8 — still a sound memmem needle, and the
-    // walk itself bails on any non-ASCII byte before consuming one).
-    if (plan_->prefix_.active() && plan_->prefix_.ascii &&
-        !plan_->prefix_.icase)
-      return prefix_onepass_find(t, from, saves, budget, plan_->prefix_.text,
-                                 plan_->prefix_.probe, plan_->prefix_.probe2);
-    if (plan_->byte_prefix_.active())
+    case Plan::WalkDriver::Prefix:
       return prefix_onepass_find(t, from, saves, budget,
-                                 plan_->byte_prefix_.text,
-                                 plan_->byte_prefix_.probe,
-                                 plan_->byte_prefix_.probe2);
-    // Assert (`body$`) patterns: the byte prefilters are not analyzed for
-    // them, but the assert tier's own leading-literal analysis is — the same
-    // required prefix, so the same memmem candidates.
-    if (!plan_->assert_.prefix.empty())
-      return prefix_onepass_find(t, from, saves, budget, plan_->assert_.prefix,
-                                 plan_->assert_.prefix_probe,
-                                 plan_->assert_.prefix_probe2);
-    if (plan_->inner_.active() && plan_->inner_.pre_nonabsorbing)
-      return inner_find_onepass(fc.inrev(*this), t, from, saves, budget);
-    return scan_onepass_find(t, from, saves, budget);
+                                 plan_->walk_prefix_.text,
+                                 plan_->walk_prefix_.probe,
+                                 plan_->walk_prefix_.probe2);
+    case Plan::WalkDriver::Inner:
+      return inner_find_onepass(fc->inrev(*this), t, from, saves, budget);
+    case Plan::WalkDriver::Scan:
+    case Plan::WalkDriver::None: // (not reached: capture_find_dispatch)
+      break;
+    }
+    return scan_onepass_find(t, from, saves, budget, byte);
   }
 
   // Dispatch head shared by the onepass driver users: the scalar chain when
   // the whole pattern is a forced chain (no automaton at all; see
   // chain_capture_find), else the candidate-driven one-pass walk.
   //
-  // Its four search() call sites stay open-coded on purpose (budget, dispatch,
-  // build_result_bytes / MatchResult{}): folding them into a helper with a
-  // MatchResult out-parameter was tried and measured +7-11 ns per search()
-  // on the httplib latency set (`/users/(\d+)` 44 -> 53 ns; the extra
-  // MatchResult move), so the duplication buys the direct return.
-  int capture_find_dispatch(FindCache &fc, std::string_view t, int from,
-                            std::vector<int> &saves, WalkBudget &budget) const {
+  // `fc` is read by ONE driver — the inner one, for its cached reverse(pre)
+  // DFA — and may be null for a plan that never reaches it
+  // (Plan::walk_driver_): a one-step find then skips fetching the
+  // thread's cache altogether (see scr_walk).
+  //
+  // capture_find_inline is the body, and it and everything down to the
+  // drivers are always inlined: once into capture_find_dispatch, the call
+  // every one-step caller makes, and once into the walk's find_all loop
+  // (onepass_fill_run), whose per-match path it is. The compiler used to
+  // decide that, and decided by how many callers there were: with one more
+  // step instantiated (find_at's) the loop got a call per match, and
+  // `(\w+)=(\S+)` over key=value text ran 5% slower.
+  REGEXLIB_ALWAYS_INLINE int
+  capture_find_inline(FindCache *fc, std::string_view t, int from,
+                      std::vector<int> &saves, WalkBudget &budget,
+                      bool byte) const {
     if (plan_->chain_.ok) {
       int e = chain_capture_find(t, from, saves, budget);
       if (e != kWalkBail && e != kWalkLocal) return e;
@@ -15198,7 +15135,13 @@ private:
     }
     if (!plan_->onepass_unbounded_)
       return kWalkBail; // neither engine planned: the located-span chain serves
-    return onepass_driver_find(fc, t, from, saves, budget);
+    return onepass_driver_find(fc, t, from, saves, budget, byte);
+  }
+  REGEXLIB_NOINLINE int
+  capture_find_dispatch(FindCache *fc, std::string_view t, int from,
+                        std::vector<int> &saves, WalkBudget &budget,
+                        bool byte) const {
+    return capture_find_inline(fc, t, from, saves, budget, byte);
   }
 
   // Anchored scalar-chain capture find (see Plan::ChainCapture): locate the
@@ -15211,6 +15154,7 @@ private:
   // walks are bounded
   // by its adjacent class runs, which non-absorption keeps disjoint across
   // candidates, and failures on the open side die within an element's min.
+  REGEXLIB_ALWAYS_INLINE
   int chain_capture_find(std::string_view t, int from, std::vector<int> &saves,
                          WalkBudget &budget) const {
     const auto &ch = plan_->chain_;
@@ -15291,88 +15235,48 @@ private:
     return -1;
   }
 
-  // The whole-subject one-pass find loop: columnar capture rows via the
-  // candidate drivers. True on completion; false on a cap or a GLOBAL bail
-  // (budget / profitability), with `resume` = the position the loop had
-  // reached. The rows appended so far are exact (each is a leftmost-first
-  // match, and the loop advanced past it), so every caller keeps them and
-  // continues its located-span chain from `resume` — the MatchIter shape —
-  // rather than clear and redo the subject.
-  //
-  // A LOCAL bail (kWalkLocal: a non-ASCII byte in the walk's way) does not
-  // end the loop: `chain_step(from)` — the caller's located-span chain, one
-  // match — appends that row and returns where to continue (or -1 / kCap),
-  // and the drivers are asked again from there. On the US tier any non-ASCII
-  // byte bails the walk, so this is what a mostly-ASCII subject turns on:
-  // `(\w+)=(\w+)` over a 256 KB kv corpus with one 'é' at the middle,
-  // find_all, measured 101 MB/s on the chain alone, 85 clearing and redoing
-  // on the chain, 144 handing the REST of the subject to the chain from the
-  // bail — and 254 with no 'é' at all, which is what the one chain match
-  // costs back.
-  template <class ChainStep>
-  bool onepass_fill(FindCache &fc, std::string_view bytes,
-                    std::vector<int> &saves, std::vector<uint32_t> &spans,
-                    int &resume, ChainStep chain_step) const {
-    int from = 0;
-    WalkBudget budget(bytes.size());
-    for (;;) {
-      int e = onepass_fill_run(fc, bytes, saves, spans, from, budget);
-      if (e == -1) return true;
-      if (e == kWalkLocal) {
-        e = chain_step(from); // this one match from the chain, row appended
-        if (e >= 0) {
-          from = e;
-          budget.resumed_at(from);
-          continue;
-        }
-        if (e == -1) return true;
-        // kCap: the chain cannot serve either; the caller's fallback decides
-      }
-      resume = from; // kCap / kWalkBail
-      return false;
-    }
-  }
-
-  // onepass_fill's driver loop: rows from `from` on until the drivers stop,
-  // returning what stopped them (-1 = no match remains, kWalkLocal,
-  // kWalkBail, LazyDfa::kCap) with `from` left where they stopped. Split out
-  // and NOT a template: onepass_fill is instantiated once per chain step
-  // (six call sites), and with this loop inside it each copy made its own
-  // inlining decision about the dispatch below — find_all over dense ASCII
-  // `\w+` measured 10% slower that way than with the one shared loop.
-  REGEXLIB_NOINLINE int onepass_fill_run(FindCache &fc, std::string_view bytes,
+  // The Walk rung run to its end (see ladder_step): rows from `from` on
+  // until the drivers stop, returning what stopped them (-1 = no match
+  // remains, kWalkLocal, kWalkBail, LazyDfa::kCap) with `from` left where
+  // they stopped. The rows appended so far are exact (each is a
+  // leftmost-first match, and the loop advanced past it), so the ladder keeps
+  // them and goes on from `from`. Its own function, NOT inlined: inside the
+  // step this loop made its own inlining decision about the dispatch below —
+  // find_all over dense ASCII `\w+` measured 10% slower that way than with
+  // the one shared loop.
+  REGEXLIB_NOINLINE int onepass_fill_run(FindCache *fc, std::string_view bytes,
                        std::vector<int> &saves, std::vector<uint32_t> &spans,
-                       int &from, WalkBudget &budget) const {
+                       int &from, WalkBudget &budget, bool byte) const {
     for (;;) {
-      int e = capture_find_dispatch(fc, bytes, from, saves, budget);
+      int e = capture_find_inline(fc, bytes, from, saves, budget, byte);
       if (e < 0) return e;
       append_match_spans_bytes(saves, spans);
       from = e; // !can_match_empty_ -> progress
     }
   }
 
-  // One assert-tier chain match appended as a columnar row (the assert twin
+  // One assert-tier chain match handed to `out` (the assert twin
   // of dfa_chain_step): the assert DFA locates the span — `byte` selects the
   // byte assert engine over the ASCII one — and the assert-aware capture
   // engine resolves the groups, if any. Returns the position to continue
   // from, or -1 when no match remains. `wbudget` is the caller's loop-wide
   // budget for the assert prefilters (see assert_find_span).
-  int assert_chain_step(FindCache &fc, std::string_view text, int from,
-                        bool byte, WalkBudget &wbudget, Scratch &sc,
-                        std::vector<int> &saves,
-                        std::vector<uint32_t> &spans) const {
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE int assert_chain_step(FindCache &fc,
+                                               std::string_view text, int from,
+                                               bool byte, WalkBudget &wbudget,
+                                               Scratch &sc,
+                                               std::vector<int> &saves,
+                                               Out &out) const {
     if (from > static_cast<int>(text.size())) return -1;
     int s = 0, e = 0;
     if (!(byte ? assert_byte_find_span(fc, text, from, s, e, &wbudget)
                : assert_find_span(fc, text, from, s, e, &wbudget)))
       return -1;
-    if (plan_->ncap_ > 0) {
-      if (!capture_saves_bytes(text, s, e, sc, saves)) return -1;
-      append_match_spans_bytes(saves, spans);
+    if (!emit_located(text, s, e, sc, saves, out)) return -1;
+    if (plan_->ncap_ > 0 && Out::kGroups) { // the span as the groups have it
       s = saves[0];
       e = saves[1];
-    } else {
-      push_span(spans, s, e);
     }
     // ASCII: us_step_byte(e) == e + 1; the byte tier steps a code point.
     return (e > s) ? e : us_step_byte(text, e);
@@ -15386,6 +15290,7 @@ private:
   // match remains, LazyDfa::kCap on a reverse state-cap, kWalkLocal on a
   // non-ASCII byte, or kWalkBail when the failed-walk budget runs out (see
   // prefix_onepass_find).
+  REGEXLIB_ALWAYS_INLINE
   int inner_find_onepass(LazyDfa &pre_rev, std::string_view text, int from,
                          std::vector<int> &saves, WalkBudget &budget) const {
     const unsigned char *p =
@@ -15430,6 +15335,11 @@ private:
   MatchResult build_result_bytes(std::string_view t,
                                  const std::vector<int> &saves) const {
     MatchResult r;
+    set_result_bytes(r, t, saves);
+    return r;
+  }
+  void set_result_bytes(MatchResult &r, std::string_view t,
+                        const std::vector<int> &saves) const {
     int wb_ = saves[0], we_ = saves[1];
     r._init(static_cast<size_t>(wb_), static_cast<size_t>(we_), t.data() + wb_,
             we_ >= wb_ ? static_cast<size_t>(we_ - wb_) : 0, plan_->ncap_);
@@ -15439,13 +15349,15 @@ private:
         r._set_group(gi, static_cast<size_t>(b), static_cast<size_t>(e));
     }
     finish_result(r);
-    return r;
   }
 
   // A capture-free match [s, e) -> one columnar row (the begin, end pair).
+  // (lvalues: push_back(const T&) keeps its capacity check inline, where the
+  // rvalue overload is an emplace_back call per cell.)
   static void push_span(std::vector<uint32_t> &spans, int s, int e) {
-    spans.push_back(static_cast<uint32_t>(s));
-    spans.push_back(static_cast<uint32_t>(e));
+    const uint32_t b = static_cast<uint32_t>(s), en = static_cast<uint32_t>(e);
+    spans.push_back(b);
+    spans.push_back(en);
   }
 
   // Byte-offset saves -> one columnar row of byte offsets (no strings).
@@ -15503,21 +15415,22 @@ private:
     }
   }
 
-  // Leftmost match at or after grapheme index `start`. With a literal prefix on
+  // The first grapheme index at or after `start` where a match can begin, or
+  // -1 when there is none. With a literal prefix on
   // an ASCII subject (grapheme index == byte index), memmem skips to the first
   // prefix occurrence and the unanchored scan resumes there — any match must
   // begin with the prefix, so nothing in between can match. The scan stays
   // unanchored (one linear pass), NOT an anchored retry per occurrence: a weak
   // prefix like "a" matches at almost every position, and a per-occurrence
   // retry would be quadratic.
-  MatchResult search_at_or_after(const detail::Segmented &seg, int start,
-                                 Scratch &sc) const {
-    bool filtered = false; // a start-filter pinned `start` to a real candidate
+  int pike_candidate(const detail::Segmented &seg, int start,
+                     bool &filtered) const {
+    filtered = false; // a start-filter pinned `start` to a real candidate
     if (plan_->prefix_.active() && seg.ascii) {
       const char *base = seg.source.data();
       size_t slen = seg.source.size();
       size_t b = static_cast<size_t>(start);
-      if (b + plan_->prefix_.text.size() > slen) return MatchResult{};
+      if (b + plan_->prefix_.text.size() > slen) return -1;
       const unsigned char *np =
           reinterpret_cast<const unsigned char *>(plan_->prefix_.text.data());
       // ASCII subject: the case-fold scan is exact (find_substr_icase note).
@@ -15529,7 +15442,7 @@ private:
               : find_substr(reinterpret_cast<const unsigned char *>(base + b),
                             slen - b, np, plan_->prefix_.text.size(),
                             plan_->prefix_.probe, plan_->prefix_.probe2);
-      if (!hit) return MatchResult{};
+      if (!hit) return -1;
       start =
           static_cast<int>(hit - reinterpret_cast<const unsigned char *>(base));
       filtered = true;
@@ -15538,7 +15451,7 @@ private:
       // A case-insensitive prefix is NOT skipped here — find_substr_icase is
       // unsound on UTF-8 (a fold byte could land inside a multi-byte cluster).
       int gi = prefix_skip_nonascii(seg, start);
-      if (gi < 0) return MatchResult{};
+      if (gi < 0) return -1;
       start = gi;
       filtered = true;
     } else if (plan_->teddy_.ok && seg.ascii) {
@@ -15548,7 +15461,7 @@ private:
       const unsigned char *p =
           reinterpret_cast<const unsigned char *>(seg.source.data());
       size_t b = teddy_next(p, seg.source.size(), static_cast<size_t>(start));
-      if (b >= seg.source.size()) return MatchResult{};
+      if (b >= seg.source.size()) return -1;
       start = static_cast<int>(b);
       filtered = true;
     } else if (plan_->first_bytes_.ok && seg.ascii) {
@@ -15559,31 +15472,61 @@ private:
       size_t slen = seg.source.size();
       const unsigned char *p = reinterpret_cast<const unsigned char *>(base);
       size_t b = skip_to_first_byte(p, slen, static_cast<size_t>(start));
-      if (b >= slen) return MatchResult{}; // no byte here can begin a match
+      if (b >= slen) return -1; // no byte here can begin a match
       start = static_cast<int>(b);
       filtered = true;
     }
+    return start;
+  }
 
-    // ASCII captures: resolve them with the anchored bounded backtracker at
-    // `start`, skipping the Pike VM (the win for non-longest-safe captures). A
-    // hit at `start` IS the leftmost match — nothing before `start` can begin
-    // one (it was pinned by a prefix/Teddy/first-byte filter, or `start` is
-    // just the current search cursor). A no-match or span-overflow falls
-    // through to the one unanchored Pike pass from `start` (linear — no
-    // per-occurrence retry, no quadratic blow-up). With a filter the attempt is
-    // cheap and almost always hits; unfiltered it might miss (the match is
-    // later), so it is restricted to short subjects where a miss wastes at most
-    // O(prog_size * subject) — the cpp-httplib header case. Large find_all
-    // subjects stay on the Pike unfiltered.
-    if (plan_->cap_bitstate_ && plan_->ncap_ > 0 && seg.ascii &&
-        (filtered || seg.source.size() <= limits::kUnfilteredBitStateBytes)) {
-      std::vector<int> saves;
-      bool overflow = false;
-      if (bitstate_bytes(plan_->cp_prog_, seg.source, start,
-                         static_cast<int>(seg.source.size()), saves, overflow))
-        return build_result_bytes(seg.source, saves);
+  // One Pike match at or after index `start` of `seg`, handed to `out`;
+  // returns the index to continue from, or -1 when no match remains. The
+  // Pike rung of the find ladder. The code-point Pike (CodePoint mode)
+  // runs unfiltered; the grapheme Pike skips to a candidate first.
+  //
+  // ASCII captures: resolve them with the anchored bounded backtracker at
+  // the candidate, skipping the Pike VM (the win for non-longest-safe
+  // captures). A hit at the candidate IS the leftmost match — nothing before
+  // it can begin one (it was pinned by a prefix/Teddy/first-byte filter, or
+  // it is just the current cursor). A no-match or span-overflow falls
+  // through to the one unanchored Pike pass from the candidate (linear — no
+  // per-occurrence retry, no quadratic blow-up). With a filter the attempt is
+  // cheap and almost always hits; unfiltered it might miss (the match is
+  // later), so it is restricted to short subjects where a miss wastes at most
+  // O(prog_size * subject) — the cpp-httplib header case. Large subjects
+  // stay on the Pike unfiltered.
+  template <class Out>
+  int pike_step(const detail::Segmented &seg, int start, Scratch &sc,
+                std::vector<int> &saves, Out &out) const {
+    const bool cp = plan_->us_;
+    if (!cp) {
+      bool filtered = false;
+      start = pike_candidate(seg, start, filtered);
+      if (start < 0) return -1;
+      if (plan_->cap_bitstate_ && plan_->ncap_ > 0 && seg.ascii &&
+          (filtered ||
+           seg.source.size() <= limits::kUnfilteredBitStateBytes)) {
+        bool overflow = false;
+        if (bitstate_bytes(plan_->cp_prog_, seg.source, start,
+                           static_cast<int>(seg.source.size()), saves,
+                           overflow)) {
+          // ASCII segmentation: byte offset == grapheme index.
+          out.groups(*this, seg.source, saves);
+          return pike_resume(saves);
+        }
+      }
     }
-    return run(plan_->prog_, seg, start, /*anchored=*/false, sc);
+    if (!run_saves(cp ? plan_->cp_prog_ : plan_->prog_, seg, start,
+                   /*anchored=*/false, sc, saves))
+      return -1;
+    out.groups(*this, seg, saves);
+    return pike_resume(saves);
+  }
+  // Where the Pike goes on after the match in `saves`: its end, or one
+  // index past an empty one.
+  static int pike_resume(const std::vector<int> &saves) {
+    int b = saves[0], e = saves[1];
+    return (e > b) ? e : e + 1;
   }
 
   // --- Result materialization & bulk fill ---
@@ -15591,6 +15534,11 @@ private:
   MatchResult build_result(const detail::Segmented &seg,
                            const std::vector<int> &saves) const {
     MatchResult r;
+    set_result(r, seg, saves);
+    return r;
+  }
+  void set_result(MatchResult &r, const detail::Segmented &seg,
+                  const std::vector<int> &saves) const {
     auto byte_of = [&](int gi) -> size_t {
       if (gi < 0) return 0;
       if (gi >= static_cast<int>(seg.byte_begin.size()))
@@ -15610,7 +15558,6 @@ private:
         r._set_group(gi, byte_of(b), byte_of(e));
     }
     finish_result(r);
-    return r;
   }
 
   // Construct a Match view (Match's constructor is private; Regex is a friend).
@@ -15648,14 +15595,11 @@ private:
     }
   }
 
-  // Run the tier dispatch over `bytes` and fill `out`'s columnar spans (defined
-  // out of class, where MatchList is complete). `cache` may be null (throwaway).
+  // Run the find ladder over `bytes` to its end and fill `out`'s columnar
+  // spans (defined out of class, where MatchList is complete). `cache` may be
+  // null (this thread's).
   void fill_matches(std::string_view bytes, FindCache *cache,
                     MatchList &out) const;
-  // fill_matches' tier dispatch: rows as the ENGINES write them (ncap_ + 1
-  // pairs per match).
-  void fill_rows(std::string_view bytes, FindCache *cache,
-                 MatchList &out) const;
 
   // Expand `repl`'s $-grammar for match `m` (a view into `text`) into `out`.
   // Same grammar as the std::regex-compat format ($$ $& $` $' $1..$99), plus
@@ -15682,382 +15626,18 @@ inline void Regex::fill_matches(std::string_view bytes, FindCache *cache,
   out.ngroups_ = plan_->ncap_;
   for (auto &kv : plan_->named_)
     out.names_.emplace(kv.first, kv.second);
-  fill_rows(bytes, cache, out);
+  // The same ladder find_iter steps, climbed to the end: one row per match,
+  // as the engines write them (ncap_ + 1 pairs). With no caller cache the
+  // rungs reuse this thread's persistent DFAs (built once, reused across
+  // calls).
+  Finder f(*this, bytes, cache);
+  RowSink rows{out.spans_};
+  f.drain(rows);
   // A whole-match capture ran as its capture-free twin (one pair per match):
   // widen each row so every group reads as the match (see alias_rows).
   if (plan_->alias_groups_) {
     alias_rows(out.spans_, plan_->alias_groups_);
     out.ngroups_ = plan_->alias_groups_;
-  }
-}
-
-inline void Regex::fill_rows(std::string_view bytes, FindCache *cache,
-                             MatchList &out) const {
-
-  // [Tier: Literal] pure printable-ASCII literal: memmem every occurrence in
-  // one pass, no subject classification and no DFA (the RE2/rure literal
-  // scan). Non-nullable, so each match advances past its end.
-  if (plan_->literal_only_) {
-    int from = 0, s, e;
-    while (literal_locate(bytes, from, s, e)) {
-      push_span(out.spans_, s, e);
-      from = e;
-    }
-    return;
-  }
-  // [Tier: LiteralAlt]
-  if (plan_->literal_alt_ok()) {
-    literal_alt_fill(bytes, out.spans_);
-    return;
-  }
-  // [Tier: AssertAnchor] (EGC; US is already gate-free)
-  if (plan_->assert_anchor_egc()) {
-    assert_anchor_fill(bytes, out.spans_);
-    return;
-  }
-
-  // No caller cache -> reuse this thread's persistent DFAs (built once, reused
-  // across calls), rather than rebuilding them into a throwaway cache each
-  // call.
-  FindCache &c = cache ? *cache : thread_cache();
-  c.bind(*this);
-
-  // UnicodeScalar mode: byte DFA offsets for capture-free DFA-eligible
-  // patterns, else the code-point Pike VM appending byte-offset rows (saves are
-  // code-point indices, mapped to byte offsets via the code-point
-  // segmentation).
-  if (plan_->us_) {
-    // [Tier: Dfa/US] capture-free byte DFA spans.
-    if (plan_->dfa_find_free()) {
-      LazyDfa &lfu = c.lfu(*this), &rv = c.rv(*this);
-      // Rare-literal prefilter: memmem the trailing/interior literal and verify
-      // each candidate, instead of stepping the DFA over every byte (same tier
-      // EGC's ASCII path uses; see suffix_fill / inner_fill). false = state cap,
-      // clear and fall through to the full scan below.
-      if (plan_->suffix_.active()) {
-        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_,
-                        /*collapse=*/false))
-          return;
-        out.spans_.clear();
-      } else if (plan_->inner_.active()) {
-        if (inner_fill(bytes, lfu, c.lfa(*this), rv, c.inrev(*this), out.spans_))
-          return;
-        out.spans_.clear();
-      }
-      // [Tier: Dfa/US+onepass] The capture tier's driver loop run for its SPAN:
-      // one walk per match where dfa_locate_all_lf below takes two (forward for
-      // the end, reverse for the start). append_match_spans_bytes writes
-      // ncap_ + 1 = 1 row per match here, i.e. exactly the (begin, end) pair
-      // this tier's columnar layout wants. A bail keeps the rows found so far
-      // and hands the rest to the chain from `resume` (see onepass_fill).
-      int resume = 0;
-      if (plan_->onepass_unbounded_) {
-        std::vector<int> saves;
-        if (onepass_fill(c, bytes, saves, out.spans_, resume, [&](int from) {
-              return dfa_chain_step(bytes, from, lfu, rv, c.sc_, saves,
-                                    out.spans_);
-            }))
-          return;
-      }
-      if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
-            push_span(out.spans_, s, e);
-            return true;
-          }))
-        return;
-      out.spans_.clear(); // state cap tripped — fall through to the Pike VM
-    } else if (plan_->dfa_find_caps()) {
-      // [Tier: Dfa/US+cap] Candidate + UNBOUNDED one-pass first (one walk per
-      // match yields end + captures; see the search() twin for soundness). A
-      // non-ASCII byte costs one chain match; a budget bail or a reverse cap
-      // keeps the rows found so far and hands the rest of the subject to the
-      // chain from `resume` — the MatchIter shape (see onepass_fill).
-      int resume = 0;
-      if (plan_->capture_scan_ok()) {
-        std::vector<int> saves;
-        if (onepass_fill(c, bytes, saves, out.spans_, resume, [&](int from) {
-              return dfa_chain_step(bytes, from, c.lfu(*this), c.rv(*this),
-                                    c.sc_, saves, out.spans_);
-            }))
-          return;
-      }
-      // Located-span chain: the leftmost-first byte DFA locates each span;
-      // the code-point backtracker (bounded by the lf end) resolves captures
-      // as columnar rows. No byte prefilters here: plan_us_prefilters only
-      // analyzes capture-FREE US patterns, so suffix_/inner_ are never
-      // planned on this path.
-      if (byte_fill_capture_lf(bytes, resume, c.lfu(*this), c.rv(*this),
-                               c.sc_, out.spans_))
-        return;
-      out.spans_
-          .clear(); // cap tripped — fall through to the code-point Pike VM
-    }
-    // [Tier: Assert/Byte] shared byte assert engine: capture-free spans or
-    // capture rows from the code-point-aware byte assert DFA, replacing the
-    // Pike for US assert patterns (the same loop EGC runs for a non-ASCII
-    // subject below).
-    if (assert_byte_path_ok(bytes)) {
-      std::vector<int> saves;
-      WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
-      auto chain_step = [&](int from) {
-        return assert_chain_step(c, bytes, from, /*byte=*/true, wbudget,
-                                 c.sc_, saves, out.spans_);
-      };
-      // `body$` one-pass find first (see onepass_require_end_); on a bail the
-      // assert chain resumes from the last one-pass row (see onepass_fill).
-      int resume = 0;
-      if (plan_->capture_scan_ok() &&
-          onepass_fill(c, bytes, saves, out.spans_, resume, chain_step))
-        return;
-      for (int start = resume; start >= 0;)
-        start = chain_step(start);
-      return;
-    }
-    // [Tier: Pike/cp] the US baseline: code-point Pike VM.
-    auto seg = detail::segment_cp(bytes);
-    std::vector<int> saves;
-    int n = static_cast<int>(seg.graphemes.size());
-    int start = 0;
-    while (start <= n) {
-      if (!run_saves(plan_->cp_prog_, seg, start, /*anchored=*/false, c.sc_, saves))
-        break;
-      append_match_spans(seg, saves, out.spans_);
-      int b = saves[0], e = saves[1];
-      start = (e > b) ? e : e + 1;
-    }
-    return;
-  }
-
-  // Classify the subject once (first non-ASCII byte), shared across the gates.
-  const size_t fna = first_nonascii(bytes);
-
-  // [Tier: Dfa/EgcByte] fused literal-prefilter path (see egc_fused_ok for
-  // the rationale). Prefix and suffix are mutually exclusive (suffix
-  // extraction requires no prefix).
-  if (plan_->egc_fused_ok() && fna < bytes.size()) {
-    if (plan_->prefix_fused()) {
-      if (prefix_egc_fill(bytes, c.blfa(*this), plan_->byte_prefix_.text,
-                          plan_->byte_prefix_.probe, plan_->byte_prefix_.probe2,
-                          out.spans_))
-        return;
-      out.spans_.clear(); // DFA cap or ineligible -> fall through to gate / Pike
-    } else if (plan_->suffix_.active()) {
-      if (suffix_egc_fill(bytes, c.blfa(*this), c.brv(*this), out.spans_))
-        return;
-      out.spans_.clear();
-    }
-  }
-
-  // [Tier: Dfa/EgcByte] fused-collapse tier (see egc_fused_collapse_ok): the
-  // suffix scan verifies eligibility (clusters AND lone CR/LF) inline, so the
-  // upfront simple_from_crlf_ok + no_lone_crlf gate passes disappear — no fna
-  // gate either (a pure-ASCII CRLF subject belongs here too, and the fused
-  // pass is the cheaper route even for ASCII-only subjects). An ineligible
-  // subject (e.g. a lone LF a few bytes in, on Unix-newline text) falls
-  // through to the gated tiers below, having scanned only up to the bail.
-  if (plan_->egc_fused_collapse_ok()) {
-    if (suffix_egc_fill(bytes, c.blfa(*this), c.brv(*this), out.spans_,
-                        /*collapse=*/true))
-      return;
-    out.spans_.clear(); // cap or ineligible -> fall through to gate / Pike
-  }
-
-  // [Tier: Dfa/EgcByte] EGC byte path (non-ASCII, no multi-code-point
-  // cluster): capture-free DFA over the UTF-8 byte programs, offsets only.
-  if (plan_->ncap_ == 0 && egc_byte_path(bytes, fna)) {
-    LazyDfa &lfu = c.blfu(*this), &rv = c.brv(*this);
-
-    // Case-insensitive clean-prefix prefilter: memchr2 the rarest clean
-    // folded-prefix char, confirm each candidate start with the anchored byte
-    // DFA. Exclusive with suffix_.lit (icase vs !icase).
-    if (plan_->icase_prefix_.active()) {
-      if (icase_prefix_fill(bytes, c.blfa(*this), out.spans_)) return;
-      out.spans_.clear(); // cap — fall through to the full DFA loop / Pike
-    }
-
-    // Required-suffix prefilter: memmem the rare trailing literal, confirm each
-    // candidate by a reverse byte-DFA scan (see suffix_find). blfa = anchored
-    // forward DFA for the variable-length re-expansion.
-    if (plan_->suffix_.active()) {
-      if (suffix_fill(bytes, c.blfa(*this), rv, out.spans_,
-                      plan_->byte_crlf_collapse_))
-        return;
-      out.spans_.clear(); // cap — fall through to the full DFA loop / Pike
-    }
-    // ReverseInner prefilter: memmem the rare interior literal, recover each
-    // match by a reverse(pre) floor + the full forward/reverse byte DFAs. Skip
-    // it on the CRLF-collapse path: inner_.pre_rev is non-collapsed, so its
-    // floor can land mid-CR-LF-cluster where the collapsed forward DFA cannot
-    // start, dropping a cluster-initial match (see the search() counterpart).
-    if (plan_->inner_.active() && !plan_->byte_crlf_collapse_) {
-      if (inner_fill(bytes, lfu, c.blfa(*this), rv, c.inrev(*this), out.spans_))
-        return;
-      out.spans_.clear(); // cap — fall through to the full DFA loop / Pike
-    }
-
-    if (dfa_locate_all_lf(bytes, 0, lfu, rv, [&](int s, int e) {
-          push_span(out.spans_, s, e);
-          return true;
-        }))
-      return;
-    out.spans_.clear(); // cap — fall through to the grapheme Pike VM
-  } else if (plan_->ncap_ > 0 && egc_byte_path(bytes, fna)) {
-    // [Tier: Dfa/EgcByte+cap] leftmost-first byte locate + bounded resolution.
-    // ReverseInner locate first when planned (same CRLF-collapse caveat as the
-    // capture-free tier above).
-    if (plan_->inner_.active() && !plan_->byte_crlf_collapse_) {
-      if (inner_fill_capture(bytes, 0, c.blfu(*this), c.blfa(*this),
-                             c.brv(*this), c.inrev(*this), c.sc_, out.spans_))
-        return;
-      out.spans_.clear();
-    }
-    if (byte_fill_capture_lf(bytes, 0, c.blfu(*this), c.brv(*this), c.sc_,
-                             out.spans_))
-      return;
-    out.spans_.clear(); // cap — fall through to the grapheme Pike VM
-  } else
-    // [Tier: Dfa/Ascii] capture-free ∧ DFA-able ∧ ASCII subject:
-    // leftmost-first DFA, offsets only.
-    if (plan_->dfa_find_free() && ascii_grapheme_ok(bytes, fna)) {
-      LazyDfa &lfu = c.lfu(*this), &rv = c.rv(*this);
-      // Required-suffix prefilter (ASCII tier): rev_prog_ is the reverse DFA here
-      // (byte == code point on ASCII), so the same suffix scan applies. lfa =
-      // anchored forward DFA for the variable-length re-expansion.
-      if (plan_->suffix_.active()) {
-        if (suffix_fill(bytes, c.lfa(*this), rv, out.spans_,
-                        /*collapse=*/false))
-          return;
-        out.spans_.clear();
-      }
-      // ReverseInner (ASCII tier): the inner pre program is a UTF-8 byte program,
-      // sound on an ASCII subject (byte == code point); the end/start come from
-      // this tier's full forward (lfu) and reverse (rv) DFAs.
-      if (plan_->inner_.active()) {
-        if (inner_fill(bytes, lfu, c.lfa(*this), rv, c.inrev(*this), out.spans_))
-          return;
-        out.spans_.clear();
-      }
-      // [Tier: Dfa/Ascii+onepass] one walk per match for the span, as the US
-      // tier does (see there); ASCII subject, so byte offset == grapheme index.
-      int resume = 0;
-      if (plan_->onepass_unbounded_) {
-        std::vector<int> op_saves;
-        if (onepass_fill(c, bytes, op_saves, out.spans_, resume,
-                         [&](int from) {
-                           return dfa_chain_step(bytes, from, lfu, rv, c.sc_,
-                                                 op_saves, out.spans_);
-                         }))
-          return;
-      }
-      if (dfa_locate_all_lf(bytes, resume, lfu, rv, [&](int s, int e) {
-            push_span(out.spans_, s, e);
-            return true;
-          }))
-        return;
-      out.spans_.clear(); // state cap tripped — fall through to the Pike VM
-    }
-
-  std::vector<int> saves;
-
-  // [Tier: Dfa/Ascii+cap] captures ∧ DFA-able ∧ ASCII subject: leftmost-first
-  // DFA locates the span, the byte backtracker resolves captures as
-  // byte-offset rows. On ASCII a "code point" is one byte == one grapheme, so
-  // this matches the grapheme Pike with no full-subject segmentation. Correct
-  // for any dfa_ok_ pattern (no longest-safe).
-  if (plan_->dfa_find_caps() && ascii_grapheme_ok(bytes, fna)) {
-    // Candidate + UNBOUNDED one-pass first: one walk over each match yields
-    // its end and captures (see cp_onepass_find), replacing the forward +
-    // reverse + bounded-capture chain. A bail (the failed-walk budget — a
-    // non-ASCII byte, and so a local bail, is impossible on this tier) hands
-    // the rest of the subject to the chain from `resume` (see onepass_fill).
-    int resume = 0;
-    if (plan_->capture_scan_ok() &&
-        onepass_fill(c, bytes, saves, out.spans_, resume, [&](int from) {
-          return dfa_chain_step(bytes, from, c.lfu(*this), c.rv(*this), c.sc_,
-                                saves, out.spans_);
-        }))
-      return;
-    // ReverseInner locate first when planned (ASCII tier: byte == code point,
-    // the inner byte programs are sound here — see the capture-free twin). Its
-    // own bail drops only the rows it added: the one-pass rows before
-    // `resume` stay, and the full scan below continues from `resume` too.
-    if (plan_->inner_.active()) {
-      const size_t keep = out.spans_.size();
-      if (inner_fill_capture(bytes, resume, c.lfu(*this), c.lfa(*this),
-                             c.rv(*this), c.inrev(*this), c.sc_, out.spans_))
-        return;
-      out.spans_.resize(keep);
-    }
-    if (byte_fill_capture_lf(bytes, resume, c.lfu(*this), c.rv(*this), c.sc_,
-                             out.spans_))
-      return;
-    out.spans_.clear(); // cap — fall through to the grapheme Pike VM
-  }
-
-  // [Tier: Assert/Ascii+cap] locate each span via the assert DFA, resolve
-  // groups with the assertion-aware bitstate, emit columnar capture rows —
-  // same layout as Dfa/Ascii+cap, replacing the grapheme Pike.
-  if (plan_->assert_cap_ && assert_find_ok(bytes, fna)) {
-    WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
-    auto chain_step = [&](int from) {
-      return assert_chain_step(c, bytes, from, /*byte=*/false, wbudget, c.sc_,
-                               saves, out.spans_);
-    };
-    // `body$` one-pass find first (see onepass_require_end_); on a bail the
-    // assert chain resumes from the last one-pass row (see onepass_fill).
-    int resume = 0;
-    if (plan_->capture_scan_ok() &&
-        onepass_fill(c, bytes, saves, out.spans_, resume, chain_step))
-      return;
-    for (int start = resume; start >= 0;)
-      start = chain_step(start);
-    return;
-  }
-
-  // [Tier: Assert/Ascii] capture-free: assertion-aware DFA find, byte-offset
-  // span rows (begin,end) — same columnar layout as the byte tiers for
-  // ncap_==0.
-  if (plan_->ncap_ == 0 && assert_find_ok(bytes, fna)) {
-    int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
-    WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
-    while (start <= n && assert_find_span(c, bytes, start, s, e, &wbudget)) {
-      push_span(out.spans_, s, e);
-      start = (e > s) ? e : e + 1;
-    }
-    return;
-  }
-
-  // [Tier: Assert/Byte] capture-free (EGC), non-ASCII simple subject: byte spans.
-  if (assert_byte_path_ok(bytes)) {
-    int n = static_cast<int>(bytes.size()), start = 0, s = 0, e = 0;
-    WalkBudget wbudget(bytes.size()); // loop-wide (see assert_find_span)
-    while (start <= n &&
-           assert_byte_find_span(c, bytes, start, s, e, &wbudget)) {
-      push_span(out.spans_, s, e);
-      start = (e > s) ? e : us_step_byte(bytes, e);
-    }
-    return;
-  }
-
-  // [Tier: Pike] the proven baseline: Pike VM over the whole subject. A
-  // non-ASCII subject with an ASCII literal prefix skips dead regions with
-  // memmem (avoiding the non-ASCII cliff), just like search_at_or_after; the
-  // grapheme Pike then confirms each candidate.
-  auto seg = detail::segment(bytes);
-  // !prefix_.icase: a case-insensitive prefix is never skipped on a non-ASCII
-  // subject (find_substr_icase is unsound on UTF-8 — see its note).
-  bool skip_prefix =
-      plan_->prefix_.active() && plan_->prefix_.ascii && !plan_->prefix_.icase && !seg.ascii;
-  int n = static_cast<int>(seg.graphemes.size());
-  int start = 0;
-  while (start <= n) {
-    if (skip_prefix) {
-      start = prefix_skip_nonascii(seg, start);
-      if (start < 0) break;
-    }
-    if (!run_saves(plan_->prog_, seg, start, /*anchored=*/false, c.sc_, saves)) break;
-    append_match_spans(seg, saves, out.spans_);
-    int b = saves[0], e = saves[1];
-    start = (e > b) ? e : e + 1;
   }
 }
 
@@ -16116,187 +15696,20 @@ inline Regex::MatchList Regex::find_all(const char *text, FindCache &cache) cons
 //------------------------------------------------------------------------------
 
 inline Regex::MatchIter::MatchIter(const Regex &re, std::string_view text,
-                                   FindCache &cache)
-    : re_(&re), text_(text), cache_(&cache) {
+                                   FindCache *cache)
+    : f_(re, text, cache) {
   one_.owns_ = false;
   one_.borrowed_ = text;
   alias_groups_ = re.plan_->alias_groups_;
   one_.ngroups_ = re.plan_->ngroups();
-  walk_budget_ = WalkBudget(text.size());
   for (auto &kv : re.plan_->named_)
     one_.names_.emplace(kv.first, kv.second);
-
-  // Same tier dispatch as fill_matches, chosen once; whether a Dfa tier
-  // resolves captures is decided per step by ncap_ (the locate is identical
-  // either way). A Dfa tier that hits the state cap mid-scan downgrades to the
-  // Pike VM in downgrade().
-  // Pure printable-ASCII literal: memmem each match, no subject classification
-  // (skips the first_nonascii / simple_from pass below) — the RE2/rure literal
-  // scan. Sound on any UTF-8; see literal_locate.
-  if (re.plan_->literal_only_) {
-    tier_ = Tier::Literal;
-    return;
-  }
-  if (re.plan_->literal_alt_ok()) {
-    tier_ = Tier::LiteralAlt;
-    return;
-  }
-  if (re.plan_->assert_anchor_egc()) {
-    tier_ = Tier::AssertAnchor;
-    return;
-  }
-  if (re.plan_->us_) {
-    if (re.plan_->dfa_find_ok()) { // [Tier: Dfa/US]
-      tier_ = Tier::Dfa;
-      fwd_kind_ = kLfu;
-      rev_kind_ = kRv;
-      // Captures: the unbounded one-pass walk drives the find, as on the EGC
-      // ASCII tier (see the search() twin); a bail reverts to the chain.
-      op_unb_ = re.plan_->capture_scan_ok();
-    } else if (re.assert_byte_path_ok(text)) {
-      // [Tier: Assert/Byte] shared byte assert engine: the per-step Assert
-      // handler resolves captures when ncap_ > 0. US only — EGC shares the
-      // engine but not the captures (assert_byte_path_ok gates its rung on
-      // ncap_ == 0).
-      tier_ = Tier::Assert;
-      assert_byte_ = true;
-      op_unb_ = re.plan_->capture_scan_ok();
-    } else { // [Tier: Pike/cp]
-      tier_ = Tier::Pike;
-      cp_mode_ = true;
-    }
-    return;
-  }
-  // [Tier: Dfa/EgcByte] fused literal-prefilter tier (see egc_fused_ok for
-  // the rationale). Streaming-specific: a bad cluster downgrades to the Pike
-  // from resume_pos_ (the last yielded end, whose region the scan already
-  // verified clean), so yielded matches stay correct.
-  if (re.plan_->egc_fused_ok() &&
-      Regex::first_nonascii(text) < text.size()) {
-    tier_ = Tier::Dfa;
-    fwd_kind_ = kBlfu;
-    rev_kind_ = kBrv;
-    egc_fused_ = true;
-    return;
-  }
-  // [Tier: Dfa/EgcByte] fused-collapse tier (see egc_fused_collapse_ok): the
-  // suffix scan itself verifies eligibility (clusters AND lone CR/LF), so no
-  // subject classification happens here at all — not even the fna pass. An
-  // ineligible subject re-primes the unfused ladder (reprime_unfused), where
-  // plain Unix-newline text lands on the ASCII DFA tier.
-  if (re.plan_->egc_fused_collapse_ok()) {
-    tier_ = Tier::Dfa;
-    fwd_kind_ = kBlfu;
-    rev_kind_ = kBrv;
-    egc_fused_ = true;
-    fused_collapse_ = true;
-    return;
-  }
-  reprime_unfused();
-}
-
-inline void Regex::MatchIter::reprime_unfused() {
-  const Regex &re = *re_;
-  std::string_view text = text_;
-  const size_t fna = Regex::first_nonascii(text); // classify once; share gates
-  if (re.egc_byte_path(text, fna)) { // [Tier: Dfa/EgcByte]
-    tier_ = Tier::Dfa;
-    fwd_kind_ = kBlfu;
-    rev_kind_ = kBrv;
-    // (?i) clean-prefix prefilter: choose the probe once (the fast-probe guard
-    // is O(n)); ip_active_ stays false if no probe applies (full DFA loop runs).
-    if (re.plan_->ncap_ == 0 && re.plan_->icase_prefix_.active())
-      ip_active_ = re.icase_choose_probe(text, ip_probe_);
-  } else if (re.plan_->dfa_find_ok() &&
-             re.ascii_grapheme_ok(text, fna)) { // [Tier: Dfa/Ascii]
-    tier_ = Tier::Dfa;
-    fwd_kind_ = kLfu;
-    rev_kind_ = kRv;
-    // Captures: drive the find with the unbounded one-pass walk (prefix /
-    // inner / position-scan candidates — see cp_onepass_find).
-    op_unb_ = re.plan_->capture_scan_ok();
-  } else if (re.assert_find_ok(text, fna)) { // [Tier: Assert/Ascii]
-    tier_ = Tier::Assert;
-    // `body$` capture patterns: the one-pass candidate drivers serve the
-    // find (see onepass_require_end_); a bail reverts to the assert chain.
-    op_unb_ = re.plan_->capture_scan_ok();
-  } else if (re.assert_byte_path_ok(text)) { // [Tier: Assert/Byte]
-    // EGC: capture-free, by assert_byte_path_ok's own gate. This rung is where
-    // that gate went missing — a capture pattern read its groups off the byte
-    // assert engine and disagreed with search() and find_all() on the same
-    // subject (`([^ ]+)$` over one ending in a lone UTF-8 lead byte).
-    tier_ = Tier::Assert;
-    assert_byte_ = true;
-  } else { // [Tier: Pike]
-    tier_ = Tier::Pike;
-    cp_mode_ = false;
-    build_seg();
-  }
-}
-
-inline Regex::LazyDfa &Regex::MatchIter::dfa(int kind) const {
-  switch (kind) {
-  case kBlfu: return cache_->blfu(*re_);
-  case kBrv: return cache_->brv(*re_);
-  case kRv: return cache_->rv(*re_);
-  default: return cache_->lfu(*re_);
-  }
-}
-
-inline void Regex::MatchIter::build_seg() {
-  seg_ = cp_mode_ ? detail::segment_cp(text_) : detail::segment(text_);
-  seg_ready_ = true;
-  gpos_ =
-      Regex::byte_to_cp(seg_, pos_); // 0 at start; mapped cursor on downgrade
-  // !prefix_.icase: a case-insensitive prefix is never skipped on a non-ASCII
-  // subject (find_substr_icase is unsound on UTF-8 — see its note).
-  pike_skip_prefix_ = !cp_mode_ && re_->plan_->prefix_.active() &&
-                      re_->plan_->prefix_.ascii && !re_->plan_->prefix_.icase && !seg_.ascii;
-}
-
-inline void Regex::MatchIter::downgrade() {
-  // DFA state cap mid-scan: continue on the Pike VM from the current byte
-  // cursor. US patterns drop to the code-point Pike, the rest to the grapheme
-  // Pike.
-  cp_mode_ = re_->plan_->us_;
-  tier_ = Tier::Pike;
-  build_seg();
-}
-
-inline bool Regex::MatchIter::dfa_chain_match() {
-  int nx = re_->dfa_chain_step(text_, pos_, dfa(fwd_kind_), dfa(rev_kind_),
-                               sc_, saves_, one_.spans_);
-  if (nx == LazyDfa::kCap) {
-    downgrade();
-    return false;
-  }
-  if (nx < 0)
-    done_ = true;
-  else
-    pos_ = nx;
-  return true;
-}
-
-// The ASCII grapheme assert tier and the US byte assert tier resolve captures
-// here (EGC's byte assert rung is capture-free — see assert_byte_path_ok).
-inline void Regex::MatchIter::assert_chain_match() {
-  int nx = re_->assert_chain_step(*cache_, text_, pos_, assert_byte_,
-                                  walk_budget_, sc_, saves_, one_.spans_);
-  if (nx < 0)
-    done_ = true;
-  else
-    pos_ = nx;
 }
 
 inline void Regex::MatchIter::advance() {
   one_.spans_.clear();
-  bool chain_once = false;
-  step(chain_once);
-  // The chain served a find the driver bailed on: tell the budget how far it
-  // got (pos_ is the byte cursor of both tiers that run the driver). Here
-  // rather than at each of the chain's yield points, and not on the driver's
-  // own path, which runs once per match.
-  if (chain_once) walk_budget_.resumed_at(pos_);
+  RowSink row{one_.spans_};
+  done_ = !f_.next(sc_, row);
   // A whole-match capture ran as its capture-free twin: widen the one row so
   // every group reads as the match (alias_rows, for a single row).
   // one_.ngroups_ already says so; the engines above wrote the twin's single
@@ -16312,353 +15725,646 @@ inline void Regex::MatchIter::advance() {
   }
 }
 
-inline void Regex::MatchIter::step(bool &chain_once) {
-  const int n = static_cast<int>(text_.size());
-  for (;;) {
-    switch (tier_) {
-    // The three literal-ish tiers differ only in which locate they call; all
-    // three needles are non-nullable, so e2 > s2 and `pos_ = e2` always makes
-    // progress.
-    case Tier::Literal:
-    case Tier::LiteralAlt:
-    case Tier::AssertAnchor: {
-      int s2, e2;
-      bool found =
-          pos_ <= n && (tier_ == Tier::Literal
-                            ? re_->literal_locate(text_, pos_, s2, e2)
-                            : tier_ == Tier::LiteralAlt
-                                  ? re_->literal_alt_locate(text_, pos_, s2, e2)
-                                  : re_->assert_anchor_locate(text_, pos_, s2,
-                                                              e2));
-      if (!found) {
-        done_ = true;
-        return;
+//------------------------------------------------------------------------------
+// The find ladder
+//------------------------------------------------------------------------------
+
+inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
+                                          Want want) {
+  Ladder l;
+  l.want = want;
+  switch (f) {
+  case kFamUsDfa:
+  case kFamAscii:
+    l.set(Ladder::kFindOk, p.dfa_find_ok());
+    // The one-pass walk drives the find (prefix / inner / position-scan
+    // candidates — see cp_onepass_find).
+    l.set(Ladder::kWalkOn, l.has(Ladder::kFindOk) && p.capture_scan_ok());
+    l.set(Ladder::kWalkByte, f == kFamUsDfa);
+    break;
+  case kFamEgcByte:
+  case kFamEgcByteIp:
+    l.set(Ladder::kByteDfas);
+    l.set(Ladder::kIpOn, f == kFamEgcByteIp);
+    l.set(Ladder::kWalkOn, p.byte_walk_ok());
+    l.set(Ladder::kWalkByte);
+    break;
+  case kFamUsAssert:
+    // Shared byte assert engine: the assert chain resolves captures when
+    // ncap_ > 0. CodePoint only — Grapheme shares the engine but not the
+    // captures (assert_byte_path_ok gates it on ncap_ == 0).
+    l.set(Ladder::kAssert);
+    l.set(Ladder::kAssertByte);
+    l.set(Ladder::kWalkOn, p.capture_scan_ok());
+    l.set(Ladder::kWalkByte);
+    break;
+  case kFamAssertAscii:
+    l.set(Ladder::kAssert);
+    l.set(Ladder::kFindOk, p.assert_lf_prog_.ok());
+    // `body$` capture patterns: the one-pass candidate drivers serve the
+    // find (see onepass_require_end_); a bail reverts to the assert chain.
+    l.set(Ladder::kWalkOn, l.has(Ladder::kFindOk) && p.capture_scan_ok());
+    break;
+  case kFamAssertByte:
+    // Grapheme: capture-free, by assert_byte_path_ok's own gate. This is
+    // where that gate went missing — a capture pattern read its groups off
+    // the byte assert engine and disagreed with search() and find_all() on
+    // the same subject (`([^ ]+)$` over one ending in a lone UTF-8 lead
+    // byte).
+    l.set(Ladder::kAssert);
+    l.set(Ladder::kAssertByte);
+    break;
+  case kFamilyCount: break;
+  }
+  ladder_repick(p, l);
+  return l;
+}
+
+inline void Regex::ladder_plan(Plan &p) {
+  p.fused_ = p.egc_fused_ok()
+                 ? (p.prefix_fused() ? Plan::Fused::Prefix
+                                     : Plan::Fused::Suffix)
+                 : p.egc_fused_collapse_ok() ? Plan::Fused::Collapse
+                                             : Plan::Fused::None;
+  // Three kinds of caller (see ladder_caller): a find, a boolean, and a
+  // boolean over a short subject — the boolean's ladders with the
+  // interior-literal rung given up (limits::kBoolSkipBytes).
+  for (int w = 0; w < 3; w++) {
+    const Want want = w ? Want::Test : Want::Rows;
+    for (int f = 0; f < kFamilyCount; f++) {
+      Ladder &fl = p.family_[f][w];
+      fl = ladder_family(p, static_cast<Family>(f), want);
+      if (w == 2) {
+        fl.set(Ladder::kInnerOff);
+        ladder_repick(p, fl);
       }
-      push_span(one_.spans_, s2, e2);
-      pos_ = e2;
-      return;
     }
-    case Tier::Dfa: {
-      if (pos_ > n) {
-        done_ = true;
-        return;
-      }
-      cache_->bind(*re_);
-      // Fused EGC-prefix tier: scan for the next prefix hit while verifying the
-      // gap is EGC-eligible (one pass, no upfront gate). A bad cluster (gap or
-      // match interior/end) downgrades to the Pike from pos_ — already-yielded
-      // matches end at or before pos_, whose region the scan verified clean.
-      if (egc_fused_ && re_->plan_->prefix_fused()) {
-        bool bad = false;
-        int s2 = re_->egc_literal_fused_find(text_, pos_, re_->plan_->byte_prefix_.text,
-                                            re_->plan_->byte_prefix_.probe,
-                                            re_->plan_->byte_prefix_.probe2, bad);
-        // A downgrade resumes the Pike from the last YIELDED end, not pos_: an
-        // anchored-verify failure (e2 <= s2) advanced pos_ past a candidate that
-        // a cluster may turn into a real grapheme match the byte engine missed.
-        if (bad) {
-          pos_ = resume_pos_;
-          downgrade();
-          break;
-        }
-        if (s2 < 0) {
-          done_ = true;
-          return;
-        }
-        int reach2 = 0;
-        int e2 = re_->dfa_forward_lf(cache_->blfa(*re_), text_, s2, &reach2);
-        if (e2 == LazyDfa::kCap) {
-          pos_ = resume_pos_;
-          downgrade();
-          break;
-        }
-        if (e2 <= s2) {
-          // A failed verify is the BYTE engine's verdict on the bytes it
-          // examined, and those lie ahead of the gap scan: unvetted. With a
-          // cluster among them the grapheme verdict can be a match — the
-          // walk of `q\w*\.` over "qqq\u0301." dies on the mark, where the
-          // Pike takes the cluster for the `\w` its base is — so such a
-          // candidate is not passed over: the Pike answers, from the last
-          // yielded end. (Left to the gap scan to find, the cluster was
-          // found too late in two ways: the budget below could run out
-          // first and hand the unfused ladder a cursor already past the
-          // candidate, and a later candidate could match in front of the
-          // cluster and be yielded — `q(?:a[a-z]+z|b)` over
-          // "qaqbcd\u0301z" gave "qb" at 2 for the match at 0. find_all
-          // has neither problem: on a cluster it discards its rows and
-          // starts over.)
-          if (!re_->egc_match_clean(text_, static_cast<size_t>(s2),
-                                    static_cast<size_t>(reach2))) {
-            pos_ = resume_pos_;
-            downgrade();
-            break;
-          }
-          // Deduct the examined bytes (linearity guard, see kWalkBail). On
-          // exhaustion re-prime the unfused ladder from pos_ — sound,
-          // because every failed candidate's examined bytes were just
-          // verified cluster-clean, so they genuinely match nothing.
-          if (!walk_budget_.spend(reach2 - s2)) {
-            egc_fused_ = false;
-            reprime_unfused();
-            break;
-          }
-          pos_ = s2 + 1; // the prefix here completes no match; rescan
-          break;
-        }
-        if (!re_->egc_match_clean(text_, static_cast<size_t>(s2),
-                                  static_cast<size_t>(reach2))) {
-          pos_ = resume_pos_;
-          downgrade(); // a fusing cluster touches the match -> Pike from resume
-          break;
-        }
-        push_span(one_.spans_, s2, e2);
-        pos_ = e2;
-        resume_pos_ = e2;
-        return;
-      }
-      // Fused EGC-suffix tier: suffix_egc_find loops its candidate scan
-      // internally (the cursor never advances past an unverified match), so a
-      // cap / ineligible result downgrades to the Pike directly from pos_ —
-      // except the COLLAPSE variant, whose ineligible subjects (lone CR/LF =
-      // ordinary Unix-newline text) are usually served by the gated DFA
-      // tiers: re-prime the unfused ladder instead. (A genuine state cap
-      // re-primes too; the unfused tier then caps again and downgrades.)
-      if (egc_fused_) {
-        int s2 = -1;
-        int e2 = re_->suffix_egc_find(cache_->blfa(*re_), cache_->brv(*re_),
-                                      text_, pos_, s2, walk_budget_,
-                                      fused_collapse_);
-        if (e2 == Regex::kWalkBail) {
-          // Failed-verify budget exhausted: leave the suffix prefilter for
-          // this iterator and re-prime onto the (linear) generic DFA tiers.
-          suffix_off_ = true;
-          egc_fused_ = false;
-          fused_collapse_ = false;
-          reprime_unfused();
-          break;
-        }
-        if (e2 == LazyDfa::kCap) {
-          if (fused_collapse_) {
-            egc_fused_ = false;
-            fused_collapse_ = false;
-            reprime_unfused();
-          } else {
-            downgrade();
-          }
-          break;
-        }
-        if (e2 < 0) {
-          done_ = true;
-          return;
-        }
-        push_span(one_.spans_, s2, e2);
-        pos_ = e2;
-        resume_pos_ = e2;
-        return;
-      }
-      // Case-insensitive prefix prefilter (byte tier only): memchr2 the rare
-      // folded-prefix probe (chosen at prime) + anchored byte-DFA verify, instead
-      // of the forward-DFA + reverse scan. Same leftmost-first matches.
-      if (ip_active_) {
-        int s2 = -1;
-        int e2 = re_->icase_prefix_find(cache_->blfa(*re_), text_, pos_,
-                                        ip_probe_, s2, walk_budget_);
-        if (e2 == LazyDfa::kCap) {
-          downgrade();
-          break;
-        }
-        if (e2 == Regex::kWalkBail) {
-          ip_active_ = false; // budget hit -> the full (linear) DFA loop
-          break;
-        }
-        if (e2 < 0) {
-          done_ = true;
-          return;
-        }
-        push_span(one_.spans_, s2, e2);
-        pos_ = e2; // non-nullable prefix pattern -> e2 > s2
-        return;
-      }
-      // The rare-literal prefilter rungs further down, named here because
-      // the order of the rungs depends on them. A capture-free find takes
-      // them BEFORE the one-pass driver, exactly as search() and
-      // fill_matches do: they answer from a memmem hit, where the driver
-      // walks candidates until its profitability rule gives it up — on
-      // `[a-q][^u-z]{13}x` (CodePoint, 594 KB of prose) that proving window
-      // was half of the find: ~17 GB/s with the driver first, ~33 with the
-      // suffix scan first. With captures the driver goes first (it yields the
-      // groups in its one walk; the inner rung below needs a capture pass).
-      // An active rung never falls through — it returns, or turns itself
-      // off and re-dispatches — so skipping the driver here is all the
-      // reordering takes.
-      const bool suffix_rung = re_->plan_->ncap_ == 0 &&
-                               re_->plan_->suffix_.active() && !suffix_off_;
-      const bool inner_rung =
-          re_->plan_->inner_.active() && !inner_off_ &&
-          !(re_->plan_->byte_crlf_collapse_ && fwd_kind_ == kBlfu);
-      const bool prefilter_first =
-          re_->plan_->ncap_ == 0 && (suffix_rung || inner_rung);
-      // Candidate + UNBOUNDED one-pass capture find (see cp_onepass_find):
-      // one walk per match yields end + captures. A reverse state-cap
-      // downgrades like the plain path; a LOCAL bail takes this one match
-      // from the chain below and leaves the driver in place; a budget bail
-      // permanently reverts this iterator to the chain.
-      if (op_unb_ && !chain_once && !prefilter_first) {
-        int e2 = re_->capture_find_dispatch(*cache_, text_, pos_, saves_,
-                                          walk_budget_);
-        if (e2 >= 0) {
-          re_->append_match_spans_bytes(saves_, one_.spans_);
-          pos_ = e2; // !can_match_empty_ -> progress
-          return;
-        }
-        if (e2 == -1) {
-          done_ = true;
-          return;
-        }
-        if (e2 == LazyDfa::kCap) {
-          downgrade();
-          break;
-        }
-        if (e2 == Regex::kWalkLocal) {
-          // This one match from the rungs below — the tier's whole chain,
-          // prefilters included: with sparse matches the next one can be far
-          // away, and the bare DFA would walk all of the way there.
-          chain_once = true;
-          break;
-        }
-        op_unb_ = false; // kWalkBail -> located-span chain from pos_
-        break;
-      }
-      // Required-suffix prefilter: memmem the rare trailing literal + reverse-DFA
-      // verify, instead of walking the forward DFA to the next match end. Same
-      // leftmost-first matches; the variable-length case re-expands forward from
-      // the start with the ANCHORED forward DFA (blfa / lfa, not the unanchored
-      // fwd_kind_). Capture-free only.
-      if (suffix_rung) {
-        int s2 = -1;
-        LazyDfa &fwd_anchored =
-            (fwd_kind_ == kBlfu) ? cache_->blfa(*re_) : cache_->lfa(*re_);
-        int e2 = re_->suffix_find(
-            fwd_anchored, dfa(rev_kind_), text_, pos_, s2, walk_budget_,
-            /*collapse=*/fwd_kind_ == kBlfu &&
-                re_->plan_->byte_crlf_collapse_);
-        if (e2 == Regex::kWalkBail) {
-          suffix_off_ = true; // budget hit -> the generic DFA scan below
-          break;
-        }
-        if (e2 == LazyDfa::kCap) {
-          downgrade();
-          break;
-        }
-        if (e2 < 0) {
-          done_ = true;
-          return;
-        }
-        push_span(one_.spans_, s2, e2);
-        pos_ = e2; // non-nullable suffix pattern -> e2 > s2
-        return;
-      }
-      // ReverseInner prefilter: memmem the interior literal -> reverse(pre) floor
-      // + the tier's full forward (fwd_kind_) / reverse (rev_kind_) DFAs. Skipped
-      // on the CRLF-collapse byte tier (fwd_kind_ == kBlfu): inner_.pre_rev is
-      // non-collapsed, so its floor can land mid-CR-LF-cluster where the
-      // collapsed forward cannot start (see search()/fill_matches).
-      if (inner_rung) {
-        int s2 = -1;
-        LazyDfa &fwd_anchored =
-            (fwd_kind_ == kBlfu) ? cache_->blfa(*re_) : cache_->lfa(*re_);
-        int e2 = re_->inner_find(dfa(fwd_kind_), fwd_anchored, dfa(rev_kind_),
-                                 cache_->inrev(*re_), text_, pos_, s2,
-                                 walk_budget_);
-        if (e2 == LazyDfa::kCap) {
-          downgrade();
-          break;
-        }
-        if (e2 == Regex::kWalkBail) {
-          inner_off_ = true; // budget hit -> the located-span chain
-          break;
-        }
-        if (e2 < 0) {
-          done_ = true;
-          return;
-        }
-        if (re_->plan_->ncap_ > 0) { // resolve groups within the located span
-          if (!re_->capture_saves_bytes(text_, s2, e2, sc_, saves_)) {
-            done_ = true;
-            return;
-          }
-          re_->append_match_spans_bytes(saves_, one_.spans_);
-        } else {
-          push_span(one_.spans_, s2, e2);
-        }
-        pos_ = e2; // non-nullable (interior literal) -> e2 > s2
-        return;
-      }
-      if (dfa_chain_match()) return;
-      break; // state cap: downgraded, re-dispatch
-    }
-    case Tier::Assert: {
-      if (pos_ > n) {
-        done_ = true;
-        return;
-      }
-      // Re-bind every advance, exactly like the Dfa tier above: a
-      // user-supplied FindCache may be shared across Regexes (or across
-      // interleaved iterators), and the assert family below reads cached
-      // DFAs (alfa/balfa/inrev/…) that are only valid for the bound Regex.
-      cache_->bind(*re_);
-      if (op_unb_ && !chain_once) {
-        int e2 = re_->capture_find_dispatch(*cache_, text_, pos_, saves_,
-                                          walk_budget_);
-        if (e2 >= 0) {
-          re_->append_match_spans_bytes(saves_, one_.spans_);
-          pos_ = e2;
-          return;
-        }
-        if (e2 == -1) {
-          done_ = true;
-          return;
-        }
-        if (e2 == Regex::kWalkLocal) {
-          chain_once = true; // this one match from the assert chain below
-          break;
-        }
-        op_unb_ = false; // kCap / kWalkBail -> the assert chain below
-        break;
-      }
-      assert_chain_match();
-      return;
-    }
-    case Tier::Pike: {
-      if (!seg_ready_) build_seg();
-      const int gn = static_cast<int>(seg_.graphemes.size());
-      if (gpos_ > gn) {
-        done_ = true;
-        return;
-      }
-      if (pike_skip_prefix_) {
-        gpos_ = re_->prefix_skip_nonascii(seg_, gpos_);
-        if (gpos_ < 0) {
-          done_ = true;
-          return;
-        }
-      }
-      const detail::Program &prog = cp_mode_ ? re_->plan_->cp_prog_ : re_->plan_->prog_;
-      if (!re_->run_saves(prog, seg_, gpos_, /*anchored=*/false, sc_, saves_)) {
-        done_ = true;
-        return;
-      }
-      re_->append_match_spans(seg_, saves_, one_.spans_);
-      int b = saves_[0], e = saves_[1];
-      gpos_ = (e > b) ? e : e + 1;
-      return;
-    }
+    // A CodePoint plan's family does not depend on the subject. (Neither
+    // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
+    Ladder &us = p.us_ladder_[w];
+    us.want = want;
+    if (p.dfa_family_ok(w != 0))
+      us = p.family_[kFamUsDfa][w];
+    else if (p.byte_assert_path_)
+      us = p.family_[kFamUsAssert][w];
+    Ladder &st = p.start_[w];
+    st.want = want;
+    if (w == 2) st.set(Ladder::kInnerOff); // carried through Rung::Classify
+    // Pure printable-ASCII literal: memmem each match, no subject
+    // classification — the RE2/rure literal scan. Sound on any UTF-8; see
+    // literal_locate.
+    if (p.literal_only_) {
+      st.rung = st.below = Rung::Literal;
+    } else if (p.literal_alt_ok()) {
+      st.rung = st.below = Rung::LiteralAlt;
+    } else if (p.assert_anchor_egc()) {
+      st.rung = st.below = Rung::AssertAnchor;
+    } else if (p.aop_.ok && (w || p.ncap_ == 0)) {
+      // The walk from 0 needs neither the subject's class nor the cache; a
+      // bail classifies (see ladder_shallow). With groups to resolve it would
+      // be a second walk on every match, and the capture walk of the assert
+      // family is the one to take.
+      st.rung = st.below = Rung::TextAnchor;
+    } else if (p.us_) {
+      st = us;
+    } else {
+      st.rung = st.below = Rung::Classify; // the subject chooses the family
     }
   }
 }
 
+inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
+                                            size_t &fna,
+                                            Plan::IcaseScan &probe) const {
+  const Plan &p = *plan_;
+  const int w = ladder_caller(l);
+  if (p.us_) return ladder_adopt(p.us_ladder_[w], l);
+  // [Tier: Dfa/EgcByte] fused literal-prefilter rungs (see egc_fused_ok for
+  // the rationale). A cluster they cannot vet downgrades to the Pike from
+  // the cursor.
+  if (p.fused_ == Plan::Fused::Prefix || p.fused_ == Plan::Fused::Suffix) {
+    if (fna == kUnclassified) fna = first_nonascii(text);
+    if (fna < text.size()) {
+      l.rung = l.below = p.fused_ == Plan::Fused::Prefix ? Rung::FusedPrefix
+                                                         : Rung::FusedSuffix;
+      return l;
+    }
+  }
+  // [Tier: Dfa/EgcByte] fused-collapse rung (see egc_fused_collapse_ok):
+  // the suffix scan itself verifies eligibility (clusters AND lone CR/LF),
+  // so no subject classification happens here at all — not even the fna
+  // pass. An ineligible subject re-primes the unfused families
+  // (ladder_unfused), where plain Unix-newline text lands on the ASCII
+  // DFA family.
+  if (p.fused_ == Plan::Fused::Collapse) {
+    l.rung = l.below = Rung::FusedSuffix;
+    return l;
+  }
+  return ladder_gated(text, l, fna, probe);
+}
+
+inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
+                                         size_t &fna,
+                                         Plan::IcaseScan &probe) const {
+  const Plan &p = *plan_;
+  // (A boolean is admitted where a find is not: see Plan::dfa_family_ok;
+  // likewise the assert family, with no leftmost-first assert program.)
+  const bool test = l.want == Want::Test;
+  // Classify once; the gates share it.
+  if (fna == kUnclassified) fna = first_nonascii(text);
+  Family f;
+  if (egc_byte_path(text, fna)) {
+    // (?i) clean-prefix prefilter: choose the probe once (the fast-probe guard
+    // is O(n)); the family has no such rung if no probe applies.
+    f = p.ncap_ == 0 && p.icase_prefix_.active() &&
+                icase_choose_probe(text, probe)
+            ? kFamEgcByteIp
+            : kFamEgcByte;
+  } else if (p.dfa_family_ok(test) && ascii_grapheme_ok(text, fna)) {
+    f = kFamAscii;
+  } else if (test ? p.dfa_assert_ok_ && ascii_grapheme_ok(text, fna)
+                  : assert_find_ok(text, fna)) {
+    f = kFamAssertAscii;
+  } else if (assert_byte_path_ok(text, fna)) {
+    f = kFamAssertByte;
+  } else { // [Tier: Pike]
+    Ladder pike;
+    pike.want = l.want;
+    return pike;
+  }
+  return ladder_adopt(p.family_[f][ladder_caller(l)], l);
+}
+
+inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
+                                      bool below_walk) {
+  const bool rows = l.want == Want::Rows;
+  const bool walk = l.has(Ladder::kWalkOn) && !below_walk;
+  if (l.has(Ladder::kAssert)) {
+    if (rows) return walk ? Rung::Walk : Rung::AssertChain;
+    // A boolean takes the assert find when a literal anchor leads it and
+    // what follows a hit is bounded by the match up to that literal — the
+    // whole match as one fixed text, a trailing literal (the verify runs
+    // backwards from it), the word-suffix scan. A LEADING literal is not
+    // such an anchor: its verify walks forward to the leftmost-first end,
+    // which can be the end of the line, where the boolean scan stops at the
+    // first accepting state. The US byte engine and a capture plan's have
+    // no boolean scan of their own.
+    const bool has_bool =
+        !l.has(Ladder::kAssertByte) || (!p.us_ && !p.byte_assert_cap_);
+    const bool bounded = !p.assert_.lit.empty() || p.assert_.word_suffix ||
+                         !p.assert_.suffix.empty();
+    if (has_bool && !(l.has(Ladder::kFindOk) && bounded)) return Rung::Bool;
+    return Rung::AssertChain;
+  }
+  if (l.has(Ladder::kIpOn)) return Rung::IcasePrefix;
+  // The rare-literal prefilters. A capture-free find takes them BEFORE the
+  // walk: they answer from a memmem hit, where the walk tries candidates
+  // until its profitability rule gives it up — on `[a-q][^u-z]{13}x`
+  // (CodePoint, 594 KB of prose) that proving window was half of the find:
+  // ~17 GB/s with the walk first, ~33 with the suffix scan first. With
+  // captures the walk goes first (it yields the groups in its one pass; the
+  // inner rung needs a capture pass per match), unless the caller wants no
+  // groups.
+  // Suffix is capture-free only. Inner is skipped on the CRLF-collapse byte
+  // family: inner_.pre_rev is non-collapsed, so its floor can land
+  // mid-CR-LF-cluster where the collapsed forward DFA cannot start.
+  const bool suffix = l.has(Ladder::kFindOk) && !l.has(Ladder::kSuffixOff) &&
+                      p.ncap_ == 0 && p.suffix_.active();
+  const bool inner =
+      l.has(Ladder::kFindOk) && !l.has(Ladder::kInnerOff) &&
+      p.inner_.active() &&
+      !(p.byte_crlf_collapse_ && l.has(Ladder::kByteDfas));
+  if (suffix) return Rung::Suffix;
+  if (inner && (p.ncap_ == 0 || !rows)) return Rung::Inner;
+  // A boolean has no use for the walk or the chain — both locate a span.
+  // (The prefilter rungs above do too, for a find; asked by a boolean they
+  // stop at the first accepting state — see dfa_forward_first.)
+  if (!rows) return Rung::Bool;
+  if (walk) return Rung::Walk;
+  if (inner) return Rung::Inner;
+  return Rung::Chain;
+}
+
+template <class Out>
+inline bool Regex::find_once(std::string_view text, Out &out) const {
+  Ladder l = plan_->start_[Out::kGroups ? 0 : 1];
+  if (l.rung <= Rung::TextAnchor) {
+    Cursor c;
+    const Step st = ladder_shallow<false, true>(text, l, c, out);
+    if (st != Step::Again) return st == Step::Yield;
+  }
+  return find_rest(text, l, out);
+}
+
+template <class Out>
+inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
+  Cursor c;
+  Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
+  bool chain_once = false;
+  WalkBudget budget(text.size());
+  if constexpr (!Out::kGroups) {
+    // A boolean over a short subject gives the interior-literal rung up
+    // before trying it (limits::kBoolSkipBytes): the plan's third ladder
+    // (see ladder_caller). Taken here, past the shallow rungs, which have
+    // no such rung to give up — on a ladder a bail of theirs has moved to
+    // Classify, the flag is what makes it the third.
+    if (text.size() < size_t(limits::kBoolSkipBytes)) {
+      if (l.rung == Rung::Classify)
+        l.set(Ladder::kInnerOff);
+      else
+        l = plan_->start_[2];
+    }
+  }
+  if (l.rung == Rung::Walk) {
+    const Step st = ladder_walk<false>(text, scr, l, c, budget, chain_once, out);
+    if (st != Step::Again) return st == Step::Yield;
+  }
+  // The rest of the ladder, over this thread's persistent lazy DFAs: built
+  // once and reused across calls, where rebuilding them was the dominant
+  // per-call cost.
+  if (!scr.cache) scr_fetch(scr);
+  Deep d;
+  // (Classified here rather than by the step's own case: one trip through
+  // the dispatch less on a Grapheme scan's way to its engine.)
+  if (l.rung == Rung::Classify) l = ladder_classify(text, l, d.fna, d.probe);
+  return ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
+}
+
+template <bool All, bool InlineWalk, class Out>
+inline Regex::Step Regex::ladder_shallow(std::string_view text, Ladder &l,
+                                         Cursor &c, Out &out) const {
+  switch (l.rung) {
+  // The three literal-ish rungs differ only in which locate they call; all
+  // three needles are non-nullable, so e2 > s2 and `pos = e2` always makes
+  // progress. They never fall.
+  case Rung::Literal:
+  case Rung::LiteralAlt:
+  case Rung::AssertAnchor:
+    for (;;) {
+      int s2, e2;
+      bool found = l.rung == Rung::Literal
+                       ? literal_locate(text, c.pos, s2, e2)
+                       : l.rung == Rung::LiteralAlt
+                             ? literal_alt_locate(text, c.pos, s2, e2)
+                             : assert_anchor_locate(text, c.pos, s2, e2);
+      if (!found) return Step::Over;
+      out.span(*this, text, s2, e2);
+      c.pos = e2;
+      if (!All) return Step::Yield;
+    }
+  // A text-anchored pattern matches at 0 or nowhere: one walk from 0 is the
+  // whole find.
+  default: { // Rung::TextAnchor
+    if (c.pos > 0) return Step::Over;
+    int e0 = 0;
+    int t = InlineWalk ? anchored_onepass_once(text, e0)
+                       : anchored_onepass_try(text, e0);
+    if (t < 0) {
+      // A byte the walk does not handle: the families answer.
+      l.rung = l.below = Rung::Classify;
+      return Step::Again;
+    }
+    if (t > 0) {
+      out.span(*this, text, 0, e0);
+      c.pos = e0 > 0 ? e0 : 1; // past 0: a next step finds nothing
+      if (!All) return Step::Yield;
+    }
+    return Step::Over;
+  }
+  }
+}
+
+template <bool All, class Out>
+inline bool Regex::ladder_step(std::string_view text, Scr &scr, Ladder &l,
+                               Cursor &c, WalkBudget &budget, Deep &d,
+                               bool &chain_once, Out &out) const {
+  const int n = static_cast<int>(text.size());
+  // (No lambdas in here: a closure that captures the ladder by reference is
+  // an object holding its address, and the ladder is then a struct in memory
+  // again — see Ladder.)
+  // A rung yields its match — or, under `All`, goes on to the next one in
+  // place, and comes back only when the scan is over. A rung that cannot
+  // serve changes the ladder (a global bail) or sets chain_once (a local
+  // one) and says Again: the loop dispatches again.
+  for (;;) {
+    const Rung r = chain_once ? l.below : l.rung;
+    if (r != Rung::Pike && c.pos > n) return false;
+    const Step st =
+        r <= Rung::TextAnchor
+            ? ladder_shallow<All, false>(text, l, c, out)
+            : r == Rung::Walk
+                  ? ladder_walk<All>(text, scr, l, c, budget, chain_once, out)
+                  : ladder_deep<All>(r, text, scr, l, c, budget, d,
+                                     chain_once, out);
+    if (st != Step::Again) return st == Step::Yield;
+  }
+}
+
+// Rung::Walk. Candidate + UNBOUNDED one-pass find (see cp_onepass_find): one
+// walk per match yields end + captures. A LOCAL bail takes this one match
+// from the rung below and leaves the walk on; a budget bail gives the walk
+// up for the rest of the scan.
+template <bool All, class Out>
+inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
+                                      Ladder &l,
+                               Cursor &c, WalkBudget &budget,
+                               bool &chain_once, Out &out) const {
+  const Plan &p = *plan_;
+  if (!scr.saves) scr_walk(scr);
+  int e2;
+  if constexpr (All) {
+    // Rows until the walk stops; e2 says why (it is never a match end).
+    e2 = onepass_fill_run(scr.cache, text, *scr.saves, out.rows, c.pos,
+                          budget, l.has(Ladder::kWalkByte));
+  } else {
+    e2 = capture_find_dispatch(scr.cache, text, c.pos, *scr.saves, budget,
+                               l.has(Ladder::kWalkByte));
+    if (e2 >= 0) {
+      if (p.ncap_ == 0) // the span alone: no group to lay out
+        out.span(*this, text, (*scr.saves)[0], e2);
+      else
+        out.groups(*this, text, *scr.saves);
+      c.pos = e2; // !can_match_empty_ -> progress
+      return Step::Yield;
+    }
+  }
+  if (e2 == -1) return Step::Over;
+  if (e2 == kWalkLocal) {
+    // This one match from the rung below — a prefilter if there is one:
+    // with sparse matches the next one can be far away, and the bare
+    // DFA would walk all of the way there.
+    chain_once = true;
+  } else if (e2 == LazyDfa::kCap && !l.has(Ladder::kAssert)) {
+    ladder_downgrade(l); // a reverse cap, as on the chain
+  } else {
+    l.set(Ladder::kWalkOn, false); // kWalkBail (the assert family: or kCap)
+    l = ladder_repicked(l);
+  }
+  return Step::Again;
+}
+
+template <bool All, class Out>
+inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
+                               Ladder &l, Cursor &c, WalkBudget &budget,
+                               Deep &d, bool &chain_once, Out &out) const {
+  const Plan &p = *plan_;
+  const int n = static_cast<int>(text.size());
+  switch (r) {
+  case Rung::Classify:
+    l = ladder_reclassify(text, l, d.fna, d.probe);
+    break;
+  // Scan for the next prefix hit while verifying the gap is EGC-eligible
+  // (one pass, no upfront gate), and verify the candidate with the byte
+  // DFA. The verify walks AHEAD of the gap scan, over bytes nothing has
+  // vetted, so its verdict — a match or none — stands only if the bytes it
+  // examined are cluster-clean; with a cluster among them the grapheme
+  // verdict can differ either way (the walk of `q\w*\.` over "qqq\u0301."
+  // dies on the mark, where the Pike takes the cluster for the `\w` its
+  // base is), and the Pike answers from the cursor. The cursor is sound to
+  // resume from: it only ever moves past a yielded match or a candidate
+  // whose failure was vetted, and a match starts at a candidate. (The
+  // inputs that pin the failed side are in test_find_ladder.)
+  case Rung::FusedPrefix: {
+    LazyDfa &blfa = scr.cache->blfa(*this);
+    for (;;) {
+      bool bad = false;
+      int s2 = egc_literal_fused_find(text, c.pos, p.byte_prefix_.text,
+                                      p.byte_prefix_.probe,
+                                      p.byte_prefix_.probe2, bad);
+      if (bad) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (s2 < 0) return Step::Over;
+      int reach2 = 0;
+      int e2 = dfa_forward_end(blfa, text, s2, /*span=*/Out::kGroups,
+                               &reach2);
+      if (e2 == LazyDfa::kCap ||
+          !egc_match_clean(text, static_cast<size_t>(s2),
+                           static_cast<size_t>(reach2))) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (e2 <= s2) {
+        // Deduct the examined bytes (linearity guard, see kWalkBail). On
+        // exhaustion the unfused families take over from the cursor.
+        if (!budget.spend(reach2 - s2)) {
+          l = ladder_unfused(text, l, d.fna, d.probe);
+          break;
+        }
+        c.pos = s2 + 1; // the prefix here completes no match; rescan
+        continue;
+      }
+      out.span(*this, text, s2, e2);
+      c.pos = e2;
+      if (!All) return Step::Yield;
+    }
+    break;
+  }
+  // suffix_egc_find loops its candidate scan internally (the cursor never
+  // advances past an unverified match), so a cap / ineligible result
+  // downgrades to the Pike directly from pos — except the COLLAPSE
+  // variant, whose ineligible subjects (lone CR/LF = ordinary Unix-newline
+  // text) are usually served by the gated DFA families: re-prime instead.
+  // (A genuine state cap re-primes too; the unfused family then caps again
+  // and downgrades.)
+  case Rung::FusedSuffix: {
+    LazyDfa &blfa = scr.cache->blfa(*this), &brv = scr.cache->brv(*this);
+    const bool collapse = p.fused_ == Plan::Fused::Collapse;
+    for (;;) {
+      int s2 = -1;
+      int e2 = suffix_egc_find(blfa, brv, text, c.pos, s2, budget, collapse,
+                               /*span=*/Out::kGroups);
+      if (e2 == kWalkBail) {
+        // Failed-verify budget exhausted: give the suffix prefilter up for
+        // this scan and re-prime onto the (linear) generic DFA rungs.
+        l.set(Ladder::kSuffixOff);
+        l = ladder_unfused(text, l, d.fna, d.probe);
+        break;
+      }
+      if (e2 == LazyDfa::kCap) {
+        if (collapse)
+          l = ladder_unfused(text, l, d.fna, d.probe);
+        else
+          ladder_downgrade(l);
+        break;
+      }
+      if (e2 < 0) return Step::Over;
+      out.span(*this, text, s2, e2);
+      c.pos = e2;
+      if (!All) return Step::Yield;
+    }
+    break;
+  }
+  // Case-insensitive prefix prefilter (EGC byte family only): memchr2 the
+  // rare folded-prefix probe (chosen at classification) + anchored byte-DFA
+  // verify, instead of the forward-DFA + reverse scan. Same leftmost-first
+  // matches.
+  case Rung::IcasePrefix: {
+    LazyDfa &blfa = scr.cache->blfa(*this);
+    for (;;) {
+      int s2 = -1;
+      int e2 = icase_prefix_find(blfa, text, c.pos, d.probe, s2, budget,
+                                 /*span=*/Out::kGroups);
+      if (e2 == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (e2 == kWalkBail) {
+        l.set(Ladder::kIpOn, false); // budget hit -> the rungs below
+        l = ladder_repicked(l);
+        break;
+      }
+      if (e2 < 0) return Step::Over;
+      out.span(*this, text, s2, e2);
+      c.pos = e2; // non-nullable prefix pattern -> e2 > s2
+      if (!All) return Step::Yield;
+    }
+    break;
+  }
+  // Required-suffix prefilter: memmem the rare trailing literal + reverse-DFA
+  // verify, instead of walking the forward DFA to the next match end. Same
+  // leftmost-first matches; the variable-length case re-expands forward from
+  // the start with the ANCHORED forward DFA.
+  case Rung::Suffix: {
+    LazyDfa &a = ladder_fwda(*scr.cache, l),
+            &rv = ladder_rev(*scr.cache, l);
+    const bool collapse = l.has(Ladder::kByteDfas) && p.byte_crlf_collapse_;
+    for (;;) {
+      int s2 = -1;
+      int e2 = suffix_find(a, rv, text, c.pos, s2, budget, collapse,
+                           /*span=*/Out::kGroups);
+      if (e2 == kWalkBail) {
+        l.set(Ladder::kSuffixOff); // budget hit -> the rungs below
+        l = ladder_repicked(l);
+        break;
+      }
+      if (e2 == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (e2 < 0) return Step::Over;
+      out.span(*this, text, s2, e2);
+      c.pos = e2; // non-nullable suffix pattern -> e2 > s2
+      if (!All) return Step::Yield;
+    }
+    break;
+  }
+  // ReverseInner prefilter: memmem the interior literal -> reverse(pre)
+  // floor + the family's full forward / reverse DFAs.
+  case Rung::Inner: {
+    LazyDfa &f = ladder_fwd(*scr.cache, l),
+            &a = ladder_fwda(*scr.cache, l),
+            &rv = ladder_rev(*scr.cache, l),
+            &inrev = scr.cache->inrev(*this);
+    for (;;) {
+      int s2 = -1;
+      int e2 = inner_find(f, a, rv, inrev, text, c.pos, s2, budget,
+                          /*span=*/Out::kGroups);
+      if (e2 == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (e2 == kWalkBail) {
+        l.set(Ladder::kInnerOff); // budget hit -> the rungs below
+        l = ladder_repicked(l);
+        break;
+      }
+      if (e2 < 0) return Step::Over;
+      if (!emit_located(text, s2, e2, *scr.sc, *scr.saves, out))
+        return Step::Over;
+      c.pos = e2; // non-nullable (interior literal) -> e2 > s2
+      const bool back = ladder_served(chain_once, budget, c.pos);
+      if (!All) return Step::Yield;
+      if (back) break;
+    }
+    break;
+  }
+  // One match from the located-span chain. A state cap downgrades.
+  case Rung::Chain: {
+    LazyDfa &f = ladder_fwd(*scr.cache, l),
+            &rv = ladder_rev(*scr.cache, l);
+    for (;;) {
+      int nx = dfa_chain_step(text, c.pos, f, rv, *scr.sc, *scr.saves, out);
+      if (nx == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (nx < 0) return Step::Over;
+      c.pos = nx; // past an empty match: may be n + 1
+      const bool back = ladder_served(chain_once, budget, c.pos);
+      if (!All) return Step::Yield;
+      if (back) break;
+      if (c.pos > n) return Step::Over;
+    }
+    break;
+  }
+  // The ASCII grapheme assert engine and the US byte assert engine resolve
+  // captures here (EGC's byte assert engine is capture-free — see
+  // assert_byte_path_ok). The assert chain has no cap, and answers -1 for
+  // a cursor past the end.
+  case Rung::AssertChain:
+    for (;;) {
+      int nx = assert_chain_step(*scr.cache, text, c.pos,
+                                 l.has(Ladder::kAssertByte), budget, *scr.sc,
+                                 *scr.saves, out);
+      if (nx < 0) return Step::Over;
+      c.pos = nx;
+      const bool back = ladder_served(chain_once, budget, c.pos);
+      if (!All) return Step::Yield;
+      if (back) break;
+    }
+    break;
+  // Boolean match is the same under leftmost-first and longest semantics,
+  // so the reseed scan answers it and stops at the first accepting state.
+  // From 0: a prefilter rung that bailed here proved nothing the scan can
+  // skip, and the scan is one pass.
+  case Rung::Bool: {
+    int e2;
+    if (l.has(Ladder::kAssert)) {
+      e2 = l.has(Ladder::kAssertByte)
+               ? assert_byte_fwd_scan(*scr.cache, text, 0)
+               : assert_fwd_scan(*scr.cache, text, 0);
+    } else {
+      LazyDfa &dfa = l.has(Ladder::kByteDfas) ? scr.cache->bfu(*this)
+                                              : scr.cache->fu(*this);
+      // CodePoint: the start-state skip is a scan-time switch, on for a
+      // subject long enough to repay it (see kBoolSkipBytes, and fu()).
+      if (p.us_)
+        dfa.byte_pf = p.byte_prefilter_ok_ && n >= limits::kBoolSkipBytes;
+      e2 = dfa_forward_scan(dfa, text, 0);
+    }
+    if (e2 == LazyDfa::kCap) {
+      // State cap: a regular pattern can still need exponentially many DFA
+      // states. The find's own rungs answer instead (and downgrade to the
+      // Pike in turn) — the boolean is the same.
+      l.want = Want::Rows;
+      l.rung = l.below = Rung::Classify;
+      break;
+    }
+    return e2 < 0 ? Step::Over : Step::Yield;
+  }
+  // The proven baseline (see pike_step).
+  case Rung::Pike: {
+    if (!d.seg)
+      c.gpos = ladder_segment(d.seg, text, c.pos);
+    const detail::Segmented &sg = *d.seg;
+    const int gn = static_cast<int>(sg.graphemes.size());
+    for (;;) {
+      if (c.gpos > gn) return Step::Over;
+      int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out);
+      if (nx < 0) return Step::Over;
+      c.gpos = nx;
+      if (!All) return Step::Yield;
+    }
+  }
+  default: break; // the shallow rungs and the walk: not dispatched here
+  }
+  return Step::Again;
+}
+
 inline Regex::MatchIter Regex::find_iter(std::string_view text) const {
-  return MatchIter(*this, text, thread_cache());
+  return MatchIter(*this, text, nullptr);
 }
 
 inline Regex::MatchIter Regex::find_iter(std::string_view text,
@@ -16667,32 +16373,27 @@ inline Regex::MatchIter Regex::find_iter(std::string_view text,
 }
 
 inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos) const {
-  return find_at(text, pos, thread_cache());
+  return find_at_step(text, pos, nullptr);
 }
-
-// One find_iter() step, stateless: seek a fresh MatchIter to `pos` and
-// advance() once, so the tier dispatch and the empty-match resume rule (Pike:
-// one grapheme / code-point index; byte tiers: us_step_byte) have exactly one
-// home — this cannot drift from what iteration does.
 inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos,
                                     FindCache &cache) const {
+  return find_at_step(text, pos, &cache);
+}
+
+// One step of the scan find_iter() takes, from `pos`: the same Finder, so
+// the ladder and the empty-match resume rule (Pike: one grapheme /
+// code-point index; byte rungs: us_step_byte) have exactly one home — this
+// cannot drift from what iteration does. The result is built in place, as
+// search() builds its own. `cache` null: this thread's.
+inline Regex::FindAt Regex::find_at_step(std::string_view text, size_t pos,
+                                         FindCache *cache) const {
   FindAt r;
   r.next_pos = text.size() + 1;
   if (pos > text.size()) return r; // past the last scan position
-  MatchIter it(*this, text, cache);
-  // Borrow the cache's warm step buffers for the duration (see step_saves_):
-  // one swapped-in pair instead of two first-touch allocations per call.
-  // Single exit past this point so they always go back.
-  it.saves_.swap(cache.step_saves_);
-  it.one_.spans_.swap(cache.step_spans_);
-  it.seek(pos);
-  it.advance();
-  if (!it.done_) {
-    r.m = it.one_[0].to_owned();
-    r.next_pos = it.resume_byte();
-  }
-  it.saves_.swap(cache.step_saves_);
-  it.one_.spans_.swap(cache.step_spans_);
+  Finder f(*this, text, cache);
+  f.seek(pos);
+  ResultSink out{r.m};
+  if (f.next(out)) r.next_pos = f.resume_byte();
   return r;
 }
 

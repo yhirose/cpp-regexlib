@@ -235,11 +235,12 @@ site, and the one site that forgot is what this paragraph is about.
 
 ### Canonical tier names (the `[Tier: …]` labels)
 
-The numbered tiers above say *what engine runs*; each public entry point
-(`test` / `search` / `match` / `fill_matches` / `find_iter`) walks its own
-dispatch ladder over them. The ladders genuinely differ (anchoring, capture
-resolution, streaming state), so they are not unified — instead every branch
-carries a `[Tier: …]` label in the source, with one canonical name per
+The numbered tiers above say *what engine runs*. Which of them serves a call
+is decided in two places: the find entry points (`test` / `search` /
+`find_all` / `find_iter` / `find_at`) climb one shared ladder (next section),
+and `match` — anchored at 0, where no prefilter applies and every rung is a
+different primitive — keeps a ladder of its own over the same gates. Every
+branch carries a `[Tier: …]` label in the source, with one canonical name per
 (pattern-class × subject-class) combination:
 
 | Label | Gate | What runs |
@@ -249,16 +250,145 @@ carries a `[Tier: …]` label in the source, with one canonical name per
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — u16 rows, accept byte off the dependency chain; a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next, in `fill_matches` and in `MatchIter` alike (§2, Linearity) |
-| `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); `+cap` as above |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity) |
+| `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa` (start recovery via the cached `AssertRevDfa`) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
 | `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | `ByteAssertDfa` / `ByteAssertRevDfa`, same prefilters; `+cap` is US-only (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
-Every ladder tries its eligible tiers top-down and falls through on a DFA
+Both ladders try their eligible tiers top-down and fall through on a DFA
 state cap; `Pike` is the proven baseline every other tier must agree with
-(§9). To see how one tier behaves across all entry points, grep its label.
+(§9).
+
+### The find ladder
+
+`search`, `test`, `find_all`, `find_iter` and `find_at` used to have a dispatch
+ladder each — five copies of the same decisions, kept in step by hand. They
+were not in step. The one-pass walk was missing from the EGC byte tier (a
+subject with one `é`, or with CR-LF line ends, ran `\w+` on the two-pass chain:
+~160 MB/s where the ASCII tier did ~260); `test()` had no suffix or
+interior-literal rung (`e[a-z]{3,}q` over 595 KB of prose: 0.56 GB/s as a
+boolean, 33 as a find); only `search()` skipped to a candidate before running
+the Pike, and only the iterator had the fused scans. Each was a capability
+tied to the entry point that happened to get it. There is one ladder now, and
+a rung exists at all of them or at none.
+
+**Rungs** (`Rung`), and what each needs of a scan:
+
+| Rung | What runs | Needs |
+| --- | --- | --- |
+| `Literal` / `LiteralAlt` / `AssertAnchor` | a plan that is its own locate; never falls | the cursor |
+| `TextAnchor` | a text-anchored pattern matches at 0 or nowhere: the `AnchoredOnePass` walk from 0 is the whole find. For a caller that reads no groups — a capture-free plan, or `test()` | the cursor |
+| `Classify` | looks at the subject and stands on the family that serves it; where a Grapheme plan starts unless a rung above is the whole plan | the subject's class |
+| `FusedPrefix` / `FusedSuffix` | the fused EGC literal scans (§4) | cache |
+| `IcasePrefix` / `Suffix` / `Inner` | the candidate + verify prefilters (§7) | cache, budget |
+| `Walk` | candidate + unbounded one-pass walk: end and groups in one pass | budget, save slots |
+| `Chain` / `AssertChain` | the located-span chain: forward to the end, reverse to the start, groups | cache |
+| `Bool` | `test()` only: the boolean forward scan, which stops at the first accepting state | cache |
+| `Pike` | the baseline; the grapheme Pike skips to a candidate first (literal prefix, Teddy, first-byte set) and tries the bounded backtracker there | segmentation |
+
+**Families.** The subject decides exactly one thing: which engine *family*
+serves it (`Family`: `Dfa/US`, `Assert/Byte` in CodePoint mode; `Dfa/EgcByte`
+with or without the `(?i)` probe, `Dfa/Ascii`, `Assert/Ascii`, `Assert/Byte`
+in Grapheme mode). Everything else about a family's ladder is the pattern's,
+so it is worked out once, when the plan is built (`ladder_plan`): each
+family's ladder for each kind of caller (`Plan::family_`; three kinds, see
+`ladder_caller`: a find, a boolean, a boolean over a short subject), and where a scan
+starts (`Plan::start_` — a CodePoint plan's family does not depend on the
+subject at all, so its scan starts on the family's first rung outright).
+`ladder_family` is the one place a family is defined, `ladder_classify` the
+one place a find reads the subject gates (`match()`, anchored, still reads
+them itself — see Tier dispatch), and `ladder_pick` the one place the
+order of a family's rungs is written (the rungs ahead of the families are
+not a family's: a plan that is its own locate, or text-anchored, starts
+there by `ladder_plan`, and the fused scans are where `ladder_classify`
+puts a Grapheme scan whose subject is not ASCII). Within a family:
+
+- `(?i)` prefix; then the suffix scan; then the interior literal — a
+  capture-free find takes the rare-literal prefilters before the walk (they
+  answer from a memmem hit, where the walk tries candidates until its
+  profitability rule gives it up);
+- the walk; then, with captures, the interior literal (it needs a capture
+  pass per match, the walk yields the groups in its one pass);
+- the chain. On the assert families: the walk, then the assert chain.
+
+**Bails.** A rung that cannot go on says why (§2, Linearity). *Locally* — a
+byte the one-pass table has no transition for: this one match comes from the
+rung below (`Ladder::below`), and the next step asks the walk again.
+*Globally* — its budget, its profitability rule: the rung is given up for the
+rest of the scan (a flag in the ladder that nothing sets back), and
+`ladder_pick` is asked again. A DFA state cap downgrades to the Pike from the
+cursor, and so does a fused scan that meets a cluster it cannot vet; the
+fused scans re-classify instead (`ladder_unfused`) when their budget runs
+out, and — the CRLF-collapse variant — on a subject it is not eligible for,
+which the gated families usually serve.
+
+The fused scans vet the subject as they go, so what they conclude holds only
+over bytes they have vetted — and a candidate's verify walks ahead of that.
+Its verdict stands, either way, only if the bytes it *examined* are
+cluster-clean (`egc_match_clean` over the walk's reach): a match is yielded
+then, and a failed candidate passed over then. Otherwise the Pike answers,
+from the cursor — which only ever moves past a yielded match or a candidate
+whose failure was vetted. The second half was missing until the ladder was
+shared and the fuzzer, at ten times its default count, met it on every entry
+point instead of the iterator alone: `q(?:a[a-z]+z|b)` over `qaqbcd́z` — the
+verify at 0 dies on the combining mark, where the Pike takes `d́` for the
+letter its base is — reported `qb` at 2 for the match at 0.
+
+**What the caller wants** changes two things and not the ladder. `Want::Test`
+(a boolean) takes the same prefilter rungs, but each stops at the first
+accepting state it reaches instead of going on to the end a find reports
+(`dfa_forward_first`; the suffix scan simply does not walk forward) — the
+rest of a match can be as long as the subject (`[^?]+\?.*`: the answer is at
+the `?`, and the leftmost-first end is the end of the line) — and where a
+find would walk or chain, it scans (`Rung::Bool`). Two limits keep a boolean
+from paying for a skip it has no use for (`limits::kBoolSkipBytes`,
+`kBoolFloorBytes`): under 64 bytes of subject it leaves the interior-literal
+rung out and scans (`[^?]+\?.*` over a 23-byte path: 48 ns through the rung,
+15 scanned), and on any subject that rung looks back 32 bytes for its floor
+and no further — a pre-part still alive there would be walked back to its
+start and then forward again, where the scan walks it once. (The boolean DFA
+of CodePoint mode had no start-state skip at all: `zqj` as a boolean over
+595 KB ran at 0.67 GB/s where the find did 89. It has the byte program's
+now, switched on per scan for a subject long enough to repay it.) And the
+match is handed to a *sink* (`RowSink`: a columnar row; `ResultSink`: the one `MatchResult`,
+built in place; `NoSink`: nothing), so no entry point pays for another's
+form: `search()` building its result out of a row it had just written cost it
+a failed store-to-load forward, ~3 ns of a 20 ns call.
+
+**One step, or every match.** `ladder_step<All, Out>` is the one
+dispatch (the rungs that need only the cursor are `ladder_shallow`, the walk
+`ladder_walk`, the rest `ladder_deep`). `find_iter` takes a step per `++`; `find_all` takes the same step
+with `All` set, under which a rung goes on to its next match in place — its
+DFAs resolved, the cursor at hand — and the ladder is consulted again only
+when a rung stops. (Re-entering it per match cost dense `\w+` 12%; the walk
+additionally keeps a loop of its own, `onepass_fill_run`.)
+
+**A one-step find costs what its rung costs.** `search()` and `test()` on a
+short subject are mostly set-up, and what runs ahead of the engine delays it.
+Three things keep the shared ladder from costing them anything:
+
+- The ladder's state is a *value* (`Ladder`: the rung, the one below the walk,
+  what the caller wants, and a word of flags — six bytes), and every
+  transition takes one and
+  returns one. A one-step find (`find_once`) keeps it, and the cursor, in its
+  own frame, where the compiler dissolves them. As an object the rungs
+  reached through a pointer, the same ladder cost `search()` ~100
+  instructions a call.
+- The rungs that can answer alone are tried before what the others work with
+  exists: the shallow rungs with a cursor and nothing else (`find_once`; the
+  text-anchored walk is inlined there — a validator's whole call is that
+  walk), then the walk (`find_rest`: the budget, and thread-local save slots
+  — a walk whose driver reads no DFA runs without the thread's cache, which
+  is 35 instructions to fetch, `scr_walk`), then the rest.
+- Nothing about the pattern is decided per call (the plan's ladders, above),
+  and a Grapheme scan's one look at its subject (`ladder_classify`) is
+  inlined into the one-step find — as two calls handing the ladder back and
+  forth it was 230 instructions of a 20 ns `test()`.
+
+A scan that outlives the call (`Finder`: `find_iter`, `find_all`, `find_at`)
+stores the same ladder and cursor and takes the same steps.
 
 ### Linearity (the O(n²) trap)
 
@@ -286,8 +416,8 @@ literal prefix/suffix finders, the unbounded one-pass candidate drivers, the
 suffix-tier candidate loop (a scalar-verify absorb bail re-enters the
 O(n)-per-candidate DFA reverse scan), and the chain-capture walks (a
 right-of-anchor element may absorb anchor bytes, so failed walks can overlap).
-The fill/iterator loops own ONE budget across all their calls (a per-call
-budget would reset at every match and still admit O(matches × n)). The other
+A scan owns ONE budget across all its steps (a per-step budget would reset
+at every match and still admit O(matches × n)). The other
 prefilters need no budget: their verifies are O(1)/pattern-bounded (literal,
 Teddy, anchor flags) or shape-bounded by admission (the var-pre suffix's
 one-atom rule, the word scan's one-candidate-per-word).
@@ -303,8 +433,8 @@ expensive part of a failure) and its table steps at half a byte (independent
 candidate walks overlap in the pipeline, unlike the chain's one dependency
 chain) — and the driver bails as soon as the charge exceeds the distance
 scanned, after a `kMinScan` proving window so short subjects keep the
-one-walk latency shape. The callers resume the chain from the bail point,
-so the loss is bounded by that window, not a subject's worth.
+one-walk latency shape. The scan goes on from the bail point on the rungs
+below, so the loss is bounded by that window, not a subject's worth.
 
 The distance scanned is the right yardstick only when the chain would have
 walked it. A driver led by a literal prefix or a sparse first-byte set shares
@@ -319,18 +449,18 @@ call's fixed cost and half a chain-byte per byte, against the chain's much
 smaller per-candidate cost plus a byte per byte on a failure and two on a
 match (forward for the end, reverse for the start). The constants are
 measured: an all-matching `e\w*` costs the walk 7 chain-bytes a candidate and
-the chain 10.9, a failing `e[a-z]+s` candidate 6.5 and 4.5.
+the chain 10.9, a failing `e[a-z]+s` candidate 6.5 and 4.5. (The rule was the
+ASCII tier's before the ladder was shared, and the cost was that tier's alone;
+with the walk on every family it showed on every subject.)
 
-That bail is **global** — the driver is done for the caller's loop
+That bail is **global** — the driver is done for the rest of the scan
 (`kWalkBail`). A non-ASCII byte in a walk's way is a different event and gets
 a different code, `kWalkLocal`: the one-pass table has no transition for the
 byte, which says nothing about the bytes after it. So it is **local**: the
-located-span chain serves that ONE find and the driver is asked again for the
-next. Both loops do it the same way — `fill_matches` through `onepass_fill`'s
-chain step, `MatchIter` by falling through to its chain rungs for one match —
-and they share the step itself (`dfa_chain_step` / `assert_chain_step`). It
-used to be one code, so a single `é` handed the rest of the subject to the
-chain: `\w+` in CodePoint mode over 512 KB of ASCII words with one `é` in the
+rung below the walk serves that ONE find (`dfa_chain_step` /
+`assert_chain_step`, or the interior-literal rung of a capture plan) and the
+walk is asked again for the next. It used to be one code, so a single `é`
+handed the rest of the subject to the chain: `\w+` in CodePoint mode over 512 KB of ASCII words with one `é` in the
 middle ran at ~270 MB/s against ~410 without it, and runs at ~410 now (with an
 `é` in one word of fifty: ~205 → ~390). A local bail is charged like a failed
 walk plus `kBailCost` for the call that produced nothing, against the distance
@@ -344,10 +474,11 @@ Where the driver sits among the rungs follows from the same accounting. A
 capture-free find takes the suffix / ReverseInner prefilters (§7) *before*
 it — they answer from a memmem hit, while the driver would walk candidates
 until the rule gives it up — and a capture find takes the driver first (its
-one walk yields the groups; the prefilter rungs need a capture pass). All
-three loops order them this way; `MatchIter` once had the driver first for
-both, which on `[a-q][^u-z]{13}x` in CodePoint mode spent half the find in
-the driver's proving window (~17 → ~33 GB/s with the suffix scan first).
+one walk yields the groups; the prefilter rungs need a capture pass). The
+order is `ladder_pick`'s, for every entry point; when each had its own, the
+iterator had the driver first for both, which on `[a-q][^u-z]{13}x` in
+CodePoint mode spent half the find in the driver's proving window (~17 →
+~33 GB/s with the suffix scan first).
 
 Two exact
 refinements keep the driver's own work down first: a failed walk reports
@@ -613,10 +744,10 @@ so a pair straddling its edge is judged by its real neighbor). Gaps between
 candidates can hold lone CR/LF harmlessly, the gap scan stays on the cheap
 plain predicate, and the subject is read once. (Every suffix rung that runs
 the collapsed programs passes `collapse` to the candidate verify, the gated
-one in `search()` included: the scalar verifier counts bytes and must leave a
+one included: the scalar verifier counts bytes and must leave a
 candidate whose walk meets a CR or LF to the DFA.) A disqualifying window (a lone
 CR/LF — i.e. ordinary Unix-newline text — near a match) or a fusing cluster
-bails to the non-fused ladder; the iterator re-primes it (`reprime_unfused`)
+bails to the families that classify the subject up front (`ladder_unfused`)
 rather than downgrading to the Pike, so plain LF text still lands on the ASCII
 DFA tier. A var-pre suffix is admitted when the scalar chain verifier serves
 it (exact ends, no forward re-expansion past the vetted window). Took
@@ -736,7 +867,8 @@ quadratically) — exhaustion falls back to the located-span chain. Lifted
 mustache `\{\{\s*(\w+)\s*\}\}` ~0.69 → ~1.3 GB/s and markdown
 `\[([^\]]+)\]\(([^)]+)\)` ~0.18 → ~0.52 GB/s (both past rure), key=value
 ~0.85 → ~1.1 GB/s; `match()` uses the same walk anchored at 0. The drivers
-route through one front door (`onepass_driver_find`: literal prefix →
+route through one front door (`onepass_driver_find`; which driver is
+decided once, when the plan is built — `Plan::walk_driver_`: literal prefix →
 non-absorbing ReverseInner → position scan, where every position is a
 candidate and a wrong one usually dies on its first byte — access-log
 ~0.13 → ~0.31 GB/s, past RE2), and a pattern whose only assertion is a
@@ -848,7 +980,7 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   scan could land inside a cluster. So `prefix_.icase` is set (prefix stored
   lowercased) iff the prefix is all-ASCII and the engine is not US mode, and
   *every* prefix-skip site is split. On an **ASCII subject** the sites (DFA scan,
-  `search_at_or_after`) call `find_substr_icase` — a SIMD `memchr2` for both cases
+  `pike_candidate`) call `find_substr_icase` — a SIMD `memchr2` for both cases
   of the rarest **case-folded** byte (`'k'` over `'s'`, since lowercase `'s'` is
   common) then an ASCII fold verify; lifted `(?i)Sherlock` ~1000 → ~8000 MB/s
   (≈ rure; RE2 ~440). On a **non-ASCII subject** a byte-level fold scan can land
@@ -1009,8 +1141,8 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
     take the prefix as their candidate source and yield the groups in the
     same walk.
 
-  `suffix_` / `inner_` stay set only for the anchor chosen, so every ladder's
-  rung reads the choice without knowing there was one; the record keeps each
+  `suffix_` / `inner_` stay set only for the anchor chosen, so the ladder's
+  rungs read the choice without knowing there was one; the record keeps each
   anchor's cost, and the tests pin choices through it (`PlanProbe`). The
   **assert tiers** choose the same way between their leading and trailing
   literal (`plan_assert_anchor`; there the order used to be suffix-first, so
@@ -1104,13 +1236,13 @@ dense matches) at ~15× less memory.
 
 ### Shared stepping
 
-Both bulk forms walk matches with the same per-tier single-step primitives the
-engine already has: `dfa_forward_lf` + `dfa_reverse_scan` (capture-free),
-`+ capture_saves_bytes` (captures, byte offsets, no strings), `assert_find_span`
-(assert tiers), `run_saves` + `append_match_spans` (Pike). `find_all()` runs the
-tier loop to completion appending rows; `find_iter()` runs one step per `++`. A DFA
-tier that hits the state cap mid-`find_iter` downgrades to the Pike VM and continues
-from the current cursor.
+Every form is the find ladder (§2, *The find ladder*) with a different sink.
+`search()` and `test()` take one step (`find_once`: a `MatchResult` built in
+place, or nothing kept); `find_iter()` holds the scan (`Finder`) and takes one
+step per `++`, a row at a time; `find_all()` takes the same step told to run
+to the end, appending rows; `find_at()` is one step of a scan seeked to a
+position. A DFA rung that hits the state cap mid-scan downgrades to the Pike
+VM and continues from the current cursor.
 
 ### Cross-call DFA reuse (`FindCache`)
 
@@ -1137,15 +1269,19 @@ destroyed `Regex` whose address is reused gets a different id, so a stale DFA is
 never served). The mutable-cache-in-`Regex`-plus-mutex model (RE2's) was rejected
 because it would serialize concurrent matching on a shared `Regex`; matching here
 stays lock-free, the `Regex` stays `const` and shareable. **Lifetime/threading
-contract**: one `FindCache` per thread (not shared), destroyed before the `Regex`
-it bound to. A cache that trips the state cap simply keeps falling back —
-correct, just unaccelerated.
+contract**: one `FindCache` per thread (not shared between threads), destroyed
+before the `Regex` it bound to. On one thread it may serve several Regexes —
+the thread-local one does, and a caller's may: **a rung that reads a cached
+DFA runs on a cache bound to its Regex**, and a scan that keeps a cache across
+calls (`Finder`) binds it at the start of every step that can reach such a
+rung, in one place (`Finder::scratch`); a one-step find gets its cache from
+`thread_cache()`, which hands it out bound. A cache that trips the state cap
+simply keeps falling back — correct, just unaccelerated.
 
-`MatchIter` additionally owns its **own** `Scratch` (Pike/backtracker state) and
-re-fetches the shared warm DFA each step, so it is safe across a suspension point
-(a `++` boundary where the caller might run other matching on the same thread):
-another regex rebinding the `thread_local` cache merely costs a rebuild, never a
-dangling read.
+`MatchIter` additionally owns its **own** `Scratch` (Pike/backtracker state),
+so it is safe across a suspension point (a `++` boundary where the caller
+might run other matching on the same thread): another regex rebinding the
+shared cache merely costs a rebuild.
 
 ---
 
@@ -1175,13 +1311,19 @@ ASan/UBSan) is layered:
   **forced** by a transformation the accelerator cannot see through:
 
   ```cpp
-  pike = Regex("(?:" + pat + ")(?=[\\s\\S]|$)");
+  pike = Regex("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)");
   ```
 
   The always-true lookahead — the next cluster is anything, or the text ends —
   matches at every position and consumes nothing, and a lookaround is a
   construct neither DFA family compiles (`dfa_ok_`/`dfa_assert_ok_` bow out),
   so this `Regex` runs the Pike — while matching the exact same whole spans.
+  It stands in front as well as behind because the Pike rung is not the bare
+  VM: it skips to a candidate first (a literal prefix, Teddy, the first-byte
+  set) and tries the bounded backtracker there — at every entry point, since
+  they share one ladder. A reference that took those would share them with
+  every pattern the Pike serves; behind a lookahead none is planned, and the
+  VM starts at every position.
   The scan's full sequence is compared span-for-span **and
   capture-for-capture** against the forced-Pike result. This is the check
   that caught the CRLF soundness bugs: `gen_subject` deliberately emits `\r`
@@ -1190,7 +1332,8 @@ ASan/UBSan) is layered:
 
   **The forcing is itself checked** (`pike_reference` in the fuzzer,
   `pike_twin` in the unit tests, both through `PlanProbe`): a reference whose
-  plan holds any accelerated tier fails the run. It was not always. The wrap
+  plan holds any accelerated tier, or any of the Pike rung's own
+  accelerators, fails the run. It was not always. The wrap
   used to be `(?:PAT)(?:\b|\B)`, chosen when an assertion meant "not
   DFA-able"; then the assert tiers were built to serve exactly `\b` and `\B`,
   and the reference quietly moved onto them — the tiers under test, behind the
@@ -1209,10 +1352,25 @@ ASan/UBSan) is layered:
 - **Layer 4 — non-ASCII assertion byte tier** against the forced grapheme Pike,
   multiline on/off.
 - **Layer 5 — `find_iter` vs `find_all`.** The lazy `find_iter()` full sequence must equal
-  the eager `find_all()` (every whole span and capture) — the two view containers
-  go through different assembly (one-step-per-`++` vs run-to-completion). Plus a
+  the eager `find_all()` (every whole span and capture). The two climb the
+  same ladder and drive it differently — a step per `++`, against one step
+  told to run to the end, under which each rung continues in place and the
+  walk has a loop of its own. Plus a
   **`FindCache` reuse** check: a single cache reused across a subject sequence vs
   fresh per subject must agree, guarding cross-subject state accumulation.
+- **The entry points share one ladder, which removes a check and asks for
+  others.** When `search`, `test`, `find_all` and `find_iter` each had a
+  dispatch of their own, comparing them was a cross-check of four
+  implementations. It is not any more: what they share, they share. What
+  differs between them is now narrow and named, and each has inputs drawn
+  for it (`gen_ladder`, `gen_egc_onewalk`): the prefilter rungs as a
+  *boolean* takes them (stopping at the first accepting state — subjects
+  that lack the literal, hold it once, hold it in the other case, or with a
+  combining mark planted inside a real match); the walk from 0 as a *find*
+  takes it (a second step must find nothing, an empty match at 0 must not
+  come back); the one-pass walk on the EGC byte tier (CR-LF pairs in a class
+  that counts them as one element, classes of non-ASCII characters only, one
+  non-ASCII character in kilobytes of ASCII).
 
 A `std::regex` differential is kept but is **informational, never a gate** (its
 semantics vary across standard libraries). A portable semantic-regression corpus

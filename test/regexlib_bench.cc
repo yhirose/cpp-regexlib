@@ -759,6 +759,16 @@ static void run_sherlock_bench(int iters) {
       // live `a` is its own position in the window): the state-cap / cache
       // behavior under a pattern that is regular but not small.
       {"wide fixed gap (DFA state growth)", "a.{20}z", false, {text}},
+      // test() on patterns whose find is driven from a literal that is not
+      // at the front. None of the three matches anywhere in the text, so the
+      // whole subject is the cost — and the literal IS in it (`q` some 400
+      // times, `-` some 1,200), so what is measured is hopping between its
+      // occurrences against stepping a DFA through every byte, not a memmem
+      // that never stops. The first two are the find rows above ("common
+      // prefix, rare suffix" and its class-led twin) asked as a boolean.
+      {"test: common prefix, rare suffix", "e[a-z]{3,}q", true, {text}},
+      {"test: class start, rare suffix", "[eE][a-z]{3,}q", true, {text}},
+      {"test: interior literal", "[a-z]+-[0-9]{4}", true, {text}},
   };
   for (auto &c : cases)
     run_case(c, iters);
@@ -1476,9 +1486,9 @@ int main(int argc, char *argv[]) {
                    false,
                    {make_words(MB, /*needle_period=*/20)}});
 
-  // Boolean variant -> regexlib dfa_test path. The needle is ABSENT so every
-  // engine must scan the whole subject (a present needle exits at the first
-  // hit near byte 0 and measures nothing).
+  // Boolean variant -> regexlib test(), the find ladder as a boolean. The
+  // needle is ABSENT so every engine must scan the whole subject (a present
+  // needle exits at the first hit near byte 0 and measures nothing).
   cases.push_back({"literal-alt test (no match)",
                    "(?:xyzzy|plugh|frobnicate)",
                    true,

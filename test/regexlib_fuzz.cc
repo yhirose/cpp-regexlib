@@ -37,7 +37,10 @@
 
 // The fuzzer's view into a Regex's plan (the header declares the peer and
 // befriends it): whether a Regex is served by the Pike VM and by nothing
-// else. Every reference below is built through pike_reference(), which asks.
+// else — no literal, DFA or assert tier, and none of the Pike rung's own
+// accelerators either (the start filters that skip to a candidate, the
+// bounded backtracker). Every reference below is built through
+// pike_reference(), which asks.
 namespace reg {
 namespace detail {
 struct PlanProbe {
@@ -46,7 +49,8 @@ struct PlanProbe {
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
-           !p.aop_.ok && !p.wop_.ok;
+           !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
+           !p.first_bytes_.ok && !p.cap_bitstate_;
   }
 };
 } // namespace detail
@@ -259,11 +263,18 @@ void fail(const std::string &why, const std::string &pat,
 // gates with the code it was supposed to check (`t[^.]+[^q]+\.` matched
 // "t\r\n." on both sides). Nothing noticed, because nothing asked; this
 // does. A reference that is not Pike-only is a failure of the run.
+//
+// The same lookahead goes in FRONT as well. The Pike rung is not the bare VM:
+// it skips to a candidate first (a literal prefix, Teddy, the first-byte
+// set) — at every entry point, since they share one ladder. A reference
+// that took those would share them with any pattern the Pike serves; behind
+// a lookahead none of them is planned, and the VM starts at every position.
 reg::Regex *pike_reference(const std::string &pat, unsigned flags,
                            reg::MatchUnit unit) {
   reg::Regex *pike = nullptr;
   try {
-    pike = new reg::Regex("(?:" + pat + ")(?=[\\s\\S]|$)", flags, unit);
+    pike = new reg::Regex("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)",
+                          flags, unit);
   } catch (...) {
     return nullptr; // wrapping may hit a limit; the caller skips the compare
   }
@@ -343,6 +354,41 @@ bool compare_groups(const M1 &a, const M2 &b, const char *what,
   return true;
 }
 
+// A FindCache SHARED WITH OTHER REGEXES: one that outlives every pattern, so
+// it arrives at each new one bound to the last (by then destroyed), and — the
+// Grapheme and CodePoint checks both draw on it — midway to whatever rung
+// that one's scan left it on. A step has to bind it before any rung reads a
+// DFA out of it: whichever rung the scan starts on, and whichever it moves to
+// within the step. The iterator and the single step over it, against the
+// rows find_all gave.
+void check_shared_cache(const reg::Regex &re, const std::string &subj,
+                        const std::vector<reg::MatchResult> &all,
+                        const std::string &pat) {
+  static thread_local reg::Regex::FindCache shared;
+  try {
+    size_t i = 0;
+    for (auto m : re.find_iter(subj, shared)) {
+      if (i >= all.size() || m.begin() != all[i].begin() ||
+          m.end() != all[i].end()) {
+        fail("find_iter(shared cache) vs find_all", pat, subj);
+        return;
+      }
+      i++;
+    }
+    if (i != all.size()) {
+      fail("find_iter(shared cache) count != find_all", pat, subj);
+      return;
+    }
+    auto at = re.find_at(subj, 0, shared);
+    if (at.m.matched() != !all.empty() ||
+        (at.m.matched() && (at.m.begin() != all[0].begin() ||
+                            at.m.end() != all[0].end())))
+      fail("find_at(shared cache) vs find_all", pat, subj);
+  } catch (...) {
+    fail("find_iter(shared cache) threw", pat, subj);
+  }
+}
+
 // A FindCache reused across subjects (a growing, persisted DFA) must give the
 // same results as a fresh find_all. `cache` is shared across the caller's whole
 // subject sequence, so this also exercises cross-subject state accumulation.
@@ -364,6 +410,7 @@ void check_cache(const reg::Regex &re, const std::string &subj,
     if (!compare_groups(got[i], all[i], "find_all(cache) vs find_all", pat,
                         subj))
       return;
+  check_shared_cache(re, subj, all, pat);
 }
 
 // The lazy scan() must yield the same sequence as find_all: every whole-match
@@ -816,7 +863,17 @@ void check_us_vs_pike(const std::string &pat,
       fail("US vs Pike: search matched != find_all", pat, subj);
     else if (one.matched())
       compare_groups(one, all[0], "US search vs find_all[0]", pat, subj);
+    bool t = false;
+    try {
+      t = us->test(subj);
+    } catch (...) {
+      fail("US vs Pike: test() threw", pat, subj);
+      continue;
+    }
+    if (t != one.matched())
+      fail("US test() != search().matched()", pat, subj);
     check_scan(*us, subj, all, pat);
+    check_shared_cache(*us, subj, all, pat);
   }
   delete us;
   delete pike;
@@ -1212,6 +1269,387 @@ void invariant_fuzz_anchor_choice(int iters) {
   }
 }
 
+// --- One-walk drivers on the EGC byte tier. ---
+//
+// In Grapheme mode a subject that is not pure ASCII — or is, with CR-LF pairs
+// in it — runs on the byte programs, and the one-walk drivers run there too:
+// candidate + one walk per match, with the located-span chain serving the one
+// find whose walk meets a byte the table has no transition for. What that
+// rests on is specific to this tier, and none of it is what the CodePoint
+// layer above exercises:
+//
+//  - The candidates. The grapheme program's first-byte set is ASCII-only and
+//    would step over a match that STARTS on a non-ASCII byte; the byte
+//    program's 256-wide set is the prune here. `[😀漢]+` over " 😀" has no
+//    ASCII candidate at all.
+//  - The CRLF collapse. A pattern whose classes count a CR-LF pair as one
+//    element runs collapsed byte programs, which the code-point table does
+//    not mirror — such a plan must stay off the walk (`[^c-za]a?` over
+//    "c\r\n3" is [1,3) then [3,4)).
+//  - The gate. The byte tier is admitted per subject; one combining mark
+//    sends the same pattern to the Pike instead.
+//
+// Patterns: the CodePoint layer's one-walk shapes, classes that hold only
+// non-ASCII members, and bounded classes that touch CR and LF (the collapse
+// shapes). Subjects: single-code-point units with CR-LF pairs, at four
+// non-ASCII densities, short and kilobytes long.
+std::string gen_egc_onewalk() {
+  switch (U(0, 5)) {
+  case 0: {
+    // Only non-ASCII members (or nearly): every match starts where the
+    // ASCII first-byte set says nothing can.
+    static const char *CLS[] = {"[\xC3\xA9\xE6\x97\xA5]", "[\xF0\x9F\x98\x80\xE6\xBC\xA2]",
+                                "[\xC3\xA9" "a]", "\\p{L}", "[^ -~\\n\\r]"};
+    static const char *Q[] = {"+", "{1,}", "{1,3}", ""};
+    static const char *LEAD[] = {"", "", "a?", "(", " "};
+    const char *lead = LEAD[U(0, 4)];
+    std::string body = std::string(CLS[U(0, 4)]) + Q[U(0, 3)];
+    if (lead[0] == '(') return "(" + body + ")";
+    return std::string(lead) + body;
+  }
+  case 1: {
+    // The collapse shapes: a bounded / single class matching both CR and LF.
+    static const char *NEG[] = {"[^c-za]", "[^q]", "[^.]", "[^ab]"};
+    static const char *BQ[] = {"", "{2}", "{1,2}", "{0,2}", "?"};
+    static const char *TAIL[] = {"a?", "x", "", "\\d", "[a-c]+"};
+    static const char *HEAD[] = {"", "", "a", "[a-c]"};
+    return std::string(HEAD[U(0, 3)]) + NEG[U(0, 3)] + BQ[U(0, 4)] +
+           TAIL[U(0, 4)];
+  }
+  default: return gen_us_onewalk();
+  }
+}
+
+void invariant_fuzz_egc_onewalk(int iters) {
+  // [0, 12) ASCII (one byte each, `\n` among them); then a CR-LF pair; then
+  // the non-ASCII ones — é and 日 (word characters), ¡ (punctuation: a
+  // non-ASCII byte that ENDS a word), 😀 and 漢 (the first class above); and
+  // last a letter with a combining mark, which no byte tier may serve.
+  static const char *UNITS[] = {
+      "a", "b", "c", "1", "2", "_", " ", "=", ":", "-", "\n", "k",
+      "\r\n",
+      "\xC3\xA9", "\xE6\x97\xA5", "\xC2\xA1", "\xF0\x9F\x98\x80", "\xE6\xBC\xA2",
+      "e\xCC\x81"};
+  const int kAscii = 12, kCrlf = 12, kNa = 13, kNaEnd = 17, kMark = 18;
+  for (int it = 0; it < iters; it++) {
+    const std::string pat = gen_egc_onewalk();
+    // `na` units in twenty are non-ASCII, `crlf` in twenty a CR-LF pair.
+    auto gen = [&](int units, int na, int crlf) {
+      std::string subj;
+      for (int i = 0; i < units; i++) {
+        int r = U(0, 19);
+        subj += r < na          ? UNITS[U(kNa, kNaEnd)]
+                : r < na + crlf ? UNITS[kCrlf]
+                                : UNITS[U(0, kAscii - 1)];
+      }
+      return subj;
+    };
+    static const int NA_PER_20[] = {0, 1, 4, 10};
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 8; s++)
+      subjects.push_back(gen(U(0, 30), NA_PER_20[s % 4], s < 4 ? 0 : 3));
+    // Long: ASCII with CR-LF line ends (the ASCII subject the byte tier
+    // takes), one non-ASCII character in kilobytes of ASCII, and — one
+    // pattern in four — a subject where most finds bail, so the
+    // profitability rule gives the driver up partway.
+    subjects.push_back(gen(1500, 0, 1));
+    subjects.push_back(gen(600, 0, 0) + UNITS[U(kNa, kNaEnd)] +
+                       gen(600, 0, 0));
+    subjects.push_back(gen(1500, 1, 1));
+    if (it % 4 == 0) subjects.push_back(gen(2000, 12, 1));
+    // One combining mark: the same subject, off the byte tier.
+    if (it % 8 == 0)
+      subjects.push_back(gen(150, 2, 1) + UNITS[kMark] + gen(150, 2, 1));
+    check_pattern(pat, subjects);
+  }
+}
+
+// --- The find ladder's rungs as only some callers take them. ---
+//
+// search, find_all, find_iter and test climb one ladder, so the layers above
+// reach its rungs through whichever entry point they call. Four things are
+// not everybody's, or rest on what those layers do not draw — one shape of
+// case each (LadderCase::Shape):
+//
+//   - Anchor: the prefilter rungs asked by a BOOLEAN. test() takes the
+//     suffix, the interior-literal, the (?i)-prefix and the fused scans as a
+//     find does, but each stops at the first accepting state it reaches
+//     instead of going on to the end a find reports (and the suffix scan
+//     does not walk forward at all). That is a second way through each of
+//     them, and it shows on the subjects a find and a boolean part ways on:
+//     long, with the literal absent, or present once, or present in the
+//     other case, or only at the very end. The long subjects above are drawn
+//     from the pattern's own letters, which rarely lack anything.
+//   - TextAnchored: Rung::TextAnchor — a text-anchored pattern whose caller
+//     reads no groups: one walk from 0 is the whole find. It was test()'s
+//     and match()'s rung; it is now search()'s and the iterator's as well,
+//     for a capture-free plan. There a second step has to find nothing, an
+//     empty match at 0 must not come back, and a byte the walk has no
+//     transition for hands the find to the families (which then must not
+//     have lost the groups of a pattern that has them).
+//   - LookBack: the interior-literal rung's look-back as a boolean takes it:
+//     32 bytes (limits::kBoolFloorBytes) and, with the part before the
+//     literal still alive there, the scan instead. A pre-part that needs
+//     about that many characters is the shape that sits on the line —
+//     `[a-z]{35,}@x` has no start inside the look, and one before it — and
+//     nothing above draws a counted repeat that long. The case carries what
+//     its subjects are built from: the run's letter, the count, and the text
+//     the literal and the rest match.
+//   - PassedOver: the fused prefix scan's failed candidates. It verifies a
+//     candidate with the byte DFA over bytes its eligibility scan has not
+//     reached, so a verify that dies on a combining mark is no verdict: the
+//     candidate may start a match the byte engine cannot see. The shape that
+//     shows a candidate passed over is a literal prefix, a long branch that
+//     runs into the mark and a short one that matches in front of it —
+//     `q(?:a[a-z]+z|b)` over "qaqbcd́z" — and a subject short enough
+//     for the failed-verify budget to run out. The case carries the subject
+//     the pattern is built around.
+//
+// All of it goes through the Grapheme battery and the CodePoint differential;
+// the latter checks test() against search() too.
+struct LadderCase {
+  enum Shape { Anchor, TextAnchored, LookBack, PassedOver } shape = Anchor;
+  std::string pat;
+  // LookBack: a run of `unit`, about `k` of them, then `text`.
+  int k = 0;
+  std::string unit, text;
+  // PassedOver: the subject the pattern is built around.
+  std::string core;
+};
+
+LadderCase gen_ladder() {
+  LadderCase lc;
+  if (U(0, 9) == 0) {
+    lc.shape = LadderCase::PassedOver;
+    static const char *LIT[] = {"q", "x", "Zq", "k"};
+    static const char *LONG[] = {"a", "e", "", "n"};
+    static const char *SHORT[] = {"b", "t", "c", "s"};
+    static const char *CLS[] = {"[a-z]", "\\w", "[^ ]", "[a-y]"};
+    static const char *REP[] = {"+", "*", "{2,}", "+"};
+    static const char *TAIL[] = {"z", "\\.", "z", ","};
+    static const char *TAILTEXT[] = {"z", ".", "z", ","};
+    static const char *FILL = "aeinlgy";
+    const std::string lit = LIT[U(0, 3)], lng = LONG[U(0, 3)],
+                      sht = SHORT[U(0, 3)];
+    int tl = U(0, 3);
+    auto fill = [&](int len) {
+      std::string f;
+      for (int i = 0; i < len; i++) f += FILL[U(0, 6)];
+      return f;
+    };
+    // prefix, long-branch head, [a second candidate with the short branch],
+    // a letter with a combining mark, the tail.
+    lc.core = lit + lng + fill(U(0, 3));
+    for (int extra = U(0, 2); extra > 0; extra--)
+      lc.core += lit + (U(0, 1) ? sht : "") + fill(U(0, 2));
+    lc.core += fill(1) + "\xCC\x81" + fill(U(0, 3)) + TAILTEXT[tl];
+    std::string longer =
+        lng + CLS[U(0, 3)] + REP[U(0, 3)] + TAIL[tl];
+    switch (U(0, 2)) {
+    case 0: lc.pat = lit + "(?:" + longer + "|" + sht + ")"; break;
+    case 1: lc.pat = lit + longer + "|" + lit + sht; break;
+    default: lc.pat = lit + longer; break; // one branch: the budget's case
+    }
+    return lc;
+  }
+  if (U(0, 7) == 0) {
+    lc.shape = LadderCase::LookBack;
+    static const char *PRE[] = {"[a-z]", "\\w", "[^?]", "[a-y]", "."};
+    static const char *UNIT[] = {"a", "b", "t", "e", "s"};
+    static const char *LIT[] = {"@x", "=[a-z]", "\\?", "-[0-9]{2}", "#q"};
+    static const char *TEXT[] = {"@x", "=c", "?", "-12", "#q"};
+    int sh = U(0, 4);
+    lc.k = U(26, 40);
+    lc.unit = UNIT[sh];
+    lc.text = TEXT[sh];
+    std::string count = std::to_string(lc.k);
+    switch (U(0, 2)) {
+    case 0: count += ","; break;
+    case 1: count += "," + std::to_string(lc.k + U(0, 6)); break;
+    default: break; // exactly k
+    }
+    lc.pat = std::string(PRE[sh]) + "{" + count + "}" + LIT[sh];
+    return lc;
+  }
+  if (U(0, 9) < 4) {
+    lc.shape = LadderCase::TextAnchored;
+    static const char *HEAD[] = {"^", "^", "\\A", "(?m)^", "^(?:", "\\A(?:"};
+    static const char *TAIL[] = {"", "", "$", "\\z", "$", ""};
+    int h = U(0, 5);
+    std::string body;
+    switch (U(0, 3)) {
+    case 0: body = gen_onepass_repeat(); break; // brings its own `^` or `\b`
+    case 1: body = "[a-c]*"; break;             // can match empty at 0
+    default: body = gen_us_onewalk(); break;
+    }
+    lc.pat = HEAD[h] + body;
+    if (h >= 4) lc.pat += ")";
+    lc.pat += TAIL[U(0, 5)];
+    return lc;
+  }
+  lc.pat = gen_anchor_choice();
+  switch (U(0, 7)) {
+  case 0:
+  case 1: lc.pat = "(?i)" + lc.pat; break;
+  case 2: {
+    // A branch the literal is no part of.
+    static const char *ALT[] = {"\\d\\d", "[A-Z]{2}", "#", "\\s\\s", "Qq"};
+    lc.pat += std::string("|") + ALT[U(0, 4)];
+    break;
+  }
+  default: break;
+  }
+  return lc;
+}
+
+void invariant_fuzz_ladder(int iters) {
+  // Letters in both cases (the generators' own, and their other case), a
+  // few digits and marks, a line break; then a CR-LF pair, a non-ASCII
+  // letter and a letter with a combining mark.
+  static const char *UNITS[] = {
+      "e", "a", "t", "s", "q", "z", "x", "l", "y", "i", "n", "g", "b", "c",
+      "k", "E", "A", "T", "S", "Q", "Z", "X", "L", "Y", "I", "N", "G", "B",
+      "C", "K", "1", "2", "_", " ", " ", ".", ",", "@", "-", "=", ":", "!",
+      "?", "#", "\n", "\r\n", "\xC3\xA9", "e\xCC\x81"};
+  const int kPlain = 45, kCrlf = 45, kNa = 46, kMark = 47;
+  for (int it = 0; it < iters; it++) {
+    const LadderCase lc = gen_ladder();
+    const std::string &pat = lc.pat;
+    // `cold`: the plain units the pattern does not spell — so a subject
+    // drawn from them lacks every literal of it, in the pattern's case.
+    // The other case of its letters stays in, which is what makes a (?i)
+    // pattern match there. `hot`: the ones it does spell.
+    std::vector<int> cold, hot;
+    for (int u = 0; u < kPlain; u++)
+      (pat.find(UNITS[u]) == std::string::npos ? cold : hot).push_back(u);
+    if (cold.empty()) cold.push_back(33);
+    if (hot.empty()) hot.push_back(0);
+    auto draw = [&](const std::vector<int> &from, int units, int special) {
+      std::string subj;
+      for (int i = 0; i < units; i++) {
+        if (special && U(0, special - 1) == 0)
+          subj += UNITS[U(kCrlf, kNa)];
+        else
+          subj += UNITS[from[static_cast<size_t>(
+              U(0, static_cast<int>(from.size()) - 1))]];
+      }
+      return subj;
+    };
+    std::vector<std::string> subjects, us_subjects;
+    if (lc.shape == LadderCase::TextAnchored) {
+      // The match, if any, is at 0: short subjects that begin with the
+      // pattern's letters, with others, with nothing; a non-ASCII letter or
+      // a CR-LF pair a few units in (the walk bails there); and long ones,
+      // for test().
+      for (int s = 0; s < 6; s++) {
+        std::string subj = draw(s % 2 ? hot : cold, U(0, 6), 0) +
+                           draw(hot, U(0, 12), 0) + draw(cold, U(0, 6), 0);
+        us_subjects.push_back(subj);
+        subjects.push_back(std::move(subj));
+      }
+      for (int s = 0; s < 4; s++) {
+        std::string head = draw(hot, U(0, 5), 0);
+        subjects.push_back(head + UNITS[U(kCrlf, kMark)] + draw(hot, 8, 4));
+        us_subjects.push_back(head + UNITS[kNa] + draw(hot, 8, 0));
+      }
+      subjects.push_back(draw(hot, 300, 0));
+      subjects.push_back(draw(hot, 300, 20));
+      us_subjects.push_back(draw(hot, 300, 0));
+    } else {
+      // Long ones. None of the pattern's letters; none but for one short
+      // window of them; that window in the other case; the window at the
+      // very end; the pattern's letters throughout; and the first two again
+      // with CR-LF and é in them.
+      auto flip = [](std::string w) {
+        for (char &ch : w)
+          ch = (ch >= 'a' && ch <= 'z')   ? static_cast<char>(ch - 32)
+               : (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + 32)
+                                          : ch;
+        return w;
+      };
+      const std::string window = draw(hot, U(2, 12), 0);
+      subjects.push_back(draw(cold, 300, 0));
+      subjects.push_back(draw(cold, 150, 0) + window + draw(cold, 150, 0));
+      subjects.push_back(draw(cold, 150, 0) + flip(window) +
+                         draw(cold, 150, 0));
+      subjects.push_back(draw(cold, 290, 0) + window); // ... at the very end
+      subjects.push_back(draw(hot, 300, 0));
+      us_subjects = subjects;
+      subjects.push_back(draw(cold, 300, 12));
+      subjects.push_back(draw(cold, 150, 12) + window + draw(cold, 150, 12));
+      // Every other pattern: a combining mark planted in a match. A short
+      // subject of the pattern's letters is searched for one, and the mark
+      // goes after one of its characters — its last one included. The bytes
+      // of the match are then all there and the match is not (that
+      // character is another cluster now), or is a shorter one; a fused
+      // scan has to see that for a boolean too, and every other rung has to
+      // leave the subject to the Pike. Alone in the subject, and once more
+      // behind a non-ASCII letter (the fused scans need one to be taken).
+      if (it % 2 == 0) {
+        try {
+          reg::Regex probe(pat);
+          for (int tries = 0; tries < 8; tries++) {
+            const std::string hay = draw(hot, U(3, 16), 0);
+            auto m = probe.search(hay);
+            if (!m.matched() || m.end() == m.begin()) continue;
+            const size_t at = m.begin() + 1 +
+                              static_cast<size_t>(U(
+                                  0, static_cast<int>(m.end() - m.begin()) - 1));
+            const std::string planted =
+                hay.substr(0, at) + "\xCC\x81" + hay.substr(at);
+            subjects.push_back(draw(cold, 150, 0) + planted +
+                               draw(cold, 150, 0));
+            subjects.push_back(std::string(UNITS[kNa]) + " " + planted);
+            break;
+          }
+        } catch (...) {
+          // a rejected pattern: check_pattern says so
+        }
+      }
+      // CodePoint: é but no `\r` (see check_us_vs_pike).
+      us_subjects.push_back(draw(cold, 150, 0) + UNITS[kNa] + window +
+                            draw(cold, 150, 0));
+      // The passed-over candidate: the subject the pattern was built
+      // around, bare (the failed-verify budget of a ten-byte subject is a
+      // few bytes), behind a non-ASCII letter, in the middle of a long
+      // subject, and followed by a match the byte engine does see.
+      // (Grapheme only: the mark is a code point of its own to CodePoint.)
+      if (lc.shape == LadderCase::PassedOver) {
+        subjects.push_back(lc.core);
+        subjects.push_back(std::string(UNITS[kNa]) + " " + lc.core);
+        subjects.push_back(draw(cold, 120, 0) + " " + lc.core + " " +
+                           draw(cold, 60, 0));
+        subjects.push_back(lc.core + " " + window + " " +
+                           draw(hot, 12, 0));
+        subjects.push_back(draw(hot, U(0, 6), 0) + lc.core);
+      }
+      // The look-back shape: a run of the pre-part's letter a few short of
+      // the count, at it, a few past it and well past it, then the literal —
+      // at the head of the subject, in the middle of one, and twice (a run
+      // too short, then one long enough).
+      if (lc.shape == LadderCase::LookBack) {
+        auto run = [&](int len) {
+          std::string r;
+          for (int i = 0; i < len; i++) r += lc.unit;
+          return r + lc.text;
+        };
+        for (int len : {lc.k - U(1, 5), lc.k, lc.k + U(1, 8),
+                        lc.k + 60}) {
+          for (const std::string &subj :
+               {run(len), " " + run(len) + " ",
+                draw(cold, 100, 0) + " " + run(len) + " " + draw(cold, 40, 0),
+                " " + run(lc.k - 2) + " " + run(len) + " "}) {
+            subjects.push_back(subj);
+            us_subjects.push_back(subj);
+          }
+        }
+      }
+    }
+    check_pattern(pat, subjects);
+    check_us_vs_pike(pat, us_subjects);
+  }
+}
+
 // Pure printable-ASCII literal fast-path differential. The literal tier
 // (literal_only_: memmem + O(1) grapheme-boundary check, no subject
 // classification) must agree with the forced Pike on EVERY surface, especially
@@ -1593,6 +2031,12 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A quarter: some twenty subjects per pattern, two of them 600 units, and
   // each pattern checked twice (the EGC battery plus the US differential).
   invariant_fuzz_anchor_choice(share(inv / 4));
+  // A tenth: three or four subjects of a kilobyte and more per pattern
+  // through the Pike reference.
+  invariant_fuzz_egc_onewalk(share(inv / 10));
+  // A fifth: half a dozen 300-unit subjects per pattern, each pattern
+  // checked twice (the EGC battery plus the US differential).
+  invariant_fuzz_ladder(share(inv / 5));
 }
 
 int main(int argc, char **argv) {
