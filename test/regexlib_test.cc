@@ -887,6 +887,43 @@ void test_onewalk_local_bail() {
   }
 }
 
+// The fused prefix scan (find_iter over a non-ASCII subject, a literal
+// prefix) verifies a candidate with the byte DFA, over bytes its eligibility
+// scan has not reached yet. A failed verify that touched a cluster is not
+// "no match here" — the byte engine cannot see the match the cluster is part
+// of. Passed over, the candidate was lost in two ways: the failed-verify
+// budget ran out on a short subject and the scan resumed past it; and a
+// later candidate matched in front of the cluster and was reported.
+void test_fused_prefix_failed_verify() {
+  auto iter_spans = [](const Regex &re, std::string_view subj) {
+    std::vector<size_t> out;
+    for (auto m : re.find_iter(subj)) {
+      out.push_back(m.begin());
+      out.push_back(m.end());
+    }
+    return out;
+  };
+  auto ok = [&](const std::string &pat, const std::string &subj) {
+    Regex bare(pat), pike = pike_twin(pat);
+    return iter_spans(bare, subj) == iter_spans(pike, subj);
+  };
+  const std::string mark = "\xCC\x81", e_acute = "\xC3\xA9";
+  for (const char *pat : {"q\\w*\\.", "q[a-z]*\\.", "q\\w+x", "Z\\w{3,},"})
+    for (const std::string &subj :
+         {"qqqq" + mark + ".", e_acute + " qqqq" + mark + ".",
+          e_acute + " qqqqqqqq" + mark + ".", " qqqq" + mark + "qx",
+          e_acute + " Z,Z,,ZZZZZ" + mark + "ZZ,Z,,", "q" + mark + ".",
+          "qq" + mark + ". qq."})
+      CHECK(ok(pat, subj));
+  for (const char *pat : {"q(?:a[a-z]+z|b)", "q(?:a\\w+z|b)", "qa[a-z]+z|qb"})
+    for (const std::string &subj :
+         {"qaqbcd" + mark + "z", e_acute + " qaqbcd" + mark + "z",
+          "qaqbcd" + mark + "z and then qb and qaz",
+          std::string(200, ' ') + "qaqbcd" + mark + "z" + std::string(200, ' '),
+          "qaqb cd" + mark + "z", "qaqbcd" + mark + "y qb"})
+      CHECK(ok(pat, subj));
+}
+
 // UnicodeScalar mode (phase 1): literal patterns compile to a UTF-8 byte
 // automaton and run on the byte DFA over non-ASCII subjects with no cliff.
 // Code-point (not grapheme) semantics; byte offsets. Non-literal constructs are
@@ -3543,6 +3580,7 @@ int main() {
   test_matches();
   test_whole_match_capture();
   test_onewalk_local_bail();
+  test_fused_prefix_failed_verify();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

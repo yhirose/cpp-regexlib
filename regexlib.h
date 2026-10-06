@@ -16322,11 +16322,30 @@ inline void Regex::MatchIter::step(bool &chain_once) {
           break;
         }
         if (e2 <= s2) {
-          // Failed verify: deduct the examined bytes (linearity guard, see
-          // kWalkBail). On exhaustion re-prime the unfused ladder from pos_ —
-          // sound here (unlike the bad-cluster downgrade) because the scanned
-          // region was verified cluster-clean, so the failed candidates
-          // genuinely match nothing.
+          // A failed verify is the BYTE engine's verdict on the bytes it
+          // examined, and those lie ahead of the gap scan: unvetted. With a
+          // cluster among them the grapheme verdict can be a match — the
+          // walk of `q\w*\.` over "qqq\u0301." dies on the mark, where the
+          // Pike takes the cluster for the `\w` its base is — so such a
+          // candidate is not passed over: the Pike answers, from the last
+          // yielded end. (Left to the gap scan to find, the cluster was
+          // found too late in two ways: the budget below could run out
+          // first and hand the unfused ladder a cursor already past the
+          // candidate, and a later candidate could match in front of the
+          // cluster and be yielded — `q(?:a[a-z]+z|b)` over
+          // "qaqbcd\u0301z" gave "qb" at 2 for the match at 0. find_all
+          // has neither problem: on a cluster it discards its rows and
+          // starts over.)
+          if (!re_->egc_match_clean(text_, static_cast<size_t>(s2),
+                                    static_cast<size_t>(reach2))) {
+            pos_ = resume_pos_;
+            downgrade();
+            break;
+          }
+          // Deduct the examined bytes (linearity guard, see kWalkBail). On
+          // exhaustion re-prime the unfused ladder from pos_ — sound,
+          // because every failed candidate's examined bytes were just
+          // verified cluster-clean, so they genuinely match nothing.
           if (!walk_budget_.spend(reach2 - s2)) {
             egc_fused_ = false;
             reprime_unfused();
