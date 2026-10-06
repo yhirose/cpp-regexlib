@@ -306,6 +306,21 @@ scanned, after a `kMinScan` proving window so short subjects keep the
 one-walk latency shape. The callers resume the chain from the bail point,
 so the loss is bounded by that window, not a subject's worth.
 
+The distance scanned is the right yardstick only when the chain would have
+walked it. A driver led by a literal prefix or a sparse first-byte set shares
+its candidates with the chain — the chain's forward DFA skips from its start
+state with the very memchr the driver runs — and between candidates neither
+does any work. Measured against the distance, such a driver's charge did not
+trip where it should: `e[a-z]+s` over prose (one candidate in 13 a match, the
+rest a failed run each) was charged 0.96 of the distance and ran at ~395 MB/s
+where the chain does ~505. For those drivers both sides are counted *per
+candidate* instead (`spend_at_candidate` / `matched_at_candidate`): a walk
+call's fixed cost and half a chain-byte per byte, against the chain's much
+smaller per-candidate cost plus a byte per byte on a failure and two on a
+match (forward for the end, reverse for the start). The constants are
+measured: an all-matching `e\w*` costs the walk 7 chain-bytes a candidate and
+the chain 10.9, a failing `e[a-z]+s` candidate 6.5 and 4.5.
+
 That bail is **global** — the driver is done for the caller's loop
 (`kWalkBail`). A non-ASCII byte in a walk's way is a different event and gets
 a different code, `kWalkLocal`: the one-pass table has no transition for the

@@ -4674,6 +4674,12 @@ class Regex {
   //     a long one is a few KB, not a subject's worth. The callers resume
   //     their chain from the bail point, so nothing scanned is redone. O(n)
   //     still: charge <= max(kMinScan, pos) <= max(kMinScan, n).
+  //   - A driver whose candidates the chain is led to as well (a literal
+  //     prefix, a sparse first-byte set) uses spend_at_candidate /
+  //     matched_at_candidate instead: between such candidates the chain
+  //     walks nothing either, so the distance is no yardstick, and both
+  //     sides are counted per candidate — there a fixed per-candidate cost
+  //     is what was measured (see spend_at_candidate).
   // What a cp_onepass_find walk reports to its driver. Filled on every
   // return: an accept is not necessarily a match the caller keeps (a
   // require_end `body$` plan rejects one that does not land at n), and such a
@@ -4685,15 +4691,21 @@ class Regex {
   };
   class WalkBudget {
     int left_;
+    int bail_at_ = -1;
     // 64-bit: the charge can reach ~9.5x the subject length (each failed walk
     // is charged up to 8.5 bytes per byte walked, and the linearity bound
     // admits a subject's worth of failed walking), which overflows an int
     // well before `left_`'s own 2 GB range.
     int64_t charge_ = 0;
-    // Local bails (see spend_local): where the pending one happened, and the
-    // subject distance the chain has covered in the driver's place so far.
-    int bail_at_ = -1;
+    // Local bails (see spend_local): the subject distance the chain has
+    // covered in the driver's place so far, and where the pending one
+    // happened (bail_at_, beside left_).
     int64_t chained_ = 0;
+    // A candidate-led driver's own two columns, in half chain-bytes: what
+    // its walks cost, and what the chain would have cost on the same
+    // candidates (see spend_at_candidate).
+    int64_t cand_charge_ = 0;
+    int64_t cand_chain_ = 0;
 
     // The profitability yardstick: the distance the DRIVER covered — the
     // position reached less what the chain covered after local bails, which
@@ -4707,6 +4719,8 @@ class Regex {
     static constexpr int kStepsPerChainByte = 2; // table steps per chain byte
     static constexpr int kBailCost = 3;          // chain-bytes per local bail
     static constexpr int kMinScan = 2048;
+    static constexpr int kCandWalk = 10; // half chain-bytes per walk call
+    static constexpr int kCandChain = 3; // ... per candidate of the chain's
     explicit WalkBudget(size_t subject_len)
         : left_(static_cast<int>(subject_len)) {}
     bool spend(int walked) {
@@ -4718,6 +4732,34 @@ class Regex {
     bool spend_profitable(const OnePassWalk &w, int scanned) {
       charge_ += w.walked / kStepsPerChainByte + kRunCost * w.runs;
       return spend(w.walked) && profitable(scanned);
+    }
+    // The same for a driver whose candidates the chain is led to as well —
+    // a literal prefix, a sparse first-byte set: the chain's forward DFA
+    // skips from its start state with the very memchr the driver runs. The
+    // distance scanned is then nobody's work, and measured against it the
+    // charge does not trip where it should: `e[a-z]+s` over prose, one
+    // candidate in 13 a match and the rest a failed run each, charged 0.96
+    // of the distance and ran at 393 MB/s where the chain does 505.
+    //
+    // The yardstick here is what the chain would have done on the SAME
+    // candidates, and both sides are counted per candidate, in half
+    // chain-bytes. Measured over 595 KB of prose, per candidate: an
+    // all-matching `e\w*` (4.5 bytes) costs the walk 7 chain-bytes and the
+    // chain 10.9; a failing `e[a-z]+s` candidate (3.4 bytes walked) 6.5 and
+    // 4.5. That is a call's fixed cost of ~5 for the walk and ~1.5 for the
+    // chain (back at its start state, into the skip), plus the bytes: half
+    // a chain-byte each for the walk, one for the chain on a failure and
+    // two on a match (forward for the end, reverse for the start). A run
+    // that ends in failure is a chain-byte more.
+    bool spend_at_candidate(const OnePassWalk &w) {
+      cand_charge_ += kCandWalk + w.walked + 2 * w.runs;
+      cand_chain_ += kCandChain + 2 * static_cast<int64_t>(w.walked);
+      return spend(w.walked) &&
+             cand_charge_ <= std::max<int64_t>(2 * kMinScan, cand_chain_);
+    }
+    void matched_at_candidate(int len) {
+      cand_charge_ += kCandWalk + len;
+      cand_chain_ += kCandChain + 4 * static_cast<int64_t>(len);
     }
     // A LOCAL bail (kWalkLocal): the walk met a byte its table has no
     // transition for, so the chain takes this ONE find and the driver is
@@ -14984,8 +15026,11 @@ private:
       OnePassWalk w;
       int e = cp_onepass_find(t, s, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, s);
-      if (e > s && onepass_end_ok(e, t)) return e;
-      if (!budget.spend_profitable(w, s))
+      if (e > s && onepass_end_ok(e, t)) {
+        budget.matched_at_candidate(e - s);
+        return e;
+      }
+      if (!budget.spend_at_candidate(w))
         return kWalkBail; // quadratic guard / unprofitable -> linear chain
       scan = s + 1; // the prefix here completes no match
     }
@@ -15068,8 +15113,14 @@ private:
       OnePassWalk w;
       int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, pos);
-      if (e > pos && onepass_end_ok(e, t)) return e;
-      if (!budget.spend_profitable(w, pos))
+      // (A pruned scan's candidates are the chain's too: its start state
+      // skips on the same set. See spend_at_candidate.)
+      if (e > pos && onepass_end_ok(e, t)) {
+        if (sparse || bsparse) budget.matched_at_candidate(e - pos);
+        return e;
+      }
+      if (!(sparse || bsparse ? budget.spend_at_candidate(w)
+                              : budget.spend_profitable(w, pos)))
         return kWalkBail; // overlap / unprofitable -> located-span chain
       // The failed walk's first run proves every start inside it fails too
       // (see State::restart_ok): resume at the run's end, not the next byte.
