@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -3731,6 +3732,66 @@ void test_findcache_shared_rebind() {
   }
 }
 
+// A scan that outlives the call that started it (find_iter, split) holds its
+// entry of the thread's cache map across the caller's loop body — and the
+// map evicts when it passes 1024 entries. The entry of a live scan has to
+// survive that: the 1025th other Regex used inside a find_iter loop used to
+// free the iterator's cache, and its next ++ read freed memory (reported by
+// ASan; here the scan must simply go on to the right matches).
+void test_iterator_survives_cache_eviction() {
+  std::string subj;
+  for (int i = 0; i < 60; i++) subj += "x ab@cd  ";
+  auto churn = [](std::vector<std::unique_ptr<Regex>> &others, int n) {
+    for (int k = 0; k < n; k++) {
+      others.push_back(std::make_unique<Regex>(
+          "q" + std::to_string(others.size()) + "[0-9]+z"));
+      (void)others.back()->test("zzz q12 zzz"); // lands in the thread's map
+    }
+  };
+  {
+    Regex re("[a-z]+@[a-z]+"); // a DFA family: every step reads the cache
+    std::vector<std::unique_ptr<Regex>> others;
+    size_t n = 0, bytes = 0;
+    for (auto m : re.find_iter(subj)) {
+      n++;
+      bytes += m.end() - m.begin();
+      if (others.size() < 1200) churn(others, 40);
+    }
+    CHECK(n == 60 && bytes == 60 * 5);
+    CHECK(others.size() >= 1200);
+  }
+  {
+    Regex re("[a-z]+@[a-z]+");
+    std::vector<std::unique_ptr<Regex>> others;
+    size_t pieces = 0;
+    for (auto piece : re.split(subj)) {
+      (void)piece;
+      pieces++;
+      if (others.size() < 1200) churn(others, 40);
+    }
+    CHECK(pieces == 61);
+  }
+  // Two scans alive at once, one of them moved: each keeps its own entry.
+  {
+    Regex a("[a-z]+@[a-z]+"), b("ab@c[a-z]");
+    std::vector<std::unique_ptr<Regex>> others;
+    auto ia = a.find_iter(subj);
+    auto moved = std::move(ia);
+    size_t na = 0, nb = 0;
+    for (auto m : moved) {
+      (void)m;
+      na++;
+      if (na == 1)
+        for (auto mb : b.find_iter(subj)) {
+          (void)mb;
+          nb++;
+          if (others.size() < 1200) churn(others, 60);
+        }
+    }
+    CHECK(na == 60 && nb == 60);
+  }
+}
+
 void test_invalid_patterns() {
   CHECK(rejects("(abc"));     // unmatched '('
   CHECK(rejects("abc)"));     // unmatched ')'
@@ -3854,6 +3915,7 @@ int main() {
   test_onepass_leftmost_first();
   test_body_dollar();
   test_findcache_shared_rebind();
+  test_iterator_survives_cache_eviction();
   test_invalid_patterns();
   test_resource_limits();
   test_error_messages();

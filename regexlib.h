@@ -5207,8 +5207,16 @@ private:
       // OTHER entries instead: unordered_map::erase leaves references to the
       // surviving element valid, and all re-entrancy is on the same Regex, so
       // caches[this] is precisely what an outer frame may still hold.
+      //
+      // ... within one call. A scan that outlives the call that started it
+      // (find_iter, split) holds its entry across the caller's loop body,
+      // where any number of OTHER Regexes may match on this thread: such an
+      // entry is pinned for as long as the scan lives (Finder::Pin), and
+      // stays. (Unpinned, the 1025th Regex used inside a find_iter loop
+      // freed the iterator's cache, and its next ++ read freed memory.)
       for (auto it = caches.begin(); it != caches.end();)
-        it = (it->first == this) ? std::next(it) : caches.erase(it);
+        it = (it->first == this || it->second.pins_ > 0) ? std::next(it)
+                                                         : caches.erase(it);
       mru = {nullptr, nullptr};
     }
     FindCache &c = caches[this];
@@ -13338,6 +13346,8 @@ public:
     // reverse.
     const Regex *owner_ = nullptr;
     uint64_t owner_gen_ = 0;           // identity guard against address reuse
+    int pins_ = 0; // scans holding this entry of the thread's map across
+                   // calls (Finder::Pin): eviction leaves it alone
     std::optional<LazyDfa> fu_, rv_;   // fu: test() reseed scan; rv: lf start
     std::optional<LazyDfa> lfu_, lfa_; // leftmost-first DFA (ordered+cut)
     std::optional<LazyDfa> bfu_, brv_; // EGC byte path (over byte_prog_)
@@ -13957,10 +13967,12 @@ public:
     Scr scratch(Scratch *sc) {
       Scr scr;
       if (l_.rung < Rung::TextAnchor) return scr;
-      if (!cache_)
+      if (!cache_) {
         cache_ = &re_->thread_cache(); // (comes bound)
-      else
+        pin_.hold(*cache_);
+      } else {
         cache_->bind(*re_);
+      }
       scr.over(*cache_);
       if (sc) {
         scr.sc = sc;
@@ -13969,9 +13981,31 @@ public:
       return scr;
     }
 
+    // This scan's hold on the entry of the thread's cache map it fetched:
+    // thread_cache() evicts when the map is full, and must not evict what a
+    // scan still alive will step on. Only an entry the scan fetched itself
+    // is held — a caller's own FindCache is the caller's to keep alive, and
+    // is not written to. The hold moves with the scan.
+    struct Pin {
+      FindCache *held = nullptr;
+      Pin() = default;
+      Pin(Pin &&o) noexcept : held(o.held) { o.held = nullptr; }
+      Pin(const Pin &) = delete;
+      Pin &operator=(const Pin &) = delete;
+      Pin &operator=(Pin &&) = delete;
+      ~Pin() {
+        if (held) --held->pins_;
+      }
+      void hold(FindCache &fc) {
+        held = &fc;
+        ++fc.pins_;
+      }
+    };
+
     const Regex *re_ = nullptr;
     std::string_view text_;
     FindCache *cache_ = nullptr;
+    Pin pin_;
     Ladder l_;
     Cursor c_;
     WalkBudget budget_; // shared by every candidate+verify rung of this scan
@@ -14032,6 +14066,7 @@ public:
   private:
     friend class Regex;
 
+    friend class SplitIter;
     // `cache` null: this thread's (see Finder).
     MatchIter(const Regex &re, std::string_view text, FindCache *cache);
     void advance(); // step to the next match (or set done_)
@@ -14056,7 +14091,7 @@ public:
   class SplitIter {
   public:
     SplitIter(const Regex &re, std::string_view text, FindCache &cache)
-        : text_(text), mit_(re, text, cache) {}
+        : SplitIter(re, text, &cache) {}
     SplitIter(SplitIter &&) = default;
     SplitIter(const SplitIter &) = delete;
     SplitIter &operator=(const SplitIter &) = delete;
@@ -14095,6 +14130,11 @@ public:
     iterator end() { return iterator{}; }
 
   private:
+    friend class Regex;
+    // `cache` null: this thread's (see Finder).
+    SplitIter(const Regex &re, std::string_view text, FindCache *cache)
+        : text_(text), mit_(re, text, cache) {}
+
     void load() {
       if (mcur_ != mend_) {
         Match m = *mcur_;
@@ -16398,7 +16438,7 @@ inline Regex::FindAt Regex::find_at_step(std::string_view text, size_t pos,
 }
 
 inline Regex::SplitIter Regex::split(std::string_view text) const {
-  return SplitIter(*this, text, thread_cache());
+  return SplitIter(*this, text, nullptr);
 }
 
 inline Regex::SplitIter Regex::split(std::string_view text,

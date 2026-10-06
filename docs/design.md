@@ -1281,7 +1281,12 @@ simply keeps falling back — correct, just unaccelerated.
 `MatchIter` additionally owns its **own** `Scratch` (Pike/backtracker state),
 so it is safe across a suspension point (a `++` boundary where the caller
 might run other matching on the same thread): another regex rebinding the
-shared cache merely costs a rebuild.
+shared cache merely costs a rebuild. And the entry of the thread-local map
+that such a scan fetched is *pinned* for as long as the scan lives
+(`Finder::Pin`): the map evicts when it passes 1024 entries, sparing only
+the Regex being called — which protects a frame further up the same call,
+not an iterator whose loop body runs a thousand other Regexes. (That one's
+cache was freed under it, and its next `++` read freed memory.)
 
 ---
 
