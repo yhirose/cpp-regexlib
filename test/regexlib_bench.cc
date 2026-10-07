@@ -731,8 +731,8 @@ static void run_sherlock_bench(int iters) {
       {"letters \\p{L}+", "\\p{L}+", false, {text}},
       {"quoted span", "[\"'][^\"']{0,30}[?!.][\"']", false, {text}},
       {"no match (rare literal)", "zqj", true, {text}},
-      // 16 literals: past the Teddy tier's 8 distinct fingerprints (cf. the
-      // 7-name row above, which fits).
+      // 16 literals: more fingerprints than Teddy has buckets, so they
+      // share (cf. the 7-name row above, a bucket each).
       {"names alternation, 16",
        "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London|Moriarty|"
        "Lestrade|Hudson|Mycroft|Gregson|Hopkins|Stamford",
@@ -1568,7 +1568,7 @@ int main(int argc, char *argv[]) {
                    {make_long_lines(MB)}});
 
   // Literal alternation too wide for one Teddy bucket per fingerprint (16
-  // literals; the tier's limit is 8 distinct fingerprints). The common
+  // literals, 14 two-byte fingerprints in 8 buckets). The common
   // keyword-set / dictionary shape — a lexer's reserved words, a log's
   // severity names. Random words, so matches are rare and the row measures
   // the multi-literal scan itself.

@@ -1447,15 +1447,33 @@ inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
 #define REGEXLIB_SSSE3 1
 #define REGEXLIB_SSSE3_DYNAMIC 1
 #endif
+// AVX2 gate for Teddy's 32-byte scan, in the same tiers: compile-time when the
+// TU is built for AVX2 (-mavx2 / -march=native / MSVC's /arch:AVX2, all of
+// which define __AVX2__), runtime dispatch wherever SSSE3 is dispatched at
+// runtime, and otherwise absent — AVX2 is nobody's baseline, so a compiler
+// with no CPU check to offer (cl.exe) stays on the 16-byte scan.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define REGEXLIB_AVX2 1
+#elif defined(REGEXLIB_SSSE3_DYNAMIC)
+#include <immintrin.h> // intrinsics carry their own target("avx2") attribute
+#define REGEXLIB_AVX2 1
+#define REGEXLIB_AVX2_DYNAMIC 1
+#endif
 #endif
 
-// Function attribute enabling the SSSE3 instruction set for one function even
-// when the TU baseline is only SSE2 (runtime-dispatch tier above). Empty in the
-// compile-time-SSSE3 and non-x86 tiers, where no per-function opt-in is needed.
+// Function attributes enabling an instruction set for one function even when
+// the TU baseline is only SSE2 (the runtime-dispatch tiers above). Empty in
+// the compile-time and non-x86 tiers, where no per-function opt-in is needed.
 #if defined(REGEXLIB_SSSE3_DYNAMIC)
 #define REGEXLIB_TARGET_SSSE3 __attribute__((target("ssse3")))
 #else
 #define REGEXLIB_TARGET_SSSE3
+#endif
+#if defined(REGEXLIB_AVX2_DYNAMIC)
+#define REGEXLIB_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define REGEXLIB_TARGET_AVX2
 #endif
 
 // Portable always-inline for lambdas/functions on hot paths: GNU attribute
@@ -1649,8 +1667,8 @@ inline int bit_ctz64(uint64_t x) {
 // compile-time and non-x86 tiers answer at build time, so this returns a
 // constant there and the branch folds away. Cached in a function-local static:
 // __builtin_cpu_supports reads the CPUID-backed __cpu_model (initialized by an
-// ELF constructor on glibc), cheap but not free, and teddy_next runs once per
-// match.
+// ELF constructor on glibc), cheap but not free, and Teddy::find runs once
+// per match.
 inline bool cpu_has_ssse3() {
 #if defined(REGEXLIB_DISABLE_SSSE3)
   // Escape hatch: force the scalar Teddy path everywhere. Defensive for exotic
@@ -1662,6 +1680,23 @@ inline bool cpu_has_ssse3() {
   return ok;
 #else
   return true; // compile-time SSSE3, or the caller is already SSSE3-guarded
+#endif
+}
+
+// ... and AVX2 (Teddy's 32-byte scan), the same way; false wherever the scan
+// was not compiled (see REGEXLIB_AVX2). REGEXLIB_DISABLE_AVX2 keeps an AVX2
+// host on the 16-byte scan — the hook that lets one machine test both — and
+// the SSSE3 escape hatch implies it: a build told to distrust the CPU check
+// takes neither.
+inline bool cpu_has_avx2() {
+#if defined(REGEXLIB_DISABLE_AVX2) || defined(REGEXLIB_DISABLE_SSSE3) ||       \
+    !defined(REGEXLIB_AVX2)
+  return false;
+#elif defined(REGEXLIB_AVX2_DYNAMIC)
+  static const bool ok = __builtin_cpu_supports("avx2");
+  return ok;
+#else
+  return true; // compile-time AVX2
 #endif
 }
 
@@ -5047,7 +5082,8 @@ public:
         return build_dfa_result(text, 0, m);
       return MatchResult{};
     }
-    // [Tier: LiteralAlt] anchored at 0: try each literal in order.
+    // [Tier: LiteralAlt] anchored at 0: try each literal in order (the
+    // alternation's, among those that can match at one position).
     if (plan_->literal_alt_ok()) {
       int n = static_cast<int>(text.size());
       for (const std::string &lit : plan_->literal_alt_) {
@@ -5519,6 +5555,589 @@ private:
     kFamilyCount
   };
 
+  // ===== Teddy: the packed multi-literal searcher =====
+  // (Hyperscan's Teddy, in the "slim" form of Rust's aho-corasick.)
+  //
+  // When every match must begin with one of a set of fixed byte strings — a
+  // literal alternation like `(?:fox|dog|cat)` — a first-byte skip still
+  // stops at every byte that shares a first byte (f/d/c are common letters),
+  // so it barely outruns a byte-at-a-time scan. Teddy looks for the leading
+  // `n` bytes of all the strings — their FINGERPRINTS — a vector at a time.
+  //
+  // Each fingerprint belongs to one of eight buckets, a bit of a byte. For
+  // each of the n positions a pair of 16-entry tables maps a byte's low and
+  // high nibble to the buckets holding a fingerprint with that nibble there;
+  // ANDing the two lookups (PSHUFB / TBL) gives, per subject byte, the
+  // buckets it could be position j of. A lane where the n consecutive bytes
+  // ending there agree on a bucket is a candidate. A bucket of one
+  // fingerprint makes it an occurrence; fingerprints that share a bucket
+  // (there can be up to kMaxPrints) can also let through the strings that
+  // mix their nibbles — build() deals them so that those are rare — and a
+  // candidate is then confirmed against the fingerprints of its buckets. At
+  // most one can be there, and find_print() says which: a caller that knows
+  // more about each (the literals behind it) goes on from that one alone.
+  //
+  // The scan carries each block's lookups into the next — a fingerprint
+  // that straddles two blocks needs both — so it advances a whole vector per
+  // step and looks at every byte once. The last, partial block is put
+  // together zero-padded (tail_words); a subject shorter than a vector is
+  // that block alone.
+  struct Teddy {
+    static constexpr int kMaxLen = 4;  // fingerprint bytes
+    static constexpr int kBuckets = 8; // one bit of a lane each
+    static constexpr size_t kMaxPrints = 64;
+    using Print = std::array<unsigned char, kMaxLen>;
+
+    // lo[j][x] / hi[j][x]: the buckets with a fingerprint whose byte j has
+    // the low / high nibble x. (Each is one vector load per call: aligned, so
+    // that none straddles a cache line.)
+    alignas(16) std::array<std::array<unsigned char, 16>, kMaxLen> lo{}, hi{};
+    bool ok = false;
+    int n = 0; // fingerprint length in [2, kMaxLen]
+    // The fingerprints by id, each as its n bytes at the front of a zeroed
+    // word (key_of), bucket by bucket: bucket b holds ids [first[b],
+    // first[b+1]).
+    std::array<unsigned char, kBuckets + 1> first{};
+    std::array<uint32_t, kMaxPrints> key{};
+    unsigned count() const { return first[kBuckets]; }
+    // The buckets (a bit each) whose word a candidate cannot be taken on:
+    // `shared` hold more than one fingerprint — which one is there has to
+    // be looked up — and `loose`, some of those, also let through strings
+    // that are none of theirs. Every other bucket in a lane IS its
+    // fingerprint, found.
+    unsigned char shared = 0, loose = 0;
+
+    // An occurrence: where, and of which fingerprint. pos >= the subject's
+    // length when there is none.
+    struct Hit {
+      size_t pos;
+      unsigned id;
+    };
+
+    static uint32_t key_of(const unsigned char *q, int len) {
+      uint32_t k = 0;
+      std::memcpy(&k, q, static_cast<size_t>(len));
+      return k;
+    }
+
+    // How often a bucket lets a byte through at one position, per mille of
+    // prose: the bytes whose low nibble is in `l` and whose high nibble is in
+    // `h` (bit x: nibble x), each as common as byte_commonness says.
+    static int nibble_mass(unsigned l, unsigned h) {
+      int mass = 0;
+      for (; h; h &= h - 1)
+        for (unsigned x = l; x; x &= x - 1)
+          mass += Plan::byte_commonness(static_cast<unsigned char>(
+              detail::bit_ctz32(h) << 4 | detail::bit_ctz32(x)));
+      return mass;
+    }
+
+    // Become the searcher for `fps`: distinct fingerprints of `len` bytes, at
+    // most kMaxPrints of them.
+    //
+    // A bucket lets through every string that has, at each position, some
+    // member's low nibble and some member's high nibble — its members, and
+    // whatever else that product holds. So which fingerprints share a
+    // bucket decides how many candidates are false: each goes, most common
+    // first, to the bucket whose estimated firing rate it raises least. One
+    // it adds nothing to (`ca` beside `co`: the bucket lets through nothing
+    // new) is taken before an empty one, which is then there for a
+    // fingerprint that needs it. Up to eight are not dealt at all: a bucket
+    // each.
+    void build(const std::vector<Print> &fps, int len) {
+      struct Bucket {
+        uint16_t lo[kMaxLen] = {}, hi[kMaxLen] = {}; // nibbles, per position
+        int64_t mass = 0; // estimated firing rate (0: empty)
+        unsigned size = 0;
+        // The bucket with `f` in it.
+        Bucket with(const Print &f, int len) const {
+          Bucket b = *this;
+          b.size++;
+          b.mass = 1;
+          for (int j = 0; j < len; j++) {
+            b.lo[j] = static_cast<uint16_t>(b.lo[j] | 1u << (f[j] & 15));
+            b.hi[j] = static_cast<uint16_t>(b.hi[j] | 1u << (f[j] >> 4));
+            b.mass *= nibble_mass(b.lo[j], b.hi[j]);
+          }
+          return b;
+        }
+      };
+      *this = Teddy{};
+      n = len;
+      const auto count = static_cast<unsigned>(fps.size());
+      std::array<unsigned char, kMaxPrints> order{}, home{};
+      std::array<int64_t, kMaxPrints> own{};
+      for (unsigned i = 0; i < count; i++) {
+        order[i] = static_cast<unsigned char>(i);
+        own[i] = Bucket{}.with(fps[i], len).mass;
+      }
+      std::sort(order.begin(), order.begin() + count,
+                [&](unsigned char a, unsigned char b) {
+                  return own[a] != own[b] ? own[a] > own[b] : a < b;
+                });
+      Bucket bucket[kBuckets];
+      for (unsigned o = 0; o < count; o++) {
+        const unsigned i = order[o];
+        int best = count <= kBuckets ? static_cast<int>(o) : 0;
+        Bucket grown = bucket[best].with(fps[i], len);
+        for (int b = 1; b < kBuckets && count > kBuckets; b++) {
+          const Bucket g = bucket[b].with(fps[i], len);
+          if (g.mass - bucket[b].mass < grown.mass - bucket[best].mass) {
+            best = b;
+            grown = g;
+          }
+        }
+        bucket[best] = grown;
+        home[i] = static_cast<unsigned char>(best);
+      }
+      for (int k = 0; k < kBuckets; k++) {
+        const Bucket &b = bucket[k];
+        // What it lets through: a low and a high nibble of its own at each
+        // position, in every combination.
+        const auto bits = [](unsigned x) {
+          unsigned c = 0;
+          for (; x; x &= x - 1)
+            c++;
+          return c;
+        };
+        unsigned strings = b.size ? 1 : 0;
+        for (int j = 0; j < len && strings <= kMaxPrints; j++)
+          strings *= bits(b.lo[j]) * bits(b.hi[j]);
+        const auto bit = static_cast<unsigned char>(1u << k);
+        if (b.size > 1) shared |= bit;
+        if (strings != b.size) loose |= bit;
+      }
+      unsigned id = 0;
+      for (int b = 0; b < kBuckets; b++) {
+        first[static_cast<size_t>(b)] = static_cast<unsigned char>(id);
+        for (unsigned i = 0; i < count; i++) {
+          if (home[i] != b) continue;
+          key[id++] = key_of(fps[i].data(), len);
+          for (int j = 0; j < len; j++) {
+            const auto bit = static_cast<unsigned char>(1u << b);
+            lo[static_cast<size_t>(j)][fps[i][static_cast<size_t>(j)] & 15] |= bit;
+            hi[static_cast<size_t>(j)][fps[i][static_cast<size_t>(j)] >> 4] |= bit;
+          }
+        }
+      }
+      first[kBuckets] = static_cast<unsigned char>(id);
+      ok = true;
+    }
+
+    // The first occurrence of a fingerprint that starts in [from, slen),
+    // and which fingerprint it is; pos == slen when there is none.
+    Hit find_print(const unsigned char *p, size_t slen, size_t from) const {
+      return find_with(pick(slen - from), p, slen, from, shared);
+    }
+    // ... for a caller that only asks where: slen when there is none. It
+    // takes the word of every bucket that lets nothing else through, shared
+    // or not — a lookup less per candidate, which is 2 to 5 ns of a call
+    // that takes 7 to 14 when the occurrences are a dozen bytes apart.
+    size_t find(const unsigned char *p, size_t slen, size_t from) const {
+      return find_with(pick(slen - from), p, slen, from, loose).pos;
+    }
+
+    // The scans: the walk — the same tables, a position at a time — and
+    // one per vector width.
+    enum class Scan : unsigned char { Walk, Vec16, Vec32 };
+
+    // Whether this build has `scan` and this CPU runs it. (Each CPU check is
+    // a compile-time constant where its instruction set is the build's own,
+    // or was not compiled at all.)
+    static bool has(Scan scan) {
+      switch (scan) {
+      case Scan::Vec16:
+#if defined(REGEXLIB_NEON)
+        return true;
+#elif defined(REGEXLIB_SSSE3)
+        return detail::cpu_has_ssse3();
+#else
+        return false;
+#endif
+      case Scan::Vec32: return detail::cpu_has_avx2();
+      default: return true;
+      }
+    }
+
+    // The scan for a range of `range` bytes: the widest there is among those
+    // the range is long enough for.
+    //   kVec16From: a vector scan costs the same ~4 ns whatever is in its
+    //     one block (tables into registers, the partial block put
+    //     together), which a walk of a few positions beats — 1 to 3 ns, a
+    //     fifth of what a search of a three-byte token takes in all.
+    //     (Measured on x86 and taken for NEON.)
+    //   kVec32From: a block of its own. Below that the 32-byte scan would
+    //     only put a partial block together, twice as wide (~1.5 ns a call
+    //     more than the 16-byte scan).
+    static constexpr size_t kVec16From = 6, kVec32From = 32;
+    static Scan pick(size_t range) {
+      if (range >= kVec32From && has(Scan::Vec32)) return Scan::Vec32;
+      if (range >= kVec16From && has(Scan::Vec16)) return Scan::Vec16;
+      return Scan::Walk;
+    }
+
+    // find_print (`must` = shared) or find (`must` = loose), by `scan`. The
+    // fingerprint length goes to a compile-time-N scan: the table loop
+    // unrolls and the tables live in registers.
+    Hit find_with(Scan scan, const unsigned char *p, size_t slen, size_t from,
+                  unsigned must) const {
+      switch (n) {
+      case 2: return run<2>(scan, p, slen, from, must);
+      case 3: return run<3>(scan, p, slen, from, must);
+      default: return run<4>(scan, p, slen, from, must);
+      }
+    }
+
+  private:
+    static constexpr unsigned kNoPrint = ~0u;
+    static constexpr size_t kNoPos = ~size_t(0);
+
+    template <int N>
+    REGEXLIB_ALWAYS_INLINE Hit run(Scan scan, const unsigned char *p,
+                                   size_t slen, size_t from,
+                                   unsigned must) const {
+      switch (scan) {
+#if defined(REGEXLIB_NEON)
+      case Scan::Vec16: return scan_neon<N>(p, slen, from, must);
+#elif defined(REGEXLIB_SSSE3)
+      case Scan::Vec16: return scan_ssse3<N>(p, slen, from, must);
+#endif
+#if defined(REGEXLIB_AVX2)
+      case Scan::Vec32: return scan_avx2<N>(p, slen, from, must);
+#endif
+      default: return scan_scalar<N>(p, slen, from, must);
+      }
+    }
+
+    // The fingerprint at q[0, N), a candidate whose lane shows `buckets`
+    // (not zero): its id, or kNoPrint. A bucket outside `must` is taken at
+    // its word — the id is then its first fingerprint's, which is THE one
+    // unless the bucket is shared — and the rest are looked through.
+    template <int N>
+    REGEXLIB_ALWAYS_INLINE unsigned confirm(const unsigned char *q,
+                                            unsigned buckets,
+                                            unsigned must) const {
+      if (const unsigned sure = buckets & ~must)
+        return first[static_cast<size_t>(detail::bit_ctz32(sure))];
+      const uint32_t k = key_of(q, N);
+      do {
+        // (A bucket that shows in a lane has a fingerprint: the first
+        // comparison needs no bound.)
+        const auto b = static_cast<size_t>(detail::bit_ctz32(buckets));
+        unsigned id = first[b];
+        do {
+          if (key[id] == k) return id;
+        } while (++id < first[b + 1]);
+        buckets &= buckets - 1;
+      } while (buckets);
+      return kNoPrint;
+    }
+
+    // The walk.
+    template <int N>
+    Hit scan_scalar(const unsigned char *p, size_t slen, size_t from,
+                    unsigned must) const {
+      for (size_t pos = from; pos + N <= slen; pos++) {
+        unsigned buckets = 0xFF;
+        for (size_t j = 0; j < N; j++)
+          buckets &= lo[j][p[pos + j] & 15] & hi[j][p[pos + j] >> 4];
+        if (!buckets) continue;
+        const unsigned id = confirm<N>(p + pos, buckets, must);
+        if (id != kNoPrint) return Hit{pos, id};
+      }
+      return Hit{slen, 0};
+    }
+
+    // q[0, len), len < 16, as the 16 bytes of two little-endian words,
+    // zero-padded: the partial block that ends a scan. Put together from
+    // loads that overlap inside [q, q + len) and never leave it — and not by
+    // copying the bytes into a buffer for the vector load to read back: that
+    // load would wait for the copy's stores to retire, on every call with a
+    // short subject (it was ~12 ns of a 30 ns search).
+    // (Both targets with a vector scan are little-endian.)
+    struct Words {
+      uint64_t lo = 0, hi = 0;
+    };
+    static REGEXLIB_ALWAYS_INLINE Words tail_words(const unsigned char *q,
+                                                   size_t len) {
+      const auto word = [](const unsigned char *b, size_t bytes) {
+        uint64_t x = 0;
+        std::memcpy(&x, b, bytes);
+        return x;
+      };
+      Words w;
+      if (len >= 8) {
+        w.lo = word(q, 8);
+        if (len > 8) w.hi = word(q + len - 8, 8) >> (8 * (16 - len));
+      } else if (len >= 4) {
+        w.lo = word(q, 4) | word(q + len - 4, 4) << (8 * (len - 4));
+      } else if (len) {
+        w.lo = q[0] | uint64_t(q[len >> 1]) << (8 * (len >> 1)) |
+               uint64_t(q[len - 1]) << (8 * (len - 1));
+      }
+      return w;
+    }
+
+    // The vector scans. Each is the same three steps over its own vector
+    // type:
+    //   lanes: m[j] is what the buckets have at position j for each byte
+    //     of the block, and a lane is a candidate — non-zero, the buckets
+    //     agreed on — when position N-1 there, N-2 one byte back, ... share
+    //     a bucket, the bytes before the block coming from the block before
+    //     (prev; zero ahead of `from`, where nothing starts).
+    //   print_in: the first candidate lane, of those in `valid`, that
+    //     confirms. The lane's buckets are picked out of the vector in
+    //     registers: a store for a byte load to read back would give the
+    //     scan a stack array, and a hardened build a canary to check on
+    //     every call.
+    //   scan_*: whole blocks, then the partial one (tail_words).
+    //
+    // (They are functions of their own so that each can carry its target
+    // attribute, and the steps are functions rather than lambdas because a
+    // lambda does not inherit the enclosing function's target on Clang: the
+    // intrinsics inside it then fail to compile.)
+#if defined(REGEXLIB_NEON)
+    template <int N>
+    static REGEXLIB_ALWAYS_INLINE uint8x16_t
+    lanes(uint8x16_t v, const uint8x16_t *tl, const uint8x16_t *th,
+               uint8x16_t *prev) {
+      const uint8x16_t nib = vdupq_n_u8(0x0F);
+      uint8x16_t m[N];
+      for (size_t j = 0; j < N; j++)
+        m[j] = vandq_u8(vqtbl1q_u8(tl[j], vandq_u8(v, nib)),
+                        vqtbl1q_u8(th[j], vshrq_n_u8(v, 4)));
+      uint8x16_t c = vandq_u8(m[N - 1], vextq_u8(prev[N - 2], m[N - 2], 15));
+      if constexpr (N >= 3)
+        c = vandq_u8(c, vextq_u8(prev[N - 3], m[N - 3], 14));
+      if constexpr (N >= 4)
+        c = vandq_u8(c, vextq_u8(prev[N - 4], m[N - 4], 13));
+      for (size_t j = 0; j + 1 < N; j++)
+        prev[j] = m[j];
+      return c;
+    }
+
+    // (`valid`, like lane_bits, has 4 bits a lane.)
+    template <int N>
+    REGEXLIB_ALWAYS_INLINE Hit print_in(uint8x16_t c, uint64_t valid,
+                                        const unsigned char *p, size_t cur,
+                                        unsigned must) const {
+      for (uint64_t mask = lane_bits(vtstq_u8(c, c)) & valid; mask;) {
+        const auto l = static_cast<unsigned>(detail::bit_ctz64(mask)) >> 2;
+        const unsigned buckets =
+            vgetq_lane_u8(vqtbl1q_u8(c, vdupq_n_u8(static_cast<uint8_t>(l))), 0);
+        const size_t pos = cur + l - (N - 1);
+        const unsigned id = confirm<N>(p + pos, buckets, must);
+        if (id != kNoPrint) return Hit{pos, id};
+        mask &= ~(uint64_t(0xF) << (4 * l));
+      }
+      return Hit{kNoPos, 0};
+    }
+
+    template <int N>
+    Hit scan_neon(const unsigned char *p, size_t slen, size_t from,
+                  unsigned must) const {
+      uint8x16_t tl[N], th[N], prev[N - 1];
+      for (size_t j = 0; j < N; j++) {
+        tl[j] = simd_load(lo[j].data(), 0);
+        th[j] = simd_load(hi[j].data(), 0);
+      }
+      for (auto &v : prev)
+        v = vdupq_n_u8(0);
+      size_t cur = from;
+      for (; cur + 16 <= slen; cur += 16) {
+        const uint8x16_t c = lanes<N>(simd_load(p, cur), tl, th, prev);
+        const Hit h = print_in<N>(c, ~uint64_t(0), p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      if (cur < slen) {
+        const Words w = tail_words(p + cur, slen - cur);
+        const uint8x16_t c = lanes<N>(
+            vreinterpretq_u8_u64(
+                vcombine_u64(vcreate_u64(w.lo), vcreate_u64(w.hi))),
+            tl, th, prev);
+        const Hit h = print_in<N>(
+            c, (uint64_t(1) << (4 * (slen - cur))) - 1, p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      return Hit{slen, 0};
+    }
+#endif
+
+#if defined(REGEXLIB_SSSE3)
+    // tail_words as a vector. (SSE2, so both x86 scans call it.)
+    static REGEXLIB_ALWAYS_INLINE __m128i tail_block(const unsigned char *q,
+                                                     size_t len) {
+      const Words w = tail_words(q, len);
+      return _mm_set_epi64x(static_cast<long long>(w.hi),
+                            static_cast<long long>(w.lo));
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_SSSE3 static REGEXLIB_ALWAYS_INLINE __m128i
+    lanes(__m128i v, const __m128i *tl, const __m128i *th,
+               __m128i *prev) {
+      // _mm_srli_epi16 shifts 16-bit lanes, so a byte's result carries the
+      // low nibble of its neighbour; the AND drops it, leaving exactly
+      // byte >> 4 (0..15, never setting PSHUFB's zeroing bit 7).
+      const __m128i nib = _mm_set1_epi8(0x0F);
+      const __m128i vl = _mm_and_si128(v, nib);
+      const __m128i vh = _mm_and_si128(_mm_srli_epi16(v, 4), nib);
+      __m128i m[N];
+      for (size_t j = 0; j < N; j++)
+        m[j] = _mm_and_si128(_mm_shuffle_epi8(tl[j], vl),
+                             _mm_shuffle_epi8(th[j], vh));
+      __m128i c =
+          _mm_and_si128(m[N - 1], _mm_alignr_epi8(m[N - 2], prev[N - 2], 15));
+      if constexpr (N >= 3)
+        c = _mm_and_si128(c, _mm_alignr_epi8(m[N - 3], prev[N - 3], 14));
+      if constexpr (N >= 4)
+        c = _mm_and_si128(c, _mm_alignr_epi8(m[N - 4], prev[N - 4], 13));
+      for (size_t j = 0; j + 1 < N; j++)
+        prev[j] = m[j];
+      return c;
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_SSSE3 REGEXLIB_ALWAYS_INLINE Hit
+    print_in(__m128i c, uint32_t valid, const unsigned char *p, size_t cur,
+             unsigned must) const {
+      for (uint32_t mask = ~static_cast<uint32_t>(_mm_movemask_epi8(
+                               _mm_cmpeq_epi8(c, _mm_setzero_si128()))) &
+                           valid;
+           mask; mask &= mask - 1) {
+        const auto l = static_cast<unsigned>(detail::bit_ctz32(mask));
+        // (Lane l to lane 0: the index vector's other bytes are zero.)
+        const unsigned buckets =
+            static_cast<unsigned>(_mm_cvtsi128_si32(_mm_shuffle_epi8(
+                c, _mm_cvtsi32_si128(static_cast<int>(l))))) &
+            0xFF;
+        const size_t pos = cur + l - (N - 1);
+        const unsigned id = confirm<N>(p + pos, buckets, must);
+        if (id != kNoPrint) return Hit{pos, id};
+      }
+      return Hit{kNoPos, 0};
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_SSSE3 Hit scan_ssse3(const unsigned char *p, size_t slen,
+                                         size_t from, unsigned must) const {
+      __m128i tl[N], th[N], prev[N - 1];
+      for (size_t j = 0; j < N; j++) {
+        tl[j] = simd_load(lo[j].data(), 0);
+        th[j] = simd_load(hi[j].data(), 0);
+      }
+      for (auto &v : prev)
+        v = _mm_setzero_si128();
+      size_t cur = from;
+      for (; cur + 16 <= slen; cur += 16) {
+        const __m128i c = lanes<N>(simd_load(p, cur), tl, th, prev);
+        const Hit h = print_in<N>(c, 0xFFFF, p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      if (cur < slen) {
+        const __m128i c =
+            lanes<N>(tail_block(p + cur, slen - cur), tl, th, prev);
+        const Hit h = print_in<N>(c, (1u << (slen - cur)) - 1, p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      return Hit{slen, 0};
+    }
+#endif
+
+#if defined(REGEXLIB_AVX2)
+    // `cur` moved up K bytes, the last K bytes of `prev` coming in below.
+    // (VPALIGNR shifts within each 128-bit half, so the half that precedes
+    // each is put beside it first.)
+    template <int K>
+    REGEXLIB_TARGET_AVX2 static REGEXLIB_ALWAYS_INLINE __m256i
+    carried(__m256i cur, __m256i prev) {
+      return _mm256_alignr_epi8(
+          cur, _mm256_permute2x128_si256(prev, cur, 0x21), 16 - K);
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_AVX2 static REGEXLIB_ALWAYS_INLINE __m256i
+    lanes(__m256i v, const __m256i *tl, const __m256i *th,
+               __m256i *prev) {
+      const __m256i nib = _mm256_set1_epi8(0x0F);
+      const __m256i vl = _mm256_and_si256(v, nib);
+      const __m256i vh = _mm256_and_si256(_mm256_srli_epi16(v, 4), nib);
+      __m256i m[N];
+      for (size_t j = 0; j < N; j++)
+        m[j] = _mm256_and_si256(_mm256_shuffle_epi8(tl[j], vl),
+                                _mm256_shuffle_epi8(th[j], vh));
+      __m256i c =
+          _mm256_and_si256(m[N - 1], carried<1>(m[N - 2], prev[N - 2]));
+      if constexpr (N >= 3)
+        c = _mm256_and_si256(c, carried<2>(m[N - 3], prev[N - 3]));
+      if constexpr (N >= 4)
+        c = _mm256_and_si256(c, carried<3>(m[N - 4], prev[N - 4]));
+      for (size_t j = 0; j + 1 < N; j++)
+        prev[j] = m[j];
+      return c;
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_AVX2 REGEXLIB_ALWAYS_INLINE Hit
+    print_in(__m256i c, uint32_t valid, const unsigned char *p, size_t cur,
+             unsigned must) const {
+      for (uint32_t mask = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                               _mm256_cmpeq_epi8(c, _mm256_setzero_si256()))) &
+                           valid;
+           mask; mask &= mask - 1) {
+        const auto l = static_cast<unsigned>(detail::bit_ctz32(mask));
+        // (The lane's 32-bit word to word 0, then the byte out of it.)
+        const __m256i word = _mm256_permutevar8x32_epi32(
+            c, _mm256_zextsi128_si256(
+                   _mm_cvtsi32_si128(static_cast<int>(l >> 2))));
+        const unsigned buckets =
+            (static_cast<unsigned>(
+                 _mm_cvtsi128_si32(_mm256_castsi256_si128(word))) >>
+             (8 * (l & 3))) &
+            0xFF;
+        const size_t pos = cur + l - (N - 1);
+        const unsigned id = confirm<N>(p + pos, buckets, must);
+        if (id != kNoPrint) return Hit{pos, id};
+      }
+      return Hit{kNoPos, 0};
+    }
+
+    template <int N>
+    REGEXLIB_TARGET_AVX2 Hit scan_avx2(const unsigned char *p, size_t slen,
+                                       size_t from, unsigned must) const {
+      __m256i tl[N], th[N], prev[N - 1];
+      for (size_t j = 0; j < N; j++) {
+        // (PSHUFB looks up within each 128-bit half: the table goes in both.)
+        tl[j] = _mm256_broadcastsi128_si256(simd_load(lo[j].data(), 0));
+        th[j] = _mm256_broadcastsi128_si256(simd_load(hi[j].data(), 0));
+      }
+      for (auto &v : prev)
+        v = _mm256_setzero_si256();
+      size_t cur = from;
+      for (; cur + 32 <= slen; cur += 32) {
+        const __m256i c = lanes<N>(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + cur)),
+            tl, th, prev);
+        const Hit h = print_in<N>(c, ~uint32_t(0), p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      if (cur < slen) {
+        // A whole half first, when there is one, then the partial one.
+        const size_t rest = slen - cur, half = rest & 16;
+        const __m128i part = tail_block(p + cur + half, rest - half);
+        const __m256i v =
+            half ? _mm256_inserti128_si256(
+                       _mm256_castsi128_si256(simd_load(p, cur)), part, 1)
+                 : _mm256_zextsi128_si256(part);
+        const __m256i c = lanes<N>(v, tl, th, prev);
+        const Hit h = print_in<N>(c, (1u << rest) - 1, p, cur, must);
+        if (h.pos != kNoPos) return h;
+      }
+      return Hit{slen, 0};
+    }
+#endif
+  };
+
   // ===== Plan: the immutable execution plan =====
   // Everything decided once at construction from (pattern, flags, unit):
   // compiled programs, tier-eligibility flags, and prefilter state. Built
@@ -5597,7 +6216,7 @@ private:
       // common leaves nothing to skip with.
       byte_prefilter_ok_ =
           byte_prefilter_ok_ &&
-          (byte_prefix_.active() || teddy_.byte_preferred ||
+          (byte_prefix_.active() || byte_teddy_ ||
            byte_first_bytes_.dfa_skip);
       Regex::ladder_plan(*this);
     }
@@ -5732,7 +6351,7 @@ private:
       analyze_dfa();
       analyze_first_bytes();
       analyze_teddy();
-      // Pure literal alternation fast path (EGC): Teddy candidate -> ordered
+      // Pure literal alternation fast path (EGC): Teddy fingerprint -> ordered
       // memcmp -> direct span, no DFA verify. teddy_.ok implies !us_ && !icase_.
       if (teddy_.ok && ncap_ == 0) analyze_literal_alternation(root);
     }
@@ -5858,12 +6477,12 @@ private:
         // ~13 -> skip; 7 names {S,H,W,I,A,J,B} ~44 -> Teddy).
         if (teddy_.ok) {
           if (!byte_first_bytes_.sparse) {
-            teddy_.byte_preferred = true;
+            byte_teddy_ = true;
           } else {
             int density = 0;
             for (unsigned char b : byte_first_bytes_.list)
               density += byte_commonness(b);
-            teddy_.byte_preferred = density >= 30;
+            byte_teddy_ = density >= 30;
           }
         }
       }
@@ -8239,27 +8858,36 @@ private:
     // (plan_anchor), which is why the punctuation prose is full of has its own
     // entries: at "rare" a trailing `.` would look cheaper to scan for than a
     // leading capital, and it is five times as common.
+    // (A table, filled once: Teddy's bucket dealing asks tens of thousands
+    // of times for a plan with sixty-four fingerprints.)
     static int byte_commonness(unsigned char c) {
-      static const unsigned char freq[26] = {// a..z, approx per-mille
-                                             82, 15, 28, 43, 127, 22, 20, 61, 70,
-                                             2,  8,  40, 24, 67,  75, 19, 1,  60,
-                                             63, 91, 28, 10, 24,  2,  20, 1};
-      if (c == ' ') return 255;
-      if (c >= 'a' && c <= 'z') return freq[c - 'a'];
-      // Capitals run ~1-4 per-mille in prose (vs their lowercase tens):
-      // score them accordingly so a capital beats every common lowercase as
-      // the probe AND stays below the pair_probe threshold (a capital probe
-      // is rare enough that the single-byte scan wins).
-      if (c >= 'A' && c <= 'Z') return (freq[c - 'A'] >> 5) + 1;
-      switch (c) {
-      case '\n': return 20; // a line break every ~50 bytes
-      case ',': return 12;
-      case '.': return 11;
-      case '"': return 6;
-      case '\'': return 4;
-      case '-': return 3;
-      default: return 1; // digits / other punctuation / non-ASCII: rare in prose
-      }
+      static const std::array<unsigned char, 256> table = [] {
+        static const unsigned char freq[26] = {// a..z, approx per-mille
+                                               82, 15, 28, 43, 127, 22, 20, 61,
+                                               70, 2,  8,  40, 24,  67, 75, 19,
+                                               1,  60, 63, 91, 28,  10, 24, 2,
+                                               20, 1};
+        std::array<unsigned char, 256> t;
+        t.fill(1); // digits / other punctuation / non-ASCII: rare in prose
+        t[' '] = 255;
+        for (int i = 0; i < 26; i++) {
+          t[static_cast<size_t>('a' + i)] = freq[i];
+          // Capitals run ~1-4 per-mille in prose (vs their lowercase tens):
+          // score them accordingly so a capital beats every common
+          // lowercase as the probe AND stays below the pair_probe threshold
+          // (a capital probe is rare enough that the single-byte scan wins).
+          t[static_cast<size_t>('A' + i)] =
+              static_cast<unsigned char>((freq[i] >> 5) + 1);
+        }
+        t['\n'] = 20; // a line break every ~50 bytes
+        t[','] = 12;
+        t['.'] = 11;
+        t['"'] = 6;
+        t['\''] = 4;
+        t['-'] = 3;
+        return t;
+      }();
+      return table[c];
     }
 
     // Offset of the rarest byte in `s` (the probe for find_substr), 0 if empty.
@@ -8329,23 +8957,56 @@ private:
         if (!collect_ascii_literal(k, s) || s.empty()) return; // not pure literal
         alts.push_back(std::move(s));
       }
-      literal_alt_ = std::move(alts);
+      // Keep the branches grouped by the fingerprint each begins with (by
+      // Teddy's id), in alternation order within a group: literal_alt_locate
+      // tries the group Teddy names. The regrouping leaves leftmost-first
+      // as it was — two branches that can match at one position begin with
+      // the same fingerprint, and those keep their order. (Every branch
+      // begins with one: analyze_teddy walked the same alternation,
+      // compiled. A branch that somehow does not leaves the pattern to the
+      // tiers below.)
+      std::vector<std::pair<unsigned, std::string>> by;
+      by.reserve(alts.size());
+      for (std::string &lit : alts) {
+        const Teddy::Hit h = teddy_.find_print(
+            reinterpret_cast<const unsigned char *>(lit.data()), lit.size(), 0);
+        if (h.pos != 0) return;
+        by.emplace_back(h.id, std::move(lit));
+      }
+      std::stable_sort(by.begin(), by.end(),
+                       [](const auto &a, const auto &b) {
+                         return a.first < b.first;
+                       });
+      literal_alt_at_.assign(teddy_.count() + 1, 0);
+      for (auto &lit : by) {
+        literal_alt_at_[lit.first + 1]++;
+        literal_alt_.push_back(std::move(lit.second));
+      }
+      for (size_t g = 1; g < literal_alt_at_.size(); g++)
+        literal_alt_at_[g] += literal_alt_at_[g - 1];
     }
 
     // Enumerate every length-N ASCII byte string that a match can begin with, by
     // walking the start ε-closure (Save/Jmp/Split are zero-width; Char consumes
     // one byte and continues at pc+1). Returns false — Teddy unusable — if any
     // path reaches a non-literal consuming instruction, a non-ASCII or multi-code
-    // -point literal, or Match before N bytes, or if enumeration explodes.
-    bool teddy_collect(int pc, int depth, int N,
-                       std::array<unsigned char, 4> &acc,
-                       std::vector<std::array<unsigned char, 4>> &out,
-                       int &budget) const {
+    // -point literal, or Match before N bytes, if there are more distinct
+    // strings than Teddy takes, or if enumeration explodes.
+    bool teddy_collect(int pc, int depth, int N, Teddy::Print &acc,
+                       std::vector<Teddy::Print> &out, int &budget) const {
       using Op = detail::Inst::Op;
       if (--budget < 0) return false;
       if (depth == N) {
+        // Several literals can begin with one fingerprint; one more
+        // distinct fingerprint than Teddy takes ends the walk. (Compared as
+        // words — acc is zero past N: a large alternation asks thousands of
+        // times before it is turned away.)
+        const uint32_t k = Teddy::key_of(acc.data(), Teddy::kMaxLen);
+        for (const Teddy::Print &f : out)
+          if (Teddy::key_of(f.data(), Teddy::kMaxLen) == k) return true;
+        if (out.size() == Teddy::kMaxPrints) return false;
         out.push_back(acc);
-        return out.size() <= 64; // bound before dedup
+        return true;
       }
       const detail::Inst &in = prog_.insts[pc];
       switch (in.op) {
@@ -8357,46 +9018,40 @@ private:
       case Op::Char: {
         const std::u32string &lit = prog_.lits[in.lit_idx()];
         if (lit.size() != 1 || lit[0] >= 128) return false;
-        acc[depth] = static_cast<unsigned char>(lit[0]);
+        acc[static_cast<size_t>(depth)] = static_cast<unsigned char>(lit[0]);
         return teddy_collect(pc + 1, depth + 1, N, acc, out, budget);
       }
       default: return false; // Class/Any/Byte/Match/asserts: not a fixed literal
       }
     }
 
+    // The instructions the walk may visit: what stops it when the
+    // fingerprints stay few and the literals do not. A literal costs its N
+    // bytes and a couple of zero-width instructions, so this is a few
+    // hundred literals — past that the pattern goes without Teddy.
+    static constexpr int kTeddyCollectBudget = 2048;
+
     void analyze_teddy() {
-      teddy_.ok = false;
+      teddy_ = Teddy{};
       // Same preconditions as the first-byte filter: a regular ASCII program that
       // cannot match empty. Case-insensitive needs case-fold orbits (skip, like
       // the literal prefix). first_bytes_.ok already implies all of this.
       if (us_ || icase_ || !first_bytes_.ok) return;
 
       // Prefer the longest fingerprint the shortest literal allows (rarer ->
-      // fewer false positives), capped at 4. Fall to a shorter N if the longer
-      // one runs off the end of some literal or yields more than 8 distinct
-      // fingerprints.
-      for (int N = 4; N >= 2; N--) {
-        std::vector<std::array<unsigned char, 4>> fps;
-        std::array<unsigned char, 4> acc{};
-        int budget = 256;
-        if (!teddy_collect(0, 0, N, acc, fps, budget)) continue;
+      // fewer false positives), capped at Teddy::kMaxLen. Fall to a shorter N
+      // if the longer one runs off the end of some literal or yields more
+      // distinct fingerprints than Teddy takes.
+      for (int N = Teddy::kMaxLen; N >= 2; N--) {
+        std::vector<Teddy::Print> fps;
+        fps.reserve(Teddy::kMaxPrints);
+        Teddy::Print acc{};
+        int budget = kTeddyCollectBudget;
+        if (!teddy_collect(0, 0, N, acc, fps, budget) || fps.empty()) continue;
+        // (Sorted: the searcher is the same whatever order the pattern
+        // names its literals in.)
         std::sort(fps.begin(), fps.end());
-        fps.erase(std::unique(fps.begin(), fps.end()), fps.end());
-        if (fps.empty() || fps.size() > 8) continue;
-        for (auto &t : teddy_.lo)
-          t.fill(0);
-        for (auto &t : teddy_.hi)
-          t.fill(0);
-        for (size_t i = 0; i < fps.size(); i++) {
-          unsigned char bit = static_cast<unsigned char>(1u << i);
-          for (int j = 0; j < N; j++) {
-            teddy_.lo[j][fps[i][j] & 0x0F] |= bit;
-            teddy_.hi[j][fps[i][j] >> 4] |= bit;
-          }
-        }
-        teddy_.fps = std::move(fps);
-        teddy_.n = N;
-        teddy_.ok = true;
+        teddy_.build(fps, N);
         return;
       }
     }
@@ -9229,26 +9884,15 @@ private:
       bool pair = false;
     };
 
-    // Teddy multi-literal SIMD prefilter (see analyze_teddy). When every match
-    // begins with one of a small set (<= 8) of fixed ASCII literals, we scan for
-    // the literals' leading teddy_.n bytes 16 positions at a time, instead of the
-    // single-byte skip — candidates are then the literal occurrences themselves,
-    // not every byte that merely shares a first byte. teddy_.lo[j]/teddy_.hi[j]
-    // are the per-position nibble->bucket-bit tables; teddy_.fps is the same set
-    // as raw bytes for the scalar fallback.
-    struct Teddy {
-      bool ok = false;
-      int n = 0; // fingerprint length in [2, 4]
-      std::array<std::array<unsigned char, 16>, 4> lo{}, hi{};
-      std::vector<std::array<unsigned char, 4>> fps;
-      // On the EGC byte path, prefer Teddy over the byte first-byte skip only when
-      // the first-byte set is non-selective (would yield many DFA-verified
-      // candidates). Selective small sets (e.g. {H,W} for Holmes|Watson) are faster
-      // with the cheaper memchr/SIMD first-byte skip. Decided once at ctor; see the
-      // analyze_byte_prefilter follow-up.
-      bool byte_preferred = false;
-    };
+    // The Teddy searcher over the leading bytes every match begins with, when
+    // those are a small set of fixed strings (see analyze_teddy).
     Teddy teddy_;
+    // On the EGC byte path, prefer Teddy over the byte first-byte skip only when
+    // the first-byte set is non-selective (would yield many DFA-verified
+    // candidates). Selective small sets (e.g. {H,W} for Holmes|Watson) are faster
+    // with the cheaper memchr/SIMD first-byte skip. Decided once at ctor; see the
+    // analyze_byte_prefilter follow-up.
+    bool byte_teddy_ = false;
     bool dfa_ok_ = false; // program is "regular" -> boolean match via lazy DFA
 
     // Like dfa_ok_, but also true when the only otherwise-DFA-breaking ops are
@@ -9345,12 +9989,18 @@ private:
     // classification pass (first_nonascii / simple_from), the way RE2 / rure scan
     // a literal. See literal_locate / literal_boundary_ok.
     bool literal_only_ = false;
-    // Pure literal alternation (>= 2 fixed printable-ASCII alternatives, in
-    // alternation order): matched by Teddy candidate -> ordered memcmp ->
-    // [pos, pos+len], skipping the DFA verify (rure's literal path). Empty = off.
+    // Pure literal alternation (>= 2 fixed printable-ASCII alternatives):
+    // matched by Teddy fingerprint -> ordered memcmp of the literals that
+    // begin with it -> [pos, pos+len], skipping the DFA verify (rure's
+    // literal path). Empty = off. Grouped by fingerprint, in alternation
+    // order within a group — the order among any literals that can match at
+    // one position (see analyze_literal_alternation).
     // EGC-only (gated on teddy_.ok, which implies !us_); the per-match
     // literal_boundary_ok keeps it grapheme-sound on any subject.
     std::vector<std::string> literal_alt_;
+    // ... the group of teddy_'s fingerprint `id` being
+    // literal_alt_[literal_alt_at_[id] .. literal_alt_at_[id + 1]).
+    std::vector<uint32_t> literal_alt_at_;
     // The anchor this plan's finds are driven from (see AnchorChoice). Read
     // at plan time and by the dispatch gates only, so it sits behind the
     // fields the per-match loops read.
@@ -9447,7 +10097,7 @@ private:
 #if defined(REGEXLIB_SSSE3)
   // PSHUFB twin of run_scan's NEON body, split into its own function so it can
   // carry REGEXLIB_TARGET_SSSE3 and still compile under an SSE2 baseline (the
-  // same shape as teddy_scan_ssse3).
+  // same shape as Teddy::scan_ssse3).
   REGEXLIB_TARGET_SSSE3 static size_t run_scan_ssse3(const unsigned char *p,
                                                      size_t n, size_t off,
                                                      const uint8_t *tbl) {
@@ -9497,7 +10147,7 @@ private:
     }
 #elif defined(REGEXLIB_SSSE3)
     // Compile-time SSSE3, or the runtime-dispatched tier (cpu_has_ssse3 is a
-    // compile-time `true` in the former; see teddy_scan). SSE2-only builds
+    // compile-time `true` in the former; see Teddy::scan). SSE2-only builds
     // and non-SIMD targets take the scalar loop.
     if (detail::cpu_has_ssse3()) return run_scan_ssse3(p, n, off, tbl);
 #endif
@@ -9517,7 +10167,7 @@ private:
   // bound off so every predicate load stays inside [0, n). The scalar tail
   // covers the final positions one byte at a time.
   //
-  // Deliberately NO runtime AVX2 dispatch here (unlike the Teddy SSSE3 scan):
+  // Deliberately NO runtime AVX2 dispatch here (unlike Teddy's scans):
   // it was tried — shared always_inline body, target("avx2") wrapper, cached
   // __builtin_cpu_supports pick, fully VEX-encoded per objdump — and measured
   // a net LOSS (Sherlock memmem cases 0.72x, [a-q][^u-z]{13}x 0.87x, P-core
@@ -9525,9 +10175,9 @@ private:
   // into its caller (whole-TU -mavx builds); an attributed wrapper cannot be
   // inlined into baseline callers, and outlining this function loses the
   // caller fusion (find_substr's probe+verify compile as one unit), which
-  // costs more than VEX wins. Teddy tolerates that because teddy_scan was
-  // already effectively outlined and its SIMD-vs-scalar gap is 10-18x, not
-  // encoding-level. Host-tuned builds (-march=native / -mavx2) get the VEX
+  // costs more than VEX wins. Teddy tolerates that because its scan was
+  // already a call of its own, and what its 32-byte scan gains is the
+  // vector's width (twice the bytes a step), not the encoding. Host-tuned builds (-march=native / -mavx2) get the VEX
   // win the sound way: the whole TU is VEX, nothing is outlined.
   template <class Pred, class Visit>
   static size_t scan64_visit(const unsigned char *p, size_t n, size_t off,
@@ -10104,10 +10754,11 @@ private:
   }
 
   // Leftmost-first match of the literal set at/after `from`: Teddy finds the
-  // next fingerprint candidate, then each literal is tried in alternation order
-  // and the first whose bytes match AND whose occurrence sits on grapheme
-  // boundaries (literal_boundary_ok — Prepend before / Extend·ZWJ·SpacingMark
-  // after) wins. Writes [s, e) and returns true; false if no match remains.
+  // next fingerprint and says which, then each literal that begins with it is
+  // tried in alternation order and the first whose bytes match AND whose
+  // occurrence sits on grapheme boundaries (literal_boundary_ok — Prepend
+  // before / Extend·ZWJ·SpacingMark after) wins. Writes [s, e) and returns
+  // true; false if no match remains.
   // Every literal begins with a Teddy fingerprint (teddy_.n <= min length) and
   // is >= teddy_.n bytes, so no match start is skipped; an ASCII literal byte
   // run never straddles a UTF-8 sequence, so this is sound on any subject.
@@ -10124,23 +10775,27 @@ private:
   bool literal_alt_locate(std::string_view t, int from, int &s, int &e) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int n = static_cast<int>(t.size());
+    // The fingerprint's own bytes are already matched: compare what follows.
+    const size_t fn = static_cast<size_t>(plan_->teddy_.n);
     int scan = from;
     while (scan < n) {
-      size_t cand = teddy_next(p, static_cast<size_t>(n),
-                               static_cast<size_t>(scan));
-      if (cand >= static_cast<size_t>(n)) return false;
-      int pos = static_cast<int>(cand);
-      for (const std::string &lit : plan_->literal_alt_) {
+      const Teddy::Hit hit = plan_->teddy_.find_print(
+          p, static_cast<size_t>(n), static_cast<size_t>(scan));
+      if (hit.pos >= static_cast<size_t>(n)) return false;
+      int pos = static_cast<int>(hit.pos);
+      const uint32_t *at = &plan_->literal_alt_at_[hit.id];
+      for (uint32_t k = at[0]; k < at[1]; k++) {
+        const std::string &lit = plan_->literal_alt_[k];
         int m = static_cast<int>(lit.size());
         if (pos + m <= n &&
-            bytes_eq(p + pos, lit.data(), static_cast<size_t>(m)) &&
+            bytes_eq(p + hit.pos + fn, lit.data() + fn, lit.size() - fn) &&
             literal_boundary_ok(t, pos, m)) {
           s = pos;
           e = pos + m;
           return true;
         }
       }
-      scan = pos + 1; // fingerprint false positive / boundary fail -> advance
+      scan = pos + 1; // no literal completes it / boundary fail -> advance
     }
     return false;
   }
@@ -10211,195 +10866,6 @@ private:
   size_t skip_to_first_byte(const unsigned char *p, size_t slen,
                             size_t b) const {
     return skip_to_set_byte<128>(plan_->first_bytes_, p, slen, b);
-  }
-
-  //----------------------------------------------------------------------------
-  // Teddy: SIMD multi-literal prefilter (Hyperscan / Rust-regex "slim" Teddy).
-  //
-  // When every match must begin with one of a small set of fixed ASCII literals
-  // — a literal alternation like `(?:fox|dog|cat)` — the first-byte skip above
-  // still stops at every byte sharing a first byte (f/d/c are common letters),
-  // so it barely outruns a byte-at-a-time scan. Teddy instead matches the
-  // leading `teddy_.n` bytes of all literals at 16 positions per step: each
-  // literal owns one bit (bucket) of an 8-bit mask, and for each of the N
-  // leading byte positions a pair of 16-entry tables maps a nibble to the set
-  // of buckets whose literal has that nibble there. A PSHUFB/TBL lookup yields,
-  // per text byte, which buckets it could be position j of; ANDing position 0
-  // at lane L with position 1 at L+1 ... position N-1 at L+N-1 leaves a nonzero
-  // lane exactly where some literal's N-byte prefix occurs. With <= 8 literals
-  // each bucket is one literal, so a candidate is an exact N-byte prefix match
-  // (no false positives from bucket sharing); the engine then confirms the
-  // full match and leftmost-longest semantics from there.
-  //----------------------------------------------------------------------------
-
-  // Scalar fingerprint membership at p[b..b+N): true if some literal's leading
-  // N bytes match here. Used as the fallback and for the post-SIMD tail.
-  // Scalar Teddy scan from `b`: the post-SIMD tail, and the whole scan when the
-  // subject is shorter than one vector. Shared by teddy_scan and its SSSE3
-  // twin (calling this un-attributed helper from the target("ssse3") function
-  // is fine — the tail is cold and needs no SSSE3 codegen).
-  template <int N>
-  size_t teddy_tail(const unsigned char *p, size_t slen, size_t b) const {
-    while (b + static_cast<size_t>(N) <= slen) {
-      if (teddy_hit(p + b)) return b;
-      b++;
-    }
-    return slen;
-  }
-
-  bool teddy_hit(const unsigned char *p) const {
-    for (const auto &fp : plan_->teddy_.fps) {
-      int j = 0;
-      for (; j < plan_->teddy_.n; j++)
-        if (p[j] != fp[j]) break;
-      if (j == plan_->teddy_.n) return true;
-    }
-    return false;
-  }
-
-#if defined(REGEXLIB_SSSE3)
-  // SSSE3 (PSHUFB) Teddy scan: a complete scan returning the first candidate
-  // index in [from, slen), or slen if none. Split out of teddy_scan so it can
-  // carry REGEXLIB_TARGET_SSSE3 — which enables the `ssse3` target for THIS
-  // function only, letting the PSHUFB intrinsics compile when the TU baseline is
-  // just SSE2 (the runtime-dispatch tier; empty otherwise). Reached only when
-  // detail::cpu_has_ssse3() holds. The member-table lookup is written out inline
-  // rather than via a lambda: on Clang a lambda's operator() does NOT inherit
-  // the enclosing function's target attribute, so an always_inline
-  // _mm_shuffle_epi8 inside it fails to compile.
-  template <int N>
-  REGEXLIB_TARGET_SSSE3 size_t teddy_scan_ssse3(const unsigned char *p,
-                                                size_t slen, size_t from) const {
-    size_t b = from;
-    if (b + 16 <= slen) {
-      __m128i lo[N], hi[N]; // constant N: unrolled into registers
-      for (int j = 0; j < N; j++) {
-        lo[j] = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(plan_->teddy_.lo[j].data()));
-        hi[j] = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(plan_->teddy_.hi[j].data()));
-      }
-      const __m128i lomask = _mm_set1_epi8(0x0F);
-      constexpr size_t step = static_cast<size_t>(17 - N);
-      for (; b + 16 <= slen; b += step) {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + b));
-        __m128i vlo = _mm_and_si128(v, lomask);
-        __m128i vhi = _mm_and_si128(_mm_srli_epi16(v, 4), lomask);
-        __m128i c = _mm_and_si128(_mm_shuffle_epi8(lo[0], vlo),
-                                  _mm_shuffle_epi8(hi[0], vhi));
-        __m128i m1 = _mm_and_si128(_mm_shuffle_epi8(lo[1], vlo),
-                                   _mm_shuffle_epi8(hi[1], vhi));
-        c = _mm_and_si128(c, _mm_srli_si128(m1, 1));
-        if constexpr (N >= 3) {
-          __m128i m2 = _mm_and_si128(_mm_shuffle_epi8(lo[2], vlo),
-                                     _mm_shuffle_epi8(hi[2], vhi));
-          c = _mm_and_si128(c, _mm_srli_si128(m2, 2));
-        }
-        if constexpr (N >= 4) {
-          __m128i m3 = _mm_and_si128(_mm_shuffle_epi8(lo[3], vlo),
-                                     _mm_shuffle_epi8(hi[3], vhi));
-          c = _mm_and_si128(c, _mm_srli_si128(m3, 3));
-        }
-        unsigned mask = static_cast<unsigned>(
-            _mm_movemask_epi8(_mm_cmpeq_epi8(c, _mm_setzero_si128())));
-        mask = (~mask) & 0xFFFFu; // bit L set where lane L survived
-        if (mask) return b + static_cast<size_t>(detail::bit_ctz32(mask));
-      }
-    }
-    return teddy_tail<N>(p, slen, b);
-  }
-#endif
-
-  // Index of the first position in [from, slen) where some literal's N-byte
-  // prefix occurs, or slen if none. Soundness: every match start begins with
-  // one of these fingerprints (analyze_teddy proved it), so no start is
-  // skipped. teddy_next dispatches the runtime fingerprint length to a
-  // compile-time-N scan: with constant N the table loop fully unrolls and the
-  // nibble tables live in registers — the old runtime-N form copied them to a
-  // stack array per CALL (a 128-byte memmove that cost ~10% of the
-  // literal-alternation tier, since the iterator calls this once per match).
-  template <int N>
-  size_t teddy_scan(const unsigned char *p, size_t slen, size_t from) const {
-    size_t b = from;
-#if defined(REGEXLIB_NEON)
-    // Carry-across-block Teddy (rure's slim Teddy) for N == 4: advance a full
-    // 16 bytes per iteration instead of 17-N. A fingerprint straddling the
-    // block boundary is resolved by vext'ing the previous block's member
-    // bytes with the current block's, so the previous block's 16 positions
-    // are all checked once the next block is loaded — no N-1 byte re-scan.
-    // Reporting lags one block: block `prevb` is checked while loading
-    // `prevb+16`.
-    if (b + 32 <= slen) {
-      uint8x16_t lo[N], hi[N]; // constant N: unrolled into registers
-      for (int j = 0; j < N; j++) {
-        lo[j] = vld1q_u8(plan_->teddy_.lo[j].data());
-        hi[j] = vld1q_u8(plan_->teddy_.hi[j].data());
-      }
-      const uint8x16_t lomask = vdupq_n_u8(0x0F);
-      auto member = [&](uint8x16_t v, int j) {
-        uint8x16_t vlo = vandq_u8(v, lomask);
-        uint8x16_t vhi = vshrq_n_u8(v, 4);
-        return vandq_u8(vqtbl1q_u8(lo[j], vlo), vqtbl1q_u8(hi[j], vhi));
-      };
-      size_t prevb = b;
-      if constexpr (N == 4) {
-        uint8x16_t v = vld1q_u8(p + prevb);
-        uint8x16_t p0 = member(v, 0), p1 = member(v, 1), p2 = member(v, 2),
-                   p3 = member(v, 3);
-        for (b = prevb + 16; b + 16 <= slen; b += 16) {
-          uint8x16_t cv = vld1q_u8(p + b);
-          uint8x16_t c0 = member(cv, 0), c1 = member(cv, 1), c2 = member(cv, 2),
-                     c3 = member(cv, 3);
-          uint8x16_t c = vandq_u8(vandq_u8(p0, vextq_u8(p1, c1, 1)),
-                                  vandq_u8(vextq_u8(p2, c2, 2),
-                                           vextq_u8(p3, c3, 3)));
-          uint8x16_t nz = vtstq_u8(c, c);
-          uint64_t m = vget_lane_u64(
-              vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(nz), 4)), 0);
-          if (m) return prevb + (static_cast<size_t>(detail::bit_ctz64(m)) >> 2);
-          prevb = b;
-          p0 = c0;
-          p1 = c1;
-          p2 = c2;
-          p3 = c3;
-        }
-        // The last loaded block (prevb) and the < 16-byte tail are finished by
-        // the scalar walk below (its straddle may read past a full block).
-        b = prevb;
-      } else {
-        // N == 2 or 3: the simpler overlap scan (step = 17-N). The carry
-        // form's extra live state isn't worth it for these (fewer member
-        // lookups already), and the overlap waste is smaller.
-        const uint8x16_t zero = vdupq_n_u8(0);
-        constexpr size_t step = static_cast<size_t>(17 - N);
-        for (; b + 16 <= slen; b += step) {
-          uint8x16_t v = vld1q_u8(p + b);
-          uint8x16_t c = member(v, 0);
-          c = vandq_u8(c, vextq_u8(member(v, 1), zero, 1));
-          if constexpr (N >= 3) c = vandq_u8(c, vextq_u8(member(v, 2), zero, 2));
-          uint8x16_t nz = vtstq_u8(c, c);
-          uint64_t m = vget_lane_u64(
-              vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(nz), 4)), 0);
-          if (m) return b + (static_cast<size_t>(detail::bit_ctz64(m)) >> 2);
-        }
-      }
-    }
-#elif defined(REGEXLIB_SSSE3)
-    // PSHUFB Teddy: usable directly when the TU is compile-time SSSE3, and
-    // behind a runtime CPU check + target("ssse3") function otherwise (see
-    // REGEXLIB_SSSE3_DYNAMIC). cpu_has_ssse3() is a compile-time `true` in the
-    // former, so the branch and the scalar tail below fold away there.
-    if (detail::cpu_has_ssse3()) return teddy_scan_ssse3<N>(p, slen, from);
-#endif
-    return teddy_tail<N>(p, slen, b);
-  }
-
-  size_t teddy_next(const unsigned char *p, size_t slen, size_t from) const {
-    switch (plan_->teddy_.n) {
-    case 2: return teddy_scan<2>(p, slen, from);
-    case 3: return teddy_scan<3>(p, slen, from);
-    default: return teddy_scan<4>(p, slen, from);
-    }
   }
 
   //----------------------------------------------------------------------------
@@ -13009,8 +13475,8 @@ private:
       return h ? static_cast<int>(h - p) : n;
     }
     if (plan_->teddy_.ok)
-      return static_cast<int>(
-          teddy_next(p, static_cast<size_t>(n), static_cast<size_t>(i)));
+      return static_cast<int>(plan_->teddy_.find(
+          p, static_cast<size_t>(n), static_cast<size_t>(i)));
     if (plan_->first_bytes_.dfa_skip)
       return static_cast<int>(
           skip_to_first_byte(p, static_cast<size_t>(n), static_cast<size_t>(i)));
@@ -13031,9 +13497,9 @@ private:
                       plan_->byte_prefix_.probe, plan_->byte_prefix_.probe2);
       return h ? static_cast<int>(h - p) : n;
     }
-    if (plan_->teddy_.byte_preferred)
-      return static_cast<int>(
-          teddy_next(p, static_cast<size_t>(n), static_cast<size_t>(i)));
+    if (plan_->byte_teddy_)
+      return static_cast<int>(plan_->teddy_.find(
+          p, static_cast<size_t>(n), static_cast<size_t>(i)));
     if (plan_->byte_first_bytes_.dfa_skip)
       return static_cast<int>(
           skip_to_byte_start(p, static_cast<size_t>(n), static_cast<size_t>(i)));
@@ -16201,7 +16667,8 @@ private:
       // first byte.
       const unsigned char *p =
           reinterpret_cast<const unsigned char *>(seg.source.data());
-      size_t b = teddy_next(p, seg.source.size(), static_cast<size_t>(start));
+      size_t b =
+          plan_->teddy_.find(p, seg.source.size(), static_cast<size_t>(start));
       if (b >= seg.source.size()) return -1;
       start = static_cast<int>(b);
       filtered = true;

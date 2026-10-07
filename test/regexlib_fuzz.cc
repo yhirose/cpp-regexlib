@@ -1782,6 +1782,126 @@ void invariant_fuzz_ladder(int iters) {
   }
 }
 
+// --- Multi-literal alternation: Teddy, and the tier that is nothing else. ---
+//
+// An alternation of fixed strings is found by their leading bytes (Teddy's
+// fingerprints), up to sixty-four of them dealt into eight buckets. Past
+// eight they share, and a shared bucket lets through strings that mix its
+// members' nibbles: every such candidate has to be turned down, by the scan
+// (a caller that asks which fingerprint), by the literal comparison behind
+// it, or by the DFA whose start state the scan skips for. gen_alt's
+// alternations have two or three branches over three letters, so nothing
+// they draw shares a bucket, runs to a second vector block or names a
+// fingerprint two literals begin with.
+//
+// The literals here are drawn over bytes whose nibbles mix INTO EACH OTHER
+// (low nibble 1 or 2 under high nibble 2, 3, 4, 6 or 7), so the mixtures a
+// shared bucket lets through are strings the subjects are made of; and the
+// subjects are the literals themselves — whole, cut short, with one byte
+// swapped for another of the set — at every length from under the scan's
+// walk threshold to several vector blocks, so a fingerprint straddles
+// blocks, ends in the partial one, and starts within its own length of the
+// end. Two to seventy literals: a bucket each, shared buckets, and past the
+// sixty-four fingerprints a plan takes (a shorter fingerprint, or none).
+// Bare (the literal-alternation tier), with a tail (the start skip of the
+// DFA tiers and the Pike), under captures (the one-pass walk's candidates),
+// and behind an optional head (fingerprints reached through two paths).
+// The bytes: kMixBytes of them mix (low nibble 1 or 2 under high nibble 2,
+// 3, 4, 6 or 7), then a few bystanders.
+const char kMultiLitBytes[] = "!\"12ABabqrxz ";
+const int kMixBytes = 10, kMultiLitByteCount = 13;
+char multi_lit_byte(bool any) {
+  return kMultiLitBytes[U(0, (any ? kMultiLitByteCount : kMixBytes) - 1)];
+}
+
+std::string gen_multi_literal(std::vector<std::string> &lits) {
+  const int kind = U(0, 9);
+  const int count = kind < 4 ? U(2, 8) : kind < 8 ? U(9, 24) : U(25, 70);
+  lits.clear();
+  for (int i = 0; i < count; i++) {
+    // Mostly two to six bytes; a one-byte literal now and then, which leaves
+    // the pattern without a fingerprint of any length.
+    const int len = U(0, 39) == 0 ? 1 : U(0, 2) == 0 ? U(2, 3) : U(2, 6);
+    std::string lit;
+    for (int j = 0; j < len; j++)
+      lit += multi_lit_byte(/*any=*/U(0, 3) == 0);
+    // (A literal an earlier one is a prefix of can never match — which is
+    // exactly what leftmost-first has to get right — so repeats and prefix
+    // pairs stay in.)
+    lits.push_back(lit);
+  }
+  std::string alt;
+  for (const std::string &l : lits)
+    alt += (alt.empty() ? "" : "|") + l;
+  switch (U(0, 7)) {
+  case 0:
+  case 1:
+  case 2: return alt;
+  case 3: return "(?:" + alt + ")" +
+                 std::string(U(0, 1) ? "x?" : U(0, 1) ? "[ab]*" : "(?:rq)?");
+  case 4: return "(" + alt + ")";
+  case 5: return "(" + alt + ")(a?)";
+  case 6: return "(?:" + alt + ")?" + lits[static_cast<size_t>(U(0, count - 1))];
+  default: return "(?:" + alt + ")(?: |$)";
+  }
+}
+
+void invariant_fuzz_multi_literal(int iters) {
+  for (int it = 0; it < iters; it++) {
+    std::vector<std::string> lits;
+    const std::string pat = gen_multi_literal(lits);
+    // `units` pieces: a literal, a literal without its last byte, a literal
+    // with one byte swapped, or a stray byte. One piece in `special` is
+    // instead a cluster the grapheme tiers have to respect — a non-ASCII
+    // letter, CR-LF, a combining mark (which fuses with a literal's last
+    // byte: no match there) — up to index `top` of that list (`special` 0:
+    // none).
+    static const char *kSpecial[] = {"\xC3\xA9", "\r\n", "\xCC\x81"};
+    auto gen = [&](int units, int top, int special) {
+      std::string subj;
+      for (int i = 0; i < units; i++) {
+        if (special && U(0, special - 1) == 0) {
+          subj += kSpecial[U(0, top)];
+          continue;
+        }
+        std::string piece = lits[static_cast<size_t>(
+            U(0, static_cast<int>(lits.size()) - 1))];
+        switch (U(0, 5)) {
+        case 0:
+        case 1: break;
+        case 2: piece.pop_back(); break;
+        case 3:
+          piece[static_cast<size_t>(U(0, static_cast<int>(piece.size()) - 1))] =
+              multi_lit_byte(/*any=*/false);
+          break;
+        default: piece.assign(1, multi_lit_byte(/*any=*/true)); break;
+        }
+        subj += piece;
+      }
+      return subj;
+    };
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 6; s++)
+      subjects.push_back(gen(U(0, 4), 0, 0)); // around the walk threshold
+    for (int s = 0; s < 6; s++)
+      subjects.push_back(gen(U(3, 14), 0, 0)); // a block or two
+    for (int s = 0; s < 3; s++)
+      subjects.push_back(gen(U(20, 120), 0, 0)); // several, and a tail
+    for (int s = 0; s < 3; s++)
+      subjects.push_back(gen(U(2, 40), 2, 5)); // with clusters
+    check_pattern(pat, subjects);
+
+    // CodePoint: the same alternation with no Teddy under it. Single-code-
+    // point clusters and no `\r` (see check_us_vs_pike), so é is the one
+    // special allowed.
+    std::vector<std::string> us_subjects;
+    for (int s = 0; s < 3; s++)
+      us_subjects.push_back(gen(U(0, 14), 0, 0));
+    us_subjects.push_back(gen(U(20, 80), 0, 8));
+    check_us_vs_pike(pat, us_subjects);
+  }
+}
+
 // Pure printable-ASCII literal fast-path differential. The literal tier
 // (literal_only_: memmem + O(1) grapheme-boundary check, no subject
 // classification) must agree with the forced Pike on EVERY surface, especially
@@ -2181,6 +2301,9 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A fifth: half a dozen 300-unit subjects per pattern, each pattern
   // checked twice (the EGC battery plus the US differential).
   invariant_fuzz_ladder(share(inv / 5));
+  // A fifth: some twenty subjects per pattern, most of them short, each
+  // pattern checked twice (the EGC battery plus the US differential).
+  invariant_fuzz_multi_literal(share(inv / 5));
 }
 
 int main(int argc, char **argv) {

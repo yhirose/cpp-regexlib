@@ -63,6 +63,10 @@ struct PlanProbe {
     return byte ? re.plan_->byte_first_bytes_.dfa_skip
                 : re.plan_->first_bytes_.dfa_skip;
   }
+  // The Teddy searcher: the type (a test deals one straight from a list of
+  // fingerprints), and the plan's (ok: the pattern has one).
+  using Teddy = Regex::Teddy;
+  static const Teddy &teddy(const Regex &re) { return re.plan_->teddy_; }
   // Served by the Pike VM and by nothing else — no literal, DFA or assert
   // tier planned, and none of the Pike rung's own accelerators either (the
   // start filters, the bounded backtracker): what a reference Regex has to
@@ -303,6 +307,29 @@ inline bool same_as_iter(const Regex &re, std::string_view s) {
   }
   return got == want;
 }
+
+// Whether every find surface of `re` — find_all, find_iter, search, test,
+// find_at stepped from 0 — gives `want` on `subj`: the flat_spans of the
+// reference.
+inline bool finds_agree(const Regex &re, const std::vector<size_t> &want,
+                        std::string_view subj) {
+  if (flat_spans(re, subj, false) != want) return false;
+  if (flat_spans(re, subj, true) != want) return false;
+  auto m = re.search(subj);
+  if (m.matched() != !want.empty()) return false;
+  if (m.matched() && (m.begin() != want[0] || m.end() != want[1])) return false;
+  if (re.test(subj) != !want.empty()) return false;
+  // find_at stepped from 0: the scan find_iter just took.
+  return same_as_iter(re, subj);
+}
+
+// Two alternations with more literals than Teddy has buckets.
+const char *const kNames16 =
+    "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London|Moriarty|"
+    "Lestrade|Hudson|Mycroft|Gregson|Hopkins|Stamford";
+const char *const kKeywords16 =
+    "return|while|for|if|else|switch|case|break|continue|struct|class|"
+    "static|const|void|int|char";
 
 // Returns true if constructing the pattern throws RegexError.
 bool rejects(const std::string &pat) {
@@ -766,6 +793,196 @@ void test_teddy_prefilter() {
   CHECK(find_all(opt, "foxbar dogbar bar").size() == 3);
   CHECK(opt.search("zzbar").str() == "bar");
   CHECK(!opt.test("foxbaz"));
+
+  // More literals than buckets: fingerprints share them, and a string that
+  // mixes the bytes of two that do is a candidate the scan has to turn
+  // down. As the tier itself, as a DFA's start skip (the optional tail), and
+  // under a capture; at every offset of a 32-byte block and into the
+  // partial block that ends the subject; against the Pike.
+  for (const std::string set : {kNames16, kKeywords16}) {
+    for (const std::string &pat :
+         {set, "(?:" + set + ")s?", "(" + set + ")( ?)"}) {
+      const Regex re(pat), pike = pike_twin(pat);
+      CHECK(PlanProbe::teddy(re).ok && PlanProbe::teddy(re).shared);
+      for (const char *body :
+           {"Hudson", "Stamford and Gregson", "Johg Ireg Greh Holmds Wadson",
+            "Holmex Watsoz Londom", "void", "if int", "ig vo sn ct ea wr",
+            "structs", "structz whilf", "Holmes\xcc\x81",
+            "caf\xc3\xa9 for Mycroft\r\nelse",
+            // Back to back on the byte tiers: the scan resumes exactly where
+            // the next literal begins.
+            "\xc3\xa9 HudsonGregsonMycroftStamford ifintvoidcharcase and "
+            "then some more, to the end of the line\r\n"}) {
+        for (size_t pad = 0; pad < 70; pad += (pad < 36 ? 1 : 7)) {
+          const std::string s = std::string(pad, '.') + body + ". ";
+          CHECK(finds_agree(re, flat_spans(pike, s, /*lazy=*/false), s));
+        }
+      }
+    }
+  }
+  // The alternation's order decides between literals that begin alike,
+  // whichever bucket each fell into.
+  {
+    const std::string pat = "ab|abc|abcd|bc|bcd|cd|cde|abd|abe|acd|ace|bce|bd";
+    const Regex re(pat), pike = pike_twin(pat);
+    CHECK(PlanProbe::teddy(re).ok && PlanProbe::start(re, false) == 'A');
+    for (const char *s : {"abcd", "abcde", "xbcdex", "acdabe", "bdcdeabd",
+                          "aabbccddee", "abdabeacdacebcebd"})
+      CHECK(finds_agree(re, flat_spans(pike, s, false), s));
+    // A one-byte literal leaves the alternation without a fingerprint.
+    CHECK(!PlanProbe::teddy(Regex(pat + "|b")).ok);
+  }
+}
+
+// Teddy's scans, each on its own, against a search that knows nothing of
+// buckets (every fingerprint compared at every position): the walk, and
+// every vector scan this build has. From every start offset of subjects of
+// every length up to three 32-byte blocks — so the first block, the carry
+// from one block into the next and the partial last block are met at every
+// alignment, by a fingerprint that starts in one and ends in the other — and
+// over sets from three fingerprints (a bucket each) to sixty-four (eight to
+// a bucket, which let through the mixtures the subjects are full of).
+void test_teddy_scans() {
+  using Teddy = PlanProbe::Teddy;
+  // Bytes whose nibbles mix into one another: low nibble 1 or 2 under high
+  // nibble 3, 4, 6 or 7. Two fingerprints over them that share a bucket let
+  // through other strings over them.
+  const std::string mix = "12ABabqr";
+  uint32_t seed = 0x2545F491u;
+  auto rnd = [&](size_t bound) {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<size_t>(seed >> 8) % bound;
+  };
+  auto word = [&](size_t len) {
+    std::string w;
+    for (size_t i = 0; i < len; i++)
+      w += mix[rnd(mix.size())];
+    return w;
+  };
+  auto mixed = [&](size_t count, size_t len) {
+    std::vector<std::string> prints;
+    while (prints.size() < count) {
+      std::string w = word(len);
+      if (std::find(prints.begin(), prints.end(), w) == prints.end())
+        prints.push_back(w);
+    }
+    return prints;
+  };
+  struct Set {
+    std::vector<std::string> prints;
+    int shared, loose; // whether some bucket has to be (-1: the dealing's
+                       // to decide)
+  };
+  const std::vector<Set> sets = {
+      // Up to eight: a bucket each — also for two that could share one and
+      // let nothing else through, as they would among more than eight.
+      {{"fox", "dog", "cat"}, 0, 0},
+      {{"<<", "<=", ">>", ">=", "=="}, 0, 0},
+      {{"Sher", "Holm", "Wats", "Iren", "Adle", "John", "Bake"}, 0, 0},
+      // Nine that differ in one nibble of one byte: whichever of them share
+      // a bucket, it lets nothing else through.
+      {{"xa", "xb", "xc", "xd", "xe", "xf", "xg", "xh", "xi"}, 1, 0},
+      // Nine that differ in both bytes: any two that share let their
+      // mixtures through.
+      {{"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii"}, 1, 1},
+      {{"re", "wh", "fo", "if", "el", "sw", "ca", "br", "co", "st", "cl",
+        "vo", "in", "ch"},
+       1, -1},
+      {{"Sher", "Holm", "Wats", "Iren", "Adle", "John", "Bake", "Stre",
+        "Lond", "Mori", "Lest", "Huds", "Mycr", "Greg", "Hopk", "Stam"},
+       1, -1},
+      {mixed(12, 2), 1, -1},
+      {mixed(20, 3), 1, -1},
+      {mixed(40, 4), 1, -1},
+      {mixed(64, 4), 1, -1},
+      // A NUL in a fingerprint: the zero padding of a partial block must
+      // not read as one.
+      {{std::string("a\0q", 3), std::string("qr\0", 3), std::string(3, '\0')},
+       0, 0},
+  };
+  for (const Set &set : sets) {
+    const size_t n = set.prints[0].size();
+    std::vector<Teddy::Print> fps;
+    for (const std::string &f : set.prints) {
+      fps.emplace_back();
+      std::copy(f.begin(), f.end(), fps.back().begin());
+    }
+    Teddy t;
+    t.build(fps, static_cast<int>(n));
+    CHECK(t.ok && t.count() == set.prints.size());
+    CHECK((t.loose & ~t.shared) == 0);
+    CHECK(set.shared < 0 || (t.shared != 0) == (set.shared != 0));
+    CHECK(set.loose < 0 || (t.loose != 0) == (set.loose != 0));
+    for (int round = 0; round < 60; round++) {
+      // The fingerprints themselves, whole and cut short, between runs of
+      // the mixing bytes.
+      std::string s;
+      const size_t want_len = rnd(100);
+      while (s.size() < want_len) {
+        const size_t k = rnd(8);
+        const std::string &f = set.prints[rnd(set.prints.size())];
+        if (k < 3)
+          s += f;
+        else if (k == 3)
+          s += f.substr(0, n - 1);
+        else
+          s += word(1 + rnd(3));
+      }
+      const auto *p = reinterpret_cast<const unsigned char *>(s.data());
+      // The fingerprint that id names is what stands at pos.
+      auto names = [&](const Teddy::Hit &h) {
+        return h.id < t.count() &&
+               std::memcmp(&t.key[h.id], p + h.pos, n) == 0;
+      };
+      for (size_t from = 0; from <= s.size(); from++) {
+        size_t want = from;
+        auto here = [&](const std::string &f) {
+          return s.compare(want, n, f) == 0;
+        };
+        while (want + n <= s.size() &&
+               std::none_of(set.prints.begin(), set.prints.end(), here))
+          want++;
+        if (want + n > s.size()) want = s.size();
+        for (Teddy::Scan scan :
+             {Teddy::Scan::Walk, Teddy::Scan::Vec16, Teddy::Scan::Vec32}) {
+          if (!Teddy::has(scan)) continue;
+          const auto which = t.find_with(scan, p, s.size(), from, t.shared);
+          CHECK(which.pos == want && (want == s.size() || names(which)));
+          CHECK(t.find_with(scan, p, s.size(), from, t.loose).pos == want);
+        }
+        const auto which = t.find_print(p, s.size(), from);
+        CHECK(which.pos == want && (want == s.size() || names(which)));
+        CHECK(t.find(p, s.size(), from) == want);
+      }
+    }
+  }
+  // What a plan takes for a pattern: the longest fingerprint its shortest
+  // literal allows, and no more than sixty-four of them.
+  auto alternation = [](const std::vector<std::string> &lits) {
+    std::string pat;
+    for (const std::string &l : lits)
+      pat += (pat.empty() ? "" : "|") + l;
+    return pat;
+  };
+  struct Taken {
+    std::string pat;
+    int n;
+    unsigned count;
+  };
+  for (const Taken &want : std::vector<Taken>{
+           {"fox|dog|cat", 3, 3},
+           {"Sherlock|Holmes|Watson|Irene|Adler|John|Baker", 4, 7},
+           {kNames16, 4, 16},
+           {kKeywords16, 2, 14},
+           {"<<=|>>=|->|==|!=|<=|>=|&&|\\|\\|", 2, 9},
+           {alternation(mixed(64, 4)), 4, 64}}) {
+    const auto &t = PlanProbe::teddy(Regex(want.pat));
+    CHECK(t.ok && t.n == want.n && t.count() == want.count);
+  }
+  {
+    const auto &t = PlanProbe::teddy(Regex(alternation(mixed(65, 4))));
+    CHECK(!t.ok || t.n < 4);
+  }
 }
 
 // Columnar matches() container: range-for/operator[], captures/named/unmatched
@@ -1049,16 +1266,7 @@ void test_find_ladder() {
       if (u == 1 && (subj.find('\r') != std::string::npos ||
                      subj.find("\xCC") != std::string::npos))
         continue;
-      const Regex &re = *last.unit[u];
-      if (flat_spans(re, subj, false) != want) return false;
-      if (flat_spans(re, subj, true) != want) return false;
-      auto m = re.search(subj);
-      if (m.matched() != !want.empty()) return false;
-      if (m.matched() && (m.begin() != want[0] || m.end() != want[1]))
-        return false;
-      if (re.test(subj) != !want.empty()) return false;
-      // find_at stepped from 0: the scan find_iter just took.
-      if (!same_as_iter(re, subj)) return false;
+      if (!finds_agree(*last.unit[u], want, subj)) return false;
     }
     return true;
   };
@@ -2406,21 +2614,22 @@ void test_anchor_choice() {
   }
 
   // The scan's own skip — the lazy DFA's start state jumping to the next byte
-  // a match can begin with — is for a set that is RARE as well as small. Nine
-  // literals are one too many for Teddy, so both of these scan with the DFA:
+  // a match can begin with — is for a set that is RARE as well as small. A
+  // CodePoint plan has no Teddy, so both of these scan with the DFA there:
   // capitals are worth jumping to, and the first letters of common words
   // stop the jump every few bytes, where stepping the DFA is the faster way
-  // through.
+  // through. (A Grapheme plan has Teddy for both, and is the literal-
+  // alternation tier's.)
   {
     const char *names =
         "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London";
     const char *words = "return|while|for|if|else|switch|case|break|continue";
-    CHECK(PlanProbe::start_skip(Regex(names), false));
-    CHECK(PlanProbe::start_skip(Regex(names), true));
     CHECK(PlanProbe::start_skip(make_us(names), true));
-    CHECK(!PlanProbe::start_skip(Regex(words), false));
-    CHECK(!PlanProbe::start_skip(Regex(words), true));
     CHECK(!PlanProbe::start_skip(make_us(words), true));
+    CHECK(!PlanProbe::teddy(make_us(names)).ok);
+    CHECK(PlanProbe::teddy(Regex(names)).ok && PlanProbe::teddy(Regex(words)).ok);
+    CHECK(PlanProbe::start(Regex(names), false) == 'A');
+    CHECK(PlanProbe::start(Regex(words), false) == 'A');
     CHECK(PlanProbe::start_skip(Regex("[A-Z][a-z]+s"), false));
     CHECK(!PlanProbe::start_skip(Regex("[aeiou][a-z]+s"), false));
     // How common a set may be depends on how the skip scans for it: a set
@@ -4215,6 +4424,7 @@ int main() {
   test_alternation_and_groups();
   test_literal_alternation();
   test_teddy_prefilter();
+  test_teddy_scans();
   test_matches();
   test_whole_match_capture();
   test_onewalk_local_bail();
