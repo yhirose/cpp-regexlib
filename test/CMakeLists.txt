@@ -26,7 +26,9 @@ add_test(NAME regexlib_scan_diff COMMAND regexlib_scan_diff)
 
 # Deterministic regression fuzzer: gates on oracle-free robustness invariants
 # (no crash/hang, self-consistent match spans, find_all/search agreement) and
-# prints an informational std::regex differential. Run under ASan/UBSan in CI.
+# with --std-diff, prints an informational std::regex differential (off by
+# default: std::regex backtracks, and two of its searches were four fifths of
+# the run). Run under ASan/UBSan in CI.
 add_executable(regexlib_fuzz regexlib_fuzz.cc)
 find_package(Threads REQUIRED)
 target_link_libraries(regexlib_fuzz PRIVATE regexlib Threads::Threads)

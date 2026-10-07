@@ -10,12 +10,20 @@
 //      agreement, capture bounds). Run it under ASan/UBSan in CI for memory
 //      safety. A fixed seed makes it reproducible.
 //
-//   2. INFO (not a gate): a differential pass against std::regex (ECMAScript,
-//      which is leftmost-first like us) over the common ASCII subset. The diff
-//      count is printed but does NOT fail the test, because std::regex
-//      semantics vary across standard libraries (libc++ vs libstdc++ differ on
-//      \b at string end and on match-complexity limits). It is a human signal,
-//      not a portable assertion.
+//   2. INFO (not a gate, and only with --std-diff): a differential pass
+//      against std::regex (ECMAScript, which is leftmost-first like us) over
+//      the common ASCII subset. The diff count is printed but does NOT fail
+//      the test, because std::regex semantics vary across standard libraries
+//      (libc++ vs libstdc++ differ on \b at string end and on
+//      match-complexity limits). It is a human signal, not a portable
+//      assertion.
+//
+//      It is off unless asked for because std::regex backtracks, and the run
+//      is then as long as its worst search: with the default seed, one
+//      std::regex_search over a 9-byte subject takes 44 s and another 7 s —
+//      four fifths of the whole run (50 s against 13 s), and some 14 of the
+//      17 minutes of the run under ASan. Nothing regexlib does is in those
+//      seconds.
 //
 //  Build (standalone):
 //    c++ -std=c++17 -Iinclude \
@@ -2087,7 +2095,13 @@ void parser_fuzz(int iters) {
 // once from main().
 std::atomic<long> g_diff_cmp{0}, g_diff_diff{0}, g_diff_skip{0};
 
-void differential_info(int iters) {
+// Without `compare` (the default: see --std-diff, and the note at the top of
+// the file) the searches are left out and everything else is kept — the
+// patterns and subjects are still drawn, and both engines still compile each
+// pattern, since which patterns std::regex rejects decides how many subjects
+// are drawn. So the layers that run after this one draw exactly what they
+// draw with the comparison on.
+void differential_info(int iters, bool compare) {
   long cmp = 0, diff = 0, skip = 0;
   for (int it = 0; it < iters; it++) {
     std::string pat = gen_alt(3);
@@ -2105,6 +2119,7 @@ void differential_info(int iters) {
     }
     for (int s = 0; s < 4; s++) {
       std::string subj = gen_subject();
+      if (!compare) continue;
       auto m = re->search(subj);
       std::smatch sm;
       bool std_m;
@@ -2132,7 +2147,7 @@ void differential_info(int iters) {
 // counts. The whole run is fully determined by (base seed, jobs, iters), so a
 // failure reproduces by rerunning with the same flags.
 void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
-                int diff_it) {
+                int diff_it, bool std_diff) {
   rng.seed(base ^ static_cast<std::uint32_t>(t));
   auto share = [&](int total) {
     return total / jobs + (t < total % jobs ? 1 : 0);
@@ -2148,7 +2163,7 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   invariant_fuzz_lookaround(share(inv));
   invariant_fuzz_us(share(inv));
   parser_fuzz(share(parser_it));
-  differential_info(share(diff_it));
+  differential_info(share(diff_it), std_diff);
   // Appended LAST so every layer above keeps the RNG stream — and so the
   // exact patterns and subjects — it had before this one existed. A fifth of
   // the budget: 2 KB padded subjects, and each pattern is checked twice (the
@@ -2172,6 +2187,7 @@ int main(int argc, char **argv) {
   std::uint32_t base = 0xC0FFEE; // base seed
   int jobs = 0;                  // 0 => auto-detect cores
   int inv = 25000;              // per invariant_* function; others scale to it
+  bool std_diff = false;        // also compare against std::regex (INFO)
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -2184,11 +2200,17 @@ int main(int argc, char **argv) {
       base = static_cast<std::uint32_t>(std::strtoul(val("0"), nullptr, 0));
     else if (a == "--iters")
       inv = std::atoi(val("25000"));
+    else if (a == "--std-diff")
+      std_diff = true;
     else if (a == "-h" || a == "--help") {
-      std::printf("usage: regexlib_fuzz [--jobs N] [--seed S] [--iters N]\n"
-                  "  --jobs   worker threads (default: detected cores)\n"
-                  "  --seed   base RNG seed (default: 0xC0FFEE)\n"
-                  "  --iters  per invariant_* function (default: 25000)\n");
+      std::printf("usage: regexlib_fuzz [--jobs N] [--seed S] [--iters N] "
+                  "[--std-diff]\n"
+                  "  --jobs      worker threads (default: detected cores)\n"
+                  "  --seed      base RNG seed (default: 0xC0FFEE)\n"
+                  "  --iters     per invariant_* function (default: 25000)\n"
+                  "  --std-diff  also count disagreements with std::regex "
+                  "(informational;\n"
+                  "              slow: std::regex backtracks)\n");
       return 0;
     } else {
       std::fprintf(stderr, "unknown arg: %s (try --help)\n", a.c_str());
@@ -2210,13 +2232,16 @@ int main(int argc, char **argv) {
   std::vector<std::thread> pool;
   pool.reserve(jobs - 1);
   for (int t = 1; t < jobs; t++)
-    pool.emplace_back(run_worker, base, jobs, t, inv, parser_it, diff_it);
-  run_worker(base, jobs, 0, inv, parser_it, diff_it); // worker 0 on main thread
+    pool.emplace_back(run_worker, base, jobs, t, inv, parser_it, diff_it,
+                      std_diff);
+  // Worker 0 on the main thread.
+  run_worker(base, jobs, 0, inv, parser_it, diff_it, std_diff);
   for (auto &th : pool) th.join();
 
-  std::printf("[info] differential vs std::regex: %ld compared, %ld diffs, "
-              "%ld skipped (platform-dependent; not a gate)\n",
-              g_diff_cmp.load(), g_diff_diff.load(), g_diff_skip.load());
+  if (std_diff)
+    std::printf("[info] differential vs std::regex: %ld compared, %ld diffs, "
+                "%ld skipped (platform-dependent; not a gate)\n",
+                g_diff_cmp.load(), g_diff_diff.load(), g_diff_skip.load());
 
   int fails = g_fail.load();
   if (fails == 0) {

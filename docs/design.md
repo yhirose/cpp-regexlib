@@ -1469,7 +1469,10 @@ ASan/UBSan) is layered:
   non-ASCII character in kilobytes of ASCII).
 
 A `std::regex` differential is kept but is **informational, never a gate** (its
-semantics vary across standard libraries). A portable semantic-regression corpus
+semantics vary across standard libraries), and runs only when asked for
+(`regexlib_fuzz --std-diff`): `std::regex` backtracks, and with the default
+seed two of its searches — 44 s and 7 s over 9-byte subjects — were four
+fifths of the fuzzer's run, 14 of its 17 minutes under ASan. A portable semantic-regression corpus
 (`regexlib_corpus`), adjudicated once against Python's `re` and baked in, needs no
 reference engine at run time.
 
