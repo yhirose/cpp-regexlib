@@ -57,11 +57,18 @@ struct PlanProbe {
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
-  // Whether the lazy DFA's start state jumps to the bytes of the plan's
-  // first-byte set — the byte program's (`byte`), or the grapheme program's.
-  static bool start_skip(const Regex &re, bool byte) {
-    return byte ? re.plan_->byte_first_bytes_.dfa_skip
-                : re.plan_->first_bytes_.dfa_skip;
+  // What the lazy DFA's start state skips with — the byte programs' DFAs
+  // (`byte`), or the grapheme program's. 'P' a literal prefix, 'T' Teddy,
+  // 'F' the first-byte set, '-' nothing.
+  static char start_skip(const Regex &re, bool byte) {
+    using Skip = Regex::Plan::StartSkip;
+    switch (byte ? re.plan_->byte_start_skip_ : re.plan_->start_skip_) {
+    case Skip::Prefix: return 'P';
+    case Skip::Teddy: return 'T';
+    case Skip::FirstBytes: return 'F';
+    case Skip::None: return '-';
+    }
+    return '!';
   }
   // The Teddy searcher: the type (a test deals one straight from a list of
   // fingerprints), and the plan's (ok: the pattern has one).
@@ -2613,33 +2620,37 @@ void test_anchor_choice() {
     CHECK(e.scan_cost > 0 && e.scan_cost < e.suffix_cost);
   }
 
-  // The scan's own skip — the lazy DFA's start state jumping to the next byte
-  // a match can begin with — is for a set that is RARE as well as small. A
-  // CodePoint plan has no Teddy, so both of these scan with the DFA there:
+  // What the lazy DFA's start state skips with. Teddy, where the pattern
+  // has one — a Grapheme plan's alternation of literals, whatever follows
+  // it. Else the first-byte set, when it is RARE as well as small: a
+  // CodePoint plan has no Teddy, so both of these scan with the DFA there —
   // capitals are worth jumping to, and the first letters of common words
   // stop the jump every few bytes, where stepping the DFA is the faster way
-  // through. (A Grapheme plan has Teddy for both, and is the literal-
-  // alternation tier's.)
+  // through.
   {
     const char *names =
         "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London";
     const char *words = "return|while|for|if|else|switch|case|break|continue";
-    CHECK(PlanProbe::start_skip(make_us(names), true));
-    CHECK(!PlanProbe::start_skip(make_us(words), true));
-    CHECK(!PlanProbe::teddy(make_us(names)).ok);
-    CHECK(PlanProbe::teddy(Regex(names)).ok && PlanProbe::teddy(Regex(words)).ok);
+    for (const char *pat : {names, words, "(?:fox|dog|cat)s?",
+                            "(?:the|and|for)s?", "(?:Xavier|Zulu)s?"}) {
+      CHECK(PlanProbe::start_skip(Regex(pat), false) == 'T');
+      CHECK(PlanProbe::start_skip(Regex(pat), true) == 'T');
+    }
     CHECK(PlanProbe::start(Regex(names), false) == 'A');
     CHECK(PlanProbe::start(Regex(words), false) == 'A');
-    CHECK(PlanProbe::start_skip(Regex("[A-Z][a-z]+s"), false));
-    CHECK(!PlanProbe::start_skip(Regex("[aeiou][a-z]+s"), false));
+    CHECK(PlanProbe::start_skip(Regex("Sherlock\\s+Holmes"), true) == 'P');
+    CHECK(PlanProbe::start_skip(make_us(names), true) == 'F');
+    CHECK(PlanProbe::start_skip(make_us(words), true) == '-');
+    CHECK(PlanProbe::start_skip(Regex("[A-Z][a-z]+s"), false) == 'F');
+    CHECK(PlanProbe::start_skip(Regex("[aeiou][a-z]+s"), false) == '-');
     // How common a set may be depends on how the skip scans for it: a set
     // of a few bytes is a SIMD compare per member, and is worth jumping to
     // where a larger one — a table lookup per subject byte — is not. Three
     // first letters at ~9% of prose still pay; at ~20% they do not.
-    CHECK(PlanProbe::start_skip(make_us("(?:fox|dog|cat)s?"), true));
-    CHECK(!PlanProbe::start_skip(make_us("(?:the|and|for)s?"), true));
-    CHECK(PlanProbe::start_skip(make_us("[bfgkpvjq][a-z]+"), true));
-    CHECK(!PlanProbe::start_skip(make_us("[bcdfgmpw][a-z]+"), true));
+    CHECK(PlanProbe::start_skip(make_us("(?:fox|dog|cat)s?"), true) == 'F');
+    CHECK(PlanProbe::start_skip(make_us("(?:the|and|for)s?"), true) == '-');
+    CHECK(PlanProbe::start_skip(make_us("[bfgkpvjq][a-z]+"), true) == 'F');
+    CHECK(PlanProbe::start_skip(make_us("[bcdfgmpw][a-z]+"), true) == '-');
     // Either way the matches are the Pike's.
     const std::string s = "if Holmes and Watson return to Baker Street while "
                           "John waits in London, break the case; caf\xc3\xa9 "

@@ -5606,6 +5606,9 @@ private:
     // that are none of theirs. Every other bucket in a lane IS its
     // fingerprint, found.
     unsigned char shared = 0, loose = 0;
+    // What a scan is estimated to meet per MB of prose (build): the lanes
+    // it has to confirm, and those of them that are a fingerprint.
+    int candidates = 0, occurrences = 0;
 
     // An occurrence: where, and of which fingerprint. pos >= the subject's
     // length when there is none.
@@ -5675,6 +5678,18 @@ private:
                 [&](unsigned char a, unsigned char b) {
                   return own[a] != own[b] ? own[a] > own[b] : a < b;
                 });
+      // (A mass is per mille to the len-th power; per MB is per mille
+      // squared.)
+      const auto per_mb = [len](int64_t mass) {
+        for (int j = 2; j < len; j++)
+          mass /= 1000;
+        return static_cast<int>(
+            std::min<int64_t>(mass, std::numeric_limits<int>::max()));
+      };
+      int64_t all = 0;
+      for (unsigned i = 0; i < count; i++)
+        all += own[i];
+      occurrences = per_mb(all);
       Bucket bucket[kBuckets];
       for (unsigned o = 0; o < count; o++) {
         const unsigned i = order[o];
@@ -5690,8 +5705,10 @@ private:
         bucket[best] = grown;
         home[i] = static_cast<unsigned char>(best);
       }
+      all = 0;
       for (int k = 0; k < kBuckets; k++) {
         const Bucket &b = bucket[k];
+        all += b.mass;
         // What it lets through: a low and a high nibble of its own at each
         // position, in every combination.
         const auto bits = [](unsigned x) {
@@ -5707,6 +5724,7 @@ private:
         if (b.size > 1) shared |= bit;
         if (strings != b.size) loose |= bit;
       }
+      candidates = per_mb(all);
       unsigned id = 0;
       for (int b = 0; b < kBuckets; b++) {
         first[static_cast<size_t>(b)] = static_cast<unsigned char>(id);
@@ -6210,14 +6228,10 @@ private:
         walk_driver_ = WalkDriver::Scan;
       }
       plan_byte_classes();
-      // The byte DFAs' start-state skip, now that every searcher behind it
-      // is planned (byte_prefilter_skip, in its order): a literal prefix,
-      // Teddy, or a first-byte set worth jumping to. A set that is small but
-      // common leaves nothing to skip with.
-      byte_prefilter_ok_ =
-          byte_prefilter_ok_ &&
-          (byte_prefix_.active() || byte_teddy_ ||
-           byte_first_bytes_.dfa_skip);
+      // The lazy DFAs' start skips, now that every searcher behind them is
+      // planned.
+      start_skip_ = start_skip(prefix_, first_bytes_);
+      byte_start_skip_ = start_skip(byte_prefix_, byte_first_bytes_);
       Regex::ladder_plan(*this);
     }
 
@@ -6399,7 +6413,7 @@ private:
         // byte_prog_) lives under the !us_ branch below, so the US lfu would scan
         // the byte DFA byte-by-byte with no literal/first-byte skip. Build the
         // byte-level prefilter here from prog_ (itself a byte automaton in US
-        // mode); the US lfu wires byte_pf from byte_prefilter_ok_. EGC builds it
+        // mode); the US lfu wires byte_pf from byte_start_skip_. EGC builds it
         // from byte_prog_ in the !us_ block.
         if (us_) analyze_byte_prefilter(prog_);
       }
@@ -6470,21 +6484,6 @@ private:
         analyze_byte_prefilter(byte_prog_.prog); // byte-level dead-skip (any UTF-8)
         plan_anchor(root); // prefix / suffix / interior literal: which one drives
         analyze_byte_icase_prefix(); // (?i) clean-prefix rare-byte prefilter
-        // Teddy vs the first-byte skip: use Teddy when there is no first-byte skip
-        // to fall back on (non-sparse set), or when the first-byte set is common
-        // enough that it would generate many candidates. Estimate density as the
-        // summed per-mille commonness of the first bytes (Holmes|Watson {H,W}
-        // ~13 -> skip; 7 names {S,H,W,I,A,J,B} ~44 -> Teddy).
-        if (teddy_.ok) {
-          if (!byte_first_bytes_.sparse) {
-            byte_teddy_ = true;
-          } else {
-            int density = 0;
-            for (unsigned char b : byte_first_bytes_.list)
-              density += byte_commonness(b);
-            byte_teddy_ = density >= 30;
-          }
-        }
       }
     }
 
@@ -7554,8 +7553,9 @@ private:
     // the byte path).
     void analyze_byte_prefilter(const detail::Program &prog) {
       using Op = detail::Inst::Op;
-      byte_prefilter_ok_ = false;
-      byte_prefix_.text.clear(); // idempotent: may be re-run after a program rebuild
+      // idempotent: may be re-run after a program rebuild
+      byte_first_bytes_ = FirstBytes<256>{};
+      byte_prefix_.text.clear();
       // Leading run of exact single-byte literals (every match begins with them).
       // Under IgnoreCase a case-folded letter compiles to a multi-byte class
       // (blo != bhi or a split), so this run captures only fold-invariant bytes
@@ -7596,8 +7596,6 @@ private:
         if (op == Op::Any)
           return; // matches nearly every byte -> skipping is moot
       }
-      byte_first_bytes_.set.fill(false);
-      byte_first_bytes_.list.clear();
 
       // A byte program's consuming instructions are all Op::Byte (US mode expands
       // every literal/class/`.` to byte ranges; Op::Any/Op::Match start pcs are
@@ -7617,11 +7615,9 @@ private:
           byte_first_bytes_.list.push_back(static_cast<unsigned char>(b));
           count++;
         }
+      byte_first_bytes_.ok = true;
       byte_first_bytes_.sparse = count <= 32;
       byte_first_bytes_.rate();
-
-      // Usable if we can skip at all: a literal prefix (memmem) or a sparse set.
-      byte_prefilter_ok_ = byte_prefix_.active() || byte_first_bytes_.sparse;
     }
 
     // True if `n` always consumes the SAME number of elements (so a given start
@@ -8198,9 +8194,9 @@ private:
       Kind kind = Kind::Scan;
       static constexpr int kNone = -1; // the pattern does not offer the anchor
       int prefix_cost = kNone, suffix_cost = kNone, inner_cost = kNone;
-      int scan_cost = kNone; // priced where the scan has a skip to price: a
-                             // sparse first-byte set (DFA tiers), the word
-                             // scan (assert tier, plan_word_onepass)
+      int scan_cost = kNone; // priced where the scan has a skip to price:
+                             // Teddy or a sparse first-byte set (DFA tiers),
+                             // the word scan (assert tier, plan_word_onepass)
       // The model's constants, in ns. A stop is a probe hit the scan has to
       // look at; a verify is what one literal occurrence then costs, by what
       // the anchor has to run to decide it.
@@ -8220,7 +8216,29 @@ private:
       // A prefix estimated at 1 ns per byte or more is dense: the DFA scan
       // costs about that whatever the subject holds.
       static constexpr int kDenseNs = 1000000;
+      // Teddy's own pace, per MB, whatever the subject holds: a vector of
+      // lookups per 16 or 32 bytes (measured as a DFA's start skip: 14-17
+      // GB/s with the 32-byte scan, about 9 with the 16-byte one).
+      static constexpr int kTeddyScanNs = 70000;
     };
+
+    // Estimated cost, in ns per MB of prose, of a byte DFA scan whose start
+    // state meets the plan's first-byte set: every member byte is a stop,
+    // and a place the DFA leaves its start state.
+    int first_bytes_cost() const {
+      return byte_first_bytes_.density() * 1000 *
+             (AnchorChoice::kStopNs + AnchorChoice::kVerifyFwdNs);
+    }
+    // ... and of one whose start state skips with Teddy: its pace, a stop
+    // per lane it has to confirm, the DFA from each fingerprint.
+    int teddy_cost() const {
+      const int64_t cost =
+          AnchorChoice::kTeddyScanNs +
+          int64_t{teddy_.candidates} * AnchorChoice::kStopNs +
+          int64_t{teddy_.occurrences} * AnchorChoice::kVerifyFwdNs;
+      return static_cast<int>(
+          std::min<int64_t>(cost, std::numeric_limits<int>::max()));
+    }
 
     // Estimated cost, in ns per MB of prose, of driving a find from the
     // literal `lit`: what its scan's stops cost plus what verifying its
@@ -8367,15 +8385,14 @@ private:
                                         ? AnchorChoice::kVerifyRevFwdNs
                                         : AnchorChoice::kVerifyInnerNs);
       }
-      // The scan's own skip when there is no literal prefix: a sparse
-      // first-byte set, each member byte a place the DFA leaves its start
-      // state.
-      if (!byte_prefix_.active() && byte_first_bytes_.sparse) {
-        int set = 0;
-        for (unsigned char b : byte_first_bytes_.list)
-          set += byte_commonness(b);
-        c.scan_cost =
-            set * 1000 * (AnchorChoice::kStopNs + AnchorChoice::kVerifyFwdNs);
+      // The scan's own skip when there is no literal prefix: Teddy, else
+      // the first-byte set — sparse is enough to price it: its bytes are
+      // where the DFA leaves its start state whether or not it jumps there.
+      switch (start_skip(byte_prefix_, byte_first_bytes_)) {
+      case StartSkip::Prefix: break;
+      case StartSkip::Teddy: c.scan_cost = teddy_cost(); break;
+      default:
+        if (byte_first_bytes_.sparse) c.scan_cost = first_bytes_cost();
       }
       c.kind = pick_anchor(c, /*dense_scans=*/true);
       if (c.kind != Kind::Suffix) suffix_ = SuffixPrefilter{};
@@ -9507,8 +9524,8 @@ private:
     template <size_t N> struct FirstBytes {
       std::array<bool, N> set{};       // bytes that can begin a match
       std::vector<unsigned char> list; // same set, listed for SIMD scan
-      bool ok = false;     // set is usable (grapheme prefilter only; the byte
-                           // tiers gate on byte_prefilter_ok_ below)
+      bool ok = false;     // the set was computed (the analysis did not
+                           // stop short: an empty match, a leading `.`)
       bool sparse = false; // set is small -> dead-byte skip pays
       // ... for the lazy DFA's start state: small AND rare. Each stop of the
       // skip costs what the DFA steps a dozen bytes in, so the jump has to
@@ -9532,11 +9549,16 @@ private:
                                       : 72;
       }
 
-      void rate() {
-        int density = 0;
+      // The summed commonness of the set's bytes: how often a scan meets
+      // one, per mille of prose.
+      int density() const {
+        int sum = 0;
         for (unsigned char b : list)
-          density += byte_commonness(b);
-        dfa_skip = sparse && density <= dfa_skip_bar(list.size());
+          sum += byte_commonness(b);
+        return sum;
+      }
+      void rate() {
+        dfa_skip = sparse && density() <= dfa_skip_bar(list.size());
       }
     };
     FirstBytes<128> first_bytes_;
@@ -9552,9 +9574,34 @@ private:
     LiteralPrefix byte_prefix_; // .icase unused (the (?i) byte
                                 // prefilter is icase_prefix_ below)
     FirstBytes<256> byte_first_bytes_;
-    bool byte_prefilter_ok_ =
-        false; // the byte DFAs' start state has something to skip with
-               // (byte_prefilter_skip): settled at the end of the ctor
+
+    // What a lazy DFA's start state skips with, to the next place a match
+    // can begin: the first searcher the plan has, in this order — or
+    // nothing. One decision for the grapheme program's DFAs (start_skip_:
+    // prefix_, first_bytes_; plan_prefilter_skip runs it) and one for the
+    // byte programs' (byte_start_skip_: byte_prefix_, byte_first_bytes_;
+    // byte_prefilter_skip), and what plan_anchor prices as the scan.
+    //
+    // Teddy goes ahead of the first-byte set always, not by estimate. It
+    // stops where a match very likely begins, at a pace that does not
+    // depend on the subject (14-17 GB/s). The first-byte scan is faster only
+    // for two or three bytes that are rare in the subject (`(?:Xavier|Zulu)s?`
+    // over prose: 34 GB/s against 15), and several times slower when they
+    // turn out not to be (`(?:xyzzy|quux)s?` over random letters: 1.5 against
+    // 14; `(?:fox|dog|cat)s?` over prose: 1.4 against 17) — and what the
+    // subject holds is not the plan's to know. A first-byte set is jumped to
+    // only when it is rare as well as small (FirstBytes::dfa_skip).
+    enum class StartSkip : uint8_t { None, Prefix, Teddy, FirstBytes };
+    StartSkip start_skip_ = StartSkip::None;
+    StartSkip byte_start_skip_ = StartSkip::None;
+    bool byte_skips() const { return byte_start_skip_ != StartSkip::None; }
+    template <size_t N>
+    StartSkip start_skip(const LiteralPrefix &prefix,
+                         const FirstBytes<N> &fb) const {
+      if (prefix.active()) return StartSkip::Prefix;
+      if (teddy_.ok) return StartSkip::Teddy;
+      return fb.ok && fb.dfa_skip ? StartSkip::FirstBytes : StartSkip::None;
+    }
 
     // Required-suffix-literal prefilter: when every match ends with a fixed
     // ASCII literal and everything before it is bounded-length, memchr/memmem
@@ -9885,14 +9932,9 @@ private:
     };
 
     // The Teddy searcher over the leading bytes every match begins with, when
-    // those are a small set of fixed strings (see analyze_teddy).
+    // those are a small set of fixed strings (see analyze_teddy): the
+    // literal-alternation tier's matcher, and a start skip (StartSkip).
     Teddy teddy_;
-    // On the EGC byte path, prefer Teddy over the byte first-byte skip only when
-    // the first-byte set is non-selective (would yield many DFA-verified
-    // candidates). Selective small sets (e.g. {H,W} for Holmes|Watson) are faster
-    // with the cheaper memchr/SIMD first-byte skip. Decided once at ctor; see the
-    // analyze_byte_prefilter follow-up.
-    bool byte_teddy_ = false;
     bool dfa_ok_ = false; // program is "regular" -> boolean match via lazy DFA
 
     // Like dfa_ok_, but also true when the only otherwise-DFA-breaking ops are
@@ -12769,7 +12811,8 @@ private:
             const Plan::ByteClasses &bc, bool rs, bool pf = true,
             bool leftmost_first = false)
         : re(&r), prog(&p), match_pc(mpc), reseed(rs), lf(leftmost_first),
-          use_prefilter(pf && r.plan_prefilter_any()) {
+          use_prefilter(pf &&
+                        r.plan_->start_skip_ != Plan::StartSkip::None) {
       // Nothing is allocated until the first scan (make_start): a rung
       // fetches its DFAs before it knows whether it will step them.
       if (bc.n) {
@@ -13448,20 +13491,17 @@ private:
   // jumped. Each returns the next viable offset, or >= n when none remains; `i`
   // comes back unchanged when the plan has no prefilter of that kind.
 
-  // Code-point-program prefilter: a literal prefix jumps to its next occurrence
-  // (memmem / the icase variant), a literal alternation uses Teddy (SIMD
-  // multi-substring), else a sparse first-byte set skips to the next viable
-  // byte. Only worth it when the first-byte set is sparse — otherwise the skip
-  // rarely fires.
-  // Whether plan_prefilter_skip has anything to skip with.
-  bool plan_prefilter_any() const {
-    return plan_->prefix_.active() || plan_->teddy_.ok ||
-           plan_->first_bytes_.dfa_skip;
-  }
-
+  // Grapheme-program skip (Plan::start_skip_): a literal prefix jumps to its
+  // next occurrence (memmem / the icase variant), a literal alternation uses
+  // Teddy (SIMD multi-substring), else a first-byte set that is small and
+  // rare skips to the next viable byte.
+  // (Tested in turn, here and below, not switched on: these are inlined into
+  // the DFA scans' start-state path, where the switch measured 6% slower on a
+  // scan that stops every few bytes.)
   REGEXLIB_ALWAYS_INLINE int plan_prefilter_skip(const unsigned char *p, int n,
                                                  int i) const {
-    if (plan_->prefix_.active()) {
+    const Plan::StartSkip skip = plan_->start_skip_;
+    if (skip == Plan::StartSkip::Prefix) {
       const unsigned char *np =
           reinterpret_cast<const unsigned char *>(plan_->prefix_.text.data());
       const unsigned char *h =
@@ -13474,21 +13514,22 @@ private:
                             plan_->prefix_.probe2);
       return h ? static_cast<int>(h - p) : n;
     }
-    if (plan_->teddy_.ok)
+    if (skip == Plan::StartSkip::Teddy)
       return static_cast<int>(plan_->teddy_.find(
           p, static_cast<size_t>(n), static_cast<size_t>(i)));
-    if (plan_->first_bytes_.dfa_skip)
+    if (skip == Plan::StartSkip::FirstBytes)
       return static_cast<int>(
           skip_to_first_byte(p, static_cast<size_t>(n), static_cast<size_t>(i)));
     return i;
   }
 
-  // Byte-program prefilter (EGC / byte tiers), same three rungs over the byte
-  // automaton's literals. All reason over bytes — ASCII needles never straddle
-  // a UTF-8 sequence — so they are sound on any UTF-8 subject.
+  // Byte-program skip (Plan::byte_start_skip_; EGC / byte tiers), the same
+  // over the byte automaton's literals. All reason over bytes — ASCII needles
+  // never straddle a UTF-8 sequence — so they are sound on any UTF-8 subject.
   REGEXLIB_ALWAYS_INLINE int byte_prefilter_skip(const unsigned char *p, int n,
                                                  int i) const {
-    if (plan_->byte_prefix_.active()) {
+    const Plan::StartSkip skip = plan_->byte_start_skip_;
+    if (skip == Plan::StartSkip::Prefix) {
       const unsigned char *h =
           find_substr(p + i, static_cast<size_t>(n - i),
                       reinterpret_cast<const unsigned char *>(
@@ -13497,10 +13538,10 @@ private:
                       plan_->byte_prefix_.probe, plan_->byte_prefix_.probe2);
       return h ? static_cast<int>(h - p) : n;
     }
-    if (plan_->byte_teddy_)
+    if (skip == Plan::StartSkip::Teddy)
       return static_cast<int>(plan_->teddy_.find(
           p, static_cast<size_t>(n), static_cast<size_t>(i)));
-    if (plan_->byte_first_bytes_.dfa_skip)
+    if (skip == Plan::StartSkip::FirstBytes)
       return static_cast<int>(
           skip_to_byte_start(p, static_cast<size_t>(n), static_cast<size_t>(i)));
     return i;
@@ -14580,7 +14621,7 @@ public:
                      re.plan_->lf_prog_.match_pc(), re.plan_->lf_prog_.classes,
                      /*reseed=*/false, /*pf=*/!re.plan_->us_,
                      /*leftmost_first=*/true);
-        if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_prefilter_ok_;
+        if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_skips();
         built(lfu_);
       }
       return *lfu_;
@@ -14604,7 +14645,7 @@ public:
                      re.plan_->byte_prog_.match_pc(),
                      re.plan_->byte_prog_.classes, /*reseed=*/true,
                      /*pf=*/false);
-        bfu_->byte_pf = re.plan_->byte_prefilter_ok_; // sound byte-level dead-skip
+        bfu_->byte_pf = re.plan_->byte_skips(); // sound byte-level dead-skip
         built(bfu_);
       }
       return *bfu_;
@@ -14630,7 +14671,7 @@ public:
                       re.plan_->byte_lf_prog_.match_pc(),
                       re.plan_->byte_lf_prog_.classes, /*reseed=*/false,
                       /*pf=*/false, /*leftmost_first=*/true);
-        blfu_->byte_pf = re.plan_->byte_prefilter_ok_;
+        blfu_->byte_pf = re.plan_->byte_skips();
         built(blfu_);
       }
       return *blfu_;
@@ -17539,7 +17580,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       // CodePoint: the start-state skip is a scan-time switch, on for a
       // subject long enough to repay it (see kBoolSkipBytes, and fu()).
       if (p.us_)
-        dfa.byte_pf = p.byte_prefilter_ok_ && n >= limits::kBoolSkipBytes;
+        dfa.byte_pf = p.byte_skips() && n >= limits::kBoolSkipBytes;
       e2 = dfa_forward_scan(dfa, text, 0);
     }
     if (e2 == LazyDfa::kCap) {
