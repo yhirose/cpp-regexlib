@@ -302,7 +302,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | Label | Gate | What runs |
 | --- | --- | --- |
 | `Literal` | `literal_only_` | memmem (+ grapheme-boundary check); no subject classification |
-| `LiteralAlt` | `literal_alt_` non-empty | Teddy / first-byte multi-literal scan, ordered verify |
+| `LiteralAlt` | `literal_alt_` non-empty | Teddy multi-literal scan, ordered verify of the literals behind the fingerprint found |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — u16 rows, accept byte off the dependency chain; a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
@@ -1082,40 +1082,74 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   3681 → 771; `(?i)Sherlock` ~6.3 → ~8.6 GB/s, `(?i)Holmes` ~2.7 → ~9.0.
 - **Teddy — SIMD multi-literal.** A literal alternation (`fox|dog|cat`) has no
   single prefix and a first-byte skip stops at every `f`/`d`/`c`. Teddy (the
-  Hyperscan / Rust-regex "slim" design) matches the leading `N` bytes of *all*
-  alternatives 16 positions at a time: each fingerprint owns one bit of an 8-bit
-  mask; per 16-byte chunk a `PSHUFB`/`TBL` nibble lookup plus a shifted-overlap AND
-  leaves a nonzero lane exactly where some literal's `N`-byte prefix occurs.
-  `N` is the longest fingerprint the shortest literal allows (capped at 4). NEON
-  and SSSE3 are hand-written; a scalar `teddy_hit` is the tail/fallback. The
-  SSSE3 scan (`_mm_shuffle_epi8`) is not part of the x86-64 baseline (SSE2 is),
-  so a plain `-O2` Release build defines neither `__SSSE3__` nor `-mssse3` and
-  used to silently fall to the scalar Teddy — a ~10–18× cliff on
-  literal-alternation patterns that hit every default Linux build (macOS is NEON;
-  cl.exe assumes an SSSE3 baseline). The scan now lives in a
-  `target("ssse3")`-tagged `teddy_scan_ssse3` reached through a cached
-  `cpu_has_ssse3()` runtime check (`__builtin_cpu_supports`, `REGEXLIB_SSSE3_DYNAMIC`
-  tier), so the PSHUFB path compiles at the SSE2 baseline and runs whenever the
-  CPU supports it — no build flag required. `REGEXLIB_DISABLE_SSSE3` forces the
-  scalar path (exotic toolchains / A-B testing). The same dispatch shape was
-  tried on `scan64_visit` for the VEX/AVX2 encoding win and **rejected on
-  measurement**: an attributed wrapper cannot inline into baseline callers, and
-  outlining the scan loses the caller fusion (probe + verify as one compiled
-  unit), costing more than VEX gains — see the comment at `scan64_visit`.
-  Host-tuned builds (`-march=native`, `REGEXLIB_ENABLE_NATIVE`) deliver that
-  win instead. Lifted
-  `fox|dog|cat` ~19 → ~390 MB/s. When **every** alternative is a full ASCII
-  literal (not just a shared prefix — `analyze_literal_alternation` → `literal_alt_`),
-  Teddy is not a prefilter but the matcher itself: `literal_alt_locate` takes the
-  Teddy hit, tries the literals in alternation order, and returns the span
-  directly with **no DFA verify** (a grapheme-boundary check keeps it sound on
-  any subject) — a pure-literal-alternation tier. A *mixed* alternation (some
-  branch not a bare literal) keeps Teddy as a candidate-finder feeding the DFA.
-  `teddy_next` dispatches the runtime fingerprint length to a compile-time-`N`
-  `teddy_scan<N>`, so the nibble tables live in registers instead of being
-  copied to a stack array per call (a 128-byte memmove that cost ~10% of the
-  tier — the iterator calls this once per match); the short-literal verify is
-  an inlined `bytes_eq` (the libc `memcmp` *call* was another ~20%).
+  Hyperscan / Rust aho-corasick "slim" design; `Regex::Teddy`) looks for the
+  leading `N` bytes of *all* alternatives — their fingerprints — a vector at a
+  time. Each fingerprint belongs to one of eight buckets, a bit of a byte; per
+  block a `PSHUFB`/`TBL` nibble lookup for each fingerprint position gives the
+  buckets every byte could be that position of, and a lane where `N`
+  consecutive bytes agree on a bucket is a candidate. `N` is the longest
+  fingerprint the shortest literal allows (capped at 4).
+  - *Up to 64 fingerprints.* Past eight they share buckets, and a shared
+    bucket lets through the strings that mix its members' nibbles. `build`
+    deals each fingerprint, most common first, to the bucket whose estimated
+    firing rate (`byte_commonness`) it raises least, and records which
+    buckets are `shared` (more than one fingerprint) and which of those are
+    `loose` (let through more than their own). A candidate in any other
+    bucket IS its fingerprint; one in a shared bucket is looked up
+    (`confirm`) — always for `find_print`, which reports which fingerprint
+    is there, and only in loose buckets for `find`, which reports where.
+    Sixteen names (`Sherlock|…|Stamford`) went from the DFA's 2.2 GB/s to
+    ~12; sixteen keywords from 0.87 to 3.3.
+  - *The scans.* One per vector type — 16 bytes (SSSE3, NEON) and 32 (AVX2) —
+    each carrying a block's lookups into the next, so a fingerprint that
+    straddles two blocks is found without re-reading and the scan advances
+    a whole vector per step (three literals, no match: 8.5 → 18 GB/s). The
+    last, partial block is put together zero-padded from overlapping word
+    loads (`tail_words`; a copy through a stack buffer cost a
+    store-forwarding stall on every short subject), and a range under six
+    bytes is walked with the same tables (`scan_scalar`, also the fallback
+    without SIMD): a lexer's nine operators on a three-byte token went from
+    30 ns a search to 12.
+  - *Dispatch.* SSSE3 (`_mm_shuffle_epi8`) is not part of the x86-64 baseline
+    (SSE2 is), and AVX2 is nobody's: a plain `-O2` Release build defines
+    neither, and once silently fell to the scalar scan — a ~10–18× cliff
+    on literal-alternation patterns that hit every default Linux build (macOS
+    is NEON; cl.exe assumes an SSSE3 baseline). The scans live in
+    `target("ssse3")` / `target("avx2")` functions (`scan_ssse3`,
+    `scan_avx2`) reached through cached runtime checks (`cpu_has_ssse3()`,
+    `cpu_has_avx2()`; `__builtin_cpu_supports`, the `REGEXLIB_SSSE3_DYNAMIC` /
+    `REGEXLIB_AVX2_DYNAMIC` tiers), so they compile at the SSE2 baseline and
+    run whenever the CPU supports them — no build flag required. A build
+    for AVX2 (`-mavx2`, `-march=native`, `/arch:AVX2`) takes the 32-byte scan
+    at compile time. `REGEXLIB_DISABLE_AVX2` keeps a build on the 16-byte
+    scan and `REGEXLIB_DISABLE_SSSE3` on the scalar one (exotic toolchains /
+    A-B testing). The same dispatch shape was tried on `scan64_visit` for
+    the VEX/AVX2 encoding win and **rejected on measurement**: an attributed
+    wrapper cannot inline into baseline callers, and outlining the scan
+    loses the caller fusion (probe + verify as one compiled unit), costing
+    more than VEX gains — see the comment at `scan64_visit`. Host-tuned
+    builds (`-march=native`, `REGEXLIB_ENABLE_NATIVE`) deliver that win
+    instead.
+  - *As the matcher.* When **every** alternative is a full ASCII literal
+    (not just a shared prefix — `analyze_literal_alternation` →
+    `literal_alt_`), Teddy is not a prefilter but the matcher itself:
+    `literal_alt_locate` takes the fingerprint `find_print` names, tries the
+    literals that begin with it in alternation order (`literal_alt_` keeps
+    them grouped by fingerprint, `literal_alt_at_`), and returns the span
+    directly with **no DFA verify** (a
+    grapheme-boundary check keeps it sound on any subject) — a
+    pure-literal-alternation tier. The short-literal compare is an inlined
+    `bytes_eq` (the libc `memcmp` *call* was ~20% of the tier).
+  - *As a start skip.* A *mixed* alternation (some branch not a bare literal)
+    keeps Teddy as the candidate-finder of the lazy DFAs' start state and of
+    the Pike. What a start state skips with is one decision per program
+    family (`StartSkip`: a literal prefix, Teddy, a first-byte set that is
+    small and rare, or nothing), and Teddy goes ahead of the first-byte set
+    — always, not by estimate. It
+    stops where a match very likely begins, at a pace that does not depend
+    on the subject; the first-byte scan is faster only for two or three
+    bytes that are rare in the subject, and several times slower when they
+    turn out not to be.
 - **First-byte (dead-byte) skip** — the generalization of a literal prefix to a
   leading first-byte *set* (`analyze_first_bytes` over the start ε-closure).
   `skip_to_first_byte` is tiered by set size (1 → `memchr`; ≤ 8 → NEON/SSE2 scan;
@@ -1226,7 +1260,10 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
     previous one read (`a[^.]*!`-shaped bodies ran 2× behind the scan);
   - a class-led pattern weighs the suffix / interior literal against its own
     start set, and takes the scan when the set is the rarer event
-    (`[A-Z][a-z]+s`: a capital is rarer than an `s`, ~0.55 → ~1.4 GB/s);
+    (`[A-Z][a-z]+s`: a capital is rarer than an `s`, ~0.55 → ~1.4 GB/s). A
+    pattern led by a literal alternation is priced as what its scan skips
+    with instead — Teddy's own pace plus its estimated candidates
+    (`teddy_cost`, `kTeddyScanNs`);
   - with captures the order stays prefix-first: the one-pass capture drivers
     take the prefix as their candidate source and yield the groups in the
     same walk.

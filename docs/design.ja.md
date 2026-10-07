@@ -288,7 +288,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | ラベル | ゲート | 動作 |
 | --- | --- | --- |
 | `Literal` | `literal_only_` | memmem（+ 書記素境界チェック）；subject 分類なし |
-| `LiteralAlt` | `literal_alt_` 非空 | Teddy / 先頭バイト複数リテラルスキャン、順序付き verify |
+| `LiteralAlt` | `literal_alt_` 非空 | Teddy 複数リテラルスキャン、見つかった fingerprint で始まるリテラルの順序付き verify |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——u16 行、accept バイトは依存チェーン外。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
@@ -993,31 +993,60 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
   固定なので、ヒットは単一の候補開始を特定——窓歩行は不要。CRLF Sherlock corpus 上の
   停止 3681 → 771；`(?i)Sherlock` ~6.3 → ~8.6 GB/s、`(?i)Holmes` ~2.7 → ~9.0。
 - **Teddy — SIMD 複数リテラル。** リテラル選択（`fox|dog|cat`）は単一前置を持たず
-  first-byte スキップは毎 `f`/`d`/`c` で止まる。Teddy（Hyperscan / Rust-regex の
-  "slim" 設計）は*全*候補の先頭 `N` バイトを 16 位置同時に照合：各 fingerprint が
-  8 ビットマスクの1ビットを持ち、16 バイトチャンクごとに `PSHUFB`/`TBL` ニブル
-  ルックアップ＋シフト重ね AND で、いずれかのリテラルの `N` バイト前置が現れる lane
-  だけ非零になる。`N` は最短リテラルが許す最長 fingerprint（最大4）。NEON と SSSE3 は
-  手書き、scalar `teddy_hit` が末尾/フォールバック。SSSE3 スキャン（`_mm_shuffle_epi8`）
-  は x86-64 ベースライン（SSE2）に含まれないため、素の `-O2` Release は `__SSSE3__` も
-  `-mssse3` も持たず、以前は無言で scalar Teddy に落ちていた――リテラル選択パターンで
-  ~10–18× の崖となり、既定の Linux ビルド全てが踏んでいた（macOS は NEON、cl.exe は
-  SSSE3 ベースラインを仮定）。現在このスキャンは `target("ssse3")` を付けた
-  `teddy_scan_ssse3` に置き、キャッシュ済み `cpu_has_ssse3()` の実行時判定
-  （`__builtin_cpu_supports`、`REGEXLIB_SSSE3_DYNAMIC` tier）経由で呼ぶので、PSHUFB
-  パスは SSE2 ベースラインでコンパイルされ CPU が対応していれば動く――ビルドフラグ不要。
-  `REGEXLIB_DISABLE_SSSE3` で scalar パスを強制できる（特殊なツールチェーン / A-B 計測）。
-  `fox|dog|cat` を ~19 → ~390 MB/s。
-  **全**候補が完全な ASCII リテラル（共有前置だけでなく――`analyze_literal_alternation`
-  → `literal_alt_`）のときは、Teddy は prefilter ではなくマッチャそのものになる：
-  `literal_alt_locate` が Teddy ヒットを取り、リテラルを選択順に試して span を
-  **DFA 検証なし**で直接返す（グラフェム境界チェックでどの subject でも健全）――
-  純リテラル選択 tier。*混在*選択（素のリテラルでない枝を含む）では Teddy は従来どおり
-  DFA に候補を供給する候補発見器のまま。`teddy_next` は実行時の fingerprint 長を
-  コンパイル時 `N` の `teddy_scan<N>` にディスパッチします：ニブル表が呼び出し毎に
-  スタック配列へコピーされる（128 バイトの memmove——イテレータはマッチ毎に呼ぶので
-  tier の ~10%）代わりにレジスタに住み、短リテラル検証はインライン `bytes_eq`
-  （libc `memcmp` の *call* がさらに ~20% だった）。
+  first-byte スキップは毎 `f`/`d`/`c` で止まる。Teddy（Hyperscan / Rust aho-corasick の
+  "slim" 設計。`Regex::Teddy`）は*全*候補の先頭 `N` バイト（fingerprint）をベクトル
+  1 本ぶん同時に照合する。各 fingerprint は 8 個のバケット（1 バイトの 1 ビット）の
+  どれかに属し、ブロックごとに fingerprint の各位置について `PSHUFB`/`TBL` のニブル
+  ルックアップで「そのバイトがその位置になりうるバケット」を求め、連続する `N` バイトが
+  同じバケットで一致した lane が候補になる。`N` は最短リテラルが許す最長 fingerprint
+  （最大4）。
+  - *fingerprint は 64 個まで。* 8 個を超えるとバケットを共有し、共有バケットは
+    メンバーのニブルを混ぜた文字列も通す。`build` は fingerprint を頻度の高い順に、
+    見積もった発火率（`byte_commonness`）の増分が最小のバケットへ配り、どのバケットが
+    `shared`（fingerprint が 2 個以上）で、そのうちどれが `loose`（自分のもの以外も
+    通す）かを記録する。それ以外のバケットの候補は fingerprint そのもの。共有バケットの
+    候補は照合する（`confirm`）——どの fingerprint かを返す `find_print` では常に、
+    位置だけを返す `find` では loose なバケットだけ。人名 16 個（`Sherlock|…|Stamford`）
+    は DFA の 2.2 GB/s から約 12 に、キーワード 16 個は 0.87 から 3.3 に。
+  - *走査。* ベクトルの型ごとに 1 つ——16 バイト（SSSE3、NEON）と 32 バイト（AVX2）。
+    どれもブロックのルックアップを次のブロックへ繰り越すので、2 ブロックにまたがる
+    fingerprint を読み直しなしで見つけ、1 ステップでベクトル 1 本ぶん進む（リテラル
+    3 個・マッチなし：8.5 → 18 GB/s）。最後の端数ブロックは、重なり合うワード読み
+    からゼロ詰めで組み立てる（`tail_words`。スタックのバッファ経由のコピーは、短い
+    主題のたびに store-forwarding の待ちを起こした）。6 バイト未満の範囲は同じ表で
+    1 位置ずつ歩く（`scan_scalar`。SIMD の無い環境のフォールバックでもある）：
+    レクサの演算子 9 種を 3 バイトのトークンに当てる search は 30 ns から 12 ns に。
+  - *切り替え。* SSSE3（`_mm_shuffle_epi8`）は x86-64 ベースライン（SSE2）に含まれず、
+    AVX2 はどの環境のベースラインでもない。素の `-O2` Release はどちらも定義しない
+    ので、以前は無言で scalar の走査に落ちていた——リテラル選択パターンで ~10–18× の
+    崖となり、既定の Linux ビルド全てが踏んでいた（macOS は NEON、cl.exe は SSSE3
+    ベースラインを仮定）。走査は `target("ssse3")` / `target("avx2")` を付けた関数
+    （`scan_ssse3`、`scan_avx2`）に置き、キャッシュ済みの実行時判定（`cpu_has_ssse3()`、
+    `cpu_has_avx2()`。`__builtin_cpu_supports`、`REGEXLIB_SSSE3_DYNAMIC` /
+    `REGEXLIB_AVX2_DYNAMIC` tier）経由で呼ぶので、SSE2 ベースラインでコンパイルされ、
+    CPU が対応していれば動く——ビルドフラグ不要。AVX2 向けのビルド（`-mavx2`、
+    `-march=native`、`/arch:AVX2`）は 32 バイトの走査をコンパイル時に選ぶ。
+    `REGEXLIB_DISABLE_AVX2` で 16 バイトの走査に、`REGEXLIB_DISABLE_SSSE3` で scalar の
+    走査に固定できる（特殊なツールチェーン / A-B 計測）。同じ切り替えの形を
+    `scan64_visit` にも試したが、**計測のうえ不採用**：属性付きのラッパーは
+    ベースラインの呼び出し元へインライン展開できず、走査を外に出すと呼び出し元との
+    融合（probe と verify が 1 つのコンパイル単位になること）を失い、VEX の得より
+    損が大きい——`scan64_visit` のコメントを参照。その分はホスト向けビルド
+    （`-march=native`、`REGEXLIB_ENABLE_NATIVE`）が得る。
+  - *マッチャとして。* **全**候補が完全な ASCII リテラル（共有前置だけでなく——
+    `analyze_literal_alternation` → `literal_alt_`）のときは、Teddy は prefilter では
+    なくマッチャそのものになる：`literal_alt_locate` が `find_print` の返す
+    fingerprint を取り、それで始まるリテラルを選択順に試して（`literal_alt_` は
+    fingerprint ごとにまとめて並べてある。`literal_alt_at_`）、span を **DFA 検証なし**で直接返す（グラフェム境界チェックでどの subject でも
+    健全）——純リテラル選択 tier。短リテラルの比較はインライン `bytes_eq`（libc
+    `memcmp` の *call* が tier の ~20% だった）。
+  - *開始スキップとして。* *混在*選択（素のリテラルでない枝を含む）では、Teddy は
+    lazy DFA の開始状態と Pike の候補発見器になる。開始状態が何で読み飛ばすかは
+    プログラムの系統ごとに 1 回決める（`StartSkip`：リテラル前置、Teddy、小さくて稀な
+    先頭バイト集合、なし）。Teddy は先頭バイト集合より常に優先——見積もりでは
+    選ばない。Teddy はマッチが始まりそうな所で止まり、その速さは主題に
+    よらない。先頭バイトの走査が速いのは、主題の中で稀な 2〜3 バイトのときだけで、
+    稀でなかった場合は数倍遅い。
 - **first-byte（dead-byte）スキップ** — リテラル前置の先頭 first-byte *集合* への
   一般化（`analyze_first_bytes` が開始 ε-閉包から収集）。`skip_to_first_byte` は集合
   サイズで階層化（1 → `memchr`；≤8 → NEON/SSE2 スキャン；それ以上 → 表引き）、
@@ -1107,7 +1136,9 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
     走査の半分の速さでした）。
   - クラス始まりのパターンは、接尾／中間リテラルを自身の開始集合と比べ、集合の
     ほうが稀なら走査を取ります（`[A-Z][a-z]+s`：大文字は `s` より稀。
-    ~0.55 → ~1.4 GB/s）。
+    ~0.55 → ~1.4 GB/s）。リテラル選択で始まるパターンは、走査が読み飛ばしに使う
+    ものの値段で比べます——Teddy 自身の速さ＋見積もった候補数（`teddy_cost`、
+    `kTeddyScanNs`）。
   - キャプチャがあるときは前置優先のままです：one-pass のキャプチャドライバが前置を
     候補源に取り、同じ歩行でグループも出すためです。
 
