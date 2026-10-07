@@ -52,6 +52,78 @@ struct PlanProbe {
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
            !p.first_bytes_.ok && !p.cap_bitstate_;
   }
+  // Whether the plan's byte classes are exact, for each program it computed
+  // them for: classes numbered in byte order, and no instruction that tells
+  // two bytes of one class apart (checked against lazy_inst_matches, the
+  // question the lazy DFA asks). `max_insts` skips a program too long to be
+  // worth the walk here.
+  static bool classes_exact(const Regex &re, size_t max_insts = ~size_t{0}) {
+    using Op = reg::detail::Inst::Op;
+    const auto &p = *re.plan_;
+    auto ok = [&](const reg::detail::Program &prog,
+                  const Regex::Plan::ByteClasses &bc) {
+      if (!bc.n || prog.insts.size() > max_insts) return true;
+      int rep[256];
+      std::fill(std::begin(rep), std::end(rep), -1);
+      unsigned next = 0;
+      for (int b = 0; b < 256; b++) {
+        const unsigned c = bc.cls[static_cast<size_t>(b)];
+        if (c >= bc.n) return false;
+        if (rep[c] < 0) {
+          if (c != next++) return false;
+          rep[c] = b;
+        }
+      }
+      if (next != bc.n) return false;
+      for (const auto &in : prog.insts) {
+        if (in.op != Op::Byte && in.op != Op::Char && in.op != Op::Class &&
+            in.op != Op::Any)
+          continue;
+        for (int b = 0; b < 256; b++)
+          if (p.lazy_inst_matches(prog, in, static_cast<unsigned char>(b)) !=
+              p.lazy_inst_matches(
+                  prog, in,
+                  static_cast<unsigned char>(
+                      rep[bc.cls[static_cast<size_t>(b)]])))
+            return false;
+      }
+      return true;
+    };
+    return ok(p.prog_, p.prog_classes_) &&
+           ok(p.rev_prog_.prog, p.rev_prog_.classes) &&
+           ok(p.lf_prog_.prog, p.lf_prog_.classes) &&
+           ok(p.byte_prog_.prog, p.byte_prog_.classes) &&
+           ok(p.byte_rev_prog_.prog, p.byte_rev_prog_.classes) &&
+           ok(p.byte_lf_prog_.prog, p.byte_lf_prog_.classes) &&
+           ok(p.inner_.pre_rev.prog, p.inner_.pre_rev.classes);
+  }
+  // Whether a lazy DFA of the thread's cache of `re` was built over a
+  // program the plan had computed no byte classes for (see
+  // Plan::plan_byte_classes): it works, a column per byte, and is a plan
+  // that forgot a program.
+  static bool unplanned_dfa(const Regex &re) {
+    const Regex::FindCache &c = re.thread_cache();
+    for (const std::optional<Regex::LazyDfa> *d :
+         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
+          &c.blfa_, &c.inrev_})
+      if (*d && (*d)->unplanned) return true;
+    return false;
+  }
+  // The lazy DFAs of a cache, built small: `bytes` of cache each, and
+  // `min_clears` refills before a fill has to have paid for itself (see
+  // LazyDfa). What `c` holds is dropped, so the settings are what its next
+  // scan builds with — until it is bound to another Regex.
+  static void dfa_cache(const Regex &re, Regex::FindCache &c, size_t bytes,
+                        uint32_t min_clears) {
+    c.rebind(re);
+    c.dfa_bytes_ = bytes;
+    c.dfa_min_clears_ = min_clears;
+  }
+  // ... and the same for the calling thread's own cache of `re`, which
+  // search / test / match and the cache-less finds draw on.
+  static void dfa_cache(const Regex &re, size_t bytes, uint32_t min_clears) {
+    dfa_cache(re, re.thread_cache(), bytes, min_clears);
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -286,6 +358,49 @@ reg::Regex *pike_reference(const std::string &pat, unsigned flags = 0) {
   return pike_reference(pat, flags, reg::MatchUnit::Grapheme);
 }
 
+// The lazy DFAs' cache budget, shrunk for some of the patterns. Stock, a DFA
+// holds megabytes and no generated pattern comes near filling it, so the two
+// things a full cache does would never run: clear and refill from the state
+// the scan stands in (every state id but that one dies, the table moves,
+// the start state is made again), and give up for the Pike in the middle of
+// a scan. A cache of a few hundred bytes does one or the other every few
+// steps, at every entry point — search / test / match and the cache-less
+// finds through the thread's cache of `re`, the rest through `held`.
+//
+// Which patterns, and how small, comes from the pattern's text (and `salt`,
+// for the layers that run one pattern in both match units), not from the
+// run's generator: the patterns a seed draws stay the ones it drew before.
+// Most keep the stock budget. The shared cache of check_shared_cache always
+// does — it is bound to a different Regex each time, which resets it.
+//
+// (Every layer that builds a Regex to check passes it through here, so this
+// is also where a sample of the patterns have their plan's byte classes
+// checked against the programs they were computed for.)
+void squeeze_dfa_cache(const reg::Regex &re, const std::string &pat,
+                       unsigned salt = 0,
+                       reg::Regex::FindCache *held = nullptr) {
+  std::uint32_t h = 2166136261u ^ salt;
+  for (unsigned char c : pat)
+    h = (h ^ c) * 16777619u;
+  h ^= h >> 15;
+  // One pattern in sixteen also has its byte classes checked against its
+  // programs, instruction by instruction (see classes_exact) — whatever the
+  // scans below happen to step.
+  if ((h >> 20) % 16 == 0 &&
+      !reg::detail::PlanProbe::classes_exact(re, /*max_insts=*/6000))
+    fail("byte classes merge bytes an instruction tells apart", pat, "");
+  const unsigned mode = h % 8;
+  if (mode < 5) return; // stock
+  // From "every new state clears" up to "a few dozen states".
+  static const size_t kBytes[] = {280, 420, 700, 1400, 4000};
+  const size_t bytes = kBytes[(h >> 8) % 5];
+  // Mostly: refill for as long as it takes (clearing is what gets
+  // exercised). Else the give-up, at once or after a refill or two.
+  const std::uint32_t min_clears = mode < 7 ? ~0u : (h >> 16) % 3;
+  reg::detail::PlanProbe::dfa_cache(re, bytes, min_clears);
+  if (held) reg::detail::PlanProbe::dfa_cache(re, *held, bytes, min_clears);
+}
+
 // Oracle-free self-consistency checks on a single match.
 void check_match(const reg::MatchResult &m, const std::string &s,
                  const std::string &pat, const std::string &subj) {
@@ -434,6 +549,12 @@ void check_scan(const reg::Regex &re, const std::string &subj,
   }
   if (i != all.size())
     fail("scan() yielded fewer matches than find_all", pat, subj);
+  // Every lazy DFA this pattern has built on this thread so far — by the
+  // searches above and the scan just run — found its byte classes in the
+  // plan.
+  if (reg::detail::PlanProbe::unplanned_dfa(re))
+    fail("a lazy DFA was built over a program without plan classes", pat,
+         subj);
 
   // split() must yield exactly all.size()+1 pieces whose concatenation, with
   // each matched text spliced back in order, reconstructs the subject.
@@ -624,6 +745,7 @@ void invariant_fuzz_unicode(int iters) {
       continue;
     }
     reg::Regex::FindCache cache; // reused across this pattern's subjects
+    squeeze_dfa_cache(*re, pat, 0, &cache);
     for (int s = 0; s < 5; s++) {
       std::string subj = gen_usubject();
       reg::MatchResult m;
@@ -679,6 +801,7 @@ void check_pattern(const std::string &pat,
   // matches. Null when the wrap hit a limit; the differential is skipped.
   reg::Regex *pike = pike_reference(pat);
   reg::Regex::FindCache cache; // reused across this pattern's subjects
+  squeeze_dfa_cache(*re, pat, 0, &cache);
   for (const std::string &subj : subjects) {
     reg::MatchResult m;
     std::vector<reg::MatchResult> all;
@@ -840,6 +963,7 @@ void check_us_vs_pike(const std::string &pat,
     delete us;
     return; // wrap limit
   }
+  squeeze_dfa_cache(*us, pat, /*salt=*/1);
   for (const std::string &subj : subjects) {
     std::vector<reg::MatchResult> all, ref;
     reg::MatchResult one;
@@ -1676,6 +1800,7 @@ void invariant_fuzz_literal(int iters) {
     reg::Regex *pike = pike_reference(pat);
     if (!pike) continue;
     reg::Regex::FindCache cache;
+    squeeze_dfa_cache(re, pat, 0, &cache);
     for (int s = 0; s < 6; s++) {
       int k = U(0, 14);
       std::string subj;
@@ -1763,6 +1888,7 @@ void invariant_fuzz_assert_suffix(int iters) {
       continue;
     }
     reg::Regex::FindCache cache;
+    squeeze_dfa_cache(*re, pat, ml, &cache);
     for (int s = 0; s < 6; s++) {
       int k = U(0, 16);
       std::string subj;
@@ -1810,6 +1936,8 @@ void invariant_fuzz_assert_unicode(int iters) {
       fail("non-RegexError at construction (assert-uni)", pat, "");
       continue;
     }
+    squeeze_dfa_cache(*re, pat,
+                      flags + (unit == reg::MatchUnit::CodePoint ? 1 : 0));
     reg::Regex *pike = pike_reference(pat, flags, unit);
     for (int s = 0; s < 6; s++) {
       std::string subj = gen_au_subject();
@@ -1891,6 +2019,7 @@ void invariant_fuzz_us(int iters) {
       delete us;
       continue;
     }
+    squeeze_dfa_cache(*us, pat, f + 1); // the oracle keeps the stock budget
     for (int s = 0; s < 6; s++) {
       std::string subj = gen_us_subject();
       std::vector<reg::MatchResult> au, ae;

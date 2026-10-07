@@ -57,7 +57,7 @@ subject's content:
 | capture-free, DFA-able | non-ASCII, but every cluster is one code point | **EGC byte-path** DFA (§4) |
 | capture-free, DFA-able | non-ASCII with a real multi-code-point cluster | grapheme **Pike** (§4) |
 | has captures, DFA-able | (any) | DFA locates the span, then a **capture engine** (§6) |
-| lookaround / nested empty loop / DFA state-cap overflow | (any) | grapheme **Pike** — the fallback (§2) |
+| lookaround / nested empty loop / a DFA that gave up on its cache (§2) | (any) | grapheme **Pike** — the fallback (§2) |
 
 The grapheme Pike VM (§1) is the one proven baseline; every other row is an
 accelerator that must return *exactly* what the Pike would. §9 is how that
@@ -193,6 +193,62 @@ is recovered by a **reverse byte DFA** scanning a reversed program leftward from
 *Pike* would need the grapheme `Segmented`, defeating tier-1's no-segmentation
 win — hence a byte DFA.
 
+### The table: byte classes, row offsets, a byte budget
+
+What a step costs is decided by the table it reads, so the table is built to
+be small and to be read once.
+
+- **A column per byte class, not per byte.** Two bytes that no instruction of
+  the program tells apart always take the same transition, so they share a
+  column. The classes are computed once per program, when the plan is built
+  (`byte_classes`, kept in `ByteClasses` next to each program a `LazyDfa`
+  can run over), and without walking a byte automaton: the compiler lists
+  the byte ranges it emits (`byte_ranges`), and a large class block — a
+  Unicode `\w` is ~470 distinct ranges in 5,000 instructions — carries the
+  classes of its own ranges, worked out once per process where the block is
+  cached (`ClassBlock`); the program's are those, refined by each other and
+  by the loose ranges (`refine_byte_classes`). A grapheme program is small
+  and is walked, each distinct operand asked for the ASCII bytes it accepts
+  (`ascii_mask`; that program is only ever stepped by bytes on an all-ASCII
+  subject: `lazy_inst_matches`). What a program's classes cost a first
+  construction is about half a microsecond, and only the programs a
+  `LazyDfa` can run over get them (`plan_byte_classes`: none for a pure
+  literal, an assert-only or a Pike-only plan); a DFA takes them with a
+  256-byte copy. `[a-zA-Z]+ing` has 6 classes, a pattern over a
+  Unicode `\w` about 100; classes are numbered in byte order, so the ASCII
+  ones are the first columns of every row and sit in one or two cache
+  lines. A row used to be 256 entries — 1 KB — whatever the pattern.
+- **A state's id is the offset of its row.** All rows live back to back in one
+  array, and a step is `tr[s + cls[byte]]`: an add and a load on the
+  dependency chain, nothing to scale. The entry in front of a row holds the
+  state's flags (accept, the leftmost-first commit, dead, and "this is the
+  start state"); the scans load them off that chain and test them with one
+  mask. They are deliberately not packed into the id (an AND on the chain
+  measured ~12% slower).
+- **States are interned through a hash set into contiguous storage**, each
+  state's program counters packed as byte-sized differences. A state of a
+  Unicode-class pattern holds its program counters by the hundred, and they
+  — not the rows — are most of what a big DFA weighs: `[a-q][^u-z]{13}x`,
+  15,587 states, went from ~1,750 to ~300 bytes a state, and its first scan
+  of a 595 KB text (which builds every one of them) from 301 ms to 48 ms.
+- **The scan loops keep the prefilter out.** The start-state skip
+  (`dfa_start_skip`) is a call the loop makes when a state's flags say so;
+  inlined, the searchers behind it took the loop's registers and the loop
+  kept its cursor and its table on the stack.
+
+Stepping regexlib's own DFAs over the Sherlock text, before and after (MB/s;
+the two-pass chain with no prefilter — matches are dense in the first row
+and sparse or absent in the rest, where the forward scan is all of it): `\w+` 168 → 196, `[a-zA-Z]+ing` 337 → 792,
+`[a-q][^u-z]{13}x` 109 → 392, `Holmes.{0,25}Watson|Watson.{0,25}Holmes`
+617 → 887, `[a-z]+ [a-z]+ [a-z]+ \.` 490 → 889. A cold `search()` that has
+to build its DFA first is typically 2–3× quicker (`/\*.*?\*/` in CodePoint
+mode: 11.4 → 3.6 µs), up to 6× over Unicode classes.
+
+The assert DFAs (`AssertDfa` and its byte / reverse kin) keep their own
+representation — 257- or 129-wide rows of packed edges. The same layout
+measured ×1.3–1.6 on their forward scan in a prototype; it has not been
+applied.
+
 ### Tier dispatch
 
 Three tiers, picked structurally from the pattern:
@@ -202,7 +258,7 @@ Three tiers, picked structurally from the pattern:
 | **1** | capture-free ∧ DFA-able | Forward ordered+cut DFA finds the leftmost-first end `e`; the reverse scan finds the start `s`; return `[s, e)`. **No Pike.** Covers the ASCII grapheme tier, the UTF-8 byte tier (§4/§5), and `^ $ \b \A \z` via an assertion-aware DFA. Targets `\w+`, `[a-z]+`, literals, general alternation (`a\|ab`, `(?m)^…\|…$`). |
 | **2** | captures ∧ DFA-able | The lf DFA locates `[s, e)`, then a capture engine resolves groups *bounded by `e`* (§6). A pattern whose every group wraps the whole match (`(\w+)`) never reaches this tier: it is planned as its capture-free twin (§3, *Root groups*). |
 | **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the grapheme assert DFA (ASCII subject) or the **byte** assert DFA (`ByteAssertDfa`: a non-ASCII EGC subject, or **US mode on any subject** — see below). |
-| **3** | DFA-ineligible (lookaround / nested empty-loop) or state-cap overflow | Pike VM over the whole subject, with the §7 prefilters. The fallback. |
+| **3** | DFA-ineligible (lookaround / nested empty-loop), or a DFA that gave up on its cache | Pike VM over the whole subject, with the §7 prefilters. The fallback. |
 
 `dfa_ok_` = "regular" program (no lookaround, no `Op::Loop`); `dfa_assert_ok_`
 additionally admits empty-width assertions, served by the assertion DFA. Both
@@ -257,9 +313,9 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | `ByteAssertDfa` / `ByteAssertRevDfa`, same prefilters; `+cap` is US-only (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
-Both ladders try their eligible tiers top-down and fall through on a DFA
-state cap; `Pike` is the proven baseline every other tier must agree with
-(§9).
+Both ladders try their eligible tiers top-down and fall through when a DFA
+gives up on its cache; `Pike` is the proven baseline every other tier must
+agree with (§9).
 
 ### The find ladder
 
@@ -318,8 +374,8 @@ byte the one-pass table has no transition for: this one match comes from the
 rung below (`Ladder::below`), and the next step asks the walk again.
 *Globally* — its budget, its profitability rule: the rung is given up for the
 rest of the scan (a flag in the ladder that nothing sets back), and
-`ladder_pick` is asked again. A DFA state cap downgrades to the Pike from the
-cursor, and so does a fused scan that meets a cluster it cannot vet; the
+`ladder_pick` is asked again. A DFA that gives up downgrades to the Pike
+from the cursor, and so does a fused scan that meets a cluster it cannot vet; the
 fused scans re-classify instead (`ladder_unfused`) when their budget runs
 out, and — the CRLF-collapse variant — on a subject it is not eligible for,
 which the gated families usually serve.
@@ -487,11 +543,35 @@ looping byte also takes the start state there, so a walk begun inside the
 run converges with the one that entered it — if that one failed, all of
 them do), and the position scan resumes there instead of at the next byte.
 
-### Safety net: the DFA state cap
+### Safety net: the DFA cache budget
 
-Interned states are bounded; exceeding the cap abandons the DFA and falls back to
-the Pike VM (unaffected). Keeps a pathological `dfa_ok_` pattern (`.*a.{18}`
-needs 2¹⁸ states) from exhausting memory.
+A regular pattern can still need exponentially many DFA states (`.*a.{18}`
+needs 2¹⁸), so a lazy DFA's cache — its table and its interned states — is
+bounded: `limits::kDfaCacheBytes`, 8 MiB per DFA (of contents; the vectors'
+growth slack is on top). It used to be bounded in states, 65,536 of them,
+which was 64 MB of table alone and over 100 MB once the states' own lists
+were counted.
+
+**A full cache is cleared and refilled**, not abandoned: the scan carries on
+from the state it stands in, and the DFA keeps running on the states the
+subject is using now. Clearing is invisible to a scan but for two things it
+must re-read after any miss — the table's address, and, by way of the flags,
+which state is the start state (it is made again at once).
+
+**The DFA gives up only when refilling does not pay.** Scans report the
+bytes they step; once a cache has been refilled `limits::kDfaMinClears` (3)
+times, a fill that covered fewer than `limits::kDfaMinBytesPerState` (10)
+bytes per state it built means states are being built about as fast as
+bytes are read. The DFA then answers `kCap` on its next miss and for good
+— what it has built still answers — and the rung downgrades to the Pike VM
+from the cursor. (The rule is RE2's and `regex-automata`'s. What a refill
+costs against the Pike depends on the pattern: for `[ae].{20}[ae]` in
+CodePoint mode, building a state costs ~1.9 µs and the Pike ~50 ns a byte,
+so the two break even near 40 bytes a state; for a small ASCII pattern,
+nearer 7.)
+
+The assert DFAs are not byte-budgeted: they keep a state cap
+(`limits::kMaxDfaStates`), and fall back to their uncached scans past it.
 
 ---
 
@@ -832,7 +912,7 @@ The ordered+cut DFA locates the leftmost-first `[s, e)`; groups are then resolve
 | --- | --- | --- |
 | **CpOnePass** (`build_cp_onepass`) | the pattern is one-pass; span is all single-code-point | A deterministic capture-recording DFA: pc-set states, each transition carrying `(next state, bitmask of capture slots to set here)`. Records captures in one forward pass at ~DFA speed. Built in two flavours: *uncut* (the full accept set — a longest-match engine, run bounded by `e` or with an accept-at-`n` condition) and *leftmost-first cut* (each state's closure is explored in thread-priority order and truncated at its first `Match`, so an unbounded walk's last accept is the exact leftmost-first end; sound for Alt-free greedy-only programs, where priority order is ascending pc). The per-byte step is **one packed `u32` load** — next-state id, capture-write mask id and a next-state-accepts bit in a single word — instead of three loads from separate arrays (three cache lines on the dependency chain); a state that self-loops on some ASCII bytes with no slot write (a repeat run like `\S+`, `\d+`, `[^"]*`) skips the whole run with one SIMD membership scan (`run_scan`) instead of a dependent load per byte — engaged once per state *entry*. The looping set is a 16-byte nibble table (low nibble → row, high nibble → bit; two table lookups test 16 bytes, exact for any ASCII set), built at construction: no exit-count cap and no per-call exit-list splat, which is what makes it pay on the dozen-byte tokens real data is made of (an exit-set `scan64` with a scalar pre-probe lost there — its per-call setup outweighed the skipped bytes). The step table has 256 entries with the non-ASCII half dead, so the per-byte loop carries no `≥ 0x80` test; a non-ASCII code point in the span aborts it (→ BitState). |
 | **BitState** (`bitstate_bytes`) | not one-pass; span ≤ `kBitStateCap` | Bounded leftmost-first backtracking over `cp_prog_` on the located span, decoding code points on the fly (no segmentation), with a visited bitmap over `(pc, byte-pos)` so it stays O(prog × span); capture writes undo on backtrack. |
-| **code-point Pike** (`run_saves` on `cp_prog_` + `segment_cp`) | span overflow, or a DFA state-cap that drops the whole pattern | The universal fallback. |
+| **code-point Pike** (`run_saves` on `cp_prog_` + `segment_cp`) | span overflow, or a DFA giving up that drops the whole pattern | The universal fallback. |
 
 All engines are leftmost-first over the same NFA, so they agree with the
 grapheme engine. (A whole-match capture — every group == the whole match,
@@ -1241,8 +1321,8 @@ Every form is the find ladder (§2, *The find ladder*) with a different sink.
 place, or nothing kept); `find_iter()` holds the scan (`Finder`) and takes one
 step per `++`, a row at a time; `find_all()` takes the same step told to run
 to the end, appending rows; `find_at()` is one step of a scan seeked to a
-position. A DFA rung that hits the state cap mid-scan downgrades to the Pike
-VM and continues from the current cursor.
+position. A DFA rung whose DFA gives up mid-scan (§2, the cache budget)
+downgrades to the Pike VM and continues from the current cursor.
 
 ### Cross-call DFA reuse (`FindCache`)
 
@@ -1275,8 +1355,9 @@ the thread-local one does, and a caller's may: **a rung that reads a cached
 DFA runs on a cache bound to its Regex**, and a scan that keeps a cache across
 calls (`Finder`) binds it at the start of every step that can reach such a
 rung, in one place (`Finder::scratch`); a one-step find gets its cache from
-`thread_cache()`, which hands it out bound. A cache that trips the state cap
-simply keeps falling back — correct, just unaccelerated.
+`thread_cache()`, which hands it out bound. A cache whose DFA has given up
+(§2, the cache budget) simply keeps falling back at that DFA's next miss —
+correct, just unaccelerated from there.
 
 `MatchIter` additionally owns its **own** `Scratch` (Pike/backtracker state),
 so it is safe across a suspension point (a `++` boundary where the caller
@@ -1393,8 +1474,8 @@ assumption; a self-consistency check is not a substitute.
 
 ## Invariants (non-negotiable)
 
-- **Linear time / ReDoS immunity** — single forward pass, reverse clamp, state
-  cap; no engine backtracks unboundedly.
+- **Linear time / ReDoS immunity** — single forward pass, reverse clamp, a
+  bounded DFA cache; no engine backtracks unboundedly.
 - **Leftmost-first for every pattern** — the ordered+cut DFA needs no
   longest-safe predicate, so no class of pattern silently gets a non-Perl answer.
 - **Grapheme semantics are the contract** — a class is decided by the cluster's

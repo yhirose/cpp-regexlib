@@ -1556,10 +1556,21 @@ constexpr int kMaxNestingDepth = 200;
 constexpr long kStepsPerPos = 1 << 11; // 2048 ε-closure steps per position
 constexpr long kStepsBase = 1 << 20;   // slack so short subjects never trip
 
-// Lazy-DFA state cap. A "regular" pattern can still need exponentially many DFA
-// states (e.g. `.*a.{18}` needs 2^18), so bound the interned state count; the
-// matcher abandons the DFA and falls back to the Pike VM (which is unaffected)
-// when this is exceeded. See docs/design.md.
+// Lazy-DFA cache budget. A "regular" pattern can still need exponentially many
+// DFA states (e.g. `.*a.{18}` needs 2^18), so each lazy DFA's cache — its
+// transition table and its interned states — is bounded in bytes. A full cache
+// is cleared and refilled from where the scan stands, so the DFA keeps running
+// on the states the subject is actually using. It is abandoned for the Pike
+// VM (which is unaffected) only when clearing does not pay: once it has been
+// refilled kDfaMinClears times, a fill that covered fewer than
+// kDfaMinBytesPerState subject bytes per state it built. See docs/design.md.
+constexpr size_t kDfaCacheBytes = size_t{8} << 20; // 8 MiB per DFA
+constexpr uint32_t kDfaMinClears = 3;
+constexpr uint64_t kDfaMinBytesPerState = 10;
+
+// State cap of the assertion DFAs (AssertDfa and its byte / reverse kin),
+// whose tables are not byte-budgeted: past it they answer kCap and the matcher
+// falls back.
 constexpr int kMaxDfaStates = 1 << 16; // 65536 interned DFA states
 
 // Bounded-backtracking (BitState) capture engine cap: it visits each (pc, pos)
@@ -2986,6 +2997,7 @@ struct Parser {
 //------------------------------------------------------------------------------
 
 struct Program; // defined below; referenced by Inst::sub
+struct ClassBlock; // a cached class sub-automaton; defined with the compiler
 
 struct Inst {
   // clang-format off
@@ -3041,6 +3053,125 @@ struct Inst {
   void set_byte(unsigned char lo, unsigned char hi) { x = lo | (hi << 8); }
 };
 
+// Byte classes: a partition of the 256 byte values such that the bytes of one
+// class are told apart by none of a set of tests (a program's consuming
+// instructions, for the lazy DFA, whose table has a column per class instead
+// of one per byte — see Regex::LazyDfa and Plan::byte_classes). Classes are
+// numbered in byte order: the class of byte 0 is 0, and a class's number is
+// the count of classes that begin below its first byte.
+struct ByteClasses {
+  std::array<uint8_t, 256> cls; // byte -> class
+  uint32_t n = 0;               // how many; 0 = not built
+};
+
+// The tests, gathered as EVENTS: a test is one bit of a byte's signature, and
+// an event is a byte value at which the test's answer flips (it accepts `at`
+// and not `at - 1`, or the other way round). A range [lo, hi] is two events;
+// a set of ASCII bytes is one per run boundary.
+struct ByteTests {
+  struct Event {
+    uint16_t at; // 0..256
+    uint32_t bit;
+  };
+  std::vector<Event> events;
+  uint32_t nbits = 0;
+
+  void range(unsigned lo, unsigned hi) {
+    if (lo > hi) return; // accepts nothing
+    events.push_back({static_cast<uint16_t>(lo), nbits});
+    events.push_back({static_cast<uint16_t>(hi + 1), nbits});
+    nbits++;
+  }
+
+  // The ASCII bytes whose bits are set in `m` (bit b of the pair for byte b;
+  // a byte >= 0x80 is not in it).
+  void ascii_set(const std::array<uint64_t, 2> &m) {
+    // The flips are the bits of m ^ (m << 1), over 129 positions: byte 128
+    // flips back whatever byte 127 left on.
+    const uint64_t flips[3] = {m[0] ^ (m[0] << 1),
+                               m[1] ^ ((m[1] << 1) | (m[0] >> 63)),
+                               m[1] >> 63};
+    for (unsigned wd = 0; wd < 3; wd++)
+      for (uint64_t f = flips[wd]; f; f &= f - 1)
+        events.push_back(
+            {static_cast<uint16_t>(wd * 64 + bit_ctz64(f)), nbits});
+    nbits++;
+  }
+
+  // The partition: sweep the byte values in order, flipping the bits whose
+  // events fall on each, so that `cur` is the byte's signature. A byte with
+  // no event has its neighbor's class; one with events is looked up among
+  // the signatures seen so far (bucketed by a hash, compared in full).
+  ByteClasses classes() const {
+    ByteClasses bc;
+    uint32_t first[258] = {}; // events of byte b: order[first[b]..first[b+1])
+    for (const Event &e : events)
+      first[e.at + 1u]++;
+    for (int b = 0; b < 257; b++)
+      first[b + 1] += first[b];
+    // (Scratch that outlives the call, here and in Plan::byte_classes: a
+    // construction should not leave half a dozen freed blocks behind it.)
+    static thread_local std::vector<uint32_t> order;
+    order.assign(events.size(), 0);
+    {
+      uint32_t fill[257];
+      std::copy(first, first + 257, fill);
+      for (const Event &e : events)
+        order[fill[e.at]++] = e.bit;
+    }
+    const size_t w = nbits ? (nbits + 63) / 64 : 1;
+    static thread_local std::vector<uint64_t> cur, sigs; // sigs: one
+    cur.assign(w, 0);                                    // signature per
+    sigs.clear();                                        // class
+    int16_t bucket[512];
+    std::fill(std::begin(bucket), std::end(bucket), int16_t{-1});
+    for (int b = 0; b < 256; b++) {
+      if (b > 0 && first[b] == first[b + 1]) {
+        bc.cls[static_cast<size_t>(b)] = bc.cls[static_cast<size_t>(b) - 1];
+        continue;
+      }
+      for (uint32_t i = first[b]; i < first[b + 1]; i++)
+        cur[order[i] >> 6] ^= uint64_t{1} << (order[i] & 63);
+      uint64_t hash = 0x9E3779B97F4A7C15ull;
+      for (uint64_t x : cur)
+        hash = (hash ^ x) * 0x9E3779B97F4A7C15ull;
+      size_t slot = static_cast<size_t>(hash >> 55); // 9 bits
+      while (bucket[slot] >= 0 &&
+             !std::equal(cur.begin(), cur.end(),
+                         sigs.begin() + bucket[slot] * static_cast<long>(w)))
+        slot = (slot + 1) & 511;
+      if (bucket[slot] < 0) {
+        bucket[slot] = static_cast<int16_t>(bc.n++);
+        sigs.insert(sigs.end(), cur.begin(), cur.end());
+      }
+      bc.cls[static_cast<size_t>(b)] = static_cast<uint8_t>(bucket[slot]);
+    }
+    return bc;
+  }
+};
+
+// Refine `a` by `b`: afterwards two bytes share a class of `a` iff they shared
+// one in both. How the partition of a program is put together from those of
+// its parts — each part's computed once, wherever the part is cached.
+inline void refine_byte_classes(ByteClasses &a, const ByteClasses &b) {
+  int32_t key[512]; // open addressing on (a's class, b's class)
+  int16_t val[512];
+  std::fill(std::begin(key), std::end(key), -1);
+  uint32_t n = 0;
+  for (size_t i = 0; i < 256; i++) {
+    const int32_t k = (static_cast<int32_t>(a.cls[i]) << 8) | b.cls[i];
+    size_t slot = (static_cast<uint32_t>(k) * 0x9E3779B1u) >> 23; // 9 bits
+    while (key[slot] != -1 && key[slot] != k)
+      slot = (slot + 1) & 511;
+    if (key[slot] == -1) {
+      key[slot] = k;
+      val[slot] = static_cast<int16_t>(n++);
+    }
+    a.cls[i] = static_cast<uint8_t>(val[slot]);
+  }
+  a.n = n;
+}
+
 struct Program {
   std::vector<Inst> insts;
   // Out-of-line operand pools, indexed by Inst::{lit,cls,sub}_idx. Indices are
@@ -3049,6 +3180,17 @@ struct Program {
   std::vector<CharClass> classes;             // Class operands
   std::vector<std::shared_ptr<Program>> subs; // lookaround bodies
   int nslots = 2; // 2 per group; group 0 is the whole match
+  // What the program's Op::Byte instructions test, kept by the compiler as it
+  // emits them so that the byte classes of a byte automaton (Plan::
+  // byte_classes) come from a short list instead of a walk over its
+  // instructions, which a repeated Unicode class copies by the hundred
+  // thousand. `byte_ranges` holds the [lo, hi] of the instructions emitted
+  // one at a time and of the small class blocks, as lo | hi << 8, each once
+  // or more; `byte_blocks` the large class blocks (a Unicode `\w` is ~470
+  // distinct ranges), each once, which bring their classes ready-made
+  // (ClassBlock::classes). Every Op::Byte of the program is on one of the two.
+  std::vector<uint16_t> byte_ranges;
+  std::vector<const ClassBlock *> byte_blocks;
 };
 
 //------------------------------------------------------------------------------
@@ -3239,15 +3381,32 @@ inline const std::vector<ByteSeq> &utf8_ranges_cached(const CpRanges &rs) {
 // sequence falls through. Only Split/Jmp carry targets — Op::Byte advances by
 // fall-through (the matcher never reads Byte::x), so a block can be appended at
 // any base offset by adding the base to just the Split/Jmp targets.
-inline std::vector<Inst> build_class_block(const std::vector<ByteSeq> &seqs,
-                                           bool reverse) {
-  std::vector<Inst> b;
+//
+// The block comes with the distinct byte ranges it tests (Program::
+// byte_ranges): collected once here, they are what every later emission of the
+// block adds to its program's list.
+//
+// A block of many ranges also brings the byte classes of those ranges
+// (`classes`), computed here once per process: the program's are then a
+// refinement by it (refine_byte_classes) instead of a pass over hundreds of
+// ranges for every program the class appears in.
+struct ClassBlock {
+  std::vector<Inst> insts;
+  std::vector<uint16_t> ranges; // distinct, as lo | hi << 8
+  ByteClasses classes;          // of `ranges`; built iff there are many
+  static constexpr size_t kManyRanges = 32;
+};
+
+inline ClassBlock build_class_block(const std::vector<ByteSeq> &seqs,
+                                    bool reverse) {
+  ClassBlock blk;
+  std::vector<Inst> &b = blk.insts;
   if (seqs.empty()) { // matches nothing: a byte range that can never match
     Inst i;
     i.op = Inst::Op::Byte;
-    i.set_byte(1, 0); // never matches: lo > hi
+    i.set_byte(1, 0); // never matches: lo > hi (and so no range to list)
     b.push_back(i);
-    return b;
+    return blk;
   }
 
   size_t need = 2 * seqs.size(); // a split + a jmp per non-final sequence
@@ -3261,6 +3420,7 @@ inline std::vector<Inst> build_class_block(const std::vector<ByteSeq> &seqs,
       i.op = Inst::Op::Byte;
       i.set_byte(br.first, br.second);
       b.push_back(i);
+      blk.ranges.push_back(static_cast<uint16_t>(i.x));
     };
     if (!reverse)
       for (const auto &br : s)
@@ -3292,7 +3452,16 @@ inline std::vector<Inst> build_class_block(const std::vector<ByteSeq> &seqs,
   for (int j : jmps)
     b[j].x = end;
 
-  return b;
+  std::sort(blk.ranges.begin(), blk.ranges.end());
+  blk.ranges.erase(std::unique(blk.ranges.begin(), blk.ranges.end()),
+                   blk.ranges.end());
+  if (blk.ranges.size() > ClassBlock::kManyRanges) {
+    ByteTests tests;
+    for (uint16_t k : blk.ranges)
+      tests.range(k & 0xFFu, k >> 8);
+    blk.classes = tests.classes();
+  }
+  return blk;
 }
 
 // A whole emitted class block, memoized by (code-point set, direction). A
@@ -3303,9 +3472,8 @@ inline std::vector<Inst> build_class_block(const std::vector<ByteSeq> &seqs,
 // (Inst is trivially copyable since the operand-pool split), independent of how
 // large the class expands. Mutex-guarded; the returned reference stays valid
 // because std::map never relocates or erases existing nodes.
-inline const std::vector<Inst> &class_block_cached(const CpRanges &rs,
-                                                   bool reverse) {
-  static std::map<std::pair<CpRanges, bool>, std::vector<Inst>> cache;
+inline const ClassBlock &class_block_cached(const CpRanges &rs, bool reverse) {
+  static std::map<std::pair<CpRanges, bool>, ClassBlock> cache;
   static std::mutex mu;
   std::lock_guard<std::mutex> lk(mu);
   auto key = std::make_pair(rs, reverse);
@@ -3408,6 +3576,7 @@ struct Compiler {
       by.op = Inst::Op::Byte;
       by.set_byte(0x00, 0xFF);
       c.prog.insts.push_back(by);
+      c.prog.byte_ranges.push_back(static_cast<uint16_t>(by.x));
       Inst jm;
       jm.op = Inst::Op::Jmp;
       jm.x = 0;
@@ -3424,6 +3593,9 @@ struct Compiler {
   }
 
   int here() const { return static_cast<int>(prog.insts.size()); }
+
+  // The class blocks already on prog's lists (see append_block).
+  std::vector<const ClassBlock *> listed_;
 
   int push(Inst i) {
     if (static_cast<int>(prog.insts.size()) >= limits::kMaxProgramInsts)
@@ -3516,6 +3688,7 @@ struct Compiler {
       Inst i;
       i.op = Inst::Op::Byte;
       i.set_byte(b, b);
+      prog.byte_ranges.push_back(static_cast<uint16_t>(i.x));
       push(std::move(i));
     }
   }
@@ -3619,13 +3792,25 @@ struct Compiler {
   // Append a cached class block onto the program and rebase its self-relative
   // Split/Jmp targets onto the current base. Op::Byte advances by fall-through,
   // so only Split/Jmp carry targets to fix up.
-  void append_block(const std::vector<Inst> &block) {
+  void append_block(const ClassBlock &blk) {
+    const std::vector<Inst> &block = blk.insts;
     if (static_cast<int>(prog.insts.size() + block.size()) >=
         limits::kMaxProgramInsts)
       throw RegexError(RegexError::Code::ProgramTooLarge,
                        "regex pattern too large (compiled program too big)");
     int base = here();
     prog.insts.insert(prog.insts.end(), block.begin(), block.end());
+    // What it tests goes on the program's lists the first time the block
+    // does (a cached block's address is its identity): the block itself if
+    // it has its classes, else its ranges.
+    if (std::find(listed_.begin(), listed_.end(), &blk) == listed_.end()) {
+      listed_.push_back(&blk);
+      if (blk.classes.n)
+        prog.byte_blocks.push_back(&blk);
+      else
+        prog.byte_ranges.insert(prog.byte_ranges.end(), blk.ranges.begin(),
+                                blk.ranges.end());
+    }
     for (size_t i = base; i < prog.insts.size(); i++) {
       Inst &in = prog.insts[i];
       if (in.op == Inst::Op::Split) {
@@ -3653,10 +3838,10 @@ struct Compiler {
   // (emit_utf8_ranges) stays for `.` and the icase single-char literal, whose
   // ranges do not come from a CharClass.
   void emit_class(const CharClass &cc) {
-    static std::map<std::vector<char32_t>, std::vector<Inst>> cache;
+    static std::map<std::vector<char32_t>, ClassBlock> cache;
     static std::mutex mu;
     std::vector<char32_t> key = class_key(cc, icase_, reverse_);
-    const std::vector<Inst> *block;
+    const ClassBlock *block;
     {
       std::lock_guard<std::mutex> lk(mu);
       auto it = cache.find(key);
@@ -4973,7 +5158,7 @@ public:
       int end = dfa_forward_lf(cache.lfa(*this), text, 0);
       if (end >= 0) return build_dfa_result(text, 0, end);
       if (end == -1) return MatchResult{};
-      // end == kCap: DFA state cap exceeded — fall through to the Pike VM.
+      // end == kCap: the DFA gave up — fall through to the Pike VM.
     }
 
     // [Tier: Dfa/Ascii+cap] ASCII captures (longest-safe or not): the anchored
@@ -5234,7 +5419,8 @@ private:
   // decides which engine family the scan STARTS on. A rung that cannot go on
   // says why: locally (a byte it does not handle — this one match comes from
   // the rung below, and the next step asks it again) or globally (its
-  // budget, a DFA state cap — the rung is given up for the rest of the scan).
+  // budget, a DFA that gave up — the rung is given up for the rest of the
+  // scan).
   //
   // The rungs. Coarser than the canonical [Tier: ...] labels (see design.md
   // "Tier dispatch"): the DFA family's rungs serve Dfa/US, Dfa/EgcByte and
@@ -5342,6 +5528,8 @@ private:
   struct Plan {
     struct Compiled; // an auxiliary compiled program; defined below
 
+    using ByteClasses = detail::ByteClasses;
+
     Plan(std::string_view pattern, unsigned flags, MatchUnit unit) {
       if (pattern.size() > limits::kMaxPatternBytes)
         throw RegexError(RegexError::Code::PatternTooLong,
@@ -5402,6 +5590,7 @@ private:
       } else {
         walk_driver_ = WalkDriver::Scan;
       }
+      plan_byte_classes();
       Regex::ladder_plan(*this);
     }
 
@@ -6697,7 +6886,8 @@ private:
       if (!dfa_ok_) return; // asserts/lookaround/loop break first-byte reasoning
       std::vector<int> startpcs;
       std::vector<char> seen(prog_.insts.size(), 0);
-      dfa_closure(prog_, {0}, startpcs, seen);
+      std::vector<int> stk{0};
+      dfa_closure(prog_, stk, startpcs, seen);
       for (int pc : startpcs) {
         Op op = prog_.insts[pc].op;
         if (op == Op::Match)
@@ -6769,7 +6959,8 @@ private:
       // here).
       std::vector<int> startpcs;
       std::vector<char> seen(prog.insts.size(), 0);
-      dfa_closure(prog, {0}, startpcs, seen);
+      std::vector<int> stk{0};
+      dfa_closure(prog, stk, startpcs, seen);
       for (int pc : startpcs) {
         Op op = prog.insts[pc].op;
         if (op == Op::Match)
@@ -8235,6 +8426,209 @@ private:
                                      icase_, dotall_);
     }
 
+    // The same question as the LAZY DFA asks it. A byte program is defined on
+    // every byte. A grapheme / code-point program stepped a byte at a time is
+    // defined on ASCII, where a byte is a code point: the lazy DFAs over one
+    // only ever run on an all-ASCII subject (ascii_grapheme_ok), and a byte
+    // >= 0x80 — part of a code point, not one — is consumed by nothing.
+    // (Which spares byte_classes below 128 class lookups per operand that no
+    // scan would use.)
+    bool lazy_inst_matches(const detail::Program &prog, const detail::Inst &in,
+                           unsigned char b) const {
+      if (in.op == detail::Inst::Op::Byte) return b >= in.blo() && b <= in.bhi();
+      return b < 0x80 && inst_matches_byte(prog, in, b);
+    }
+
+    // The ASCII bytes each class predicate accepts (bit b of the pair for
+    // byte b), from the predicates themselves, once.
+    static const std::array<uint64_t, 2> &pred_ascii(CharClass::Pred p) {
+      static const std::array<std::array<uint64_t, 2>, 6> table = [] {
+        std::array<std::array<uint64_t, 2>, 6> t{};
+        using P = CharClass::Pred;
+        auto put = [&](P is, P is_not, bool in, unsigned b) {
+          t[static_cast<size_t>(in ? is : is_not)][b >> 6] |= uint64_t{1}
+                                                              << (b & 63);
+        };
+        for (unsigned b = 0; b < 128; b++) {
+          put(P::Digit, P::NotDigit, detail::is_digit_cp(b), b);
+          put(P::Word, P::NotWord, detail::is_word_cp(b), b);
+          put(P::Space, P::NotSpace, detail::is_space_cp(b), b);
+        }
+        return t;
+      }();
+      return table[static_cast<size_t>(p)];
+    }
+
+    // The ASCII bytes the operand of `in` (a Char / Class / Any) accepts:
+    // inst_matches_byte over 0..127, by the short way where there is one — a
+    // literal is its one byte (or the bytes that fold with it), and a class
+    // of ranges and predicates is their union — and by asking about each
+    // byte where there is not (a case-insensitive class, a Unicode property,
+    // `.`).
+    std::array<uint64_t, 2> ascii_mask(const detail::Program &prog,
+                                       const detail::Inst &in) const {
+      using Op = detail::Inst::Op;
+      std::array<uint64_t, 2> m{0, 0};
+      auto set = [&](unsigned b) { m[b >> 6] |= uint64_t{1} << (b & 63); };
+      if (in.op == Op::Char) {
+        const std::u32string &lit = prog.lits[in.lit_idx()];
+        if (lit.size() != 1) return m; // more than a code point: no byte is
+        if (!icase_) {
+          if (lit[0] < 0x80) set(static_cast<unsigned>(lit[0]));
+          return m;
+        }
+        // Case-insensitive: the ASCII bytes that fold where it does (`k` and
+        // `K` for either, and for U+212A KELVIN SIGN).
+        static const std::array<char32_t, 128> folded = [] {
+          std::array<char32_t, 128> t{};
+          for (char32_t b = 0; b < 128; b++)
+            t[b] = detail::fold(b);
+          return t;
+        }();
+        const char32_t f = detail::fold(lit[0]);
+        for (unsigned b = 0; b < 128; b++)
+          if (folded[b] == f) set(b);
+        return m;
+      }
+      if (in.op == Op::Class && !icase_ &&
+          prog.classes[in.cls_idx()].uprops.empty()) {
+        const CharClass &cc = prog.classes[in.cls_idx()];
+        for (const auto &r : cc.ranges)
+          for (char32_t c = r.first; c <= r.second && c < 0x80; c++)
+            set(static_cast<unsigned>(c));
+        for (CharClass::Pred p : cc.preds) {
+          m[0] |= pred_ascii(p)[0];
+          m[1] |= pred_ascii(p)[1];
+        }
+        if (cc.negate) m = {~m[0], ~m[1]};
+        return m;
+      }
+      for (unsigned b = 0; b < 128; b++)
+        if (inst_matches_byte(prog, in, static_cast<unsigned char>(b))) set(b);
+      return m;
+    }
+
+    // Partition the 256 byte values into the classes of `prog`: two bytes
+    // share one iff every consuming instruction treats them alike, which is
+    // all a lazy-DFA transition can depend on (LazyDfa::next asks
+    // lazy_inst_matches and nothing else about the byte). Classes are
+    // numbered in byte order, so the ASCII bytes' are the low ones.
+    //
+    // A byte automaton's tests are its Op::Byte ranges, which the compiler
+    // listed as it emitted them (Program::byte_ranges / byte_blocks): a
+    // Unicode class is a few hundred distinct ranges however many thousand
+    // instructions, or copies of itself, it compiles to — and its own
+    // classes are worked out once per process. A grapheme / code-point
+    // program is small, and is walked: each Char / Class / Any operand's
+    // ASCII bytes (ascii_mask), once per pool entry, and one test per
+    // distinct set of them — every letter of a literal is one, every `\w`
+    // the same one.
+    //
+    // A walked program with an assertion, a lookaround or a guarded loop is
+    // not one a LazyDfa runs over: it gets none (n == 0).
+    ByteClasses byte_classes(const detail::Program &prog) const {
+      using Op = detail::Inst::Op;
+      static thread_local detail::ByteTests tests;
+      tests.events.clear();
+      tests.nbits = 0;
+      uint64_t have[1024] = {}; // ranges already taken: a bit per (lo, hi)
+      auto range_once = [&](uint16_t k) {
+        if (have[k >> 6] & (uint64_t{1} << (k & 63))) return;
+        have[k >> 6] |= uint64_t{1} << (k & 63);
+        tests.range(k & 0xFFu, k >> 8);
+      };
+      const bool listed =
+          (!prog.byte_ranges.empty() || !prog.byte_blocks.empty()) &&
+          prog.lits.empty() && prog.classes.empty();
+      if (listed) {
+        tests.events.reserve(2 * prog.byte_ranges.size());
+        for (uint16_t k : prog.byte_ranges)
+          range_once(k);
+      } else {
+        static thread_local std::vector<char> lit_seen, cls_seen;
+        lit_seen.assign(prog.lits.size(), 0);
+        cls_seen.assign(prog.classes.size(), 0);
+        bool any_seen = false;
+        using Mask = std::array<uint64_t, 2>;
+        static thread_local std::vector<Mask> masks;
+        masks.clear();
+        // A mask goes on the list unless the last one that hashed where it
+        // does was the same: the letters of a long literal alternation
+        // repeat, and the sort below should see each a few times, not a
+        // thousand.
+        Mask recent[64];
+        std::fill(std::begin(recent), std::end(recent), Mask{0, 0});
+        auto take = [&](const detail::Inst &in) {
+          const Mask m = ascii_mask(prog, in);
+          Mask &r = recent[((m[0] ^ m[1]) * 0x9E3779B97F4A7C15ull) >> 58];
+          if (r == m && (m[0] | m[1])) return;
+          r = m;
+          masks.push_back(m);
+        };
+        for (const detail::Inst &in : prog.insts) {
+          switch (in.op) {
+          case Op::Byte:
+            range_once(static_cast<uint16_t>(in.blo() | (in.bhi() << 8)));
+            break;
+          case Op::Any:
+            if (!any_seen) take(in);
+            any_seen = true;
+            break;
+          case Op::Char:
+            if (!lit_seen[static_cast<size_t>(in.lit_idx())]) take(in);
+            lit_seen[static_cast<size_t>(in.lit_idx())] = 1;
+            break;
+          case Op::Class:
+            if (!cls_seen[static_cast<size_t>(in.cls_idx())]) take(in);
+            cls_seen[static_cast<size_t>(in.cls_idx())] = 1;
+            break;
+          case Op::Split:
+          case Op::Jmp:
+          case Op::Save:
+          case Op::Match: break;
+          default: return ByteClasses{}; // not a lazy-DFA program
+          }
+        }
+        std::sort(masks.begin(), masks.end());
+        masks.erase(std::unique(masks.begin(), masks.end()), masks.end());
+        for (const Mask &m : masks)
+          tests.ascii_set(m);
+      }
+      ByteClasses bc = tests.classes();
+      if (listed)
+        for (const detail::ClassBlock *blk : prog.byte_blocks)
+          detail::refine_byte_classes(bc, blk->classes);
+      return bc;
+    }
+
+    // The classes of every program a LazyDfa can be built over, by the
+    // FindCache slot that builds it. Once per plan, so that building a DFA —
+    // which every thread does for itself — costs a 256-byte copy. And only
+    // for those programs: a plan served without a LazyDfa (a pure literal's
+    // memmem, the assert DFAs, the Pike alone) is left as it was — for what
+    // the work costs a first construction, and for what it leaves behind
+    // (the scans that follow a construction ran measurably slower for their
+    // first dozen passes with it done: a 10 us literal scan, 13 -> 17 us).
+    // A LazyDfa built over a program left out here still works, a column
+    // per byte (see its constructor); the fuzzer fails a run that builds one.
+    void plan_byte_classes() {
+      if (literal_only_) return; // Rung::Literal, and match()'s memcmp
+      auto classes = [&](Compiled &c) {
+        if (c.ok()) c.classes = byte_classes(c.prog);
+      };
+      if (dfa_ok_) { // the US / ASCII DFA families
+        prog_classes_ = byte_classes(prog_); // fu, lfa
+        classes(rev_prog_);                  // rv
+        classes(lf_prog_);                   // lfu
+      }
+      if (byte_path_) { // the EGC byte family
+        classes(byte_prog_);     // bfu, blfa
+        classes(byte_rev_prog_); // brv
+        classes(byte_lf_prog_);  // blfu
+      }
+      classes(inner_.pre_rev); // inrev
+    }
+
     // Does the consuming instruction `in` (Char/Class/Any) match grapheme `g`?
     // The per-position test all three Pike VMs run over their thread list; `g`
     // is null past the end of the subject, where nothing consumes.
@@ -8250,9 +8644,10 @@ private:
       }
     }
 
-    // Capture-free ε-closure: from `seeds`, follow Jmp/Split/Save and collect the
-    // reachable consuming (Char/Class/Any) and Match program counters of `prog`.
-    void dfa_closure(const detail::Program &prog, std::vector<int> stk,
+    // Capture-free ε-closure: from the seeds in `stk`, follow Jmp/Split/Save
+    // and collect the reachable consuming (Char/Class/Any) and Match program
+    // counters of `prog`. `stk` is the work stack: it comes back empty.
+    void dfa_closure(const detail::Program &prog, std::vector<int> &stk,
                      std::vector<int> &out, std::vector<char> &seen) const {
       using Op = detail::Inst::Op;
       while (!stk.empty()) {
@@ -8283,6 +8678,7 @@ private:
     }
 
     detail::Program prog_;
+    ByteClasses prog_classes_; // prog_'s, for the lazy DFA (see byte_classes)
     detail::Program cp_prog_; // US: code-point program for the Pike VM (see ctor)
 
     // !us_ captures: cp_prog_ is built and bitstate-eligible (dfa_ok_, so no
@@ -8635,6 +9031,7 @@ private:
     // program built" flag.
     struct Compiled {
       detail::Program prog;
+      ByteClasses classes; // for the programs a LazyDfa runs over
       int match_pc() const { return static_cast<int>(prog.insts.size()) - 1; }
       bool ok() const { return !prog.insts.empty(); }
     };
@@ -11741,8 +12138,9 @@ private:
 
   struct Scratch; // reusable Pike VM buffers, defined below
 
-  // Packed DFA edge. Every CACHED transition stores the destination id plus
-  // the flags the scan loops test at every byte — accept, leftmost-first
+  // Packed edge of the ASSERT DFAs (the plain LazyDfa keeps its flags per
+  // state, in its own layout — see there). Every CACHED transition stores the
+  // destination id plus the flags the scan loops test at every byte — accept, leftmost-first
   // front (match is the highest-priority thread), and dead (empty state set)
   // — so a step is ONE table load. The old layout spread these over parallel
   // arrays (trans + accept/acc + status/frnt + dead): three to four dependent
@@ -11759,12 +12157,32 @@ private:
     kEdgeDead = 1 << (kEdgeIdBits + 2),
   };
 
-  // Shared lazy-DFA driver. A state is a sorted, de-duplicated set of program
-  // counters (interned to an int id); byte transitions are built on demand. A
-  // state is accepting if it contains `match_pc`. `next` returns the
-  // destination state, or kCap if the interned-state count exceeds the cap (the
-  // caller then falls back to the Pike VM). Drives the boolean test() DFA and
-  // the forward/reverse find DFAs over either the forward or reverse program.
+  // Shared lazy-DFA driver. A state is a set of program counters — sorted and
+  // de-duplicated, or in priority order with the match cut when `lf` — and
+  // byte transitions are built on demand. A state is accepting if it contains
+  // `match_pc`. Drives the boolean test() DFA and the forward/reverse find
+  // DFAs over either the forward or reverse program.
+  //
+  // The table is ONE array of rows, a row per state, a column per BYTE CLASS:
+  // bytes no instruction of the program tells apart share a column (`cls`),
+  // so a row is as wide as the pattern is varied, not 256 entries — a handful
+  // for `[a-z]+ing`, ~100 for a Unicode `\w`, whose ASCII columns come first
+  // (classes are numbered in byte order) and so sit together at the row's
+  // head. A state's id IS the offset of its row (premultiplied), which makes
+  // a step `tr[s + cls[byte]]`: one add and one load on the dependency chain,
+  // into a table several times denser in cache than a 1 KB row per state.
+  // The entry in front of a row holds the state's flags (accept / front /
+  // dead), which the scans read OFF that chain, next to the columns they are
+  // about to load.
+  //
+  // The cache is bounded in BYTES (`budget`), not states. Full, it is cleared
+  // and refilled from the state the scan is in — a DFA with more states than
+  // fit keeps running as a DFA on the ones the subject is using. It gives up
+  // (next() answers kQuit, the scan kCap, and the caller falls back to the
+  // Pike VM) only when clearing is not paying: after `min_clears` refills, a
+  // fill that took fewer than limits::kDfaMinBytesPerState subject bytes per
+  // state built means states are being built about as fast as bytes are
+  // read, and that is the Pike's work done the slow way.
   struct LazyDfa {
     // Pointers (not references) so LazyDfa is a regular movable value type: it
     // lives inside std::optional in a FindCache and, in future, inside a pooled
@@ -11786,110 +12204,283 @@ private:
     bool byte_pf = false; // EGC byte path: use the byte-program prefilter
                           // (byte_prefix_.text memmem / byte first-byte skip),
                           // which is sound over arbitrary UTF-8
-    std::map<std::vector<int>, int> intern;
-    std::vector<std::vector<int>> states;
-    std::vector<char> accept;
-    // Flat per-state status: bit0 dead (empty set), bit1 front (lf commit). The
-    // scan loop reads this single byte instead of dereferencing the states[]
-    // vector-of-vectors (states[s].empty() / states[s].front()) every step — one
-    // cache-line load, not a heap indirection. The big win is the reverse-verify
-    // scans (e.g. `[a-q][^u-z]{13}x`), which walk many bytes per candidate.
-    std::vector<uint8_t> status;
-    static constexpr uint8_t kDead = 1, kFront = 2;
-    std::vector<std::array<int, 256>> trans; // 256 so US (byte) DFA can index
-                                             // any byte; EGC uses only 0..127
-    std::vector<char> seen;
-    int start_state = -1; // interned start state, invariant per DFA (cached)
-    static constexpr int kCap = -2;
+    bool quit = false;    // gave up (see above): every miss answers kQuit.
+                          // What is cached still answers, so a scan that
+                          // stays on built transitions is still a DFA scan.
+    bool unplanned = false; // built over a program without plan classes
+
+    static constexpr uint32_t kUnknown = 0xFFFFFFFFu; // transition not built
+    static constexpr uint32_t kQuit = 0xFFFFFFFEu;    // next(): gave up
+    static constexpr int kCap = -2; // what a scan returns for kQuit
+    // State flags (the entry in front of the state's row).
+    static constexpr uint32_t kDead = 1;   // empty set: nothing can match
+    static constexpr uint32_t kFront = 2;  // lf: the match is the highest-
+                                           // priority thread -> committed
+    static constexpr uint32_t kAccept = 4; // contains match_pc
+    static constexpr uint32_t kStart = 8;  // the start state: where a forward
+                                           // scan may skip ahead (see
+                                           // dfa_start_skip)
+
+    uint8_t cls[256];    // byte -> column of its class
+    uint32_t stride = 0; // entries per state: the flags + one per class
+    // Rows back to back: [flags][column 0][column 1]... A state id is the
+    // index of its column 0, so tr[s - 1] is its flags and tr[s + cls[b]] its
+    // transition on byte b (kUnknown until built).
+    std::vector<uint32_t> tr;
+    // The interned states: each one's pc list is a slice of `pcs` (packed,
+    // see pack()), found through an open-addressing set of state numbers
+    // (`slots`, 0 = empty). The lists are most of what a big DFA weighs — a
+    // state of a Unicode-class pattern holds its pcs by the hundred — so they
+    // are stored as byte-sized differences, about a quarter of an int each.
+    struct State {
+      uint32_t off, len; // its packed pcs: pcs[off .. off + len)
+      uint32_t hash;
+    };
+    std::vector<State> states;
+    std::vector<uint8_t> pcs;
+    std::vector<uint32_t> slots;
+    uint32_t start_state = kUnknown; // invariant per DFA (cached); re-made
+                                     // by a clear
+
+    // Bytes of table + states the cache may hold, and the refills allowed
+    // before a fill has to pay. Set by the FindCache that builds the DFA.
+    size_t budget = limits::kDfaCacheBytes;
+    uint32_t min_clears = limits::kDfaMinClears;
+    uint32_t clears = 0;
+    // Subject bytes stepped since the last clear. Scans report what they
+    // stepped when they return and when they miss (see next()).
+    uint64_t scanned = 0;
+
+    std::vector<char> seen;        // closure scratch (per program inst)
+    std::vector<int> seeds_, out_; // next()'s scratch: no allocation per miss
+    std::vector<uint8_t> key_;     // ... and the packed form of out_
 
     // `reseed` is part of the DFA's identity: the transition tables for the
     // unanchored (re-seeding) and anchored runs differ, so each needs its own
     // LazyDfa. One instance is reused across every match in a find_all (and,
     // via FindCache, across find_all calls).
-    LazyDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
-            bool pf = true, bool leftmost_first = false)
+    // `bc` is the program's byte classes, as the plan computed them.
+    LazyDfa(const Regex &r, const detail::Program &p, int mpc,
+            const Plan::ByteClasses &bc, bool rs, bool pf = true,
+            bool leftmost_first = false)
         : re(&r), prog(&p), match_pc(mpc), reseed(rs), lf(leftmost_first),
-          use_prefilter(pf), seen(p.insts.size(), 0) {}
-
-    int intern_state(std::vector<int> pcs) {
-      if (!lf) { // unordered (longest/boolean): sort for a canonical set key
-        std::sort(pcs.begin(), pcs.end());
-        pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
-      } // leftmost-first: keep priority order (the closure already deduped)
-      auto it = intern.find(pcs);
-      if (it != intern.end()) return it->second;
-      int id = static_cast<int>(states.size());
-      bool acc = std::find(pcs.begin(), pcs.end(), match_pc) != pcs.end();
-      uint8_t st = 0;
-      if (pcs.empty()) st |= kDead;
-      if (lf && !pcs.empty() && pcs.front() == match_pc) st |= kFront;
-      intern.emplace(pcs, id);
-      states.push_back(std::move(pcs));
-      accept.push_back(acc);
-      status.push_back(st);
-      std::array<int, 256> t;
-      t.fill(-1);
-      trans.push_back(t);
-      return id;
+          use_prefilter(pf && r.plan_prefilter_any()) {
+      // Nothing is allocated until the first scan (make_start): a rung
+      // fetches its DFAs before it knows whether it will step them.
+      if (bc.n) {
+        std::memcpy(cls, bc.cls.data(), sizeof cls);
+        stride = bc.n + 1;
+      } else {
+        // A program the plan computed no classes for (none is known to get
+        // here — see plan_byte_classes): a column per byte, which is always
+        // right.
+        for (int b = 0; b < 256; b++)
+          cls[b] = static_cast<uint8_t>(b);
+        stride = 257;
+        unplanned = true;
+      }
     }
 
-    int start() {
+    // The state's canonical key: a sorted set, or — leftmost-first — the
+    // list as the closure ordered it (priority is identity, and the closure
+    // already de-duplicated it).
+    void canonical(std::vector<int> &v) const {
+      if (lf) return;
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+    }
+
+    // A pc list as bytes, the form it is interned and stored in: each pc as
+    // its difference from the one before (zigzag, so the priority-ordered
+    // lists, which also step backwards, stay small), in 7-bit groups.
+    static void pack(const std::vector<int> &v, std::vector<uint8_t> &out) {
+      out.clear();
+      int prev = 0;
+      for (int pc : v) {
+        uint32_t d = static_cast<uint32_t>(pc - prev);
+        d = (d << 1) ^ (0u - (d >> 31));
+        prev = pc;
+        for (; d >= 0x80; d >>= 7)
+          out.push_back(static_cast<uint8_t>(d | 0x80));
+        out.push_back(static_cast<uint8_t>(d));
+      }
+    }
+
+    // The next pc of a packed list at `q`, given the one before it.
+    static int unpack(const uint8_t *&q, int prev) {
+      uint32_t d = 0;
+      for (int sh = 0;; sh += 7) {
+        const uint8_t c = *q++;
+        d |= static_cast<uint32_t>(c & 0x7F) << sh;
+        if (!(c & 0x80)) break;
+      }
+      return prev + static_cast<int>((d >> 1) ^ (0u - (d & 1)));
+    }
+
+    static uint32_t hash_of(const std::vector<uint8_t> &k) {
+      uint64_t h = 0x9E3779B97F4A7C15ull;
+      for (uint8_t c : k)
+        h = (h ^ c) * 0x9E3779B97F4A7C15ull;
+      return static_cast<uint32_t>(h >> 32);
+    }
+
+    // The id of the state whose packed pc list is `k`, or kUnknown.
+    uint32_t lookup(const std::vector<uint8_t> &k, uint32_t h) const {
+      const uint32_t mask = static_cast<uint32_t>(slots.size()) - 1;
+      for (uint32_t i = h & mask;; i = (i + 1) & mask) {
+        uint32_t e = slots[i];
+        if (!e) return kUnknown;
+        const State &st = states[e - 1];
+        if (st.hash == h && st.len == k.size() &&
+            std::equal(k.begin(), k.end(), pcs.begin() + st.off))
+          return (e - 1) * stride + 1;
+      }
+    }
+
+    void slot_insert(uint32_t n, uint32_t h) {
+      const uint32_t mask = static_cast<uint32_t>(slots.size()) - 1;
+      uint32_t i = h & mask;
+      while (slots[i]) i = (i + 1) & mask;
+      slots[i] = n;
+    }
+
+    // The id of the state whose (canonical) pc list is `v`, or kUnknown.
+    // Leaves the list packed in key_ and its hash in `h`, for add().
+    uint32_t find(const std::vector<int> &v, uint32_t &h) {
+      pack(v, key_);
+      h = hash_of(key_);
+      return lookup(key_, h);
+    }
+
+    // Append the state `v`, packed in key_ with hash `h` (find() just missed
+    // it), and return its id.
+    uint32_t add(const std::vector<int> &v, uint32_t h) {
+      uint32_t flags = 0;
+      if (v.empty()) flags |= kDead;
+      if (lf && !v.empty() && v.front() == match_pc) flags |= kFront;
+      if (std::find(v.begin(), v.end(), match_pc) != v.end()) flags |= kAccept;
+      states.push_back({static_cast<uint32_t>(pcs.size()),
+                        static_cast<uint32_t>(key_.size()), h});
+      pcs.insert(pcs.end(), key_.begin(), key_.end());
+      const size_t row = tr.size();
+      tr.resize(row + stride, kUnknown);
+      tr[row] = flags;
+      if (states.size() * 2 > slots.size()) { // keep the set at most half full
+        slots.assign(slots.size() * 2, 0);
+        for (size_t i = 0; i < states.size(); i++)
+          slot_insert(static_cast<uint32_t>(i) + 1, states[i].hash);
+      } else {
+        slot_insert(static_cast<uint32_t>(states.size()), h);
+      }
+      return static_cast<uint32_t>(row) + 1;
+    }
+
+    // Bytes the cache holds (what `budget` bounds; the vectors' unused
+    // capacity is on top of it).
+    size_t bytes() const {
+      return tr.size() * sizeof(uint32_t) + pcs.size() +
+             states.size() * sizeof(State) + slots.size() * sizeof(uint32_t);
+    }
+
+    // Would one more state — the one packed in key_ — overflow the budget?
+    bool full() const {
+      return bytes() + stride * sizeof(uint32_t) + key_.size() +
+                 sizeof(State) + 2 * sizeof(uint32_t) >
+             budget;
+    }
+
+    // Drop every state. The buffers keep their capacity: the refill reuses
+    // them.
+    void clear() {
+      tr.clear();
+      states.clear();
+      pcs.clear();
+      slots.assign(64, 0);
+      start_state = kUnknown;
+      scanned = 0;
+      clears++;
+    }
+
+    uint32_t start() {
       // The start state (closure of {0}) is the same on every scan, so compute
       // it once — find_all calls start() ~3x per match on the reused DFAs.
-      if (start_state >= 0) return start_state;
-      std::vector<int> sp;
-      std::fill(seen.begin(), seen.end(), 0); // seen is reused across calls
+      if (start_state != kUnknown) return start_state;
+      return make_start();
+    }
+
+    REGEXLIB_NOINLINE uint32_t make_start() {
+      if (slots.empty()) slots.assign(64, 0);
+      std::vector<int> sp, seeds{0};
+      seen.assign(prog->insts.size(), 0); // reused across calls
       if (lf)
-        re->dfa_closure_lf(*prog, {0}, sp, seen, match_pc);
+        re->dfa_closure_lf(*prog, seeds, sp, seen, match_pc);
       else
-        re->plan_->dfa_closure(*prog, {0}, sp, seen);
-      return start_state = intern_state(std::move(sp));
+        re->plan_->dfa_closure(*prog, seeds, sp, seen);
+      canonical(sp);
+      uint32_t h;
+      uint32_t s = find(sp, h);
+      if (s == kUnknown) s = add(sp, h);
+      tr[s - 1] |= kStart;
+      return start_state = s;
     }
 
-    bool is_accept(int s) const { return accept[s]; }
+    // NOTE: a state's flags (accept / front / dead) are deliberately NOT
+    // packed into the transition value the way the assert DFAs pack theirs.
+    // They are per-STATE, and the scan loops load them OFF the step's
+    // dependency chain (in parallel with the next step's load, from the same
+    // row); packing them into the id would put an extra AND ON the chain —
+    // measured ~12% slower. The assert tables pack because their flags are
+    // per-EDGE in Width-wide parallel rows (three wide cache lines per step),
+    // where collapsing to one load wins far more than the AND costs.
 
-    bool is_dead(int s) const { return (status[s] & kDead) != 0; }
-
-    // Leftmost-first: the match is committed (no higher-priority thread can
-    // extend it) iff match_pc is the highest-priority (front) pc of the ordered
-    // state.
-    bool front_is_match(int s) const { return (status[s] & kFront) != 0; }
-
-    // NOTE: LazyDfa deliberately does NOT use the packed-edge encoding the
-    // assert DFAs use. Its flags (accept / front / dead) are per-STATE and
-    // live in tiny per-state byte arrays that the scan loops load OFF the
-    // step's dependency chain (in parallel with the next trans row); packing
-    // them into the transition value would put an extra `& kEdgeIdMask` ON
-    // the chain — measured ~12% slower. The assert tables pack because their
-    // flags are per-EDGE in Width-wide parallel rows (three wide cache lines
-    // per step), where collapsing to one load wins far more than the AND
-    // costs.
-
-    // Hot-path transition: inline the cached lookup so the scan loop pays only
-    // a table load per byte, deferring the cold ε-closure computation to next()
-    // (not inlined) on a cache miss. `b` is < 128 on the ASCII DFA path.
-    int step(int s, unsigned char b) {
-      int nx = trans[s][b];
-      return nx >= 0 ? nx : next(s, b);
-    }
-
-    // The cache-miss path of step(): build the transition from state `s` on
-    // byte `b`. Returns the destination state, or kCap on state-cap overflow.
-    int next(int s, unsigned char b) {
-      std::vector<int> seeds;
-      for (int pc : states[s]) // ordered: priority preserved for the lf closure
-        if (pc != match_pc && re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-          seeds.push_back(pc + 1);
-      if (reseed) seeds.push_back(0); // unanchored start at lowest priority
+    // The cache-miss path of a step: build the transition from state `s` on
+    // byte `b`. `stepped` is how many subject bytes the scan has stepped
+    // since it last reported (see `scanned`). Returns the destination state,
+    // or kQuit when the DFA has given up.
+    //
+    // A NEW state that does not fit clears the cache first, and then every
+    // id but the one returned is gone: the scan carries on from the returned
+    // state. Either way it must re-read the table's address, which any new
+    // state can move.
+    REGEXLIB_NOINLINE uint32_t next(uint32_t s, unsigned char b, int stepped) {
+      scanned += static_cast<uint64_t>(stepped);
+      if (quit) return kQuit;
+      const State st = states[(s - 1) / stride];
+      seeds_.clear();
+      // In stored order: priority is preserved for the lf closure.
+      int pc = 0;
+      for (const uint8_t *q = pcs.data() + st.off, *end = q + st.len;
+           q < end;) {
+        pc = unpack(q, pc);
+        if (pc != match_pc &&
+            re->plan_->lazy_inst_matches(*prog, prog->insts[pc], b))
+          seeds_.push_back(pc + 1);
+      }
+      if (reseed) seeds_.push_back(0); // unanchored start at lowest priority
       std::fill(seen.begin(), seen.end(), 0);
-      std::vector<int> out;
+      out_.clear();
       if (lf)
-        re->dfa_closure_lf(*prog, seeds, out, seen, match_pc);
+        re->dfa_closure_lf(*prog, seeds_, out_, seen, match_pc);
       else
-        re->plan_->dfa_closure(*prog, std::move(seeds), out, seen);
-      int nxt = intern_state(std::move(out));
-      trans[s][b] = nxt; // indexed after intern_state (vectors may have grown)
-      if (static_cast<int>(states.size()) > limits::kMaxDfaStates) return kCap;
+        re->plan_->dfa_closure(*prog, seeds_, out_, seen);
+      canonical(out_);
+      uint32_t h;
+      uint32_t nxt = find(out_, h);
+      if (nxt == kUnknown) {
+        if (full()) {
+          if (clears >= min_clears &&
+              scanned < limits::kDfaMinBytesPerState * states.size()) {
+            quit = true;
+            return kQuit;
+          }
+          clear();
+          make_start(); // every scan starts there, and skips there
+          nxt = find(out_, h); // (the start state itself, possibly)
+          return nxt != kUnknown ? nxt : add(out_, h);
+        }
+        nxt = add(out_, h);
+      }
+      tr[s + cls[b]] = nxt;
       return nxt;
     }
   };
@@ -12357,6 +12948,12 @@ private:
   // multi-substring), else a sparse first-byte set skips to the next viable
   // byte. Only worth it when the first-byte set is sparse — otherwise the skip
   // rarely fires.
+  // Whether plan_prefilter_skip has anything to skip with.
+  bool plan_prefilter_any() const {
+    return plan_->prefix_.active() || plan_->teddy_.ok ||
+           plan_->first_bytes_.sparse;
+  }
+
   REGEXLIB_ALWAYS_INLINE int plan_prefilter_skip(const unsigned char *p, int n,
                                                  int i) const {
     if (plan_->prefix_.active()) {
@@ -12406,49 +13003,45 @@ private:
 
   // Forward DFA scan over `d` (unanchored, d.reseed == true) from byte `from`:
   // the end of the FIRST match at or after `from`, or -1 — the boolean test()
-  // tier. Returns kCap if the state cap is exceeded. `d` is reusable across
-  // calls.
+  // tier. Returns kCap if the DFA gives up (see LazyDfa). `d` is reusable
+  // across calls.
   int dfa_forward_scan(LazyDfa &d, std::string_view text, int from) const {
-    int s = d.start();
-    if (d.is_accept(s)) return from; // first/empty match at `from`
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    int n = static_cast<int>(text.size());
-    for (int i = from; i < n; i++) {
-      // Back at the start state (no match in progress): jump the dead bytes to
-      // the next position a match can begin at.
-      if (d.reseed && s == d.start_state && d.use_prefilter) {
-        i = plan_prefilter_skip(p, n, i);
-        if (i >= n) break;
-      } else if (d.reseed && s == d.start_state && d.byte_pf) {
-        i = byte_prefilter_skip(p, n, i);
-        if (i >= n) break;
-      }
-      s = d.step(s, p[i]);
-      if (s == LazyDfa::kCap) return LazyDfa::kCap;
-      if (d.is_accept(s)) return i + 1;
-    }
-    return -1;
+    int reach = from;
+    return dfa_forward_lf_scan<true>(d, text, from, reach);
   }
 
   // Reverse DFA scan over `d` (the reverse program). Given that some match ends
   // at byte `e`, scan leftward and return the leftmost start `s` (>= floor)
-  // such that the forward pattern matches [s, e); -1 if none in range, kCap on
-  // cap. Anchored at `e` (d.reseed must be false). `d` is reusable across
-  // calls.
+  // such that the forward pattern matches [s, e); -1 if none in range, kCap if
+  // the DFA gives up. Anchored at `e` (d.reseed must be false). `d` is
+  // reusable across calls.
   int dfa_reverse_scan(LazyDfa &d, std::string_view text, int e, int floor,
                        int *low_out = nullptr) const {
-    int s = d.start();
-    int leftmost = d.is_accept(s) ? e : -1; // empty match [e, e)
+    uint32_t s = d.start();
+    const uint32_t *tr = d.tr.data();
+    uint32_t f = tr[s - 1];
+    int leftmost = (f & LazyDfa::kAccept) ? e : -1; // empty match [e, e)
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     int pos = e;
-    for (; pos > floor; pos--) {
-      if (d.is_dead(s)) break;
-      s = d.step(s, p[pos - 1]); // consume the grapheme left of pos
-      if (s == LazyDfa::kCap) return LazyDfa::kCap;
-      if (d.is_accept(s)) leftmost = pos - 1;
-    }
+    int mark = e; // stepped bytes are reported to `d` from here down
+    if (!(f & LazyDfa::kDead))
+      while (pos > floor) {
+        // Consume the byte left of pos.
+        uint32_t nx = tr[size_t{s} + d.cls[p[pos - 1]]];
+        if (nx == LazyDfa::kUnknown) {
+          nx = d.next(s, p[pos - 1], mark - pos);
+          if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
+          mark = pos;
+          tr = d.tr.data(); // the table moved, or was cleared and restarted
+        }
+        s = nx;
+        pos--;
+        f = tr[size_t{s} - 1];
+        if (f & LazyDfa::kAccept) leftmost = pos;
+        if (f & LazyDfa::kDead) break;
+      }
+    d.scanned += static_cast<uint64_t>(mark - pos);
     if (low_out) *low_out = pos; // lowest boundary examined (p[pos] onward)
     return leftmost;
   }
@@ -12474,7 +13067,7 @@ private:
   // using the rare trailing literal (suffix_.lit) as a prefilter — memmem it,
   // then confirm each candidate end with a reverse-DFA scan (`rv`) floored at
   // `from`. Returns the match end (writes the start to `s_out`), -1 if none, or
-  // LazyDfa::kCap on a DFA state-cap (caller falls back). Every match ends with
+  // LazyDfa::kCap when a DFA gives up (caller falls back). Every match ends with
   // the literal, so scanning suffix occurrences in order finds every match end.
   //
   // FIXED-length pre-suffix (suffix_.var_pre == false): each suffix occurrence
@@ -12915,7 +13508,7 @@ private:
   // probe. memchr2 its two ASCII cases, then for each probe hit verify every
   // candidate start in [hp-maxlead, hp-j] (ascending) with the anchored byte DFA
   // `blfa`. Returns the match end (writes the start to s_out), -1, or
-  // LazyDfa::kCap on a DFA state-cap.
+  // LazyDfa::kCap when the DFA gives up.
   //
   // Leftmost-first soundness: the probe char is found at every occurrence (clean
   // probe => ASCII-only pre-images; unclean probe => caller checked the subject
@@ -13058,42 +13651,68 @@ private:
                 : dfa_forward_first(d, text, from, reach_out);
   }
 
+  // The start-state skip of a forward scan: from `i`, the next position a
+  // match can begin at (see LazyDfa::kStart). Note the lf program's
+  // `(?s:.)*?` prefix makes its own first-byte set universal — what skips
+  // here is the PLAN's prefilter (the memmem over a literal prefix, for a
+  // literal-led pattern), which the DFA is told to use or not.
+  // Out of line on purpose: inlined, the searchers behind it took the
+  // stepping loop's registers, and the loop kept its cursor, its table and
+  // its last accept on the stack.
+  REGEXLIB_NOINLINE int dfa_start_skip(const LazyDfa &d, const unsigned char *p,
+                                       int n, int i) const {
+    return d.use_prefilter ? plan_prefilter_skip(p, n, i)
+                           : byte_prefilter_skip(p, n, i);
+  }
+
   template <bool First>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
-                          int &reach) const {
-    int s = d.start();
+                          int &reach_out) const {
+    uint32_t s = d.start();
+    const uint32_t *tr = d.tr.data();
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
-    int n = static_cast<int>(text.size());
-    int e = d.is_accept(s) ? from : -1;
+    const int n = static_cast<int>(text.size());
+    uint32_t f = tr[s - 1];
+    int e = (f & LazyDfa::kAccept) ? from : -1;
     if (First && e >= 0) return e;
-    if (d.front_is_match(s)) return e; // committed at `from` (e.g. lazy empty)
-    for (int i = from; i < n; i++) {
-      if (d.is_dead(s)) break; // no thread (prefix cut + pattern died) -> done
-
-      // In the pure-prefix start state, jump to the next position the pattern
-      // can begin at (the prefix would otherwise consume the dead bytes one by
-      // one). Note the lf program's `(?s:.)*?` prefix makes the first-byte set
-      // universal, so the sparse-first-byte rung never fires here — the memmem
-      // over a literal prefix is what skips dead regions for a literal-led
-      // pattern.
-      if (s == d.start_state && d.use_prefilter) {
-        i = plan_prefilter_skip(p, n, i);
-        if (i >= n) break;
-      } else if (s == d.start_state && d.byte_pf) {
-        i = byte_prefilter_skip(p, n, i);
-        if (i >= n) break;
+    // Committed at `from` (e.g. lazy empty), or no thread at all.
+    if (f & (LazyDfa::kFront | LazyDfa::kDead)) return e;
+    // The flags that end the scan: the match is the highest-priority thread
+    // -> committed; no thread is left (prefix cut + pattern died) -> done;
+    // and a boolean has its answer at the first accept.
+    const uint32_t ends = (First ? LazyDfa::kAccept : 0) | LazyDfa::kFront |
+                          LazyDfa::kDead;
+    // ... and the one that only interrupts the stepping: in the pure-prefix
+    // start state, jump to the next position the pattern can begin at (the
+    // prefix would otherwise consume the dead bytes one by one).
+    const uint32_t stops =
+        ends | (d.use_prefilter || d.byte_pf ? LazyDfa::kStart : 0);
+    int i = from;
+    int mark = from; // stepped bytes are reported to `d` from here on
+    int reach = from; // one past the last byte consumed
+    if (stops & LazyDfa::kStart) i = mark = dfa_start_skip(d, p, n, i);
+    while (i < n) {
+      uint32_t nx = tr[size_t{s} + d.cls[p[i]]];
+      if (nx == LazyDfa::kUnknown) {
+        nx = d.next(s, p[i], i - mark);
+        if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
+        mark = i;
+        tr = d.tr.data(); // the table moved, or was cleared and restarted
       }
-      s = d.step(s, p[i]);
-      if (s == LazyDfa::kCap) return LazyDfa::kCap;
-      reach = i + 1; // consumed p[i]
-      if (d.is_accept(s)) {
-        e = i + 1;
-        if (First) return e;
+      s = nx;
+      reach = ++i; // consumed p[i]
+      f = tr[size_t{s} - 1];
+      if (f & LazyDfa::kAccept) e = i;
+      if (f & stops) {
+        if (f & ends) break;
+        const int j = dfa_start_skip(d, p, n, i);
+        mark += j - i; // jumped, not stepped
+        i = j;
       }
-      if (d.front_is_match(s))
-        return e; // match is highest priority -> committed
     }
+    d.scanned += static_cast<uint64_t>(i - mark);
+    reach_out = reach;
     return e;
   }
 
@@ -13364,8 +13983,21 @@ public:
         balfa_;                            // leftmost-first byte assert DFA
     std::optional<ByteAssertRevDfa> barv_; // cached reverse assertion DFA
     Scratch sc_;                           // reused Pike / backtracker buffers
+    // What this cache's lazy DFAs are built with (see LazyDfa). The library
+    // never changes them — a rebind puts them back — and the test suite
+    // shrinks them (PlanProbe), after binding, to put every scan through the
+    // clear-and-refill and give-up paths.
+    size_t dfa_bytes_ = limits::kDfaCacheBytes;
+    uint32_t dfa_min_clears_ = limits::kDfaMinClears;
     friend class Regex;
     friend class MatchIter;
+    friend struct detail::PlanProbe;
+
+    LazyDfa &built(std::optional<LazyDfa> &d) {
+      d->budget = dfa_bytes_;
+      d->min_clears = dfa_min_clears_;
+      return *d;
+    }
 
     // Bind to `re`; on a different (or first) Regex, drop the stale DFAs so
     // they are rebuilt for the new owner. The generation guards a thread-local
@@ -13396,6 +14028,8 @@ public:
       balfu_.reset();
       balfa_.reset();
       barv_.reset();
+      dfa_bytes_ = limits::kDfaCacheBytes;
+      dfa_min_clears_ = limits::kDfaMinClears;
     }
 
     // The boolean reseed DFA (test()). Its start-state skip follows lfu's
@@ -13405,15 +14039,22 @@ public:
     // memmem jumps (`zqj` over 595 KB of prose: 0.67 GB/s, the find 89).
     // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
     LazyDfa &fu(const Regex &re) {
-      if (!fu_)
-        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
+      if (!fu_) {
+        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
+                    re.plan_->prog_classes_, /*reseed=*/true,
                     /*pf=*/!re.plan_->us_);
+        built(fu_);
+      }
       return *fu_;
     }
 
     LazyDfa &rv(const Regex &re) {
-      if (!rv_)
-        rv_.emplace(re, re.plan_->rev_prog_.prog, re.plan_->rev_prog_.match_pc(), /*reseed=*/false);
+      if (!rv_) {
+        rv_.emplace(re, re.plan_->rev_prog_.prog,
+                    re.plan_->rev_prog_.match_pc(),
+                    re.plan_->rev_prog_.classes, /*reseed=*/false);
+        built(rv_);
+      }
       return *rv_;
     }
 
@@ -13430,17 +14071,23 @@ public:
         // byte automaton — use the byte-level prefilter (byte_pf, byte_prefix_.text /
         // byte first-byte set) instead, mirroring blfu. The two are exclusive:
         // use_prefilter reads prefix_.text (empty in US), byte_pf reads byte_prefix_.text.
-        lfu_.emplace(re, re.plan_->lf_prog_.prog, re.plan_->lf_prog_.match_pc(), /*reseed=*/false,
-                     /*pf=*/!re.plan_->us_, /*leftmost_first=*/true);
+        lfu_.emplace(re, re.plan_->lf_prog_.prog,
+                     re.plan_->lf_prog_.match_pc(), re.plan_->lf_prog_.classes,
+                     /*reseed=*/false, /*pf=*/!re.plan_->us_,
+                     /*leftmost_first=*/true);
         if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_prefilter_ok_;
+        built(lfu_);
       }
       return *lfu_;
     }
 
     LazyDfa &lfa(const Regex &re) {
-      if (!lfa_)
-        lfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/false, /*pf=*/false,
+      if (!lfa_) {
+        lfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
+                     re.plan_->prog_classes_, /*reseed=*/false, /*pf=*/false,
                      /*leftmost_first=*/true);
+        built(lfa_);
+      }
       return *lfa_;
     }
 
@@ -13448,17 +14095,24 @@ public:
     // grapheme program's ASCII-only first_bytes_.set would skip non-ASCII starts).
     LazyDfa &bfu(const Regex &re) {
       if (!bfu_) {
-        bfu_.emplace(re, re.plan_->byte_prog_.prog, re.plan_->byte_prog_.match_pc(), /*reseed=*/true,
+        bfu_.emplace(re, re.plan_->byte_prog_.prog,
+                     re.plan_->byte_prog_.match_pc(),
+                     re.plan_->byte_prog_.classes, /*reseed=*/true,
                      /*pf=*/false);
         bfu_->byte_pf = re.plan_->byte_prefilter_ok_; // sound byte-level dead-skip
+        built(bfu_);
       }
       return *bfu_;
     }
 
     LazyDfa &brv(const Regex &re) {
-      if (!brv_)
-        brv_.emplace(re, re.plan_->byte_rev_prog_.prog, re.plan_->byte_rev_prog_.match_pc(),
-                     /*reseed=*/false, /*pf=*/false);
+      if (!brv_) {
+        brv_.emplace(re, re.plan_->byte_rev_prog_.prog,
+                     re.plan_->byte_rev_prog_.match_pc(),
+                     re.plan_->byte_rev_prog_.classes, /*reseed=*/false,
+                     /*pf=*/false);
+        built(brv_);
+      }
       return *brv_;
     }
 
@@ -13467,10 +14121,12 @@ public:
     // memmem skip.
     LazyDfa &blfu(const Regex &re) {
       if (!blfu_) {
-        blfu_.emplace(re, re.plan_->byte_lf_prog_.prog, re.plan_->byte_lf_prog_.match_pc(),
-                      /*reseed=*/false,
+        blfu_.emplace(re, re.plan_->byte_lf_prog_.prog,
+                      re.plan_->byte_lf_prog_.match_pc(),
+                      re.plan_->byte_lf_prog_.classes, /*reseed=*/false,
                       /*pf=*/false, /*leftmost_first=*/true);
         blfu_->byte_pf = re.plan_->byte_prefilter_ok_;
+        built(blfu_);
       }
       return *blfu_;
     }
@@ -13478,9 +14134,13 @@ public:
     // Anchored leftmost-first byte DFA over byte_prog_ (no prefix), for
     // match().
     LazyDfa &blfa(const Regex &re) {
-      if (!blfa_)
-        blfa_.emplace(re, re.plan_->byte_prog_.prog, re.plan_->byte_prog_.match_pc(), /*reseed=*/false,
+      if (!blfa_) {
+        blfa_.emplace(re, re.plan_->byte_prog_.prog,
+                      re.plan_->byte_prog_.match_pc(),
+                      re.plan_->byte_prog_.classes, /*reseed=*/false,
                       /*pf=*/false, /*leftmost_first=*/true);
+        built(blfa_);
+      }
       return *blfa_;
     }
 
@@ -13488,10 +14148,12 @@ public:
     // floor start from a literal hit (like brv). The end / exact start then come
     // from the existing full forward (blfu/lfu) and reverse (brv/rv) DFAs.
     LazyDfa &inrev(const Regex &re) {
-      if (!inrev_)
+      if (!inrev_) {
         inrev_.emplace(re, re.plan_->inner_.pre_rev.prog,
                        re.plan_->inner_.pre_rev.match_pc(),
-                       /*reseed=*/false);
+                       re.plan_->inner_.pre_rev.classes, /*reseed=*/false);
+        built(inrev_);
+      }
       return *inrev_;
     }
 
@@ -13794,7 +14456,7 @@ public:
         plan_->us_ ? detail::segment_cp(text) : detail::segment(text));
     return byte_to_cp(*seg, pos);
   }
-  // DFA state cap mid-scan: continue on the Pike VM from the current byte
+  // A DFA gave up mid-scan: continue on the Pike VM from the current byte
   // cursor (the Pike rung segments, and maps the cursor, on its first
   // step). US patterns drop to the code-point Pike, the rest to the
   // grapheme Pike. The Pike locates and resolves, so a boolean caller gets
@@ -15327,7 +15989,7 @@ private:
   // floor IS the exact match start (see inner_find), so one one-pass walk
   // from it yields the end and the captures — replacing the anchored forward
   // DFA + bounded capture pass. Returns the end (saves filled), -1 when no
-  // match remains, LazyDfa::kCap on a reverse state-cap, kWalkLocal on a
+  // match remains, LazyDfa::kCap when the reverse DFA gives up, kWalkLocal on a
   // non-ASCII byte, or kWalkBail when the failed-walk budget runs out (see
   // prefix_onepass_find).
   REGEXLIB_ALWAYS_INLINE
@@ -16206,8 +16868,8 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // downgrades to the Pike directly from pos — except the COLLAPSE
   // variant, whose ineligible subjects (lone CR/LF = ordinary Unix-newline
   // text) are usually served by the gated DFA families: re-prime instead.
-  // (A genuine state cap re-primes too; the unfused family then caps again
-  // and downgrades.)
+  // (A DFA that really gave up re-primes too; the unfused family then meets
+  // the same answer and downgrades.)
   case Rung::FusedSuffix: {
     LazyDfa &blfa = scr.cache->blfa(*this), &brv = scr.cache->brv(*this);
     const bool collapse = p.fused_ == Plan::Fused::Collapse;
@@ -16320,7 +16982,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
     }
     break;
   }
-  // One match from the located-span chain. A state cap downgrades.
+  // One match from the located-span chain. A DFA that gives up downgrades.
   case Rung::Chain: {
     LazyDfa &f = ladder_fwd(*scr.cache, l),
             &rv = ladder_rev(*scr.cache, l);
@@ -16375,9 +17037,10 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       e2 = dfa_forward_scan(dfa, text, 0);
     }
     if (e2 == LazyDfa::kCap) {
-      // State cap: a regular pattern can still need exponentially many DFA
-      // states. The find's own rungs answer instead (and downgrade to the
-      // Pike in turn) — the boolean is the same.
+      // The DFA gave up: a regular pattern can still need exponentially
+      // many DFA states, and this subject kept asking for new ones. The
+      // find's own rungs answer instead (and downgrade to the Pike in turn)
+      // — the boolean is the same.
       l.want = Want::Rows;
       l.rung = l.below = Rung::Classify;
       break;

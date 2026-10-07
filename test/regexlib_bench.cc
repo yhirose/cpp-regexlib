@@ -759,6 +759,12 @@ static void run_sherlock_bench(int iters) {
       // live `a` is its own position in the window): the state-cap / cache
       // behavior under a pattern that is regular but not small.
       {"wide fixed gap (DFA state growth)", "a.{20}z", false, {text}},
+      // The same gap with no rare literal at either end to drive the find
+      // from, so the forward DFA walks the subject and builds a state for
+      // every arrangement of live starts it meets (some 19,000 over this
+      // text): what a big DFA's table and state store cost per byte.
+      {"wide gap, no rare literal (many DFA states)", "[ae].{20}[ae]", false,
+       {text}},
       // test() on patterns whose find is driven from a literal that is not
       // at the front. None of the three matches anywhere in the text, so the
       // whole subject is the cost — and the literal IS in it (`q` some 400

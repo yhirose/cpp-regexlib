@@ -98,6 +98,105 @@ struct PlanProbe {
     }
     return '!';
   }
+  // Whether a lazy DFA of the thread's cache of `re` was built over a
+  // program the plan had computed no byte classes for (see
+  // Plan::plan_byte_classes): it works, a column per byte, and is a plan
+  // that forgot a program.
+  static bool unplanned_dfa(const Regex &re) {
+    const Regex::FindCache &c = re.thread_cache();
+    for (const std::optional<Regex::LazyDfa> *d :
+         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
+          &c.blfa_, &c.inrev_})
+      if (*d && (*d)->unplanned) return true;
+    return false;
+  }
+  // The lazy DFAs of a cache, built small: `bytes` of cache each, and
+  // `min_clears` refills before a fill has to have paid for itself (see
+  // LazyDfa). What `c` holds is dropped, so the settings are what its next
+  // scan builds with — until it is bound to another Regex.
+  static void dfa_cache(const Regex &re, Regex::FindCache &c, size_t bytes,
+                        uint32_t min_clears) {
+    c.rebind(re);
+    c.dfa_bytes_ = bytes;
+    c.dfa_min_clears_ = min_clears;
+  }
+  // ... and the same for the calling thread's own cache of `re`, which
+  // search / test / match and the cache-less finds draw on.
+  static void dfa_cache(const Regex &re, size_t bytes, uint32_t min_clears) {
+    dfa_cache(re, re.thread_cache(), bytes, min_clears);
+  }
+  // Whether the plan's byte classes are exact, for each program it computed
+  // them for: classes numbered in byte order, and no instruction that tells
+  // two bytes of one class apart (checked against lazy_inst_matches, the
+  // question the lazy DFA asks). `max_insts` skips a program too long to be
+  // worth the walk here.
+  static bool classes_exact(const Regex &re, size_t max_insts = ~size_t{0}) {
+    using Op = reg::detail::Inst::Op;
+    const auto &p = *re.plan_;
+    auto ok = [&](const reg::detail::Program &prog,
+                  const Regex::Plan::ByteClasses &bc) {
+      if (!bc.n || prog.insts.size() > max_insts) return true;
+      int rep[256];
+      std::fill(std::begin(rep), std::end(rep), -1);
+      unsigned next = 0;
+      for (int b = 0; b < 256; b++) {
+        const unsigned c = bc.cls[static_cast<size_t>(b)];
+        if (c >= bc.n) return false;
+        if (rep[c] < 0) {
+          if (c != next++) return false;
+          rep[c] = b;
+        }
+      }
+      if (next != bc.n) return false;
+      for (const auto &in : prog.insts) {
+        if (in.op != Op::Byte && in.op != Op::Char && in.op != Op::Class &&
+            in.op != Op::Any)
+          continue;
+        for (int b = 0; b < 256; b++)
+          if (p.lazy_inst_matches(prog, in, static_cast<unsigned char>(b)) !=
+              p.lazy_inst_matches(
+                  prog, in,
+                  static_cast<unsigned char>(
+                      rep[bc.cls[static_cast<size_t>(b)]])))
+            return false;
+      }
+      return true;
+    };
+    return ok(p.prog_, p.prog_classes_) &&
+           ok(p.rev_prog_.prog, p.rev_prog_.classes) &&
+           ok(p.lf_prog_.prog, p.lf_prog_.classes) &&
+           ok(p.byte_prog_.prog, p.byte_prog_.classes) &&
+           ok(p.byte_rev_prog_.prog, p.byte_rev_prog_.classes) &&
+           ok(p.byte_lf_prog_.prog, p.byte_lf_prog_.classes) &&
+           ok(p.inner_.pre_rev.prog, p.inner_.pre_rev.classes);
+  }
+  // What the lazy DFAs of a cache came to: how many were built, the refills
+  // and give-ups among them, and the largest one's size.
+  struct DfaStats {
+    int built = 0;
+    unsigned clears = 0; // summed
+    bool quit = false;   // any
+    size_t bytes = 0, states = 0;
+    unsigned stride = 0; // the widest row: the flags + one entry per class
+  };
+  static DfaStats dfa_stats(const Regex::FindCache &c) {
+    DfaStats s;
+    for (const std::optional<Regex::LazyDfa> *d :
+         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
+          &c.blfa_, &c.inrev_}) {
+      if (!*d) continue;
+      s.built++;
+      s.clears += (*d)->clears;
+      s.quit = s.quit || (*d)->quit;
+      s.bytes = std::max(s.bytes, (*d)->bytes());
+      s.states = std::max(s.states, (*d)->states.size());
+      s.stride = std::max(s.stride, (*d)->stride);
+    }
+    return s;
+  }
+  static DfaStats dfa_stats(const Regex &re) {
+    return dfa_stats(re.thread_cache());
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -2802,9 +2901,10 @@ void test_dfa_boolean() {
   CHECK(Regex("^abc$").test("abc"));
   CHECK(Regex("foo(?=bar)").test("foobar"));
   // State-heavy "regular" pattern: `.*a.{N}` needs ~2^N DFA states in the
-  // limit. The state cap abandons the DFA and falls back to the Pike VM, which
-  // must give the same boolean. This guards the M0 safety net (the answer is
-  // identical whether or not the cap trips on a given input).
+  // limit. A DFA that outgrows its cache budget refills it, or gives up for
+  // the Pike VM, which must give the same boolean. This guards the M0 safety
+  // net (the answer is identical whether or not the budget is reached on a
+  // given input; test_dfa_cache makes sure it is reached).
   {
     Regex heavy(".*a.{18}");
     std::string s = "the quick brown fox a jumps 12345 over xyz a lazy dog; ";
@@ -2813,6 +2913,199 @@ void test_dfa_boolean() {
     CHECK(heavy.test(s) == heavy.search(s).matched());
     std::string none(80000, 'b'); // no 'a' -> no match on either path
     CHECK(heavy.test(none) == heavy.search(none).matched());
+  }
+}
+
+// The lazy DFA's table and its cache budget (LazyDfa): byte classes, the
+// clear-and-refill of a full cache, and the give-up when refilling does not
+// pay. Every scan here is checked against the Pike twin — the budget decides
+// what a scan costs, never what it answers.
+void test_dfa_cache() {
+  using Stats = PlanProbe::DfaStats;
+  auto spans = [](const Regex &re, std::string_view s,
+                  Regex::FindCache *fc = nullptr) {
+    std::vector<size_t> v;
+    if (fc)
+      for (auto m : re.find_all(s, *fc)) {
+        v.push_back(m.begin());
+        v.push_back(m.end());
+      }
+    else
+      for (auto m : re.find_all(s)) {
+        v.push_back(m.begin());
+        v.push_back(m.end());
+      }
+    return v;
+  };
+  // Letters drawn from `alphabet` by a fixed generator.
+  auto noise = [](size_t n, const char *alphabet, unsigned seed) {
+    const size_t k = std::strlen(alphabet);
+    std::string s;
+    unsigned x = seed;
+    for (size_t i = 0; i < n; i++) {
+      x = x * 1664525u + 1013904223u;
+      s += alphabet[(x >> 16) % k];
+    }
+    return s;
+  };
+
+  // A row is as wide as the pattern is varied: the bytes a program does not
+  // tell apart share a column. Five kinds of byte here (i, n, g, the other
+  // lowercase letters, everything else), where a row used to be 256 wide.
+  for (bool us : {false, true}) {
+    Regex re = us ? make_us("[a-z]+ing") : Regex("[a-z]+ing");
+    Regex::FindCache fc;
+    const std::string s = "sing a song of bringing things, king; ring-a-ding";
+    CHECK(spans(re, s, &fc) == spans(pike_twin("[a-z]+ing"), s));
+    Stats st = PlanProbe::dfa_stats(fc);
+    CHECK(st.built > 0);
+    CHECK(st.stride >= 5 && st.stride <= 24);
+  }
+  // ... and the classes are exact: `\w` and `\d` overlap, a negated class
+  // splits the rest, and every byte of a multi-byte code point keeps its
+  // place in the UTF-8 automaton.
+  for (const char *pat : {"\\w+\\d[^a-f]", "[^\\W\\d]+_?\\d*", "é+|[à-ÿ]x"}) {
+    const std::string s = "ab12_x9z éé àx ÿx c3po r2d2_7! naïve 42q";
+    for (bool us : {false, true}) {
+      Regex re = us ? make_us(pat) : Regex(pat);
+      Regex::FindCache fc;
+      CHECK(spans(re, s, &fc) == spans(pike_twin(pat), s));
+      CHECK(re.test(s) == pike_twin(pat).test(s));
+    }
+  }
+  // The same, asked of the plan: no instruction of a program tells two bytes
+  // of one class apart. The classes of a byte automaton come from the byte
+  // ranges the compiler listed while emitting it, so every way it emits one
+  // is here — class blocks (cached per class and direction, and shared
+  // between Regexes), their copies under a repeat, literal bytes, the folded
+  // orbits of (?i), `.` with and without (?s), the any-byte prefix of the
+  // unanchored programs, a negated class, an interior literal's pre part.
+  for (const char *pat :
+       {"[a-z]+ing", "\\w+\\s+\\w+", "\\w{2,5}x", "\\p{Lu}\\p{Ll}+ \\d+",
+        "caf\xc3\xa9|na\xc3\xafve|\xe6\xbc\xa2+", "stra\xc3\x9f" "e k\\w+",
+        "a.c", "(?s)a.c", "[^a-c\\n]+z", "\\w+@\\w+\\.com", "x*",
+        "(\\d+)-(\\d+)", "[\\x00-\\x10\\x7f]+|\\t", "\\S+\\s", "^ab$",
+        "\\bfoo\\b"}) {
+    CHECK(PlanProbe::classes_exact(Regex(pat)));
+    CHECK(PlanProbe::classes_exact(make_us(pat)));
+    CHECK(PlanProbe::classes_exact(Regex(pat, IgnoreCase)));
+    CHECK(PlanProbe::classes_exact(make_us(pat, IgnoreCase)));
+    // ... and every lazy DFA these build, on subjects that send them down
+    // each family, found its classes in the plan.
+    for (unsigned flags : {0u, static_cast<unsigned>(IgnoreCase)})
+      for (bool us : {false, true}) {
+        Regex re = us ? make_us(pat, flags) : Regex(pat, flags);
+        for (std::string_view subj :
+             {"ab12 sing x9z foo@bar.com 7-8 caf\xc3\xa9 na\xc3\xafve",
+              "plain ascii: king 12-34 a.c abc xxz\t\x01 foo ab",
+              "\xe6\xbc\xa2\xe6\xbc\xa2 Stra\xc3\x9f" "e kW 99-1 \r\n ab"}) {
+          (void)re.test(subj);
+          (void)re.search(subj);
+          (void)re.match(subj);
+          for (auto m : re.find_all(subj)) (void)m;
+          for (auto m : re.find_iter(subj)) (void)m;
+        }
+        CHECK(!PlanProbe::unplanned_dfa(re));
+      }
+  }
+
+  // A DFA with more states than its cache holds keeps running: the cache is
+  // cleared and refilled from the state the scan is in. Over random a-d this
+  // one has a state per window of the last eight letters (and, being an
+  // alternation of two shapes, is not one-pass: the chain's DFAs serve it).
+  {
+    const char *pat = "b[a-d]{7}c|a[a-d]{7}d";
+    const std::string s = noise(6000, "abcd", 1);
+    const std::vector<size_t> want = spans(pike_twin(pat), s);
+    CHECK(!want.empty());
+    for (bool us : {false, true}) {
+      Regex re = us ? make_us(pat) : Regex(pat);
+      Regex::FindCache roomy;
+      CHECK(spans(re, s, &roomy) == want);
+      Stats full = PlanProbe::dfa_stats(roomy);
+      CHECK(full.states > 200 && full.clears == 0 && !full.quit);
+
+      // Room for a fraction of them, and refills without limit: the same
+      // matches, the cache within its budget, never given up.
+      Regex::FindCache tight;
+      PlanProbe::dfa_cache(re, tight, /*bytes=*/4096, /*min_clears=*/~0u);
+      CHECK(spans(re, s, &tight) == want);
+      Stats st = PlanProbe::dfa_stats(tight);
+      CHECK(st.clears > 3 && !st.quit);
+      CHECK(st.bytes <= 4096);
+      CHECK(spans(re, s, &tight) == want); // and again, over what is left
+
+      // The stock rule: nearly every byte needs a state built, so once the
+      // free refills are spent the DFA gives up — and the Pike answers.
+      Regex::FindCache thrash;
+      PlanProbe::dfa_cache(re, thrash, 4096, reg::limits::kDfaMinClears);
+      CHECK(spans(re, s, &thrash) == want);
+      st = PlanProbe::dfa_stats(thrash);
+      CHECK(st.quit && st.clears == reg::limits::kDfaMinClears);
+      CHECK(spans(re, s, &thrash) == want); // a cache that gave up stays right
+
+      // The same through the thread's cache, which the one-shot entry
+      // points draw on.
+      for (uint32_t clears : {~0u, 0u}) {
+        Regex r2 = us ? make_us(pat) : Regex(pat);
+        PlanProbe::dfa_cache(r2, 1024, clears);
+        CHECK(r2.test(s));
+        auto m = r2.search(s);
+        CHECK(m.matched() && m.begin() == want[0] && m.end() == want[1]);
+        CHECK(flat_spans(r2, s, /*lazy=*/true) == want);
+        CHECK(same_as_iter(r2, s));
+        CHECK(r2.match(s).matched() == (want[0] == 0));
+        st = PlanProbe::dfa_stats(r2);
+        CHECK(clears ? (st.clears > 0 && !st.quit) : st.quit);
+      }
+    }
+  }
+
+  // Refilling that PAYS is not given up on, however often it happens. Each
+  // letter's run is one state, entered once and stepped through for 60
+  // bytes: a cache with room for a few of them refills every few runs, and
+  // every fill has covered far more than kDfaMinBytesPerState per state.
+  {
+    std::string pat, s;
+    for (char c = 'a'; c <= 'p'; c++) {
+      if (!pat.empty()) pat += '|';
+      pat += std::string(1, c) + "+" + std::string(1, 'A' + (c - 'a'));
+    }
+    for (int rep = 0; rep < 6; rep++)
+      for (char c = 'a'; c <= 'p'; c++) {
+        s += std::string(60, c);
+        if ((c - 'a' + rep) % 5 == 0) s += static_cast<char>('A' + (c - 'a'));
+        s += ' ';
+      }
+    const std::vector<size_t> want = spans(pike_twin(pat), s);
+    CHECK(want.size() > 20);
+    for (bool us : {false, true}) {
+      Regex re = us ? make_us(pat) : Regex(pat);
+      Regex::FindCache roomy;
+      CHECK(spans(re, s, &roomy) == want);
+      Stats full = PlanProbe::dfa_stats(roomy);
+      Regex::FindCache tight;
+      // Room for about a third of the states the roomy cache came to.
+      PlanProbe::dfa_cache(re, tight, 256 + full.bytes / 3,
+                           reg::limits::kDfaMinClears);
+      CHECK(spans(re, s, &tight) == want);
+      Stats st = PlanProbe::dfa_stats(tight);
+      CHECK(st.clears > reg::limits::kDfaMinClears && !st.quit);
+    }
+  }
+
+  // A cache bound to another Regex goes back to the stock budget: the
+  // settings above belong to the test, not to the cache.
+  {
+    Regex a("b[a-d]{7}c|a[a-d]{7}d"), b("b[a-d]{7}c|a[a-d]{7}d");
+    const std::string s = noise(3000, "abcd", 2);
+    Regex::FindCache fc;
+    PlanProbe::dfa_cache(a, fc, 2048, 0);
+    CHECK(spans(a, s, &fc) == spans(b, s));
+    CHECK(PlanProbe::dfa_stats(fc).quit);
+    CHECK(spans(b, s, &fc) == spans(a, s));
+    Stats st = PlanProbe::dfa_stats(fc);
+    CHECK(!st.quit && st.clears == 0);
   }
 }
 
@@ -3906,6 +4199,7 @@ int main() {
   test_gpt2_tokenizer();
   test_nullable_quantifiers();
   test_dfa_boolean();
+  test_dfa_cache();
   test_dfa_match();
   test_dfa_search();
   test_longest_safe_repeat();

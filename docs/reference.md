@@ -522,6 +522,15 @@ caps this: a match that exceeds it raises `RegexError` from the matching call
 many seconds. Real patterns stay far below the budget. The ε-closure is
 iterative, so a long zero-width chain cannot overflow the stack.
 
+Match-time memory is bounded too. A lazy DFA builds its states as the subject
+asks for them, and a pattern can ask for exponentially many (`.*a.{18}`), so
+each lazy DFA's cache is capped at 8 MiB. A full cache is cleared and refilled
+from where the scan stands; if refilling keeps happening without the scan
+getting anywhere (fewer than 10 bytes per state built), that DFA is given up
+and the Pike VM, which needs no such table, finishes the job — the result is
+the same. A `FindCache` holds up to nine of these DFAs. (The DFAs behind
+`^`, `$` and `\b` are still capped by state count, 65,536, rather than bytes.)
+
 ## Not supported
 
 | Feature | Reason / alternative |
