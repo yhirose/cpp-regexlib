@@ -5591,6 +5591,14 @@ private:
         walk_driver_ = WalkDriver::Scan;
       }
       plan_byte_classes();
+      // The byte DFAs' start-state skip, now that every searcher behind it
+      // is planned (byte_prefilter_skip, in its order): a literal prefix,
+      // Teddy, or a first-byte set worth jumping to. A set that is small but
+      // common leaves nothing to skip with.
+      byte_prefilter_ok_ =
+          byte_prefilter_ok_ &&
+          (byte_prefix_.active() || teddy_.byte_preferred ||
+           byte_first_bytes_.dfa_skip);
       Regex::ladder_plan(*this);
     }
 
@@ -6913,6 +6921,7 @@ private:
       // bytes to the next viable one pays off; a large set (e.g. `\w` ≈ 63 bytes)
       // is common, so the skip rarely fires and only adds per-byte overhead.
       first_bytes_.sparse = count <= 32;
+      first_bytes_.rate();
     }
 
     // Byte-program counterpart of extract_prefix + analyze_first_bytes: the
@@ -6990,6 +6999,7 @@ private:
           count++;
         }
       byte_first_bytes_.sparse = count <= 32;
+      byte_first_bytes_.rate();
 
       // Usable if we can skip at all: a literal prefix (memmem) or a sparse set.
       byte_prefilter_ok_ = byte_prefix_.active() || byte_first_bytes_.sparse;
@@ -8845,6 +8855,34 @@ private:
       bool ok = false;     // set is usable (grapheme prefilter only; the byte
                            // tiers gate on byte_prefilter_ok_ below)
       bool sparse = false; // set is small -> dead-byte skip pays
+      // ... for the lazy DFA's start state: small AND rare. Each stop of the
+      // skip costs what the DFA steps a dozen bytes in, so the jump has to
+      // be longer than that on average to be worth asking for — and a set of
+      // common letters stops every few bytes (the first letters of 16
+      // keywords: 280 MB/s with the skip, 860 stepping). See rate().
+      bool dfa_skip = false;
+
+      // The bar: the summed commonness of the set's bytes (byte_commonness,
+      // per-mille of prose) up to which the skip pays. It depends on the
+      // scan behind the skip (skip_to_set_byte): a SIMD compare per member
+      // for a set of up to kSimdSetMax bytes, a table lookup per subject
+      // byte for a larger one. Measured over prose, the skip against the
+      // bare scan:
+      //   3 bytes   at 115: 1.4x    144: 1.1x    195: 0.85x
+      //   5 bytes   at 128: 1.3x
+      //   8 bytes   at  58: 1.5x     97: 1.2x    142: 0.9x
+      //   9+ bytes  at  44: 1.6x     83: 1.0x    120: 0.85x
+      static int dfa_skip_bar(size_t members) {
+        return members <= kSimdSetMax ? 180 - 8 * static_cast<int>(members)
+                                      : 72;
+      }
+
+      void rate() {
+        int density = 0;
+        for (unsigned char b : list)
+          density += byte_commonness(b);
+        dfa_skip = sparse && density <= dfa_skip_bar(list.size());
+      }
     };
     FirstBytes<128> first_bytes_;
 
@@ -8860,7 +8898,8 @@ private:
                                 // prefilter is icase_prefix_ below)
     FirstBytes<256> byte_first_bytes_;
     bool byte_prefilter_ok_ =
-        false; // byte_prefix_ or byte first-byte skip usable
+        false; // the byte DFAs' start state has something to skip with
+               // (byte_prefilter_skip): settled at the end of the ctor
 
     // Required-suffix-literal prefilter: when every match ends with a fixed
     // ASCII literal and everything before it is bounded-length, memchr/memmem
@@ -12951,7 +12990,7 @@ private:
   // Whether plan_prefilter_skip has anything to skip with.
   bool plan_prefilter_any() const {
     return plan_->prefix_.active() || plan_->teddy_.ok ||
-           plan_->first_bytes_.sparse;
+           plan_->first_bytes_.dfa_skip;
   }
 
   REGEXLIB_ALWAYS_INLINE int plan_prefilter_skip(const unsigned char *p, int n,
@@ -12972,7 +13011,7 @@ private:
     if (plan_->teddy_.ok)
       return static_cast<int>(
           teddy_next(p, static_cast<size_t>(n), static_cast<size_t>(i)));
-    if (plan_->first_bytes_.sparse)
+    if (plan_->first_bytes_.dfa_skip)
       return static_cast<int>(
           skip_to_first_byte(p, static_cast<size_t>(n), static_cast<size_t>(i)));
     return i;
@@ -12995,7 +13034,7 @@ private:
     if (plan_->teddy_.byte_preferred)
       return static_cast<int>(
           teddy_next(p, static_cast<size_t>(n), static_cast<size_t>(i)));
-    if (plan_->byte_first_bytes_.sparse)
+    if (plan_->byte_first_bytes_.dfa_skip)
       return static_cast<int>(
           skip_to_byte_start(p, static_cast<size_t>(n), static_cast<size_t>(i)));
     return i;

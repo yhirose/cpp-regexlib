@@ -1121,6 +1121,16 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   `skip_to_first_byte` is tiered by set size (1 → `memchr`; ≤ 8 → NEON/SSE2 scan;
   else table lookup) and gated on `first_bytes_.sparse` (≤ 32): a dense set
   (`\w` ≈ 63 bytes) would fire rarely and only add overhead, so it pays nothing.
+  The lazy DFA's start state asks for it only when the set is also *rare*
+  (`dfa_skip`: the summed `byte_commonness` of its bytes under a bar). A
+  stop of the skip costs what the DFA steps a dozen bytes in, and a small set
+  of common letters stops every few bytes: the first letters of 16 keywords
+  ran at 280 MB/s with the skip and 860 MB/s on the bare scan. The bar
+  (`dfa_skip_bar`) follows the scan behind the skip: 72 per mille for a set
+  the table scans (9 bytes or more: at ~45, the capitals, the skip is 1.6×
+  the bare scan; near 85 they tie), and 172 down to 116 for the 1 to 8 bytes
+  the SIMD scan takes (three letters still pay at 144 per mille, and no
+  longer at 195).
 - **ASCII-prefix skip on non-ASCII subjects** — a non-ASCII subject on the
   grapheme Pike still benefits if the pattern has an all-ASCII required prefix:
   `prefix_skip_nonascii` runs `find_substr` over raw UTF-8 with a
