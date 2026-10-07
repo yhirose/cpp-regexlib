@@ -5072,13 +5072,14 @@ public:
   // Match anchored at the start of `text` (need not reach the end).
   MatchResult match(std::string_view text) const {
     // [Tier: Literal] pure printable-ASCII literal anchored at 0: the literal
-    // must be a prefix of `text`, and its end must fall on a grapheme
-    // boundary.
+    // must be a prefix of `text`, and — in Grapheme mode — its end must fall
+    // on a grapheme boundary.
     if (plan_->literal_only_) {
-      int m = static_cast<int>(plan_->prefix_.text.size());
+      const std::string &lit = plan_->byte_prefix_.text;
+      int m = static_cast<int>(lit.size());
       if (static_cast<int>(text.size()) >= m &&
-          std::memcmp(text.data(), plan_->prefix_.text.data(), m) == 0 &&
-          literal_boundary_ok(text, 0, m))
+          std::memcmp(text.data(), lit.data(), m) == 0 &&
+          literal_occurrence_ok(text, 0, m))
         return build_dfa_result(text, 0, m);
       return MatchResult{};
     }
@@ -5089,7 +5090,7 @@ public:
       for (const std::string &lit : plan_->literal_alt_) {
         int m = static_cast<int>(lit.size());
         if (m <= n && std::memcmp(text.data(), lit.data(), m) == 0 &&
-            literal_alt_boundary_ok(text, 0, m))
+            literal_occurrence_ok(text, 0, m))
           return build_dfa_result(text, 0, m);
       }
       return MatchResult{};
@@ -6201,6 +6202,7 @@ private:
       plan_egc_captures(root);
       plan_egc_byte_path(root);
       plan_us_prefilters(root);
+      plan_literal(root);
       plan_assert_tiers(root);
       plan_capture_onepass(root);
       plan_anchored_onepass(root);
@@ -6345,26 +6347,10 @@ private:
           /*cp=*/false, /*icase=*/icase_, /*lf_byte_prefix=*/true);
     }
 
-    // Pattern-shape analyses: the pure-literal tier, DFA / assert-DFA
-    // eligibility, the first-byte sets, the Teddy multi-literal prefilter, and
-    // the pure literal alternation.
+    // Pattern-shape analyses: DFA / assert-DFA eligibility, the first-byte
+    // sets, the Teddy multi-literal prefilter, and the pure literal
+    // alternation.
     void analyze_core(const detail::Node &root) {
-      // Pure printable-ASCII literal: the whole pattern is one literal run, so a
-      // single memmem pass locates every match (no subject classification). Gate
-      // on printable ASCII [0x20,0x7E] — those code points are all
-      // Grapheme_Cluster_Break=Other, so the only grapheme fuses to rule out are a
-      // Prepend just before / an Extend·ZWJ·SpacingMark just after the match,
-      // both checked locally (literal_boundary_ok). Excludes CR/LF/controls (their
-      // GB properties differ) and !icase/!us/capture-free (memmem is exact only
-      // then; us has its own byte prefilter).
-      // collect_ascii_literal answers both halves of the gate in one walk: the
-      // AST is a pure literal AND every code point of it is printable ASCII.
-      // literal_locate then memmems prefix_.text as the whole needle, so assert
-      // that it really is the whole literal rather than assuming it.
-      std::string lit;
-      if (!us_ && !icase_ && ncap_ == 0 && prefix_.ascii && prefix_.active() &&
-          collect_ascii_literal(root, lit) && lit == prefix_.text)
-        literal_only_ = true;
       // Pure AST property, used by every mode's gates (one-pass admissions,
       // CRLF gates, prefilter progress arguments) — NOT just the EGC CRLF
       // analysis it used to live in, which left US plans at the conservative
@@ -6376,6 +6362,27 @@ private:
       // Pure literal alternation fast path: Teddy fingerprint -> ordered
       // memcmp -> direct span, no DFA verify. teddy_.ok implies !icase_.
       if (teddy_.ok && ncap_ == 0) analyze_literal_alternation(root);
+    }
+
+    // Pure printable-ASCII literal: the whole pattern is one literal run, so a
+    // single memmem pass locates every match (no subject classification), in
+    // either mode. The gate is the same in both — case-sensitive (memmem is
+    // exact only then), capture-free, and printable ASCII [0x20,0x7E], which
+    // is what lets a Grapheme match be checked locally (see
+    // literal_boundary_ok; a CodePoint match needs no check, and no such
+    // limit — it has it for now). collect_ascii_literal answers both halves
+    // in one walk: the AST is a pure literal AND every code point of it is
+    // printable ASCII.
+    // The needle is the byte program's leading literal (byte_prefix_ — the
+    // bytes every match begins with, on any subject), so this runs after the
+    // byte programs are planned (plan_reverse_and_lf for a CodePoint plan,
+    // plan_egc_byte_path for a Grapheme one), and asserts that it really is
+    // the whole literal rather than assuming it.
+    void plan_literal(const detail::Node &root) {
+      std::string lit;
+      if (!icase_ && ncap_ == 0 && byte_prefix_.active() &&
+          collect_ascii_literal(root, lit) && lit == byte_prefix_.text)
+        literal_only_ = true;
     }
 
     // Reverse program (match-start recovery) and the unanchored leftmost-first
@@ -6587,6 +6594,7 @@ private:
       //    candidate drivers' one walk per match, which finds the end itself.
       onepass_unbounded_ = false;
       onepass_anchored_start_ = false;
+      if (literal_only_) return; // Rung::Literal, and match()'s memcmp
       // ncap == 0 is admitted too: the compiler emits Save 0/1 (the whole
       // match) at every capture count, so the SAME walk that yields a capture
       // pattern's groups yields a capture-free pattern's span — and the same
@@ -9587,7 +9595,8 @@ private:
     // over arbitrary UTF-8: byte_prefix_.text is the leading run of exact literal
     // bytes every match must begin with (memmem-skippable on any subject), and
     // byte_first_bytes_.set is the full 0..255 set of bytes a match can start with.
-    // See analyze_byte_prefilter.
+    // See analyze_byte_prefilter. byte_prefix_ is also the literal tier's
+    // needle, in both modes (plan_literal): the whole run, never a part of it.
     LiteralPrefix byte_prefix_; // .icase unused (the (?i) byte
                                 // prefilter is icase_prefix_ below)
     FirstBytes<256> byte_first_bytes_;
@@ -10042,11 +10051,12 @@ private:
     bool crlf_fused_lit_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
-    // Whole pattern is a single printable-ASCII literal (capture-free, !icase,
-    // !us): every match is the exact literal bytes as standalone graphemes, so a
-    // memmem + O(1) boundary check finds it in ONE pass — no subject-
-    // classification pass (first_nonascii / simple_from), the way RE2 / rure scan
-    // a literal. See literal_locate / literal_boundary_ok.
+    // Whole pattern is a single printable-ASCII literal (capture-free,
+    // !icase): every match is the exact literal bytes — as standalone
+    // graphemes, in Grapheme mode — so a memmem + O(1) boundary check finds
+    // it in ONE pass — no subject-classification pass (first_nonascii /
+    // simple_from), the way RE2 / rure scan a literal. See plan_literal /
+    // literal_locate.
     bool literal_only_ = false;
     // Pure literal alternation (>= 2 fixed printable-ASCII alternatives):
     // matched by Teddy fingerprint -> ordered memcmp of the literals that
@@ -10054,7 +10064,7 @@ private:
     // literal path). Empty = off. Grouped by fingerprint, in alternation
     // order within a group — the order among any literals that can match at
     // one position (see analyze_literal_alternation).
-    // Both modes, on any subject (see literal_alt_boundary_ok).
+    // Both modes, on any subject (see literal_occurrence_ok).
     std::vector<std::string> literal_alt_;
     // ... the group of teddy_'s fingerprint `id` being
     // literal_alt_[literal_alt_at_[id] .. literal_alt_at_[id + 1]).
@@ -10744,7 +10754,8 @@ private:
     return scan64(p, n, off, PredNonAscii{});
   }
 
-  // --- Literal tier: memmem locate + per-match grapheme-boundary check ---
+  // --- Literal tier: memmem locate + per-match grapheme-boundary check
+  // (Grapheme mode) ---
 
   // A printable-ASCII literal occurrence at byte [h, h+m) is a valid EGC match
   // iff it sits on grapheme boundaries. Each literal byte is one
@@ -10784,32 +10795,32 @@ private:
     return true;
   }
 
-  // The literal-alternation tier's test of an occurrence, for find and
-  // match() alike: a CodePoint match is the bytes wherever they are, a
-  // Grapheme one sits on cluster boundaries (Prepend before /
-  // Extend·ZWJ·SpacingMark after).
-  bool literal_alt_boundary_ok(std::string_view t, int h, int m) const {
+  // The literal tiers' test of an occurrence (the literal's and the
+  // literal alternation's, for find and match() alike): a CodePoint match is
+  // the bytes wherever they are, a Grapheme one sits on cluster boundaries
+  // (Prepend before / Extend·ZWJ·SpacingMark after).
+  bool literal_occurrence_ok(std::string_view t, int h, int m) const {
     return plan_->us_ || literal_boundary_ok(t, h, m);
   }
 
   // Pure-literal fast path: locate the next match with start >= `from` by
   // memmem of the literal (single pass, no subject classification), accepting
-  // the first occurrence that passes the grapheme-boundary check. Writes byte
+  // the first occurrence the mode takes (literal_occurrence_ok). Writes byte
   // offsets to s/e and returns true, or returns false if there is no match.
   bool literal_locate(std::string_view t, int from, int &s, int &e) const {
+    const Plan::LiteralPrefix &lit = plan_->byte_prefix_;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const unsigned char *np =
-        reinterpret_cast<const unsigned char *>(plan_->prefix_.text.data());
+        reinterpret_cast<const unsigned char *>(lit.text.data());
     int n = static_cast<int>(t.size());
-    int m = static_cast<int>(plan_->prefix_.text.size());
+    int m = static_cast<int>(lit.text.size());
     int scan = from;
     while (scan + m <= n) {
       const unsigned char *h =
-          find_substr(p + scan, n - scan, np, m, plan_->prefix_.probe,
-                      plan_->prefix_.probe2);
+          find_substr(p + scan, n - scan, np, m, lit.probe, lit.probe2);
       if (!h) return false;
       int pos = static_cast<int>(h - p);
-      if (literal_boundary_ok(t, pos, m)) {
+      if (literal_occurrence_ok(t, pos, m)) {
         s = pos;
         e = pos + m;
         return true;
@@ -10822,7 +10833,7 @@ private:
   // Leftmost-first match of the literal set at/after `from`: Teddy finds the
   // next fingerprint and says which, then each literal that begins with it is
   // tried in alternation order and the first whose bytes match AND whose
-  // occurrence is one the mode takes (literal_alt_boundary_ok) wins. Writes
+  // occurrence is one the mode takes (literal_occurrence_ok) wins. Writes
   // [s, e) and returns true; false if no match remains.
   // Every literal begins with a Teddy fingerprint (teddy_.n <= min length) and
   // is >= teddy_.n bytes, so no match start is skipped; an ASCII literal byte
@@ -10854,7 +10865,7 @@ private:
         int m = static_cast<int>(lit.size());
         if (pos + m <= n &&
             bytes_eq(p + hit.pos + fn, lit.data() + fn, lit.size() - fn) &&
-            literal_alt_boundary_ok(t, pos, m)) {
+            literal_occurrence_ok(t, pos, m)) {
           s = pos;
           e = pos + m;
           return true;
@@ -14606,7 +14617,8 @@ public:
     // rule below: the grapheme program's in Grapheme mode, the byte
     // program's in CodePoint mode — where it had none, and a boolean over a
     // literal-led pattern stepped the DFA through every byte the find's
-    // memmem jumps (`zqj` over 595 KB of prose: 0.67 GB/s, the find 89).
+    // memmem jumps (`zqj`, before a CodePoint literal had the literal tier,
+    // over 595 KB of prose: 0.67 GB/s, the find 89).
     // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
     LazyDfa &fu(const Regex &re) {
       if (!fu_) {

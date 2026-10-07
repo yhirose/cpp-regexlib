@@ -287,7 +287,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 
 | ラベル | ゲート | 動作 |
 | --- | --- | --- |
-| `Literal` | `literal_only_` | memmem（+ 書記素境界チェック）；subject 分類なし |
+| `Literal` | `literal_only_` | memmem（+ Grapheme モードでは書記素境界チェック）；subject 分類なし |
 | `LiteralAlt` | `literal_alt_` 非空 | Teddy 複数リテラルスキャン、見つかった fingerprint で始まるリテラルの順序付き verify |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——u16 行、accept バイトは依存チェーン外。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
@@ -1047,7 +1047,7 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
     なくマッチャそのものになる：`literal_alt_locate` が `find_print` の返す
     fingerprint を取り、それで始まるリテラルを選択順に試して（`literal_alt_` は
     fingerprint ごとにまとめて並べてある。`literal_alt_at_`）、span を **DFA 検証なし**で直接返す
-    ——純リテラル選択 tier。両モードで使う。Grapheme モードではグラフェム境界チェック
+    ——純リテラル選択 tier。両モードで使う（`literal_occurrence_ok`）。Grapheme モードではグラフェム境界チェック
     （`literal_boundary_ok`）でどの subject でも健全、CodePoint モードのマッチは
     バイト列そのもの。短リテラルの比較はインライン `bytes_eq`（libc
     `memcmp` の *call* が tier の ~20% だった）。
@@ -1209,6 +1209,12 @@ one-pass のドライバは
   飛ばし、**単一**パスでマッチする。`zqj` を ~20000 → ~38600 MB/s、`/Sherlock/` を
   ~13500 → ~23800（RE2 超え）に。同じバイト単位リテラルプリフィルタは **UnicodeScalar**
   モードにも配線済み——従来は EGC 限定で、US `zqj` を ~450 MB/s に留めていた欠落穴。
+  tier そのものは両モードで使う：針はバイトプログラムの先頭リテラル（`byte_prefix_`。
+  パターン全体であることは `plan_literal` が確かめる）、ヒットに求めるものは選択 tier と
+  同じ問い（`literal_occurrence_ok`）——Grapheme モードではクラスタ境界、CodePoint モードでは
+  何も求めない。CodePoint では従来このリテラルは DFA 走査の開始スキップだった
+  （散文の `Holmes` 20 → 33 GB/s、`the` 1.5 → 2.1。3 バイトのトークンの search 29 → 18 ns、
+  60 バイトへの `test()` 52 → 18）。
 
 各プレフィルタは正しい scalar フォールバックを持ち、ディスパッチは排他なので、どの
 プレフィルタを無効にしても速度が変わるだけで結果は変わりません。

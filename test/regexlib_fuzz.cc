@@ -52,6 +52,7 @@
 namespace reg {
 namespace detail {
 struct PlanProbe {
+  static bool literal_only(const Regex &re) { return re.plan_->literal_only_; }
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
@@ -1954,7 +1955,9 @@ void invariant_fuzz_multi_literal(int iters) {
 // on subjects that interleave grapheme-fusing code points around the literal —
 // a Prepend just before a match (must reject) or an Extend/ZWJ/SpacingMark just
 // after it (must reject). gen_subject() is ASCII-only, so the main
-// invariant_fuzz never stresses these boundaries; this does.
+// invariant_fuzz never stresses these boundaries; this does. The same
+// pattern in CodePoint mode is on the tier too, and takes every occurrence,
+// fused or not: against the code-point Pike, over the same subjects.
 void invariant_fuzz_literal(int iters) {
   // Literal alphabet: printable ASCII only (the tier's gate), incl. space and
   // an uppercase letter / digit so probe-byte selection varies.
@@ -1970,32 +1973,19 @@ void invariant_fuzz_literal(int iters) {
     int m = U(1, 4);
     std::string pat;
     for (int i = 0; i < m; i++) pat += LITCH[U(0, 5)];
-    reg::Regex re(pat);
-    reg::Regex *pike = pike_reference(pat);
-    if (!pike) continue;
-    reg::Regex::FindCache cache;
-    squeeze_dfa_cache(re, pat, 0, &cache);
+    for (reg::MatchUnit unit :
+         {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+      if (!reg::detail::PlanProbe::literal_only(reg::Regex(pat, 0u, unit)))
+        fail("literal: not on the literal tier", pat, "");
+    std::vector<std::string> subjects;
     for (int s = 0; s < 6; s++) {
       int k = U(0, 14);
       std::string subj;
       for (int i = 0; i < k; i++) subj += UNITS[U(0, 11)];
-      auto all = find_all(re, subj);
-      auto ref = find_all(*pike, subj);
-      reg::MatchResult sm = re.search(subj);
-      if (re.test(subj) != sm.matched())
-        fail("literal: test() != search().matched()", pat, subj);
-      if (re.match(subj).matched() != (sm.matched() && sm.begin() == 0))
-        fail("literal: match() != (search anchored at 0)", pat, subj);
-      if (all.size() != ref.size())
-        fail("literal: find_all count != Pike", pat, subj);
-      else
-        for (size_t i = 0; i < all.size(); i++)
-          compare_groups(all[i], ref[i], "literal: find_all vs Pike", pat,
-                         subj);
-      check_scan(re, subj, all, pat);
-      check_cache(re, subj, all, cache, pat);
+      subjects.push_back(subj);
     }
-    delete pike;
+    check_pattern(pat, subjects);
+    check_us_vs_pike(pat, subjects, reg::MatchUnit::CodePoint);
   }
 }
 

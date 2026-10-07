@@ -1224,9 +1224,19 @@ void test_find_ladder() {
   auto test = [](const Regex &re) { return PlanProbe::start(re, true); };
 
   // --- where a scan starts ---
-  // A plan that is its own locate, for every caller.
-  CHECK(rows(Regex("Sherlock")) == 'L' && test(Regex("Sherlock")) == 'L');
-  CHECK(rows(Regex("fox|dog|cat")) == 'A' && test(Regex("fox|dog|cat")) == 'A');
+  // A plan that is its own locate, for every caller, in either mode: a
+  // printable-ASCII literal (under a group that wraps the whole of it or
+  // not), and an alternation of them.
+  for (const char *pat : {"Sherlock", ">>=", "a", "(Holmes)", "a\\.b c"})
+    for (const Regex &re : {Regex(pat), make_us(pat)})
+      CHECK(rows(re) == 'L' && test(re) == 'L');
+  // (Not a pattern that is more than a literal. Nor, for now, a literal
+  // that is not printable ASCII — which only a Grapheme plan has to ask.)
+  for (const char *pat : {"ab?", "caf\xC3\xA9", "a\\nb"})
+    for (const Regex &re : {Regex(pat), make_us(pat)})
+      CHECK(rows(re) != 'L' && test(re) != 'L');
+  for (const Regex &re : {Regex("fox|dog|cat"), make_us("fox|dog|cat")})
+    CHECK(rows(re) == 'A' && test(re) == 'A');
   // A text-anchored pattern: one walk from 0, before the subject is looked
   // at or the cache fetched — for test() always, for a find when there are
   // no groups to hand out (with groups, the capture walk of the family is
@@ -2692,7 +2702,8 @@ void test_anchor_choice() {
     auto cp_pike = [](const std::string &pat) {
       return pike_twin(pat, 0, reg::MatchUnit::CodePoint);
     };
-    for (const char *pat : {"fox|dog|cat", "(fox|dog|cat)", "[fd]o[xg]|cat",
+    for (const char *pat : {"fox", "(cat)", "fo",
+                            "fox|dog|cat", "(fox|dog|cat)", "[fd]o[xg]|cat",
                             "(?:caf\xC3\xA9|na\xC3\xAFve|fox)s?"}) {
       const auto want = flat_spans(cp_pike(pat), marks, false);
       CHECK(finds_agree(make_us(pat), want, marks));
@@ -2703,6 +2714,10 @@ void test_anchor_choice() {
           (std::vector<size_t>{0, 3, 6, 9, 12, 15, 16, 19}));
     CHECK(flat_spans(Regex("fox|dog|cat"), marks, false) ==
           (std::vector<size_t>{6, 9, 16, 19}));
+    CHECK(flat_spans(make_us("fox"), marks, false) ==
+          (std::vector<size_t>{0, 3, 16, 19}));
+    CHECK(flat_spans(Regex("fox"), marks, false) ==
+          (std::vector<size_t>{16, 19}));
     // The one-pass walk's position scan takes its candidates from the
     // same searcher: a literal behind optional bytes (either mode), behind
     // a small class (CodePoint), with a match at the very start and one
@@ -2720,8 +2735,12 @@ void test_anchor_choice() {
     CHECK(PlanProbe::start(make_us("x?y?ab(c*)"), false) == 'W');
     CHECK(PlanProbe::start(make_us("[aeiou]n"), false) == 'W');
     // match(), anchored at 0, by the same rule.
-    CHECK(make_us("fox|dog").match("fox\xCC\x81").matched());
-    CHECK(!Regex("fox|dog").match("fox\xCC\x81").matched());
+    for (const char *pat : {"fox", "fox|dog"}) {
+      CHECK(make_us(pat).match("fox\xCC\x81").matched());
+      CHECK(!Regex(pat).match("fox\xCC\x81").matched());
+      CHECK(make_us(pat).match("fox").end() == 3);
+      CHECK(!make_us(pat).match("a fox").matched());
+    }
     CHECK(make_us("fox|dog").match("dog").end() == 3);
     CHECK(!make_us("fox|dog").match("a dog").matched());
   }

@@ -301,7 +301,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 
 | Label | Gate | What runs |
 | --- | --- | --- |
-| `Literal` | `literal_only_` | memmem (+ grapheme-boundary check); no subject classification |
+| `Literal` | `literal_only_` | memmem (+ grapheme-boundary check in Grapheme mode); no subject classification |
 | `LiteralAlt` | `literal_alt_` non-empty | Teddy multi-literal scan, ordered verify of the literals behind the fingerprint found |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — u16 rows, accept byte off the dependency chain; a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
@@ -1148,7 +1148,7 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
     literals that begin with it in alternation order (`literal_alt_` keeps
     them grouped by fingerprint, `literal_alt_at_`), and returns the span
     directly with **no DFA verify** — a pure-literal-alternation tier, in
-    both modes. In Grapheme mode a grapheme-boundary check
+    both modes (`literal_occurrence_ok`). In Grapheme mode a grapheme-boundary check
     (`literal_boundary_ok`) keeps it sound on any subject; a CodePoint
     match is the bytes wherever they are. The short-literal compare is an inlined
     `bytes_eq` (the libc `memcmp` *call* was ~20% of the tier).
@@ -1341,6 +1341,13 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   ~20000 → ~38600 MB/s, `/Sherlock/` ~13500 → ~23800 (past RE2). The same
   byte-level literal prefilter is also wired into **UnicodeScalar** mode — it had
   been EGC-only, a missing-prefilter hole that left US `zqj` at ~450 MB/s.
+  The tier itself serves both modes: its needle is the byte program's
+  leading literal (`byte_prefix_`, which `plan_literal` checks is the whole
+  pattern), and what it asks of an occurrence is the alternation tier's
+  question (`literal_occurrence_ok`) — cluster boundaries in Grapheme mode,
+  nothing in CodePoint mode, where the literal used to be the start skip of
+  a DFA scan (`Holmes` over prose 20 → 33 GB/s, `the` 1.5 → 2.1; a search of
+  a three-byte token 29 → 18 ns, a `test()` over 60 bytes 52 → 18).
 
 Every prefilter has a correct scalar fallback and the dispatch is exclusive, so
 disabling any prefilter changes speed, never results.
