@@ -5744,14 +5744,20 @@ private:
 
     // The first occurrence of a fingerprint that starts in [from, slen),
     // and which fingerprint it is; pos == slen when there is none.
-    Hit find_print(const unsigned char *p, size_t slen, size_t from) const {
+    // (This and find are inlined by name, down to the scan: they are a
+    // dispatch, and left to the compiler they went out of line once there
+    // was one more caller — a call and some 25 instructions on every find
+    // of the alternation tier, 3 to 6% of a dense scan.)
+    REGEXLIB_ALWAYS_INLINE Hit find_print(const unsigned char *p, size_t slen,
+                                          size_t from) const {
       return find_with(pick(slen - from), p, slen, from, shared);
     }
     // ... for a caller that only asks where: slen when there is none. It
     // takes the word of every bucket that lets nothing else through, shared
     // or not — a lookup less per candidate, which is 2 to 5 ns of a call
     // that takes 7 to 14 when the occurrences are a dozen bytes apart.
-    size_t find(const unsigned char *p, size_t slen, size_t from) const {
+    REGEXLIB_ALWAYS_INLINE size_t find(const unsigned char *p, size_t slen,
+                                       size_t from) const {
       return find_with(pick(slen - from), p, slen, from, loose).pos;
     }
 
@@ -5797,8 +5803,9 @@ private:
     // find_print (`must` = shared) or find (`must` = loose), by `scan`. The
     // fingerprint length goes to a compile-time-N scan: the table loop
     // unrolls and the tables live in registers.
-    Hit find_with(Scan scan, const unsigned char *p, size_t slen, size_t from,
-                  unsigned must) const {
+    REGEXLIB_ALWAYS_INLINE Hit find_with(Scan scan, const unsigned char *p,
+                                         size_t slen, size_t from,
+                                         unsigned must) const {
       switch (n) {
       case 2: return run<2>(scan, p, slen, from, must);
       case 3: return run<3>(scan, p, slen, from, must);
