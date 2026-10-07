@@ -4911,7 +4911,7 @@ class Regex {
   //     their chain from the bail point, so nothing scanned is redone. O(n)
   //     still: charge <= max(kMinScan, pos) <= max(kMinScan, n).
   //   - A driver whose candidates the chain is led to as well (a literal
-  //     prefix, a sparse first-byte set) uses spend_at_candidate /
+  //     prefix, Teddy, a sparse first-byte set) uses spend_at_candidate /
   //     matched_at_candidate instead: between such candidates the chain
   //     walks nothing either, so the distance is no yardstick, and both
   //     sides are counted per candidate — there a fixed per-candidate cost
@@ -4970,8 +4970,8 @@ class Regex {
       return spend(w.walked) && profitable(scanned);
     }
     // The same for a driver whose candidates the chain is led to as well —
-    // a literal prefix, a sparse first-byte set: the chain's forward DFA
-    // skips from its start state with the very memchr the driver runs. The
+    // a literal prefix, Teddy, a sparse first-byte set: the chain's forward
+    // DFA skips from its start state with the very scan the driver runs. The
     // distance scanned is then nobody's work, and measured against it the
     // charge does not trip where it should: `e[a-z]+s` over prose, one
     // candidate in 13 a match and the rest a failed run each, charged 0.96
@@ -5089,7 +5089,7 @@ public:
       for (const std::string &lit : plan_->literal_alt_) {
         int m = static_cast<int>(lit.size());
         if (m <= n && std::memcmp(text.data(), lit.data(), m) == 0 &&
-            literal_boundary_ok(text, 0, m))
+            literal_alt_boundary_ok(text, 0, m))
           return build_dfa_result(text, 0, m);
       }
       return MatchResult{};
@@ -6237,7 +6237,8 @@ private:
       plan_byte_classes();
       // The lazy DFAs' start skips, now that every searcher behind them is
       // planned.
-      start_skip_ = start_skip(prefix_, first_bytes_);
+      // (A CodePoint plan's programs are byte programs: it has the one.)
+      if (!us_) start_skip_ = start_skip(prefix_, first_bytes_);
       byte_start_skip_ = start_skip(byte_prefix_, byte_first_bytes_);
       Regex::ladder_plan(*this);
     }
@@ -6372,8 +6373,8 @@ private:
       analyze_dfa();
       analyze_first_bytes();
       analyze_teddy();
-      // Pure literal alternation fast path (EGC): Teddy fingerprint -> ordered
-      // memcmp -> direct span, no DFA verify. teddy_.ok implies !us_ && !icase_.
+      // Pure literal alternation fast path: Teddy fingerprint -> ordered
+      // memcmp -> direct span, no DFA verify. teddy_.ok implies !icase_.
       if (teddy_.ok && ncap_ == 0) analyze_literal_alternation(root);
     }
 
@@ -9010,12 +9011,14 @@ private:
         literal_alt_at_[g] += literal_alt_at_[g - 1];
     }
 
-    // Enumerate every length-N ASCII byte string that a match can begin with, by
-    // walking the start ε-closure (Save/Jmp/Split are zero-width; Char consumes
-    // one byte and continues at pc+1). Returns false — Teddy unusable — if any
-    // path reaches a non-literal consuming instruction, a non-ASCII or multi-code
-    // -point literal, or Match before N bytes, if there are more distinct
-    // strings than Teddy takes, or if enumeration explodes.
+    // Enumerate every length-N byte string that a match can begin with, by
+    // walking the start ε-closure of prog_ (Save/Jmp/Split are zero-width).
+    // An instruction that takes exactly one byte appends it and continues at
+    // pc+1: a grapheme program's Char of one ASCII code point, a CodePoint
+    // plan's Byte of one value. Returns false — Teddy unusable — if any path
+    // reaches another consuming instruction or Match before N bytes, if
+    // there are more distinct strings than Teddy takes, or if enumeration
+    // explodes.
     bool teddy_collect(int pc, int depth, int N, Teddy::Print &acc,
                        std::vector<Teddy::Print> &out, int &budget) const {
       using Op = detail::Inst::Op;
@@ -9045,7 +9048,11 @@ private:
         acc[static_cast<size_t>(depth)] = static_cast<unsigned char>(lit[0]);
         return teddy_collect(pc + 1, depth + 1, N, acc, out, budget);
       }
-      default: return false; // Class/Any/Byte/Match/asserts: not a fixed literal
+      case Op::Byte:
+        if (in.blo() != in.bhi()) return false;
+        acc[static_cast<size_t>(depth)] = in.blo();
+        return teddy_collect(pc + 1, depth + 1, N, acc, out, budget);
+      default: return false; // Class/Any/Match/asserts: not a fixed literal
       }
     }
 
@@ -9057,18 +9064,21 @@ private:
 
     void analyze_teddy() {
       teddy_ = Teddy{};
-      // Same preconditions as the first-byte filter: a regular ASCII program that
-      // cannot match empty. Case-insensitive needs case-fold orbits (skip, like
-      // the literal prefix). first_bytes_.ok already implies all of this.
-      if (us_ || icase_ || !first_bytes_.ok) return;
+      // A regular program that cannot match empty: the lazy DFAs', whose
+      // start state the searcher skips for (an assertion past the
+      // fingerprints is nothing the walk below would see). Not under
+      // IgnoreCase: a Char then stands for its fold orbit, and the literal
+      // alternation tier takes its literals from the AST as written.
+      if (icase_ || !dfa_ok_ || can_match_empty_) return;
 
       // Prefer the longest fingerprint the shortest literal allows (rarer ->
       // fewer false positives), capped at Teddy::kMaxLen. Fall to a shorter N
       // if the longer one runs off the end of some literal or yields more
       // distinct fingerprints than Teddy takes.
+      std::vector<Teddy::Print> fps;
+      fps.reserve(Teddy::kMaxPrints);
       for (int N = Teddy::kMaxLen; N >= 2; N--) {
-        std::vector<Teddy::Print> fps;
-        fps.reserve(Teddy::kMaxPrints);
+        fps.clear();
         Teddy::Print acc{};
         int budget = kTeddyCollectBudget;
         if (!teddy_collect(0, 0, N, acc, fps, budget) || fps.empty()) continue;
@@ -9428,10 +9438,10 @@ private:
     // Where the unbounded one-pass walk takes its candidates from, best
     // first: position 0 alone, a literal prefix (walk_prefix_ — whichever of
     // the plan's prefix analyses has one, see the constructor), a
-    // non-absorbing interior literal, or every position (pruned by the
-    // first-byte set). Inner is the one driver that reads the FindCache (its
-    // cached reverse(pre) DFA), so a one-step find on any other runs
-    // without fetching it (see Regex::scr_walk).
+    // non-absorbing interior literal, or every position (pruned by Teddy
+    // or the first-byte set). Inner is the one driver that reads the
+    // FindCache (its cached reverse(pre) DFA), so a one-step find on any
+    // other runs without fetching it (see Regex::scr_walk).
     enum class WalkDriver : uint8_t {
       None, // no unbounded one-pass table
       AnchoredStart,
@@ -10044,8 +10054,7 @@ private:
     // literal path). Empty = off. Grouped by fingerprint, in alternation
     // order within a group — the order among any literals that can match at
     // one position (see analyze_literal_alternation).
-    // EGC-only (gated on teddy_.ok, which implies !us_); the per-match
-    // literal_boundary_ok keeps it grapheme-sound on any subject.
+    // Both modes, on any subject (see literal_alt_boundary_ok).
     std::vector<std::string> literal_alt_;
     // ... the group of teddy_'s fingerprint `id` being
     // literal_alt_[literal_alt_at_[id] .. literal_alt_at_[id + 1]).
@@ -10775,6 +10784,14 @@ private:
     return true;
   }
 
+  // The literal-alternation tier's test of an occurrence, for find and
+  // match() alike: a CodePoint match is the bytes wherever they are, a
+  // Grapheme one sits on cluster boundaries (Prepend before /
+  // Extend·ZWJ·SpacingMark after).
+  bool literal_alt_boundary_ok(std::string_view t, int h, int m) const {
+    return plan_->us_ || literal_boundary_ok(t, h, m);
+  }
+
   // Pure-literal fast path: locate the next match with start >= `from` by
   // memmem of the literal (single pass, no subject classification), accepting
   // the first occurrence that passes the grapheme-boundary check. Writes byte
@@ -10805,9 +10822,8 @@ private:
   // Leftmost-first match of the literal set at/after `from`: Teddy finds the
   // next fingerprint and says which, then each literal that begins with it is
   // tried in alternation order and the first whose bytes match AND whose
-  // occurrence sits on grapheme boundaries (literal_boundary_ok — Prepend
-  // before / Extend·ZWJ·SpacingMark after) wins. Writes [s, e) and returns
-  // true; false if no match remains.
+  // occurrence is one the mode takes (literal_alt_boundary_ok) wins. Writes
+  // [s, e) and returns true; false if no match remains.
   // Every literal begins with a Teddy fingerprint (teddy_.n <= min length) and
   // is >= teddy_.n bytes, so no match start is skipped; an ASCII literal byte
   // run never straddles a UTF-8 sequence, so this is sound on any subject.
@@ -10838,7 +10854,7 @@ private:
         int m = static_cast<int>(lit.size());
         if (pos + m <= n &&
             bytes_eq(p + hit.pos + fn, lit.data() + fn, lit.size() - fn) &&
-            literal_boundary_ok(t, pos, m)) {
+            literal_alt_boundary_ok(t, pos, m)) {
           s = pos;
           e = pos + m;
           return true;
@@ -13531,8 +13547,9 @@ private:
   }
 
   // Byte-program skip (Plan::byte_start_skip_; EGC / byte tiers), the same
-  // over the byte automaton's literals. All reason over bytes — ASCII needles
-  // never straddle a UTF-8 sequence — so they are sound on any UTF-8 subject.
+  // over the byte automaton's literals. All reason over bytes — the bytes a
+  // match of the byte automaton begins with, and an ASCII needle never
+  // straddles a UTF-8 sequence — so they are sound on any UTF-8 subject.
   REGEXLIB_ALWAYS_INLINE int byte_prefilter_skip(const unsigned char *p, int n,
                                                  int i) const {
     const Plan::StartSkip skip = plan_->byte_start_skip_;
@@ -16228,7 +16245,7 @@ private:
   // Position-scan + unbounded one-pass walk: the candidate source of last
   // resort for onepass_unbounded_ patterns with NO literal prefix or usable
   // ReverseInner (`(\S+) \S+ … (\d+)` — the access-log shape). Every
-  // position at or after `from` is a candidate, pruned by the pattern's
+  // position at or after `from` is a candidate, pruned by Teddy or the
   // first-byte set; the first position whose one-pass walk completes is the
   // leftmost match (same argument as the prefix driver with an empty prefix),
   // and that ONE walk already yields the end and every capture — replacing
@@ -16261,14 +16278,18 @@ private:
     // sparse form is usable: `.sparse` is set once the set was filled, while
     // a non-sparse set is indistinguishable from the unfilled early return.
     const bool bsparse = byte && plan_->byte_first_bytes_.sparse;
+    // Teddy ahead of either set, as for a lazy DFA's start state (see
+    // Plan::StartSkip) — the scan plan_anchor priced. Its fingerprints are
+    // the leading bytes of the program this plan runs, so they hold on any
+    // subject the walk is given.
+    const bool teddy = plan_->teddy_.ok;
+    const bool pruned = teddy || sparse || bsparse;
     for (int pos = from; pos < n; pos++) {
-      if (sparse) {
-        pos = static_cast<int>(skip_to_first_byte(p, static_cast<size_t>(n),
-                                                  static_cast<size_t>(pos)));
-        if (pos >= n) return -1;
-      } else if (bsparse) {
-        pos = static_cast<int>(skip_to_byte_start(p, static_cast<size_t>(n),
-                                                  static_cast<size_t>(pos)));
+      if (pruned) {
+        const size_t un = static_cast<size_t>(n), at = static_cast<size_t>(pos);
+        pos = static_cast<int>(teddy    ? plan_->teddy_.find(p, un, at)
+                               : sparse ? skip_to_first_byte(p, un, at)
+                                        : skip_to_byte_start(p, un, at));
         if (pos >= n) return -1;
       }
       // (No scalar first_bytes_ rung here: the byte-0 test below asks the
@@ -16305,13 +16326,13 @@ private:
       int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, pos);
       // (A pruned scan's candidates are the chain's too: its start state
-      // skips on the same set. See spend_at_candidate.)
+      // skips with the same searcher. See spend_at_candidate.)
       if (e > pos && onepass_end_ok(e, t)) {
-        if (sparse || bsparse) budget.matched_at_candidate(e - pos);
+        if (pruned) budget.matched_at_candidate(e - pos);
         return e;
       }
-      if (!(sparse || bsparse ? budget.spend_at_candidate(w)
-                              : budget.spend_profitable(w, pos)))
+      if (!(pruned ? budget.spend_at_candidate(w)
+                   : budget.spend_profitable(w, pos)))
         return kWalkBail; // overlap / unprofitable -> located-span chain
       // The failed walk's first run proves every start inside it fails too
       // (see State::restart_ok): resume at the run's end, not the next byte.

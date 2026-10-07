@@ -1089,6 +1089,17 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   buckets every byte could be that position of, and a lane where `N`
   consecutive bytes agree on a bucket is a candidate. `N` is the longest
   fingerprint the shortest literal allows (capped at 4).
+  - *Where the fingerprints come from.* The program the plan's DFAs run
+    (`teddy_collect` walks its start closure): an instruction that takes
+    exactly one byte extends a fingerprint, anything else ends the attempt.
+    In Grapheme mode that is a `Char` of one ASCII code point. In CodePoint
+    mode the program is the UTF-8 byte automaton, and it is a `Byte` of one
+    value — so the same alternation gets the same searcher in both modes
+    (seven names, CodePoint: 3.3 → 13.4 GB/s; a lexer's nine operators, one
+    search: 25 → 12 ns), a fingerprint may be non-ASCII bytes there
+    (`café|naïve`), and a class of a few single bytes, which the byte
+    automaton holds as a choice between them, reads as one
+    (`[Hh]olmes|[Ww]atson`: 1.2 → 12 GB/s).
   - *Up to 64 fingerprints.* Past eight they share buckets, and a shared
     bucket lets through the strings that mix its members' nibbles. `build`
     deals each fingerprint, most common first, to the bucket whose estimated
@@ -1136,13 +1147,15 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
     `literal_alt_locate` takes the fingerprint `find_print` names, tries the
     literals that begin with it in alternation order (`literal_alt_` keeps
     them grouped by fingerprint, `literal_alt_at_`), and returns the span
-    directly with **no DFA verify** (a
-    grapheme-boundary check keeps it sound on any subject) — a
-    pure-literal-alternation tier. The short-literal compare is an inlined
+    directly with **no DFA verify** — a pure-literal-alternation tier, in
+    both modes. In Grapheme mode a grapheme-boundary check
+    (`literal_boundary_ok`) keeps it sound on any subject; a CodePoint
+    match is the bytes wherever they are. The short-literal compare is an inlined
     `bytes_eq` (the libc `memcmp` *call* was ~20% of the tier).
   - *As a start skip.* A *mixed* alternation (some branch not a bare literal)
-    keeps Teddy as the candidate-finder of the lazy DFAs' start state and of
-    the Pike. What a start state skips with is one decision per program
+    keeps Teddy as the candidate-finder of the lazy DFAs' start state, of
+    the one-pass walk's position scan (`scan_onepass_find`) and of the
+    grapheme Pike. What a start state skips with is one decision per program
     family (`StartSkip`: a literal prefix, Teddy, a first-byte set that is
     small and rare, or nothing), and Teddy goes ahead of the first-byte set
     — always, not by estimate. It

@@ -952,21 +952,25 @@ void invariant_fuzz_onepass_repeat(int iters) {
   }
 }
 
-// US (CodePoint) differential against the EGC forced Pike: find_all, search
-// and find_iter of `pat` built in CodePoint mode must give the spans and
-// groups the grapheme Pike gives. The oracle is valid on subjects whose every
-// cluster is ONE code point and that hold no `\r` (US never fuses CR-LF, EGC
-// does) — the callers' job. It is the EGC engine on purpose: the code-point
+// US (CodePoint) differential against the EGC forced Pike: find_all, search,
+// match and find_iter of `pat` built in CodePoint mode must give the spans
+// and groups the grapheme Pike gives. The oracle is valid on subjects whose
+// every cluster is ONE code point and that hold no `\r` (US never fuses
+// CR-LF, EGC does) — the callers' job. It is the EGC engine on purpose: the code-point
 // Pike shares its program with the one-walk tables it would be checking.
+// Where the modes part is what a caller is after — the tiers that read the
+// byte program or the AST, not those tables — it asks for the code-point
+// Pike (`oracle`), and any subject goes.
 void check_us_vs_pike(const std::string &pat,
-                      const std::vector<std::string> &subjects) {
+                      const std::vector<std::string> &subjects,
+                      reg::MatchUnit oracle = reg::MatchUnit::Grapheme) {
   reg::Regex *us = nullptr, *pike = nullptr;
   try {
     us = new reg::Regex(pat, 0u, reg::MatchUnit::CodePoint);
   } catch (...) {
     return; // rejected pattern: nothing to compare
   }
-  pike = pike_reference(pat);
+  pike = pike_reference(pat, 0u, oracle);
   if (!pike) {
     delete us;
     return; // wrap limit
@@ -1004,6 +1008,16 @@ void check_us_vs_pike(const std::string &pat,
     }
     if (t != one.matched())
       fail("US test() != search().matched()", pat, subj);
+    // match(): anchored at 0, its own tiers in front of the ladder's.
+    try {
+      const reg::MatchResult m0 = us->match(subj), r0 = pike->match(subj);
+      if (m0.matched() != r0.matched())
+        fail("US vs Pike: match()", pat, subj);
+      else if (m0.matched())
+        compare_groups(m0, r0, "US match() vs Pike", pat, subj);
+    } catch (...) {
+      fail("US vs Pike: match() threw", pat, subj);
+    }
     check_scan(*us, subj, all, pat);
     check_shared_cache(*us, subj, all, pat);
   }
@@ -1806,6 +1820,10 @@ void invariant_fuzz_ladder(int iters) {
 // Bare (the literal-alternation tier), with a tail (the start skip of the
 // DFA tiers and the Pike), under captures (the one-pass walk's candidates),
 // and behind an optional head (fingerprints reached through two paths).
+// And the shapes a walk can take from its first byte on, where its
+// candidates are Teddy's: a literal behind a class of a few bytes (a choice
+// of fixed bytes in a CodePoint plan's program, so fingerprints there) or
+// behind optional bytes (fingerprints in both modes).
 // The bytes: kMixBytes of them mix (low nibble 1 or 2 under high nibble 2,
 // 3, 4, 6 or 7), then a few bystanders.
 const char kMultiLitBytes[] = "!\"12ABabqrxz ";
@@ -1833,7 +1851,7 @@ std::string gen_multi_literal(std::vector<std::string> &lits) {
   std::string alt;
   for (const std::string &l : lits)
     alt += (alt.empty() ? "" : "|") + l;
-  switch (U(0, 7)) {
+  switch (U(0, 8)) {
   case 0:
   case 1:
   case 2: return alt;
@@ -1842,6 +1860,27 @@ std::string gen_multi_literal(std::vector<std::string> &lits) {
   case 4: return "(" + alt + ")";
   case 5: return "(" + alt + ")(a?)";
   case 6: return "(?:" + alt + ")?" + lits[static_cast<size_t>(U(0, count - 1))];
+  case 7: {
+    // `[ab]lit` or `a?b?lit`, and what they match among the subjects'
+    // pieces.
+    const std::string lit = lits[static_cast<size_t>(U(0, count - 1))];
+    std::string heads;
+    for (int i = U(2, 3); i > 0; i--) {
+      const char b = multi_lit_byte(/*any=*/false);
+      if (heads.find(b) != std::string::npos) continue;
+      heads += b;
+      lits.push_back(b + lit);
+    }
+    lits.push_back(heads + lit);
+    std::string head = "[" + heads + "]";
+    if (U(0, 1)) {
+      head.clear();
+      for (char b : heads)
+        head += std::string(1, b) + "?";
+    }
+    static const char *kTail[] = {"", "x?", "(a?)", "([ab]*)z"};
+    return head + lit + kTail[U(0, 3)];
+  }
   default: return "(?:" + alt + ")(?: |$)";
   }
 }
@@ -1891,14 +1930,21 @@ void invariant_fuzz_multi_literal(int iters) {
       subjects.push_back(gen(U(2, 40), 2, 5)); // with clusters
     check_pattern(pat, subjects);
 
-    // CodePoint: the same alternation with no Teddy under it. Single-code-
-    // point clusters and no `\r` (see check_us_vs_pike), so é is the one
-    // special allowed.
+    // CodePoint: the same alternation, over the byte program's
+    // fingerprints. Single-code-point clusters and no `\r` (see
+    // check_us_vs_pike), so é is the one special allowed.
     std::vector<std::string> us_subjects;
     for (int s = 0; s < 3; s++)
       us_subjects.push_back(gen(U(0, 14), 0, 0));
     us_subjects.push_back(gen(U(20, 80), 0, 8));
     check_us_vs_pike(pat, us_subjects);
+    // ... and with the clusters, against the code-point Pike: a literal in
+    // front of a combining mark is a match here, where Grapheme mode has
+    // none.
+    us_subjects.clear();
+    for (int s = 0; s < 3; s++)
+      us_subjects.push_back(gen(U(2, 40), 2, 5));
+    check_us_vs_pike(pat, us_subjects, reg::MatchUnit::CodePoint);
   }
 }
 

@@ -1000,6 +1000,15 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
   ルックアップで「そのバイトがその位置になりうるバケット」を求め、連続する `N` バイトが
   同じバケットで一致した lane が候補になる。`N` は最短リテラルが許す最長 fingerprint
   （最大4）。
+  - *fingerprint の出どころ。* プランの DFA が走らせるプログラム（`teddy_collect` が
+    開始閉包を歩く）：ちょうど 1 バイトを取る命令が fingerprint を 1 バイト伸ばし、
+    それ以外の命令に当たれば打ち切る。Grapheme モードでは ASCII 1 コードポイントの
+    `Char`。CodePoint モードではプログラムが UTF-8 のバイトオートマトンなので、
+    値が 1 つの `Byte`。だから同じ選択は両モードで同じ検索器を得る（人名 7 個、
+    CodePoint：3.3 → 13.4 GB/s。lexer の演算子 9 種、search 1 回：25 → 12 ns）。
+    CodePoint では fingerprint が非 ASCII のバイトでもよく（`café|naïve`）、数個の
+    単一バイトからなるクラスは、バイトオートマトンがそれらの分岐として持つので、
+    選択として読まれる（`[Hh]olmes|[Ww]atson`：1.2 → 12 GB/s）。
   - *fingerprint は 64 個まで。* 8 個を超えるとバケットを共有し、共有バケットは
     メンバーのニブルを混ぜた文字列も通す。`build` は fingerprint を頻度の高い順に、
     見積もった発火率（`byte_commonness`）の増分が最小のバケットへ配り、どのバケットが
@@ -1037,11 +1046,14 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
     `analyze_literal_alternation` → `literal_alt_`）のときは、Teddy は prefilter では
     なくマッチャそのものになる：`literal_alt_locate` が `find_print` の返す
     fingerprint を取り、それで始まるリテラルを選択順に試して（`literal_alt_` は
-    fingerprint ごとにまとめて並べてある。`literal_alt_at_`）、span を **DFA 検証なし**で直接返す（グラフェム境界チェックでどの subject でも
-    健全）——純リテラル選択 tier。短リテラルの比較はインライン `bytes_eq`（libc
+    fingerprint ごとにまとめて並べてある。`literal_alt_at_`）、span を **DFA 検証なし**で直接返す
+    ——純リテラル選択 tier。両モードで使う。Grapheme モードではグラフェム境界チェック
+    （`literal_boundary_ok`）でどの subject でも健全、CodePoint モードのマッチは
+    バイト列そのもの。短リテラルの比較はインライン `bytes_eq`（libc
     `memcmp` の *call* が tier の ~20% だった）。
   - *開始スキップとして。* *混在*選択（素のリテラルでない枝を含む）では、Teddy は
-    lazy DFA の開始状態と Pike の候補発見器になる。開始状態が何で読み飛ばすかは
+    lazy DFA の開始状態、one-pass 歩行の位置走査（`scan_onepass_find`）、書記素 Pike の
+    候補発見器になる。開始状態が何で読み飛ばすかは
     プログラムの系統ごとに 1 回決める（`StartSkip`：リテラル前置、Teddy、小さくて稀な
     先頭バイト集合、なし）。Teddy は先頭バイト集合より常に優先——見積もりでは
     選ばない。Teddy はマッチが始まりそうな所で止まり、その速さは主題に

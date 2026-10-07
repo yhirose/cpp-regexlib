@@ -231,8 +231,9 @@ using reg::detail::PlanProbe;
 // The same lookahead in front keeps the Pike rung's own accelerators off it
 // (a literal prefix, Teddy or first-byte set to skip to): the twin is the
 // VM started at every position, and shares nothing with what it checks.
-inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0) {
-  reg::Regex re("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)", flags);
+inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0,
+                            reg::MatchUnit unit = reg::MatchUnit::Grapheme) {
+  reg::Regex re("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)", flags, unit);
   check(PlanProbe::pike_only(re), "pike_twin: reference is Pike-only",
         __LINE__);
   return re;
@@ -2621,12 +2622,12 @@ void test_anchor_choice() {
   }
 
   // What the lazy DFA's start state skips with. Teddy, where the pattern
-  // has one — a Grapheme plan's alternation of literals, whatever follows
-  // it. Else the first-byte set, when it is RARE as well as small: a
-  // CodePoint plan has no Teddy, so both of these scan with the DFA there —
-  // capitals are worth jumping to, and the first letters of common words
-  // stop the jump every few bytes, where stepping the DFA is the faster way
-  // through.
+  // has one — an alternation of literals, whatever follows it, in either
+  // mode (the fingerprints are read off the program the plan runs: a
+  // CodePoint plan's are the bytes of its byte program). Else the
+  // first-byte set, when it is RARE as well as small: capitals are worth
+  // jumping to, and the first letters of common words stop the jump every
+  // few bytes, where stepping the DFA is the faster way through.
   {
     const char *names =
         "Sherlock|Holmes|Watson|Irene|Adler|John|Baker|Street|London";
@@ -2635,20 +2636,40 @@ void test_anchor_choice() {
                             "(?:the|and|for)s?", "(?:Xavier|Zulu)s?"}) {
       CHECK(PlanProbe::start_skip(Regex(pat), false) == 'T');
       CHECK(PlanProbe::start_skip(Regex(pat), true) == 'T');
+      CHECK(PlanProbe::start_skip(make_us(pat), true) == 'T');
     }
-    CHECK(PlanProbe::start(Regex(names), false) == 'A');
-    CHECK(PlanProbe::start(Regex(words), false) == 'A');
+    for (const char *pat : {names, words}) {
+      CHECK(PlanProbe::start(Regex(pat), false) == 'A');
+      CHECK(PlanProbe::start(make_us(pat), false) == 'A');
+    }
     CHECK(PlanProbe::start_skip(Regex("Sherlock\\s+Holmes"), true) == 'P');
-    CHECK(PlanProbe::start_skip(make_us(names), true) == 'F');
-    CHECK(PlanProbe::start_skip(make_us(words), true) == '-');
+    // A CodePoint plan's fingerprints are bytes, so a literal need not be
+    // ASCII there; a Grapheme plan's are one-byte clusters. (The
+    // alternation tier's literals are printable ASCII in both.)
+    CHECK(PlanProbe::teddy(make_us("\xC3\xA9t\xC3\xA9|\xC3\xBC" "ber")).ok);
+    CHECK(!PlanProbe::teddy(Regex("\xC3\xA9t\xC3\xA9|\xC3\xBC" "ber")).ok);
+    CHECK(PlanProbe::start(make_us("\xC3\xA9t\xC3\xA9|\xC3\xBC" "ber"), false) !=
+          'A');
+    // A range is not a fixed byte, in either program. A class of a few
+    // single bytes is a choice between them in the byte program, and reads
+    // as one: `dox`, `fox`, `cat`.
+    CHECK(!PlanProbe::teddy(make_us("[a-f]ox|cat")).ok);
+    CHECK(!PlanProbe::teddy(Regex("[fd]ox|cat")).ok);
+    CHECK(PlanProbe::teddy(make_us("[fd]ox|cat")).ok);
+    CHECK(PlanProbe::start(make_us("[fd]ox|cat"), false) != 'A');
+    CHECK(!PlanProbe::teddy(make_us("fox|dogs", IgnoreCase)).ok);
+    // A length the shortest literal turns down leaves nothing behind for
+    // the next one tried.
+    for (const Regex &re : {Regex("abcd|ab"), make_us("abcd|ab")})
+      CHECK(PlanProbe::teddy(re).ok && PlanProbe::teddy(re).count() == 1);
     CHECK(PlanProbe::start_skip(Regex("[A-Z][a-z]+s"), false) == 'F');
     CHECK(PlanProbe::start_skip(Regex("[aeiou][a-z]+s"), false) == '-');
     // How common a set may be depends on how the skip scans for it: a set
     // of a few bytes is a SIMD compare per member, and is worth jumping to
     // where a larger one — a table lookup per subject byte — is not. Three
     // first letters at ~9% of prose still pay; at ~20% they do not.
-    CHECK(PlanProbe::start_skip(make_us("(?:fox|dog|cat)s?"), true) == 'F');
-    CHECK(PlanProbe::start_skip(make_us("(?:the|and|for)s?"), true) == '-');
+    CHECK(PlanProbe::start_skip(make_us("[fdc][a-z]+"), true) == 'F');
+    CHECK(PlanProbe::start_skip(make_us("[taf][a-z]+"), true) == '-');
     CHECK(PlanProbe::start_skip(make_us("[bfgkpvjq][a-z]+"), true) == 'F');
     CHECK(PlanProbe::start_skip(make_us("[bcdfgmpw][a-z]+"), true) == '-');
     // Either way the matches are the Pike's.
@@ -2658,11 +2679,51 @@ void test_anchor_choice() {
     for (const char *pat : {names, words}) {
       const auto want = flat_spans(pike_twin(pat), s, /*lazy=*/false);
       CHECK(want.size() >= 12);
-      CHECK(flat_spans(Regex(pat), s, false) == want);
-      CHECK(flat_spans(Regex(pat), s, true) == want);
-      CHECK(flat_spans(make_us(pat), s, false) == want);
-      CHECK(Regex(pat).test(s) && make_us(pat).test(s));
+      CHECK(finds_agree(Regex(pat), want, s));
+      CHECK(finds_agree(make_us(pat), want, s));
     }
+    // ... and where the modes differ, each mode's own. A literal's bytes
+    // next to a combining mark (after) or a Prepend (before) are part of a
+    // longer cluster — no match — and code points of their own in
+    // CodePoint mode, where the alternation tier takes the bytes as they
+    // are. So does a byte literal's start skip.
+    const std::string marks = "fox\xCC\x81 dog \xD8\x80" "cat fox, "
+                              "caf\xC3\xA9s na\xC3\xAFve\xCC\x81 fo";
+    auto cp_pike = [](const std::string &pat) {
+      return pike_twin(pat, 0, reg::MatchUnit::CodePoint);
+    };
+    for (const char *pat : {"fox|dog|cat", "(fox|dog|cat)", "[fd]o[xg]|cat",
+                            "(?:caf\xC3\xA9|na\xC3\xAFve|fox)s?"}) {
+      const auto want = flat_spans(cp_pike(pat), marks, false);
+      CHECK(finds_agree(make_us(pat), want, marks));
+      CHECK(finds_agree(Regex(pat), flat_spans(pike_twin(pat), marks, false),
+                        marks));
+    }
+    CHECK(flat_spans(make_us("fox|dog|cat"), marks, false) ==
+          (std::vector<size_t>{0, 3, 6, 9, 12, 15, 16, 19}));
+    CHECK(flat_spans(Regex("fox|dog|cat"), marks, false) ==
+          (std::vector<size_t>{6, 9, 16, 19}));
+    // The one-pass walk's position scan takes its candidates from the
+    // same searcher: a literal behind optional bytes (either mode), behind
+    // a small class (CodePoint), with a match at the very start and one
+    // right behind another.
+    const std::string walks = "abc1abc2 xabc7 abcc yab xyabab, The then "
+                              "than Holmes said holmes, unto an inn on";
+    for (const char *pat : {"x?y?ab(c*)", "[aeiou]n", "[Tt]h[ae]",
+                            "([Hh]olmes) (\\w+)", "[xy]?ab(\\d?)"}) {
+      CHECK(finds_agree(make_us(pat), flat_spans(cp_pike(pat), walks, false),
+                        walks));
+      CHECK(finds_agree(Regex(pat), flat_spans(pike_twin(pat), walks, false),
+                        walks));
+    }
+    CHECK(PlanProbe::teddy(make_us("x?y?ab(c*)")).ok);
+    CHECK(PlanProbe::start(make_us("x?y?ab(c*)"), false) == 'W');
+    CHECK(PlanProbe::start(make_us("[aeiou]n"), false) == 'W');
+    // match(), anchored at 0, by the same rule.
+    CHECK(make_us("fox|dog").match("fox\xCC\x81").matched());
+    CHECK(!Regex("fox|dog").match("fox\xCC\x81").matched());
+    CHECK(make_us("fox|dog").match("dog").end() == 3);
+    CHECK(!make_us("fox|dog").match("a dog").matched());
   }
 
   // --- results ---
