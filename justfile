@@ -5,7 +5,7 @@ default:
 
 build:
     cmake -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build
+    cmake --build build --parallel
 
 test: build
     ctest --test-dir build --output-on-failure
@@ -18,7 +18,7 @@ test: build
 test-asan:
     cmake -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-    cmake --build build-asan
+    cmake --build build-asan --parallel
     ctest --test-dir build-asan --output-on-failure
 
 # Build + run the throughput benchmark (opt-in; uses RE2/PCRE2/rure if present).

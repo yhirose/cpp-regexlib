@@ -24,7 +24,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel
 
       # ctest runs the default suite: regexlib_test, regexlib_std_compat_test,
       # regexlib_scan_diff, regexlib_corpus, regexlib_fuzz.
@@ -60,7 +60,7 @@ jobs:
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
 
       - name: Build
-        run: cmake --build build-asan
+        run: cmake --build build-asan --parallel
 
       - name: Test
         run: ctest --test-dir build-asan --output-on-failure
