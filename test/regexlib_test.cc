@@ -78,6 +78,20 @@ struct PlanProbe {
   static char walk_skip(const Regex &re, bool byte) {
     return skip_letter(re.plan_->walk_skip(byte));
   }
+  // The slots the one-pass table writes: the bits of every step's mask and
+  // every accept's, or'd together (-1: the plan has no such table). Group
+  // 0's two are the walk's own to write, so they are never among them.
+  static int64_t onepass_slots(const Regex &re) {
+    const auto &op = re.plan_->cp_onepass_;
+    if (!op.ok) return -1;
+    uint64_t slots = 0;
+    for (const auto &st : op.states) {
+      slots |= st.match_mask;
+      for (uint64_t m : st.mask)
+        slots |= m;
+    }
+    return static_cast<int64_t>(slots);
+  }
   // The Teddy searcher: the type (a test deals one straight from a list of
   // fingerprints), and the plan's (ok: the pattern has one).
   using Teddy = Regex::Teddy;
@@ -1049,6 +1063,122 @@ void test_matches() {
       CHECK(fa[i].group(g).matched() == m3[i].group(g).matched());
       if (fa[i].group(g).matched()) CHECK(fa[i].group(g).str() == m3[i].group(g).str());
     }
+  }
+}
+
+// The rows a find_all returns and the one a find_iter yields (SpanRows), and
+// the walk's part in them: group 0 is the walk's own to write, every other
+// group the table's.
+void test_match_rows() {
+  // A result that outgrows its rows many times over: 20,000 matches, each
+  // where the text was built to have it.
+  std::string text;
+  std::vector<size_t> want; // as flat_spans lays them out
+  for (int i = 0; i < 20000; i++) {
+    const std::string w(static_cast<size_t>(1 + i % 7),
+                        static_cast<char>('a' + i % 26));
+    want.insert(want.end(), {text.size(), text.size() + w.size()});
+    text += w;
+    text += i % 5 ? " " : ", ";
+  }
+  // (The walk serves both: a CodePoint plan starts on it, a Grapheme one
+  // once it has seen that the subject is ASCII.)
+  Regex words(R"(\w+)"), words_us = make_us(R"(\w+)");
+  CHECK(PlanProbe::start(words_us, false) == 'W');
+  for (const Regex *re : {&words, &words_us})
+    CHECK(flat_spans(*re, text, false) == want &&
+          flat_spans(*re, text, true) == want);
+
+  // A MatchList is a value: a copy has rows of its own, a move takes them,
+  // and an assignment replaces what was there.
+  {
+    auto same_spans = [&](const Regex::MatchList &ms) {
+      if (2 * ms.size() != want.size()) return false;
+      for (size_t i = 0; i < ms.size(); i++)
+        if (ms[i].begin() != want[2 * i] || ms[i].end() != want[2 * i + 1])
+          return false;
+      return true;
+    };
+    auto ms = words.find_all(text);
+    Regex::MatchList copy = ms;
+    ms = words.find_all("x yz");
+    CHECK(ms.size() == 2 && ms[1].str() == "yz");
+    CHECK(same_spans(copy));
+    Regex::MatchList moved = std::move(copy);
+    CHECK(same_spans(moved));
+    copy = moved;
+    CHECK(same_spans(copy) && same_spans(moved));
+    ms = std::move(moved);
+    CHECK(same_spans(ms));
+    Regex::MatchList none, none2 = none;
+    CHECK(none2.empty() && none2.size() == 0);
+    ms = none;
+    CHECK(ms.empty());
+  }
+
+  // Groups, one of them unset in some rows and one empty in others, over
+  // many rows: `key`, digits or nothing, `=`, a value or nothing.
+  {
+    std::string kv;
+    std::vector<size_t> rows;
+    for (int i = 0; i < 3000; i++) {
+      const size_t b = kv.size(), none = size_t(-1);
+      kv += std::string(static_cast<size_t>(1 + i % 3), 'k');
+      const size_t k = kv.size();
+      if (i % 3) kv += std::to_string(i);
+      const size_t d = kv.size();
+      kv += '=';
+      const size_t e = kv.size();
+      kv += std::string(static_cast<size_t>(i % 4), 'v');
+      const size_t v = kv.size();
+      kv += i % 2 ? "; " : "\n";
+      rows.insert(rows.end(), {b, v, b, k, d > k ? k : none, d > k ? d : none,
+                               e, v});
+    }
+    for (const char *pat :
+         {R"(([a-z]+)(\d+)?=([a-z]*))", R"((?:([a-z]+)(\d+)?=([a-z]*)))"}) {
+      Regex re(pat);
+      CHECK(PlanProbe::onepass_slots(re) == 0b11111100);
+      CHECK(finds_agree(re, rows, kv));
+      // ... and the single result with its groups (finds_agree reads its
+      // span only).
+      auto one = re.search(std::string_view(kv).substr(rows[7 * 8]));
+      CHECK(one.matched() && one.begin() == 0 && one.group(1).str() == "kk" &&
+            one.group(2).str() == "7" && one.group(3).str() == "vvv");
+    }
+  }
+
+  // The table leaves group 0 to the walk: a capture-free one writes no slot
+  // at all, and one with groups writes theirs and no other. (-1 would be a
+  // plan with no table.)
+  CHECK(PlanProbe::onepass_slots(words) == 0);
+  CHECK(PlanProbe::onepass_slots(words_us) == 0);
+  CHECK(PlanProbe::onepass_slots(Regex(R"((\w+))")) == 0); // (its twin)
+  CHECK(PlanProbe::onepass_slots(Regex(R"((\w+)=(\d+))")) == 0b111100);
+
+  // More groups than the 16 slots the walk clears in one go: the ones a
+  // match leaves unset read unset, whatever the match before it set.
+  {
+    std::string pat;
+    for (int g = 0; g < 10; g++)
+      pat += std::string("(?:(") + static_cast<char>('a' + g) + ")|(" +
+             static_cast<char>('A' + g) + "))";
+    Regex re(pat);
+    CHECK(PlanProbe::onepass_slots(re) > 0);
+    const std::string t = "ABCDEFGHIJ abcdefghij AbCdEfGhIj";
+    std::vector<size_t> spans;
+    for (size_t at : {size_t(0), size_t(11), size_t(22)}) {
+      spans.insert(spans.end(), {at, at + 10});
+      for (size_t k = 0; k < 10; k++) {
+        const bool upper = t[at + k] < 'a';
+        const size_t none = size_t(-1);
+        spans.insert(spans.end(), {upper ? none : at + k,
+                                   upper ? none : at + k + 1,
+                                   upper ? at + k : none,
+                                   upper ? at + k + 1 : none});
+      }
+    }
+    CHECK(finds_agree(re, spans, t));
   }
 }
 
@@ -4564,6 +4694,7 @@ int main() {
   test_teddy_prefilter();
   test_teddy_scans();
   test_matches();
+  test_match_rows();
   test_whole_match_capture();
   test_onewalk_local_bail();
   test_find_ladder();

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -24,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -4129,7 +4131,9 @@ struct Compiler {
 struct CpOnePass {
   struct State {
     std::array<int, 128> next;      // next state id per ASCII code point, or -1
-    std::array<uint64_t, 128> mask; // capture slots to set to the current pos
+    // Capture slots to set to the current pos: on a step, and at an accept.
+    // Group 0's two are never among them (see build_cp_onepass, Op::Save).
+    std::array<uint64_t, 128> mask;
     uint64_t match_mask = 0;
     bool can_match = false;
     // Self-loop run skip (rure's DFA accel, generalized to any set): when the
@@ -4175,9 +4179,8 @@ struct CpOnePass {
   int start = 0;
   bool ok = false;
   static constexpr int kMaxStates = 4096;
-  // Capture slots (=> <=32 groups). Bounds both the fixed `saves[kMaxSlots]`
-  // walk buffers and the per-transition slot bitmap, which is one uint64_t bit
-  // per slot — so the two must stay in step.
+  // Capture slots (=> <=32 groups): the per-transition slot bitmap is one
+  // uint64_t bit per slot.
   static constexpr int kMaxSlots = 64;
   static_assert(kMaxSlots <= 64, "slot bitmap is a uint64_t, one bit per slot");
 };
@@ -4280,8 +4283,21 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
         stk.push_back({in.x, mask});
         break;
       case Op::Save: {
+        // Group 0 is not the table's to record: a walk is anchored, so the
+        // whole match begins where the walk does and ends at its accept, and
+        // the walk writes the pair itself (see onepass_saves_span). Left in,
+        // the two slots were a mask to consult on the first step of every
+        // walk and another at its accept — all a capture-free table has.
+        // That holds for the program the compiler emits — Save 0 first,
+        // Save 1 into Match — and a program of any other shape gets no table.
+        // (The other slots are the walk's to write into the caller's
+        // `nslots` of them: none is recorded past that.)
+        if (in.n == 0 ? pc != 0
+                      : in.n == 1 && (pc + 1 >= psz ||
+                                      prog.insts[pc + 1].op != Op::Match))
+          onepass = false;
         uint64_t m = mask;
-        if (in.n >= 0 && in.n < CpOnePass::kMaxSlots) m |= (1ull << in.n);
+        if (in.n >= 2 && in.n < prog.nslots) m |= (1ull << in.n);
         stk.push_back({pc + 1, m});
         break;
       }
@@ -4581,6 +4597,78 @@ public:
 
 // Sentinel byte offset for an unmatched (sub)group span.
 inline constexpr uint32_t kSpanNone = UINT32_MAX;
+
+namespace detail {
+
+// The rows of a MatchList (and the one row a MatchIter yields): uint32 cells,
+// appended a row at a time. Not a std::vector, for what growing one costs a
+// find_all whose matches are dense:
+//  - resize() zero-fills the cells the caller is about to write, through a
+//    libstdc++ call per match;
+//  - each time it doubles, the cells move to a new allocation, and a new
+//    allocation of that size is new pages, faulted in again.
+// append() hands out cells without writing them, and the block grows by
+// realloc(), which can extend it where it stands or remap it — no copy, no
+// page touched twice (glibc does, for a block of this size). `\w+` over
+// 512 KB of words, find_all, on glibc: 437 MB/s on the vector, 757 on this.
+class SpanRows {
+  uint32_t *p_ = nullptr;
+  size_t n_ = 0, cap_ = 0;
+
+  REGEXLIB_NOINLINE void grow(size_t k) {
+    size_t cap = cap_ * 2 > n_ + k ? cap_ * 2 : n_ + k;
+    if (cap < 64) cap = 64;
+    void *p = cap > SIZE_MAX / sizeof(uint32_t)
+                  ? nullptr
+                  : std::realloc(p_, cap * sizeof(uint32_t));
+    if (!p) throw std::bad_alloc();
+    p_ = static_cast<uint32_t *>(p);
+    cap_ = cap;
+  }
+
+public:
+  SpanRows() = default;
+
+  SpanRows(const SpanRows &o) {
+    if (o.n_) std::memcpy(append(o.n_), o.p_, o.n_ * sizeof(uint32_t));
+  }
+
+  SpanRows(SpanRows &&o) noexcept : p_(o.p_), n_(o.n_), cap_(o.cap_) {
+    o.p_ = nullptr;
+    o.n_ = o.cap_ = 0;
+  }
+
+  SpanRows &operator=(SpanRows o) noexcept {
+    std::swap(p_, o.p_);
+    std::swap(n_, o.n_);
+    std::swap(cap_, o.cap_);
+    return *this;
+  }
+
+  ~SpanRows() { std::free(p_); }
+
+  size_t size() const noexcept { return n_; }
+
+  bool empty() const noexcept { return n_ == 0; }
+
+  uint32_t *data() noexcept { return p_; }
+
+  const uint32_t *data() const noexcept { return p_; }
+
+  void clear() noexcept { n_ = 0; }
+
+  // `k` more cells, unwritten: the caller writes every one of them. (Inlined
+  // by name, the growing kept out of line: with both left to the compiler a
+  // row cost find_iter a call — 20 instructions where this is five.)
+  REGEXLIB_ALWAYS_INLINE uint32_t *append(size_t k) {
+    if (cap_ - n_ < k) grow(k);
+    uint32_t *cells = p_ + n_;
+    n_ += k;
+    return cells;
+  }
+};
+
+} // namespace detail
 
 struct MatchResult; // owning single-match result (defined below)
 
@@ -6601,8 +6689,8 @@ private:
       onepass_unbounded_ = false;
       onepass_anchored_start_ = false;
       if (literal_only_) return; // Rung::Literal, and match()'s memcmp
-      // ncap == 0 is admitted too: the compiler emits Save 0/1 (the whole
-      // match) at every capture count, so the SAME walk that yields a capture
+      // ncap == 0 is admitted too: every walk writes the whole match's span
+      // itself (onepass_saves_span), so the SAME walk that yields a capture
       // pattern's groups yields a capture-free pattern's span — and the same
       // candidate drivers then replace the capture-free chain's two passes
       // (unanchored forward DFA for the end, reverse DFA for the start) with
@@ -14447,13 +14535,14 @@ private:
   // match, as a capture-free plan writes them, and each is widened in place
   // to a row of `groups` + 1 identical pairs. Back to front, so no row is
   // overwritten before it is read.
-  static void alias_rows(std::vector<uint32_t> &spans, int groups) {
+  static void alias_rows(detail::SpanRows &spans, int groups) {
     const size_t matches = spans.size() / 2;
     const size_t stride = 2 * (static_cast<size_t>(groups) + 1);
-    spans.resize(matches * stride);
+    spans.append(matches * stride - spans.size());
+    uint32_t *const cells = spans.data();
     for (size_t i = matches; i-- > 0;) {
-      const uint32_t b = spans[2 * i], e = spans[2 * i + 1];
-      uint32_t *row = spans.data() + i * stride;
+      const uint32_t b = cells[2 * i], e = cells[2 * i + 1];
+      uint32_t *row = cells + i * stride;
       for (size_t k = 0; k < stride; k += 2) {
         row[k] = b;
         row[k + 1] = e;
@@ -14878,7 +14967,7 @@ public:
     bool owns_ = false;
     std::string owned_;           // owning mode: holds the subject
     std::string_view borrowed_;   // borrow mode: points at the caller's bytes
-    std::vector<uint32_t> spans_; // SoA rows: g0.begin,g0.end, g1.begin,...
+    detail::SpanRows spans_;      // SoA rows: g0.begin,g0.end, g1.begin,...
     int ngroups_ = 0;             // capture groups (group 0 = whole match)
     NameMap names_; // copied from Regex::named_
     friend class Regex;
@@ -14945,9 +15034,15 @@ public:
   // RowSink appends one columnar row per match (find_all, find_iter).
   struct RowSink {
     static constexpr bool kGroups = true;
-    std::vector<uint32_t> &rows;
-    void span(const Regex &, std::string_view, int s, int e) {
-      push_span(rows, s, e);
+    detail::SpanRows &rows;
+    // A capture-free match [s, e): the begin, end pair. (Inlined by name:
+    // left to the compiler, find_iter made a call of it per match — 18
+    // instructions for the two stores.)
+    REGEXLIB_ALWAYS_INLINE void span(const Regex &, std::string_view, int s,
+                                     int e) {
+      uint32_t *o = rows.append(2);
+      o[0] = static_cast<uint32_t>(s);
+      o[1] = static_cast<uint32_t>(e);
     }
     void groups(const Regex &re, std::string_view,
                 const std::vector<int> &saves) {
@@ -15892,27 +15987,36 @@ private:
     return true;
   }
 
-  // Init / copy-out for the one-pass walks' fixed-size `saves` scratch (shared
-  // by cp_onepass_find and cp_onepass_saves). A length-`nslots` loop becomes a
-  // libc memset/memcpy CALL (loop idiom), one per match; real patterns rarely
-  // exceed 8 groups, so the fixed 16-slot (64-byte) form runs unconditionally
-  // (it inlines to four stores; an if/else over the size merges back into one
-  // variable-length libc call) and only the rare big pattern pays a second
-  // call for the rest.
-  static void onepass_saves_init(int *saves, int nslots) {
+  // The one-pass walks write the caller's slots, in place. They used to fill
+  // an array of their own and copy it out at the accept, and the copy read
+  // back, 16 bytes at a time, slots written 4 bytes at a time a moment
+  // earlier: a load that waits for its stores to retire, some 3 ns of a
+  // 15 ns match (dense `\w+`).
+  //
+  // onepass_saves_begin readies `out` and returns its slots, every one unset.
+  // A length-`nslots` fill becomes a libc memset CALL (loop idiom), one per
+  // walk; real patterns rarely exceed 8 groups, so the fixed 16-slot
+  // (64-byte) form runs unconditionally (it inlines to four stores; an
+  // if/else over the size merges back into one variable-length libc call)
+  // and only the rare big pattern pays a second call for the rest. A walk
+  // that fails leaves the slots as it got to them — `out` holds a match only
+  // when the walk returns one — and whoever takes the find over writes its
+  // own.
+  static int *onepass_saves_begin(std::vector<int> &out, int nslots) {
+    const size_t need = nslots <= 16 ? 16 : static_cast<size_t>(nslots);
+    if (out.size() < need) out.resize(need);
+    int *saves = out.data();
     std::memset(saves, 0xFF, 16 * sizeof(int)); // every slot = -1
     if (nslots > 16)
       std::memset(saves + 16, 0xFF,
-                  sizeof(int) * static_cast<size_t>(detail::CpOnePass::kMaxSlots - 16));
-  }
-  static void onepass_saves_copy(const int *saves, int nslots,
-                                 std::vector<int> &out) {
-    if (static_cast<int>(out.size()) < nslots || out.size() < 16)
-      out.resize(nslots <= 16 ? 16 : nslots);
-    std::memcpy(out.data(), saves, 16 * sizeof(int));
-    if (nslots > 16)
-      std::memcpy(out.data() + 16, saves + 16,
                   sizeof(int) * static_cast<size_t>(nslots - 16));
+    return saves;
+  }
+  // Group 0 of a walk from `s` that accepted at `e`: the table records every
+  // group but this one (see build_cp_onepass, Op::Save).
+  static void onepass_saves_span(int *saves, int s, int e) {
+    saves[0] = s;
+    saves[1] = e;
   }
 
   // One-pass capture extraction over the code-point program, anchored at byte
@@ -15921,16 +16025,15 @@ private:
   // table keyed on ASCII code points. On an ASCII span a code point is one
   // byte. Returns true with byte-offset `out` (slot 0/1 = whole match) on a
   // match; false if it reaches a non-ASCII byte (caller -> backtracker) or no
-  // match exists within [s, hi). The bound `hi` MUST be the
+  // match exists within [s, hi) — and `out` is then scratch (see
+  // onepass_saves_begin). The bound `hi` MUST be the
   // leftmost-first-located end: this is a longest-match walk, correct only when
   // capped there. Only valid when cp_onepass_.ok.
   bool cp_onepass_saves(const detail::CpOnePass &op, std::string_view t, int s,
                         int hi, std::vector<int> &out) const {
     int st = op.start;
     int pos = s;
-    const int nslots = op.nslots;
-    int saves[detail::CpOnePass::kMaxSlots];
-    onepass_saves_init(saves, nslots);
+    int *const saves = onepass_saves_begin(out, op.nslots);
     const detail::CpOnePass::State *states = op.states.data();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
 
@@ -15964,7 +16067,7 @@ private:
     if (!S->can_match) return false;
     for (uint64_t m = S->match_mask; m; m &= m - 1)
       saves[detail::bit_ctz64(m)] = pos;
-    onepass_saves_copy(saves, nslots, out);
+    onepass_saves_span(saves, s, pos);
     return true;
   }
 
@@ -16011,7 +16114,8 @@ private:
   // reverse-DFA + bounded-capture chain (three walks over the match) when the
   // caller already knows the match START (a required-prefix candidate or a
   // non-absorbing ReverseInner floor). Returns -1 if no match starts at `s`,
-  // kWalkLocal on a non-ASCII byte.
+  // kWalkLocal on a non-ASCII byte; `out` is scratch on any return but a
+  // match (see onepass_saves_begin).
   //
   // Soundness rests on plan_->onepass_unbounded_ (see plan_capture_onepass):
   // the table is built with the leftmost-first cut (see build_cp_onepass),
@@ -16034,9 +16138,7 @@ private:
     // they cost a measurable few percent on short dense matches.
     int skip = s + 1, runs = 0;
     const int n = static_cast<int>(t.size());
-    const int nslots = op.nslots;
-    int saves[detail::CpOnePass::kMaxSlots];
-    onepass_saves_init(saves, nslots);
+    int *const saves = onepass_saves_begin(out, op.nslots);
     const detail::CpOnePass::State *states = op.states.data();
     const detail::CpOnePass::State *S = states + op.start;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
@@ -16119,7 +16221,7 @@ private:
     if (acc_pos < 0) return -1;
     for (uint64_t m = acc_mask; m; m &= m - 1)
       saves[detail::bit_ctz64(m)] = acc_pos;
-    onepass_saves_copy(saves, nslots, out);
+    onepass_saves_span(saves, s, acc_pos);
     return acc_pos;
   }
 
@@ -16590,14 +16692,25 @@ private:
   // find_all over dense ASCII `\w+` measured 10% slower that way than with
   // the one shared loop.
   REGEXLIB_NOINLINE int onepass_fill_run(FindCache *fc, std::string_view bytes,
-                       std::vector<int> &saves, std::vector<uint32_t> &spans,
-                       int &from, WalkBudget &budget, bool byte) const {
+                       std::vector<int> &saves, RowSink &out, int &from,
+                       WalkBudget &budget, bool byte) const {
     for (;;) {
       int e = capture_find_inline(fc, bytes, from, saves, budget, byte);
       if (e < 0) return e;
-      append_match_spans_bytes(saves, spans);
+      walk_yield(out, bytes, saves, e);
       from = e; // !can_match_empty_ -> progress
     }
+  }
+  // The walk's match [saves[0], e), handed to the sink: the span alone when
+  // the plan has no group to lay out.
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE void walk_yield(Out &out, std::string_view text,
+                                         const std::vector<int> &saves,
+                                         int e) const {
+    if (plan_->ncap_ == 0)
+      out.span(*this, text, saves[0], e);
+    else
+      out.groups(*this, text, saves);
   }
 
   // One assert-tier chain match handed to `out` (the assert twin
@@ -16669,7 +16782,8 @@ private:
   MatchResult run_captures_bytes(std::string_view t, int s, int e,
                                  Scratch &sc) const {
     // Reuse the per-thread saves buffer instead of a fresh heap vector each
-    // call (capture_saves_bytes only assign()s into it, so capacity is reused).
+    // call (capture_saves_bytes writes it in place or assign()s into it, so
+    // capacity is reused).
     std::vector<int> &saves = sc.saves;
     if (!capture_saves_bytes(t, s, e, sc, saves)) return MatchResult{};
     return build_result_bytes(t, saves);
@@ -16696,25 +16810,12 @@ private:
     finish_result(r);
   }
 
-  // A capture-free match [s, e) -> one columnar row (the begin, end pair).
-  // (lvalues: push_back(const T&) keeps its capacity check inline, where the
-  // rvalue overload is an emplace_back call per cell.)
-  static void push_span(std::vector<uint32_t> &spans, int s, int e) {
-    const uint32_t b = static_cast<uint32_t>(s), en = static_cast<uint32_t>(e);
-    spans.push_back(b);
-    spans.push_back(en);
-  }
-
   // Byte-offset saves -> one columnar row of byte offsets (no strings).
   void append_match_spans_bytes(const std::vector<int> &saves,
-                                std::vector<uint32_t> &spans) const {
-    // One grow + direct writes (a push_back per cell re-checks capacity 2 per
-    // group, measurable on capture-dense find_all).
-    const int rows = plan_->ncap_ + 1;
-    size_t base = spans.size();
-    spans.resize(base + 2 * static_cast<size_t>(rows));
-    uint32_t *o = spans.data() + base;
-    for (int gi = 0; gi < rows; gi++) {
+                                detail::SpanRows &spans) const {
+    const int groups = plan_->ncap_ + 1;
+    uint32_t *o = spans.append(2 * static_cast<size_t>(groups));
+    for (int gi = 0; gi < groups; gi++) {
       int b = saves[2 * gi], e = saves[2 * gi + 1];
       bool set = b >= 0 && e >= b;
       o[2 * gi] = set ? static_cast<uint32_t>(b) : kSpanNone;
@@ -16921,22 +17022,20 @@ private:
   // strings.
   void append_match_spans(const detail::Segmented &seg,
                           const std::vector<int> &saves,
-                          std::vector<uint32_t> &spans) const {
+                          detail::SpanRows &spans) const {
     auto byte_of = [&](int gi) -> uint32_t {
       if (gi < 0) return 0;
       if (gi >= static_cast<int>(seg.byte_begin.size()))
         return static_cast<uint32_t>(seg.byte_begin.back());
       return static_cast<uint32_t>(seg.byte_begin[gi]);
     };
-    for (int gi = 0; gi <= plan_->ncap_; gi++) {
+    const int groups = plan_->ncap_ + 1;
+    uint32_t *o = spans.append(2 * static_cast<size_t>(groups));
+    for (int gi = 0; gi < groups; gi++) {
       int b = saves[2 * gi], e = saves[2 * gi + 1];
-      if (b >= 0 && e >= 0 && e >= b) {
-        spans.push_back(byte_of(b));
-        spans.push_back(byte_of(e));
-      } else {
-        spans.push_back(kSpanNone);
-        spans.push_back(kSpanNone);
-      }
+      const bool set = b >= 0 && e >= b;
+      o[2 * gi] = set ? byte_of(b) : kSpanNone;
+      o[2 * gi + 1] = set ? byte_of(e) : kSpanNone;
     }
   }
 
@@ -17058,14 +17157,14 @@ inline void Regex::MatchIter::advance() {
   // A whole-match capture ran as its capture-free twin: widen the one row so
   // every group reads as the match (alias_rows, for a single row).
   // one_.ngroups_ already says so; the engines above wrote the twin's single
-  // pair. push_back, not a resize: this runs once per match, and the resize
-  // is a libstdc++ call where these inline to two stores (dense `((\w+))`
-  // measured 14% slower through alias_rows).
+  // pair. Written out, not a call to alias_rows: this runs once per match,
+  // and that is a loop over rows (dense `(\w+)`: 26 instructions a match).
   if (alias_groups_ && !done_) {
-    const uint32_t b = one_.spans_[0], e = one_.spans_[1];
+    const uint32_t b = one_.spans_.data()[0], e = one_.spans_.data()[1];
+    uint32_t *o = one_.spans_.append(2 * static_cast<size_t>(alias_groups_));
     for (int g = 0; g < alias_groups_; g++) {
-      one_.spans_.push_back(b);
-      one_.spans_.push_back(e);
+      o[2 * g] = b;
+      o[2 * g + 1] = e;
     }
   }
 }
@@ -17414,21 +17513,17 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
                                       Ladder &l,
                                Cursor &c, WalkBudget &budget,
                                bool &chain_once, Out &out) const {
-  const Plan &p = *plan_;
   if (!scr.saves) scr_walk(scr);
   int e2;
   if constexpr (All) {
     // Rows until the walk stops; e2 says why (it is never a match end).
-    e2 = onepass_fill_run(scr.cache, text, *scr.saves, out.rows, c.pos,
-                          budget, l.has(Ladder::kWalkByte));
+    e2 = onepass_fill_run(scr.cache, text, *scr.saves, out, c.pos, budget,
+                          l.has(Ladder::kWalkByte));
   } else {
     e2 = capture_find_dispatch(scr.cache, text, c.pos, *scr.saves, budget,
                                l.has(Ladder::kWalkByte));
     if (e2 >= 0) {
-      if (p.ncap_ == 0) // the span alone: no group to lay out
-        out.span(*this, text, (*scr.saves)[0], e2);
-      else
-        out.groups(*this, text, *scr.saves);
+      walk_yield(out, text, *scr.saves, e2);
       c.pos = e2; // !can_match_empty_ -> progress
       return Step::Yield;
     }
