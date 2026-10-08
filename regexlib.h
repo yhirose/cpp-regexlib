@@ -10225,7 +10225,7 @@ private:
   // Core form: call `visit(i)` on each hit index in order; the first accepted
   // hit (visit returns true) is returned, rejected hits continue IN PLACE —
   // no rescan of the current 64-byte stride. Returns >= n if no hit is
-  // accepted. The candidate-verify loops (find_substr's memcmp, the (?i)
+  // accepted. The candidate-verify loops (find_substr's compare, the (?i)
   // fold-compare) ride on this so a false positive costs only the next
   // ctz, not a misaligned loop restart — that matters when the probe byte is
   // common in the subject.
@@ -10233,7 +10233,9 @@ private:
   // A predicate looks at p[off, off+16) (plus up to look() bytes beyond, for
   // the pair probes) and answers for those 16 positions; the vector loops
   // bound off so every predicate load stays inside [0, n). The scalar tail
-  // covers the final positions one byte at a time.
+  // covers the final positions one byte at a time. A predicate that compares
+  // against a byte known only at run time spreads it with simd_splat (see its
+  // note), never with the set1 intrinsic.
   //
   // Deliberately NO runtime AVX2 dispatch here (unlike Teddy's scans):
   // it was tried — shared always_inline body, target("avx2") wrapper, cached
@@ -10351,9 +10353,18 @@ private:
   static uint8x16_t simd_load(const unsigned char *p, size_t off) {
     return vld1q_u8(p + off);
   }
+  static uint8x16_t simd_splat(unsigned char c) { return vdupq_n_u8(c); }
 #elif defined(REGEXLIB_SSE2)
   static __m128i simd_load(const unsigned char *p, size_t off) {
     return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + off));
+  }
+  // A probe byte in all 16 lanes, widened from a 32-bit value. Not
+  // _mm_set1_epi8: a predicate keeps the byte as a member, and GCC then
+  // splats it by reading that one-byte slot back as four (movd) right after
+  // writing it — a load no store can forward to, 5-7 ns per predicate built,
+  // which was 40% of a literal search on a short subject.
+  static __m128i simd_splat(unsigned char c) {
+    return _mm_set1_epi32(static_cast<int>(c * 0x01010101u));
   }
 #endif
 
@@ -10362,14 +10373,13 @@ private:
     unsigned char a;
 #if defined(REGEXLIB_NEON)
     uint8x16_t av;
-    explicit PredEq(unsigned char a_) : a(a_), av(vdupq_n_u8(a_)) {}
+    explicit PredEq(unsigned char a_) : a(a_), av(simd_splat(a_)) {}
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       return vceqq_u8(simd_load(p, off), av);
     }
 #elif defined(REGEXLIB_SSE2)
     __m128i av;
-    explicit PredEq(unsigned char a_)
-        : a(a_), av(_mm_set1_epi8(static_cast<char>(a_))) {}
+    explicit PredEq(unsigned char a_) : a(a_), av(simd_splat(a_)) {}
     __m128i lanes(const unsigned char *p, size_t off) const {
       return _mm_cmpeq_epi8(simd_load(p, off), av);
     }
@@ -10392,8 +10402,8 @@ private:
 #if defined(REGEXLIB_NEON)
     uint8x16_t av, bv;
     PredPair(unsigned char a_, unsigned char b_, size_t d_, size_t end_)
-        : a(a_), b(b_), d(d_), end(end_), av(vdupq_n_u8(a_)),
-          bv(vdupq_n_u8(b_)) {}
+        : a(a_), b(b_), d(d_), end(end_), av(simd_splat(a_)),
+          bv(simd_splat(b_)) {}
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       return vandq_u8(vceqq_u8(simd_load(p, off), av),
                       vceqq_u8(simd_load(p, off + d), bv));
@@ -10401,9 +10411,8 @@ private:
 #elif defined(REGEXLIB_SSE2)
     __m128i av, bv;
     PredPair(unsigned char a_, unsigned char b_, size_t d_, size_t end_)
-        : a(a_), b(b_), d(d_), end(end_),
-          av(_mm_set1_epi8(static_cast<char>(a_))),
-          bv(_mm_set1_epi8(static_cast<char>(b_))) {}
+        : a(a_), b(b_), d(d_), end(end_), av(simd_splat(a_)),
+          bv(simd_splat(b_)) {}
     __m128i lanes(const unsigned char *p, size_t off) const {
       return _mm_and_si128(_mm_cmpeq_epi8(simd_load(p, off), av),
                            _mm_cmpeq_epi8(simd_load(p, off + d), bv));
@@ -10449,7 +10458,7 @@ private:
 #if defined(REGEXLIB_NEON)
     uint8x16_t av, bv;
     PredEq2(unsigned char a_, unsigned char b_)
-        : a(a_), b(b_), av(vdupq_n_u8(a_)), bv(vdupq_n_u8(b_)) {}
+        : a(a_), b(b_), av(simd_splat(a_)), bv(simd_splat(b_)) {}
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       uint8x16_t v = simd_load(p, off);
       return vorrq_u8(vceqq_u8(v, av), vceqq_u8(v, bv));
@@ -10457,8 +10466,7 @@ private:
 #elif defined(REGEXLIB_SSE2)
     __m128i av, bv;
     PredEq2(unsigned char a_, unsigned char b_)
-        : a(a_), b(b_), av(_mm_set1_epi8(static_cast<char>(a_))),
-          bv(_mm_set1_epi8(static_cast<char>(b_))) {}
+        : a(a_), b(b_), av(simd_splat(a_)), bv(simd_splat(b_)) {}
     __m128i lanes(const unsigned char *p, size_t off) const {
       __m128i v = simd_load(p, off);
       return _mm_or_si128(_mm_cmpeq_epi8(v, av), _mm_cmpeq_epi8(v, bv));
@@ -10482,8 +10490,8 @@ private:
     uint8x16_t av, uav, bv, ubv;
     PredFoldPair(unsigned char a_, unsigned char ua_, unsigned char b_,
                  unsigned char ub_, size_t d_, size_t end_)
-        : a(a_), ua(ua_), b(b_), ub(ub_), d(d_), end(end_), av(vdupq_n_u8(a_)),
-          uav(vdupq_n_u8(ua_)), bv(vdupq_n_u8(b_)), ubv(vdupq_n_u8(ub_)) {}
+        : a(a_), ua(ua_), b(b_), ub(ub_), d(d_), end(end_), av(simd_splat(a_)),
+          uav(simd_splat(ua_)), bv(simd_splat(b_)), ubv(simd_splat(ub_)) {}
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       uint8x16_t v = simd_load(p, off);
       uint8x16_t w = simd_load(p, off + d);
@@ -10494,11 +10502,8 @@ private:
     __m128i av, uav, bv, ubv;
     PredFoldPair(unsigned char a_, unsigned char ua_, unsigned char b_,
                  unsigned char ub_, size_t d_, size_t end_)
-        : a(a_), ua(ua_), b(b_), ub(ub_), d(d_), end(end_),
-          av(_mm_set1_epi8(static_cast<char>(a_))),
-          uav(_mm_set1_epi8(static_cast<char>(ua_))),
-          bv(_mm_set1_epi8(static_cast<char>(b_))),
-          ubv(_mm_set1_epi8(static_cast<char>(ub_))) {}
+        : a(a_), ua(ua_), b(b_), ub(ub_), d(d_), end(end_), av(simd_splat(a_)),
+          uav(simd_splat(ua_)), bv(simd_splat(b_)), ubv(simd_splat(ub_)) {}
     __m128i lanes(const unsigned char *p, size_t off) const {
       __m128i v = simd_load(p, off);
       __m128i w = simd_load(p, off + d);
@@ -10547,9 +10552,9 @@ private:
                 int nb_, size_t end_)
         : la(la_), lb(lb_), na(na_), nb(nb_), end(end_) {
       for (int k = 0; k < na; k++)
-        ta[k] = vdupq_n_u8(la[k]);
+        ta[k] = simd_splat(la[k]);
       for (int k = 0; k < nb; k++)
-        tb[k] = vdupq_n_u8(lb[k]);
+        tb[k] = simd_splat(lb[k]);
     }
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       uint8x16_t v = simd_load(p, off);
@@ -10568,9 +10573,9 @@ private:
                 int nb_, size_t end_)
         : la(la_), lb(lb_), na(na_), nb(nb_), end(end_) {
       for (int k = 0; k < na; k++)
-        ta[k] = _mm_set1_epi8(static_cast<char>(la[k]));
+        ta[k] = simd_splat(la[k]);
       for (int k = 0; k < nb; k++)
-        tb[k] = _mm_set1_epi8(static_cast<char>(lb[k]));
+        tb[k] = simd_splat(lb[k]);
     }
     __m128i lanes(const unsigned char *p, size_t off) const {
       __m128i v = simd_load(p, off);
@@ -10642,7 +10647,7 @@ private:
     PredInList(const unsigned char *list_, size_t cnt_)
         : list(list_), cnt(cnt_) {
       for (size_t k = 0; k < cnt; k++)
-        tgt[k] = vdupq_n_u8(list[k]);
+        tgt[k] = simd_splat(list[k]);
     }
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       uint8x16_t v = simd_load(p, off);
@@ -10656,7 +10661,7 @@ private:
     PredInList(const unsigned char *list_, size_t cnt_)
         : list(list_), cnt(cnt_) {
       for (size_t k = 0; k < cnt; k++)
-        tgt[k] = _mm_set1_epi8(static_cast<char>(list[k]));
+        tgt[k] = simd_splat(list[k]);
     }
     __m128i lanes(const unsigned char *p, size_t off) const {
       __m128i v = simd_load(p, off);
@@ -10830,6 +10835,27 @@ private:
     return false;
   }
 
+  // The literal scans' compare of a candidate (find_substr, the literal
+  // alternation, the fused grapheme scan). Inline for a short literal, where a
+  // libc memcmp CALL costs more than the compare itself (~20% of the
+  // alternation tier, 1-2 ns of a single literal's search); long needles
+  // still take memcmp.
+  static bool bytes_eq(const unsigned char *a, const unsigned char *b,
+                       size_t m) {
+    if (m > 16) return std::memcmp(a, b, m) == 0;
+    if (m >= 8) { // two 8-byte words, the second ending where the bytes do
+      uint64_t a0, b0, a1, b1;
+      std::memcpy(&a0, a, 8);
+      std::memcpy(&b0, b, 8);
+      std::memcpy(&a1, a + m - 8, 8);
+      std::memcpy(&b1, b + m - 8, 8);
+      return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+    }
+    for (size_t i = 0; i < m; i++)
+      if (a[i] != b[i]) return false;
+    return true;
+  }
+
   // Leftmost-first match of the literal set at/after `from`: Teddy finds the
   // next fingerprint and says which, then each literal that begins with it is
   // tried in alternation order and the first whose bytes match AND whose
@@ -10838,16 +10864,6 @@ private:
   // Every literal begins with a Teddy fingerprint (teddy_.n <= min length) and
   // is >= teddy_.n bytes, so no match start is skipped; an ASCII literal byte
   // run never straddles a UTF-8 sequence, so this is sound on any subject.
-  // Inline short compare: the alternation's literals are a few bytes, where a
-  // libc memcmp CALL costs more than the compare itself (it was ~20% of this
-  // tier); long needles still take memcmp.
-  static bool bytes_eq(const unsigned char *a, const char *b, size_t m) {
-    if (m > 16) return std::memcmp(a, b, m) == 0;
-    for (size_t i = 0; i < m; i++)
-      if (a[i] != static_cast<unsigned char>(b[i])) return false;
-    return true;
-  }
-
   bool literal_alt_locate(std::string_view t, int from, int &s, int &e) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int n = static_cast<int>(t.size());
@@ -10864,7 +10880,9 @@ private:
         const std::string &lit = plan_->literal_alt_[k];
         int m = static_cast<int>(lit.size());
         if (pos + m <= n &&
-            bytes_eq(p + hit.pos + fn, lit.data() + fn, lit.size() - fn) &&
+            bytes_eq(p + hit.pos + fn,
+                     reinterpret_cast<const unsigned char *>(lit.data()) + fn,
+                     lit.size() - fn) &&
             literal_occurrence_ok(t, pos, m)) {
           s = pos;
           e = pos + m;
@@ -10879,9 +10897,9 @@ private:
   // Substring search: locate `needle` (length m) in hay[0,n). scan64 finds the
   // rare probe byte (needle[probe]) — or, when that byte is common, the two
   // rarest bytes at their needle distance (pair_probe / PredPair) — and a full
-  // memcmp verifies each candidate. This is RE2/rure's rare-byte literal scan,
-  // at scan64's 64-bytes-per-iteration rate. Returns the match start or
-  // nullptr.
+  // compare (bytes_eq) verifies each candidate. This is RE2/rure's rare-byte
+  // literal scan, at scan64's 64-bytes-per-iteration rate. Returns the match
+  // start or nullptr.
   static const unsigned char *find_substr(const unsigned char *hay, size_t n,
                                           const unsigned char *needle, size_t m,
                                           size_t probe, size_t probe2) {
@@ -10890,8 +10908,10 @@ private:
     const size_t o1 = probe < probe2 ? probe : probe2;
     const size_t o2 = probe < probe2 ? probe2 : probe;
     const size_t qmax = (n - m) + o1; // last index the o1 byte can occupy
-    auto verify = [&](size_t i) {
-      return m == 1 || std::memcmp(hay + (i - o1), needle, m) == 0;
+    // By value: the scan calls this out of line, and a closure of references
+    // would pin the four operands to the stack for the whole scan.
+    auto verify = [=](size_t i) {
+      return bytes_eq(hay + (i - o1), needle, m);
     };
     size_t q = o1 == o2
                    ? scan64_visit(hay, qmax + 1, o1, PredEq(needle[o1]), verify)
@@ -13347,8 +13367,7 @@ private:
           if (p[i] >= 0x80) return true; // cluster: handled outside
           int s = static_cast<int>(i) - static_cast<int>(o1);
           if (s >= from && s + m <= n &&
-              bytes_eq(p + s, reinterpret_cast<const char *>(np),
-                       static_cast<size_t>(m))) {
+              bytes_eq(p + s, np, static_cast<size_t>(m))) {
             found = s;
             return true;
           }

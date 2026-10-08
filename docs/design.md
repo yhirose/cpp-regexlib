@@ -1029,8 +1029,8 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   digits / non-ASCII / most punctuation rare → good probes; the punctuation
   prose is full of — `,` `.` `"` `'` `-` and the line break — has its own
   entries, since the same table prices anchors against each other below), then
-  `memcmp`
-  to verify (both legs ride `scan64_visit`; zero dependencies). An all-ASCII
+  compare the candidate in place to verify (`bytes_eq`: inline up to 16
+  bytes, `memcmp` beyond; both legs ride `scan64_visit`; zero dependencies). An all-ASCII
   prefix (`prefix_.ascii`) is `memmem`-skippable on *any* UTF-8 subject. When
   the rarest byte is itself **common** (per-mille frequency ≥ 16 — the
   genuinely common lowercase letters: `ing`, `Holmes`), the scan upgrades to a

@@ -2743,6 +2743,26 @@ void test_anchor_choice() {
     }
     CHECK(make_us("fox|dog").match("dog").end() == 3);
     CHECK(!make_us("fox|dog").match("a dog").matched());
+    // The scans' compare of a candidate, at every length it has a path for
+    // (a byte loop, two words, memcmp): the subject is the literal with one
+    // byte changed, at each position in turn, and then the literal itself —
+    // the only match, whichever bytes the scan probes for.
+    const std::string letters = "abcdefghijklmnopqrst";
+    for (size_t m = 1; m <= letters.size(); m++) {
+      const std::string lit = letters.substr(0, m);
+      std::string near;
+      for (size_t k = 0; k < m; k++) {
+        near += lit + ' ';
+        near[near.size() - 1 - m + k] = 'Z';
+      }
+      const std::vector<size_t> want{near.size(), near.size() + m};
+      near += lit;
+      for (const std::string &pat : {lit, lit + "|Z!", lit + "\\d*"})
+        for (const Regex &re : {Regex(pat), make_us(pat)}) {
+          CHECK(flat_spans(re, near, false) == want);
+          CHECK(re.search(near).begin() == want[0] && re.test(near));
+        }
+    }
   }
 
   // --- results ---
