@@ -996,7 +996,9 @@ per stop) to ~65 GB/s, and every scan expressed through the primitive gets that
 rate. A predicate is a small struct supplying the platform lane mask and the
 matching scalar test (`PredEq`, `PredPair`, `PredInList`, `PredSetPair`, …),
 and predicates **compose**: `PredOrNonAscii<P>` adds the byte-path tiers'
-stop-at-non-ASCII to any scan. The `_visit` form drives candidate verification
+stop-at-non-ASCII to any scan (it refers to the predicate it widens rather
+than holding a copy: copying one just built was a quarter of
+`[a-zA-Z]+ing`'s time). The `_visit` form drives candidate verification
 *in place* — the verifier runs on each hit inside the stride and a rejected
 candidate continues from the next ctz, not a loop restart — so the
 candidate+verify prefilters below (the `find_substr` compare, the `(?i)` fold

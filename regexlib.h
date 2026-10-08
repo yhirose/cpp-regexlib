@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -10429,10 +10430,17 @@ private:
 
   // Widens a predicate's stop set with the non-ASCII bytes (>= 0x80) — every
   // EGC-fused scan composes its base probe this way. The inner predicate
-  // loads the block again; identical loads CSE.
+  // loads the block again; identical loads CSE. It is referred to, not held:
+  // a copy of a predicate just built reads back what was written a moment
+  // ago in wider pieces (PredSetPair is 288 bytes), which was a quarter of
+  // `[a-zA-Z]+ing`'s time. The caller names the predicate and keeps it for
+  // as long as this is used — so no temporary is taken, and no copy of
+  // this is made that could outlast it.
   template <class P> struct PredOrNonAscii {
-    P inner;
-    explicit PredOrNonAscii(P inner_) : inner(inner_) {}
+    const P &inner;
+    explicit PredOrNonAscii(const P &inner_) : inner(inner_) {}
+    PredOrNonAscii(const P &&) = delete;
+    PredOrNonAscii(const PredOrNonAscii &) = delete;
 #if defined(REGEXLIB_NEON)
     uint8x16_t lanes(const unsigned char *p, size_t off) const {
       return vorrq_u8(vcgeq_u8(simd_load(p, off), vdupq_n_u8(0x80)),
@@ -10448,9 +10456,16 @@ private:
       return p[i] >= 0x80 || inner.scalar(p, i);
     }
   };
-  template <class P> static PredOrNonAscii<P> or_nonascii(P inner) {
+  // (Built through this, not spelled at the call: the fused scans ran 6-17%
+  // slower with the type written out, on the same instructions.)
+  template <class P> static PredOrNonAscii<P> or_nonascii(const P &inner) {
     return PredOrNonAscii<P>(inner);
   }
+  template <class P> static PredOrNonAscii<P> or_nonascii(const P &&) = delete;
+  static_assert(
+      !std::is_constructible<PredOrNonAscii<PredEq>, PredEq>::value &&
+          !std::is_copy_constructible<PredOrNonAscii<PredEq>>::value,
+      "PredOrNonAscii must not outlive what it refers to");
 
   // p[i] == a || p[i] == b — the two-case probe of the (?i) prefilters.
   struct PredEq2 {
@@ -13353,9 +13368,10 @@ private:
     // build them once; only the matching one is ever consulted.
     const size_t o1 = probe < probe2 ? probe : probe2;
     const size_t o2 = probe < probe2 ? probe2 : probe;
-    const auto pred_eq = or_nonascii(PredEq(rare));
-    const auto pred_pair = or_nonascii(
-        PredPair(np[o1], np[o2], o2 - o1, static_cast<size_t>(n)));
+    const PredEq eq(rare);
+    const PredPair pair(np[o1], np[o2], o2 - o1, static_cast<size_t>(n));
+    const auto pred_eq = or_nonascii(eq);
+    const auto pred_pair = or_nonascii(pair);
     size_t off = static_cast<size_t>(from);
     while (off < static_cast<size_t>(n)) {
       if (p[off] < 0x80) {
@@ -13939,12 +13955,13 @@ private:
     const auto &sf = plan_->suffix_;
     int n = static_cast<int>(text.size());
     const bool class_anchor = !sf.cls.empty();
-    const auto set_pair = or_nonascii(suffix_set_pair(sf, class_anchor, n));
+    const PredSetPair set_pair = suffix_set_pair(sf, class_anchor, n);
+    const auto pred_set_pair = or_nonascii(set_pair);
     int scan = from;
     while (scan <= n) {
       bool bad = false;
       int occ = class_anchor
-                    ? egc_class_fused_find(text, scan, set_pair, bad)
+                    ? egc_class_fused_find(text, scan, pred_set_pair, bad)
                     : egc_literal_fused_find(text, scan, sf.lit, sf.probe,
                                              sf.probe2, bad);
       if (bad) return LazyDfa::kCap; // ineligible subject -> Pike
