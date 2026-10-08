@@ -4972,7 +4972,8 @@ class Regex {
     }
     // The same for a driver whose candidates the chain is led to as well —
     // a literal prefix, Teddy, a sparse first-byte set: the chain's forward
-    // DFA skips from its start state with the very scan the driver runs. The
+    // DFA skips from its start state with the very scan the driver runs (or,
+    // for a set that is small but common, steps to the same bytes). The
     // distance scanned is then nobody's work, and measured against it the
     // charge does not trip where it should: `e[a-z]+s` over prose, one
     // candidate in 13 a match and the rest a failed run each, charged 0.96
@@ -6238,11 +6239,15 @@ private:
         walk_driver_ = WalkDriver::Scan;
       }
       plan_byte_classes();
-      // The lazy DFAs' start skips, now that every searcher behind them is
-      // planned.
+      // The lazy DFAs' start skips and the walk's scan, now that every
+      // searcher behind them is planned.
       // (A CodePoint plan's programs are byte programs: it has the one.)
-      if (!us_) start_skip_ = start_skip(prefix_, first_bytes_);
+      if (!us_) {
+        start_skip_ = start_skip(prefix_, first_bytes_);
+        walk_skip_ = scan_skip(first_bytes_.small());
+      }
       byte_start_skip_ = start_skip(byte_prefix_, byte_first_bytes_);
+      byte_walk_skip_ = scan_skip(byte_first_bytes_.small());
       Regex::ladder_plan(*this);
     }
 
@@ -8393,6 +8398,17 @@ private:
         c.prefix_cost =
             literal_cost(byte_prefix_.text, byte_prefix_.probe,
                          byte_prefix_.probe2, AnchorChoice::kVerifyFwdNs);
+      else
+        // The scan's own skip when there is no literal prefix: Teddy, else
+        // the first-byte set — small is enough to price it: its bytes are
+        // where the DFA leaves its start state whether or not it jumps
+        // there. (Asked of scan_skip here: the walk's fields, which hold
+        // the same answer, are filled after the anchor is chosen.)
+        switch (scan_skip(byte_first_bytes_.small())) {
+        case StartSkip::Teddy: c.scan_cost = teddy_cost(); break;
+        case StartSkip::FirstBytes: c.scan_cost = first_bytes_cost(); break;
+        default: break;
+        }
       if (suffix_.active()) c.suffix_cost = suffix_cost();
       if (!inner.lit.empty()) {
         size_t probe, probe2;
@@ -8401,15 +8417,6 @@ private:
                                     inner.nonabsorbing
                                         ? AnchorChoice::kVerifyRevFwdNs
                                         : AnchorChoice::kVerifyInnerNs);
-      }
-      // The scan's own skip when there is no literal prefix: Teddy, else
-      // the first-byte set — sparse is enough to price it: its bytes are
-      // where the DFA leaves its start state whether or not it jumps there.
-      switch (start_skip(byte_prefix_, byte_first_bytes_)) {
-      case StartSkip::Prefix: break;
-      case StartSkip::Teddy: c.scan_cost = teddy_cost(); break;
-      default:
-        if (byte_first_bytes_.sparse) c.scan_cost = first_bytes_cost();
       }
       c.kind = pick_anchor(c, /*dense_scans=*/true);
       if (c.kind != Kind::Suffix) suffix_ = SuffixPrefilter{};
@@ -9586,6 +9593,7 @@ private:
       void rate() {
         dfa_skip = sparse && density() <= dfa_skip_bar(list.size());
       }
+      bool small() const { return ok && sparse; }
     };
     FirstBytes<128> first_bytes_;
 
@@ -9607,7 +9615,7 @@ private:
     // nothing. One decision for the grapheme program's DFAs (start_skip_:
     // prefix_, first_bytes_; plan_prefilter_skip runs it) and one for the
     // byte programs' (byte_start_skip_: byte_prefix_, byte_first_bytes_;
-    // byte_prefilter_skip), and what plan_anchor prices as the scan.
+    // byte_prefilter_skip).
     //
     // Teddy goes ahead of the first-byte set always, not by estimate. It
     // stops where a match very likely begins, at a pace that does not
@@ -9618,16 +9626,33 @@ private:
     // 14; `(?:fox|dog|cat)s?` over prose: 1.4 against 17) — and what the
     // subject holds is not the plan's to know. A first-byte set is jumped to
     // only when it is rare as well as small (FirstBytes::dfa_skip).
+    //
+    // What comes after the prefix — Teddy, then the first-byte set — is one
+    // rule (scan_skip, which never answers Prefix), and each reader says
+    // what it asks of the set. The one-pass walk's position scan
+    // (scan_onepass_find, through walk_skip: a prefix is a driver of its own
+    // there) asks that it be small, rare or not — a walk costs more to
+    // start than a DFA step. plan_anchor prices the scan by the same bar
+    // (see there). The grapheme Pike's seed (pike_candidate) asks only that
+    // there be a set.
     enum class StartSkip : uint8_t { None, Prefix, Teddy, FirstBytes };
     StartSkip start_skip_ = StartSkip::None;
     StartSkip byte_start_skip_ = StartSkip::None;
+    StartSkip walk_skip_ = StartSkip::None;
+    StartSkip byte_walk_skip_ = StartSkip::None;
     bool byte_skips() const { return byte_start_skip_ != StartSkip::None; }
+    StartSkip walk_skip(bool byte) const {
+      return byte ? byte_walk_skip_ : walk_skip_;
+    }
+    StartSkip scan_skip(bool set_usable) const {
+      if (teddy_.ok) return StartSkip::Teddy;
+      return set_usable ? StartSkip::FirstBytes : StartSkip::None;
+    }
     template <size_t N>
     StartSkip start_skip(const LiteralPrefix &prefix,
                          const FirstBytes<N> &fb) const {
-      if (prefix.active()) return StartSkip::Prefix;
-      if (teddy_.ok) return StartSkip::Teddy;
-      return fb.ok && fb.dfa_skip ? StartSkip::FirstBytes : StartSkip::None;
+      return prefix.active() ? StartSkip::Prefix
+                             : scan_skip(fb.ok && fb.dfa_skip);
     }
 
     // Required-suffix-literal prefilter: when every match ends with a fixed
@@ -16309,11 +16334,12 @@ private:
                         WalkBudget &budget, bool byte) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int n = static_cast<int>(t.size());
-    // The first-byte prune is usable only when the set was computed
-    // (first_bytes_.ok; a `.`-led pattern has none — every position is then a
-    // real candidate, and its walk dies wherever the pattern disagrees).
-    const bool sparse =
-        !byte && plan_->first_bytes_.ok && plan_->first_bytes_.sparse;
+    // What prunes the positions, decided with the plan (Plan::StartSkip):
+    // Teddy, else a small first-byte set, else nothing — a `.`-led pattern
+    // has no set, every position is then a real candidate, and its walk
+    // dies wherever the pattern disagrees. Teddy's fingerprints are the
+    // leading bytes of the program this plan runs, so they hold on any
+    // subject the walk is given.
     // `byte` — a US plan, or a Grapheme one on its byte family: first_bytes_
     // is not the set to read there (analyze_first_bytes is ASCII-only, and
     // US plans never compute it). The 256-wide byte_first_bytes_ (from the
@@ -16322,22 +16348,16 @@ private:
     // Without this the US walk started at EVERY position, which on a
     // sparse-start pattern lost to the located-span chain it replaced
     // (`(\d+)\s+(\w+)` over ASCII prose,
-    // find_all: 2834 MB/s chain alone, 250 unpruned, 2940 pruned). Only the
-    // sparse form is usable: `.sparse` is set once the set was filled, while
-    // a non-sparse set is indistinguishable from the unfilled early return.
-    const bool bsparse = byte && plan_->byte_first_bytes_.sparse;
-    // Teddy ahead of either set, as for a lazy DFA's start state (see
-    // Plan::StartSkip) — the scan plan_anchor priced. Its fingerprints are
-    // the leading bytes of the program this plan runs, so they hold on any
-    // subject the walk is given.
-    const bool teddy = plan_->teddy_.ok;
-    const bool pruned = teddy || sparse || bsparse;
+    // find_all: 2834 MB/s chain alone, 250 unpruned, 2940 pruned).
+    const Plan::StartSkip skip = plan_->walk_skip(byte);
+    const bool teddy = skip == Plan::StartSkip::Teddy;
+    const bool pruned = skip != Plan::StartSkip::None;
     for (int pos = from; pos < n; pos++) {
       if (pruned) {
         const size_t un = static_cast<size_t>(n), at = static_cast<size_t>(pos);
-        pos = static_cast<int>(teddy    ? plan_->teddy_.find(p, un, at)
-                               : sparse ? skip_to_first_byte(p, un, at)
-                                        : skip_to_byte_start(p, un, at));
+        pos = static_cast<int>(teddy  ? plan_->teddy_.find(p, un, at)
+                               : byte ? skip_to_byte_start(p, un, at)
+                                      : skip_to_first_byte(p, un, at));
         if (pos >= n) return -1;
       }
       // (No scalar first_bytes_ rung here: the byte-0 test below asks the
@@ -16374,7 +16394,8 @@ private:
       int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, pos);
       // (A pruned scan's candidates are the chain's too: its start state
-      // skips with the same searcher. See spend_at_candidate.)
+      // is left on the same bytes, and jumps to them with the same searcher
+      // unless they are a set too common to. See spend_at_candidate.)
       if (e > pos && onepass_end_ok(e, t)) {
         if (pruned) budget.matched_at_candidate(e - pos);
         return e;
@@ -16778,26 +16799,25 @@ private:
       if (gi < 0) return -1;
       start = gi;
       filtered = true;
-    } else if (plan_->teddy_.ok && seg.ascii) {
-      // Multi-literal alternation: Teddy skips to the next position whose
-      // N-byte prefix matches one of the literals — far rarer than a shared
-      // first byte.
+    } else if (seg.ascii) {
+      // No literal prefix: what the plan's scan has (Plan::scan_skip; here a
+      // first-byte set serves whatever its size). Teddy skips to the next
+      // position whose N-byte prefix matches one of the literals — far
+      // rarer than a shared first byte; else the set skips to the next byte
+      // a match can begin with, before the NFA is seeded. One forward scan,
+      // then one unanchored run — both linear, so find_all stays O(n).
       const unsigned char *p =
           reinterpret_cast<const unsigned char *>(seg.source.data());
-      size_t b =
-          plan_->teddy_.find(p, seg.source.size(), static_cast<size_t>(start));
-      if (b >= seg.source.size()) return -1;
-      start = static_cast<int>(b);
-      filtered = true;
-    } else if (plan_->first_bytes_.ok && seg.ascii) {
-      // No literal prefix, but we know the set of bytes a match can begin with:
-      // skip to the next viable byte before seeding the NFA. One forward scan,
-      // then one unanchored run — both linear, so find_all stays O(n).
-      const char *base = seg.source.data();
-      size_t slen = seg.source.size();
-      const unsigned char *p = reinterpret_cast<const unsigned char *>(base);
-      size_t b = skip_to_first_byte(p, slen, static_cast<size_t>(start));
-      if (b >= slen) return -1; // no byte here can begin a match
+      const size_t slen = seg.source.size(), at = static_cast<size_t>(start);
+      size_t b;
+      switch (plan_->scan_skip(plan_->first_bytes_.ok)) {
+      case Plan::StartSkip::Teddy: b = plan_->teddy_.find(p, slen, at); break;
+      case Plan::StartSkip::FirstBytes:
+        b = skip_to_first_byte(p, slen, at);
+        break;
+      default: return start;
+      }
+      if (b >= slen) return -1; // nothing here can begin a match
       start = static_cast<int>(b);
       filtered = true;
     }

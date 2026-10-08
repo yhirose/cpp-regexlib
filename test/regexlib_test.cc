@@ -58,17 +58,25 @@ struct PlanProbe {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
   // What the lazy DFA's start state skips with — the byte programs' DFAs
-  // (`byte`), or the grapheme program's. 'P' a literal prefix, 'T' Teddy,
-  // 'F' the first-byte set, '-' nothing.
-  static char start_skip(const Regex &re, bool byte) {
+  // (`byte`), or the grapheme program's — and what prunes the positions of
+  // the one-pass walk's scan. 'P' a literal prefix, 'T' Teddy, 'F' the
+  // first-byte set, '-' nothing.
+  static char skip_letter(Regex::Plan::StartSkip skip) {
     using Skip = Regex::Plan::StartSkip;
-    switch (byte ? re.plan_->byte_start_skip_ : re.plan_->start_skip_) {
+    switch (skip) {
     case Skip::Prefix: return 'P';
     case Skip::Teddy: return 'T';
     case Skip::FirstBytes: return 'F';
     case Skip::None: return '-';
     }
     return '!';
+  }
+  static char start_skip(const Regex &re, bool byte) {
+    return skip_letter(byte ? re.plan_->byte_start_skip_
+                            : re.plan_->start_skip_);
+  }
+  static char walk_skip(const Regex &re, bool byte) {
+    return skip_letter(re.plan_->walk_skip(byte));
   }
   // The Teddy searcher: the type (a test deals one straight from a list of
   // fingerprints), and the plan's (ok: the pattern has one).
@@ -2682,6 +2690,25 @@ void test_anchor_choice() {
     CHECK(PlanProbe::start_skip(make_us("[taf][a-z]+"), true) == '-');
     CHECK(PlanProbe::start_skip(make_us("[bfgkpvjq][a-z]+"), true) == 'F');
     CHECK(PlanProbe::start_skip(make_us("[bcdfgmpw][a-z]+"), true) == '-');
+    // The walk's scan asks only that the set be small — a walk costs more
+    // to start than a DFA step — and takes Teddy ahead of it as well; a
+    // prefix is a driver of its own there, never this scan's.
+    CHECK(PlanProbe::walk_skip(make_us("[taf][a-z]+"), true) == 'F');
+    CHECK(PlanProbe::walk_skip(Regex("[aeiou][a-z]+s"), false) == 'F');
+    CHECK(PlanProbe::walk_skip(Regex("[aeiou][a-z]+s"), true) == 'F');
+    CHECK(PlanProbe::walk_skip(make_us("[a-z]+s"), true) == 'F');
+    CHECK(PlanProbe::walk_skip(make_us("\\w+s"), true) == '-');
+    CHECK(PlanProbe::walk_skip(make_us("[aeiou]n"), true) == 'T');
+    for (bool byte : {false, true}) {
+      CHECK(PlanProbe::walk_skip(Regex("(?:fox|dog|cat)s?"), byte) == 'T');
+      CHECK(PlanProbe::walk_skip(Regex("Sherlock\\s+Holmes"), byte) != 'P');
+    }
+    // Each program family by its own set: ASCII letters are few, the lead
+    // bytes of everything past ASCII are not.
+    CHECK(PlanProbe::walk_skip(Regex("[a-z\\x{80}-\\x{10FFFF}]+\\d"), false) ==
+          'F');
+    CHECK(PlanProbe::walk_skip(Regex("[a-z\\x{80}-\\x{10FFFF}]+\\d"), true) ==
+          '-');
     // Either way the matches are the Pike's.
     const std::string s = "if Holmes and Watson return to Baker Street while "
                           "John waits in London, break the case; caf\xc3\xa9 "

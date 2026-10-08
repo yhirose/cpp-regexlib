@@ -1160,11 +1160,13 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
     grapheme Pike. What a start state skips with is one decision per program
     family (`StartSkip`: a literal prefix, Teddy, a first-byte set that is
     small and rare, or nothing), and Teddy goes ahead of the first-byte set
-    — always, not by estimate. It
-    stops where a match very likely begins, at a pace that does not depend
-    on the subject; the first-byte scan is faster only for two or three
-    bytes that are rare in the subject, and several times slower when they
-    turn out not to be.
+    — always, not by estimate. Teddy stops where a match very likely
+    begins, at a pace that does not depend on the subject; the first-byte
+    scan is faster only for two or three bytes that are rare in the subject,
+    and several times slower when they turn out not to be. The walk's scan
+    and the Pike's seed take their candidates by the same rule (`scan_skip`,
+    which the anchor's pricing reads too); each says what it asks of the
+    set — the walk, only that it be small.
 - **First-byte (dead-byte) skip** — the generalization of a literal prefix to a
   leading first-byte *set* (`analyze_first_bytes` over the start ε-closure).
   `skip_to_first_byte` is tiered by set size (1 → `memchr`; ≤ 8 → NEON/SSE2 scan;
