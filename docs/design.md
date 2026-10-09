@@ -305,7 +305,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `LiteralAlt` | `literal_alt_` non-empty | Teddy multi-literal scan, ordered verify of the literals behind the fingerprint found |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — u16 rows, accept byte off the dependency chain; a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
-| WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
+| WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes, taken a block at a time (`word_start_block`, see the scan section) behind a short scalar entry ramp; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity) |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
@@ -476,7 +476,7 @@ A scan owns ONE budget across all its steps (a per-step budget would reset
 at every match and still admit O(matches × n)). The other
 prefilters need no budget: their verifies are O(1)/pattern-bounded (literal,
 Teddy, anchor flags) or shape-bounded by admission (the var-pre suffix's
-one-atom rule, the word scan's one-candidate-per-word).
+one-atom rule, `assert_word_find`'s one-candidate-per-word).
 
 The unbounded one-pass candidate drivers add a **profitability rule** to the
 same budget (`WalkBudget::spend_profitable`): whether a candidate+verify
@@ -1003,7 +1003,23 @@ than holding a copy: copying one just built was a quarter of
 candidate continues from the next ctz, not a loop restart — so the
 candidate+verify prefilters below (the `find_substr` compare, the `(?i)` fold
 compare, the fused-collapse verify) pay one bit-scan per false positive even
-when the probe byte is common.
+when the probe byte is common. `find_substr_if` hands a caller's own reject
+to the same verifier (the assert tier's trailing `\b`, which most occurrences
+of a letter fail).
+
+**Nibble-table scans (`run_scan`, `word_start_block`).** A predicate over an
+arbitrary ASCII *set* is two 16-lane table lookups (low nibble → row, high
+nibble → bit: `PSHUFB`/`TBL`), exact whatever the set holds. These are loops
+of their own beside `scan64` — its stride is shaped for sparse probes, and a
+table lookup needs SSSE3, which it is not dispatched for: `run_scan` (the
+one-pass walk's self-loop runs, which end within a block) and `word_start_block`
+(WordOnePass's candidates — a byte of the body's start set after a byte that
+is not a word byte, as a mask of sixteen positions with the previous block's
+last lane carried in; ~14 GB/s where candidates are rare, against ~3.4 for
+the byte-at-a-time loop it replaced). The find that takes those masks looks at
+its first four positions one byte at a time first (`word_onepass_find`): right
+after a match the next candidate is usually a byte or two on, and a predicted
+branch hands the walk its start at once where a mask keeps it waiting.
 
 **Where they run.** The DFA tiers fold the skip into the forward scan's start
 state: a literal-prefix **memmem** (`find_substr` over `prefix_` / `byte_prefix_`)
@@ -1295,9 +1311,10 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   literal (`plan_assert_anchor`; there the order used to be suffix-first, so
   `Sherlock [a-z]+e\b` scanned for `e`: ~0.35 → ~30 GB/s), and order the word
   scan against the anchor chosen (`wop_after_anchor_`: `\bq[a-z]+e\b` is a
-  memchr for `q`, ~3.3 → ~23 GB/s). Lifted, Sherlock corpus: `e[a-z]{3,}q`
-  ~0.4 → ~34 GB/s, `a.{16}z` ~0.4 → ~35, `a[^.]*!` ~0.33 → ~9.3, `s[a-z]*\?`
-  ~0.67 → ~16 — each within a few percent of its class-led twin.
+  memchr for `q`, ~29 GB/s where the word scan runs at ~14). Lifted, Sherlock
+  corpus: `e[a-z]{3,}q` ~0.4 → ~34 GB/s, `a.{16}z` ~0.4 → ~35, `a[^.]*!`
+  ~0.33 → ~9.3, `s[a-z]*\?` ~0.67 → ~16 — each within a few percent of its
+  class-led twin.
 - **Assertion-tier fixed-text literal** — an assertion pattern (`(?m)^X`, `X$`,
   `^X$`, `\bX\b`) is served by the assertion DFA, which otherwise scans every
   position. When stripping the zero-width assertions leaves a single **fixed
@@ -1319,11 +1336,12 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   variable start by reverse. A special **word-scan fast shape** handles the exact
   shape `\b \w{n,m} <lit> \b` (`\b\w+n\b`, `\b\w+ing\b`) — "a whole word ending in
   `<lit>`" — with **no DFA at all**: `memmem` the literal, confirm the trailing
-  `\b` (the next code point is non-word), then walk left over word code points to
+  `\b` (the next code point is non-word — inside the scan, `find_substr_if`, as
+  `assert_suffix_find` does its own cheap reject), then walk left over word code points to
   the run start (`assert_word_find`), checking the `\w` run length against
   `{n,m}`. Sound because the assert tier serves only single-code-point clusters
   (code point == grapheme) and the `\w` here is exactly the bare Word predicate,
-  so the walk reproduces the regex. Lifted `\b\w+n\b` ~190 → ~776 MB/s (past
+  so the walk reproduces the regex. Lifted `\b\w+n\b` ~190 → ~1,100 MB/s (past
   rure/RE2).
 - **Assertion-tier leading literal** (`assert_.prefix`) — when the assertion
   pattern is *not* a fixed text but its **first consuming atoms** are a fixed

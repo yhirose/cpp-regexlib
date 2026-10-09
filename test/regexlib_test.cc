@@ -92,6 +92,25 @@ struct PlanProbe {
     }
     return static_cast<int64_t>(slots);
   }
+  // WordOnePass: whether the plan has the table, and its candidate scan —
+  // every candidate at or after `off`, a block at a time as the find takes
+  // them, by the scan this build and CPU pick or (`walk`) a position at a
+  // time. A set is the nibble table the scan reads.
+  static bool word_onepass(const Regex &re) { return re.plan_->wop_.ok; }
+  static std::vector<size_t> word_starts(std::string_view s, size_t off,
+                                         const NibbleSet &starts, bool walk) {
+    const auto *p = reinterpret_cast<const unsigned char *>(s.data());
+    std::vector<size_t> out;
+    while (off < s.size()) { // as word_onepass_scan takes them
+      Regex::WordStarts ws =
+          walk ? Regex::word_start_walk(p, s.size(), off, starts.data())
+               : Regex::word_start_block(p, s.size(), off, starts.data());
+      off = ws.at + 16;
+      for (; ws.mask; ws.pop())
+        out.push_back(ws.first());
+    }
+    return out;
+  }
   // Whether the literal prefix scans as a pair of bytes (false: for one
   // byte, or the plan has no prefix).
   static bool prefix_pair(const Regex &re) {
@@ -1019,6 +1038,95 @@ void test_teddy_scans() {
   {
     const auto &t = PlanProbe::teddy(Regex(alternation(mixed(65, 4))));
     CHECK(!t.ok || t.n < 4);
+  }
+}
+
+// WordOnePass's candidate scan against its definition — a byte of the start
+// set after a byte that is not a word byte, or a non-ASCII byte — from every
+// start offset of subjects of every length up to five blocks, so the first
+// block, the lane carried from one block into the next and the partial last
+// block are met at every alignment; the vector scan and the walk alike. Then
+// the find that rides on it, against the Pike.
+void test_word_start_scan() {
+  using reg::detail::nibble_set_has;
+  using Set = reg::detail::NibbleSet;
+  const Set &word_set = reg::detail::kAsciiWordNibbles;
+  for (int b = 0; b < 256; b++)
+    CHECK(nibble_set_has(word_set.data(), static_cast<unsigned char>(b)) ==
+          (b < 128 && reg::detail::is_word_cp(static_cast<char32_t>(b))));
+  auto set_of = [](const std::string &members) {
+    Set t{};
+    for (unsigned char c : members)
+      reg::detail::nibble_set_add(t, c);
+    return t;
+  };
+  const Set sets[] = {set_of("0123456789"), set_of("x"), set_of("aZ_9"),
+                      word_set};
+  uint32_t seed = 0x9E3779B9u;
+  auto rnd = [&](size_t bound) {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<size_t>(seed >> 8) % bound;
+  };
+  // Word bytes in and out of the sets, bytes that are neither — among them
+  // the one either side of each range of word bytes (`/`, `:`, `@`, `[`,
+  // `` ` ``, `{`) — and now and then a non-ASCII one.
+  const std::string word = "ax09Z_", other = " .-\n@[`{/:";
+  for (int round = 0; round < 300; round++) {
+    std::string s;
+    const size_t len = static_cast<size_t>(round) % 82, words = 1 + rnd(8);
+    while (s.size() < len) {
+      const size_t k = rnd(40);
+      s += k == 0   ? '\xC3'
+           : k == 1 ? '\x80'
+           : k <= 1 + 4 * words ? word[rnd(word.size())]
+                                : other[rnd(other.size())];
+    }
+    bool ok = true;
+    for (const Set &set : sets) {
+      for (size_t off = 0; off <= s.size(); off++) {
+        std::vector<size_t> want;
+        for (size_t i = off; i < s.size(); i++) {
+          const auto c = static_cast<unsigned char>(s[i]);
+          const bool edge =
+              i == 0 || !reg::detail::ascii_word_byte(
+                            static_cast<unsigned char>(s[i - 1]));
+          if (c >= 0x80 || (edge && nibble_set_has(set.data(), c)))
+            want.push_back(i);
+        }
+        for (bool walk : {false, true})
+          ok = ok && PlanProbe::word_starts(s, off, set, walk) == want;
+      }
+    }
+    CHECK(ok);
+  }
+
+  // The find: a candidate at every offset of a block and into the partial
+  // one, behind candidates that fail (a digit run that is not an address, a
+  // capital with no lowercase after it), back to back with the match before
+  // — the entry ramp's — and far from it.
+  for (const char *pat :
+       {R"(\b[0-9]+\b)", R"(\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)",
+        R"(\b[A-Z][a-z]+\b)", R"(\b[xy][0-9]+\b)", R"(\b[a-c]\w+\b)",
+        R"(\b[0-9]{2}x?)"}) {
+    const Regex re(pat), pike = pike_twin(pat);
+    CHECK(PlanProbe::word_onepass(re) &&
+          !PlanProbe::word_scan_after_anchor(re));
+    for (const char *body :
+         {"42", "10.0.0.1", "Holmes", "x7", "abc", "1.2.3.4.5 6.7.8 9.9.9.9x",
+          "10/Oct/2026:13:55:36 +0000 10.20.30.40", "a1 b2 c3 x1 x22 X3 x_4",
+          "Ab CD Ef g Hi9 Jk_ Lm", "12 34,56;78\r\n90", "_12 1_2 12_ 99"}) {
+      for (size_t pad = 0; pad < 70; pad += (pad < 36 ? 1 : 7)) {
+        for (const char *fill : {".", "a", " 7 "}) {
+          std::string s;
+          while (s.size() < pad)
+            s += fill;
+          s.resize(pad);
+          s += std::string(" ") + body + " " + body + "," + body + "  ..  " +
+               body;
+          CHECK(finds_agree(re, flat_spans(pike, s, /*lazy=*/false), s));
+        }
+      }
+    }
   }
 }
 
@@ -2758,6 +2866,12 @@ void test_anchor_choice() {
   CHECK(PlanProbe::word_scan_after_anchor(Regex("\\bq[a-z]+e\\b")));
   CHECK(PlanProbe::word_scan_after_anchor(Regex("\\bthe [a-z]+q\\b")));
   CHECK(!PlanProbe::word_scan_after_anchor(Regex("\\be[a-z]+s\\b")));
+  // ... as the scan's pace prices it (kWordScanNs, which these two pin): a
+  // letter one byte in a hundred is already dearer to stop at than the scan
+  // is to run.
+  CHECK(PlanProbe::word_scan_after_anchor(Regex("\\bj[a-z]+\\b")));
+  CHECK(PlanProbe::word_onepass(Regex("\\bk[a-z]+\\b")) &&
+        !PlanProbe::word_scan_after_anchor(Regex("\\bk[a-z]+\\b")));
   CHECK(!PlanProbe::word_scan_after_anchor(
       Regex("\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b")));
 
@@ -3856,6 +3970,18 @@ void test_walk_budget_linearity() {
     s += "\xc3\xa9";
     cases.push_back({"suffix-absorb-bail", "[A-Z][a-z]+ing", s, 0});
   }
+  { // the word scan: a body that runs on over spaces, so the walk from every
+    // word's start reaches the same dead end. The words begin past the
+    // scan's entry ramp, so it is the block scan the budget stops.
+    const char *pat = R"(\b[a-c]+(?: [a-c]+)* [0-9]\b)";
+    CHECK(PlanProbe::word_onepass(Regex(pat)) &&
+          !PlanProbe::word_scan_after_anchor(Regex(pat)));
+    std::string s = "-------- ";
+    for (int i = 0; i < 200000; i++)
+      s += "ab ";
+    cases.push_back({"word-scan", pat, s + "ab.", 0});
+    cases.push_back({"word-scan-bail-match", pat, s + "ab. ab 7", 1});
+  }
   for (auto &c : cases) {
     Regex re(c.pat);
     auto t0 = std::chrono::steady_clock::now();
@@ -4717,6 +4843,7 @@ int main() {
   test_literal_alternation();
   test_teddy_prefilter();
   test_teddy_scans();
+  test_word_start_scan();
   test_matches();
   test_match_rows();
   test_whole_match_capture();

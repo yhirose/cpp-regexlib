@@ -1716,6 +1716,32 @@ inline bool is_word_cp(char32_t cp) {
          gc == unicode::GeneralCategory::Pc;
 }
 
+// An ASCII byte set as a nibble table: bit h of row l is byte (h << 4 | l) —
+// the form a 16-lane table lookup tests 16 bytes at a time (Regex::run_scan,
+// word_start_block). No byte >= 0x80 is a member: its row has no bit that
+// high.
+using NibbleSet = std::array<uint8_t, 16>;
+constexpr void nibble_set_add(NibbleSet &set, unsigned char c) {
+  set[c & 15] = static_cast<uint8_t>(set[c & 15] | (1u << (c >> 4)));
+}
+inline bool nibble_set_has(const uint8_t *set, unsigned char c) {
+  return (set[c & 15] >> (c >> 4)) & 1;
+}
+// ... and the ASCII bytes is_word_cp holds for, as one. (Not is_word_byte:
+// that reads a byte >= 0x80 as the Latin-1 code point, this as no word byte.)
+constexpr NibbleSet ascii_word_nibbles() {
+  NibbleSet set{};
+  for (int b = 0; b < 128; b++)
+    if ((b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') ||
+        (b >= 'a' && b <= 'z') || b == '_')
+      nibble_set_add(set, static_cast<unsigned char>(b));
+  return set;
+}
+inline constexpr NibbleSet kAsciiWordNibbles = ascii_word_nibbles();
+inline bool ascii_word_byte(unsigned char c) {
+  return nibble_set_has(kAsciiWordNibbles.data(), c);
+}
+
 inline bool is_space_cp(char32_t cp) { return unicode::is_white_space(cp); }
 
 inline char32_t fold(char32_t cp) { return unicode::simple_case_folding(cp); }
@@ -4149,7 +4175,7 @@ struct CpOnePass {
     // never tests as a member, so a run stops there and the per-byte loop
     // bails as usual.
     bool loop_ok = false;
-    std::array<uint8_t, 16> loop_tbl{};
+    detail::NibbleSet loop_tbl{};
     // Candidate-skip admission for the position-scan driver: every byte in
     // this state's self-loop set also takes the START state here. Then a
     // walk begun anywhere inside one of this state's runs reaches this state
@@ -4354,7 +4380,7 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
   for (auto &S : op.states) {
     int id = static_cast<int>(&S - op.states.data());
     bool loops = false, ok = true, restart = true;
-    std::array<uint8_t, 16> tbl{};
+    detail::NibbleSet tbl{};
     for (int b = 0; b < 128; b++) {
       if (S.next[b] != id) continue;
       if (S.mask[b] != 0) {
@@ -4366,7 +4392,7 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
       // literal `x` does not (the start consumes only `x`).
       if (start_next[b] != id) restart = false;
       loops = true;
-      tbl[b & 15] |= static_cast<uint8_t>(1u << (b >> 4));
+      detail::nibble_set_add(tbl, static_cast<unsigned char>(b));
     }
     if (ok && loops) {
       S.loop_ok = true;
@@ -7075,20 +7101,20 @@ private:
               return;
         }
       }
-      for (int b = 0; b < 128; b++)
-        wop_start_[b] =
-            wop_.next[wop_.start][b] != AnchoredOnePass::kDeadState;
       wop_trail_wb_ = trail;
       wop_.ok = true;
       // Price the word scan as the anchors were priced (plan_assert_anchor
-      // has run): its byte-at-a-time candidate loop, plus a walk wherever a
-      // start byte follows a non-word byte — about one occurrence in
-      // kWordEdgeThin. A literal anchor estimated cheaper than that goes
-      // first (assert_find_span): `\bq[a-z]+e\b` is a memchr for `q`, not a
-      // look at every byte.
+      // has run): its candidate scan, plus a walk wherever a start byte
+      // follows a non-word byte — about one occurrence in kWordEdgeThin. A
+      // literal anchor estimated cheaper than that goes first
+      // (assert_find_span): `\bq[a-z]+e\b` is a memchr for `q`, twice the
+      // scan's pace.
       int set = 0;
-      for (int b = 0; b < 128; b++)
-        if (wop_start_[b]) set += byte_commonness(static_cast<unsigned char>(b));
+      for (int b = 0; b < 128; b++) {
+        if (wop_.next[wop_.start][b] == AnchoredOnePass::kDeadState) continue;
+        detail::nibble_set_add(wop_start_, static_cast<unsigned char>(b));
+        set += byte_commonness(static_cast<unsigned char>(b));
+      }
       anchor_.scan_cost =
           AnchorChoice::kWordScanNs +
           set * 1000 / AnchorChoice::kWordEdgeThin *
@@ -8321,8 +8347,10 @@ private:
                                             // beat the prefix by
       static constexpr int kWordEdgeThin = 3; // a letter is at a word's edge
                                               // about one time in three
-      static constexpr int kWordScanNs = 300000; // WordOnePass's scalar
-                                                 // candidate loop, per MB
+      // WordOnePass's candidate scan (word_start_block), per MB: three
+      // table lookups per 16 bytes whatever the start set holds (measured
+      // 14-15 GB/s).
+      static constexpr int kWordScanNs = 70000;
       // A prefix estimated at 1 ns per byte or more is dense: the DFA scan
       // costs about that whatever the subject holds.
       static constexpr int kDenseNs = 1000000;
@@ -9593,7 +9621,7 @@ private:
     // the assert DFA's forward scan + per-match reverse start recovery for
     // `\b(?:\d{1,3}\.){3}\d{1,3}\b`-class patterns.
     AnchoredOnePass wop_;            // compact body automaton (reused type)
-    std::array<bool, 128> wop_start_{}; // bytes the body can start on
+    detail::NibbleSet wop_start_{};  // bytes the body can start on
     bool wop_trail_wb_ = false;
     bool wop_after_anchor_ = false; // the assert literal anchor is estimated
                                     // cheaper than the word scan and runs
@@ -10335,6 +10363,144 @@ private:
     return run_scan_tail(p, n, off, tbl);
   }
 
+  // Word-start scan — where a `\b`-led body can begin: a byte in `starts`
+  // after a byte that is not a word byte (the start of the text counts as
+  // one). word_start_block finds the first block of up to 16 positions at or
+  // after `off` that holds any, and returns where the block is and which of
+  // its positions they are; an empty mask, and none is left. Both
+  // sets are nibble tables, so a block is three table lookups and the last
+  // lane of the block before it whatever the sets hold: a start set of ten
+  // digits or of every letter scans at one pace. (Beside run_scan, not a
+  // scan64 predicate: a table lookup is SSSE3, which scan64 is not
+  // dispatched for.)
+  //
+  // For ASCII text. A non-ASCII byte is reported as a candidate, for the
+  // caller to stop at; the byte after one is not looked at as a code point
+  // would be — it reads as following a non-word byte.
+  struct WordStarts {
+    size_t at;
+    uint64_t mask; // a bit per position on x86 (movemask), a nibble on NEON
+                   // (lane_bits) thinned to its low bit: either way the
+                   // lowest bit set is the first candidate
+#if defined(REGEXLIB_NEON)
+    static constexpr int kShift = 2;
+#else
+    static constexpr int kShift = 0;
+#endif
+    size_t first() const {
+      return at + (static_cast<size_t>(detail::bit_ctz64(mask)) >> kShift);
+    }
+    void pop() { mask &= mask - 1; }
+  };
+
+  // The same a position at a time: where there is no vector to do it with,
+  // and for a subject shorter than one.
+  static WordStarts word_start_walk(const unsigned char *p, size_t n,
+                                    size_t off, const uint8_t *starts) {
+    bool edge = off == 0 || !detail::ascii_word_byte(p[off - 1]);
+    for (; off < n; off += 16) {
+      uint64_t m = 0;
+      for (size_t k = 0; k < 16 && off + k < n; k++) {
+        const unsigned char c = p[off + k];
+        if (c >= 0x80 || (edge && detail::nibble_set_has(starts, c)))
+          m |= uint64_t(1) << (k << WordStarts::kShift);
+        edge = !detail::ascii_word_byte(c);
+      }
+      if (m) return {off, m};
+    }
+    return {off, 0};
+  }
+
+#if defined(REGEXLIB_SSSE3)
+  // One block of word_start_block: the candidates among the 16 bytes at `q`,
+  // a bit each. `prev` holds, in lane 15, whether the byte before the block
+  // is not a word byte, and leaves holding the same for the block after.
+  REGEXLIB_TARGET_SSSE3 static REGEXLIB_ALWAYS_INLINE unsigned
+  word_start_lanes_ssse3(const unsigned char *q, __m128i Ts, __m128i Tw,
+                         __m128i &prev) {
+    // 1 << hi for hi < 8; 0 for hi >= 8 (see run_scan_ssse3).
+    const __m128i B = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0,
+                                    0, 0, 0, 0);
+    const __m128i lomask = _mm_set1_epi8(0x0F), zero = _mm_setzero_si128();
+    const __m128i v = simd_load(q, 0);
+    // (PSHUFB reads an index's low four bits, and gives zero for a byte
+    // >= 0x80: not a member of either set.)
+    const __m128i bit =
+        _mm_shuffle_epi8(B, _mm_and_si128(_mm_srli_epi16(v, 4), lomask));
+    const __m128i nonstart =
+        _mm_cmpeq_epi8(_mm_and_si128(_mm_shuffle_epi8(Ts, v), bit), zero);
+    const __m128i nonword =
+        _mm_cmpeq_epi8(_mm_and_si128(_mm_shuffle_epi8(Tw, v), bit), zero);
+    // Each lane's left neighbour: this block moved up one, the block
+    // before's last lane coming in below.
+    const __m128i edge = _mm_alignr_epi8(nonword, prev, 15);
+    prev = nonword;
+    // (`v` itself: movemask reads the sign bit, set on a non-ASCII byte.)
+    return static_cast<unsigned>(_mm_movemask_epi8(
+        _mm_or_si128(v, _mm_andnot_si128(nonstart, edge))));
+  }
+
+  REGEXLIB_TARGET_SSSE3 static WordStarts
+  word_start_block_ssse3(const unsigned char *p, size_t n, size_t off,
+                         const uint8_t *starts) {
+    const __m128i Ts = simd_load(starts, 0),
+                  Tw = simd_load(detail::kAsciiWordNibbles.data(), 0);
+    __m128i prev = _mm_set1_epi32(
+        -static_cast<int>(off == 0 || !detail::ascii_word_byte(p[off - 1])));
+    for (; off + 16 <= n; off += 16) {
+      const unsigned mask = word_start_lanes_ssse3(p + off, Ts, Tw, prev);
+      if (mask) return {off, mask};
+    }
+    if (off < n && n >= 16) {
+      // The last, partial block: looked at as the 16 bytes that end the
+      // subject, less the positions before `off`. (`prev` is not this
+      // block's, but only its first position reads it, and that one is
+      // before `off`.)
+      const size_t b = n - 16;
+      return {off, word_start_lanes_ssse3(p + b, Ts, Tw, prev) >> (off - b)};
+    }
+    return word_start_walk(p, n, off, starts);
+  }
+#endif
+
+  static REGEXLIB_ALWAYS_INLINE WordStarts
+  word_start_block(const unsigned char *p, size_t n, size_t off,
+                   const uint8_t *starts) {
+#if defined(REGEXLIB_NEON)
+    // As the SSSE3 twin, with the carried lane the other way up: whether
+    // the byte before the block IS a word byte.
+    const uint8x16_t Ts = vld1q_u8(starts),
+                     Tw = vld1q_u8(detail::kAsciiWordNibbles.data());
+    const uint8x16_t B =
+        vcombine_u8(vcreate_u8(0x8040201008040201ull), vcreate_u8(0));
+    uint8x16_t prev =
+        vdupq_n_u8(off != 0 && detail::ascii_word_byte(p[off - 1]) ? 0xFF : 0);
+    const auto lanes = [=, &prev](size_t b) REGEXLIB_ALWAYS_INLINE {
+      const uint8x16_t v = simd_load(p, b);
+      const uint8x16_t lo = vandq_u8(v, vdupq_n_u8(0x0F));
+      const uint8x16_t bit = vqtbl1q_u8(B, vshrq_n_u8(v, 4));
+      const uint8x16_t start = vtstq_u8(vqtbl1q_u8(Ts, lo), bit);
+      const uint8x16_t isword = vtstq_u8(vqtbl1q_u8(Tw, lo), bit);
+      const uint8x16_t cand = vbicq_u8(start, vextq_u8(prev, isword, 15));
+      prev = isword;
+      return lane_bits(vorrq_u8(vcgeq_u8(v, vdupq_n_u8(0x80)), cand)) &
+             0x1111111111111111ull;
+    };
+    for (; off + 16 <= n; off += 16) {
+      const uint64_t mask = lanes(off);
+      if (mask) return {off, mask};
+    }
+    if (off < n && n >= 16) {
+      const size_t b = n - 16;
+      return {off, lanes(b) >> ((off - b) << WordStarts::kShift)};
+    }
+#elif defined(REGEXLIB_SSSE3)
+    if (detail::cpu_has_ssse3())
+      return word_start_block_ssse3(p, n, off, starts);
+#endif
+    return word_start_walk(p, n, off, starts);
+  }
+
   // Core form: call `visit(i)` on each hit index in order; the first accepted
   // hit (visit returns true) is returned, rejected hits continue IN PLACE —
   // no rescan of the current 64-byte stride. Returns >= n if no hit is
@@ -11045,6 +11211,35 @@ private:
     // would pin the four operands to the stack for the whole scan.
     auto verify = [=](size_t i) {
       return bytes_eq(hay + (i - o1), needle, m);
+    };
+    size_t q = o1 == o2
+                   ? scan64_visit(hay, qmax + 1, o1, PredEq(needle[o1]), verify)
+                   : scan64_visit(hay, qmax + 1, o1,
+                                  PredPair(needle[o1], needle[o2], o2 - o1,
+                                           qmax + 1 + (o2 - o1)),
+                                  verify);
+    return q <= qmax ? hay + (q - o1) : nullptr;
+  }
+
+  // find_substr among the occurrences `accept(start)` takes. One it turns
+  // down costs the scan its next hit, in place, where a caller that looked
+  // at what find_substr returned and called again restarted the scan at
+  // every occurrence — the assert tier's trailing `\b`, which most
+  // occurrences of a letter fail (`\b\w+n\b` 960 -> 1110 MB/s,
+  // `\b[0-9]+th\b` 3.0 -> 4.2 GB/s). `needle` is not empty. find_substr is
+  // not this with an accept that takes everything: written so, the scans
+  // that call it moved (`Holmes.{0,25}Watson|Watson.{0,25}Holmes` 0.92x).
+  template <class Accept>
+  static const unsigned char *
+  find_substr_if(const unsigned char *hay, size_t n,
+                 const unsigned char *needle, size_t m, size_t probe,
+                 size_t probe2, Accept accept) {
+    if (m > n) return nullptr;
+    const size_t o1 = probe < probe2 ? probe : probe2;
+    const size_t o2 = probe < probe2 ? probe2 : probe;
+    const size_t qmax = (n - m) + o1; // last index the o1 byte can occupy
+    auto verify = [=](size_t i) {
+      return bytes_eq(hay + (i - o1), needle, m) && accept(i - o1);
     };
     size_t q = o1 == o2
                    ? scan64_visit(hay, qmax + 1, o1, PredEq(needle[o1]), verify)
@@ -12347,10 +12542,10 @@ private:
 
   // True iff the code point starting at byte `pos` is a word code point. ASCII
   // bytes are decoded trivially; pos == n (no code point) is non-word.
-  bool word_cp_at(std::string_view t, int pos, int n) const {
+  static bool word_cp_at(std::string_view t, int pos, int n) {
     if (pos >= n) return false;
     unsigned char b = static_cast<unsigned char>(t[pos]);
-    if (b < 0x80) return is_word_byte(b);
+    if (b < 0x80) return detail::ascii_word_byte(b);
     char32_t cp;
     size_t bytes;
     if (!unicode::utf8::decode_codepoint(t.data() + pos, n - pos, bytes, cp))
@@ -12376,18 +12571,15 @@ private:
     int m = static_cast<int>(plan_->assert_.suffix.size());
     int scan = from;
     while (scan + m <= n) {
-      const unsigned char *h =
-          find_substr(p + scan, n - scan, lit, m,
-                      plan_->assert_.suffix_probe,
-                      plan_->assert_.suffix_probe2);
+      // Trailing \b: the code point after the literal must be non-word.
+      const unsigned char *h = find_substr_if(
+          p + scan, n - scan, lit, m, plan_->assert_.suffix_probe,
+          plan_->assert_.suffix_probe2, [text, scan, m, n](size_t at) {
+            return !word_cp_at(text, scan + static_cast<int>(at) + m, n);
+          });
       if (!h) return false;
       int ls = static_cast<int>(h - p);
       int e = ls + m;
-      // Trailing \b: the code point after the literal must be non-word.
-      if (word_cp_at(text, e, n)) {
-        scan = ls + 1;
-        continue;
-      }
       // Walk left over word code points to the start of the maximal \w-run.
       int ws = ls;
       while (ws > 0) {
@@ -12441,21 +12633,20 @@ private:
     int m = static_cast<int>(plan_->assert_.suffix.size());
     int scan = from;
     while (scan + m <= n) {
-      const unsigned char *h =
-          find_substr(p + scan, n - scan, lit, m,
-                      plan_->assert_.suffix_probe,
-                      plan_->assert_.suffix_probe2);
-      if (!h) return 0;
-      int ls = static_cast<int>(h - p);
-      int e = ls + m; // a match would end here (literal is the last atom)
       // Cheap `\b` reject: a word byte right after a word-ending literal fails
       // the trailing boundary, so no match ends here. ASCII only — a non-ASCII
       // following byte's word-ness needs a full code-point decode (the reverse
       // verify handles it).
-      if (plan_->assert_.suffix_wb && e < n && p[e] < 0x80 && is_word_byte(p[e])) {
-        scan = ls + 1;
-        continue;
-      }
+      const bool wb = plan_->assert_.suffix_wb;
+      const unsigned char *h = find_substr_if(
+          p + scan, n - scan, lit, m, plan_->assert_.suffix_probe,
+          plan_->assert_.suffix_probe2, [p, scan, m, n, wb](size_t at) {
+            const int e = scan + static_cast<int>(at) + m;
+            return !(wb && e < n && detail::ascii_word_byte(p[e]));
+          });
+      if (!h) return 0;
+      int ls = static_cast<int>(h - p);
+      int e = ls + m; // a match would end here (literal is the last atom)
       int walked = 0;
       int s = byte
                   ? assert_byte_reverse_start(fc, text, e, /*floor=*/from,
@@ -16338,36 +16529,93 @@ private:
   // (found, s/e set), 0 (none), kWalkBail (budget / non-ASCII — the caller
   // falls back to the assert DFA chain). ASCII-tier callers only.
   //
+  // The candidates come a block at a time (word_start_block), behind an
+  // entry ramp: the first few positions are looked at one byte at a time. A
+  // find resuming after a match usually has its next candidate a byte or
+  // two on (the word after the space), and a branch the predictor has
+  // learnt hands the walk its start at once, where a block's mask keeps it
+  // waiting on a dozen operations in a row (`\b\w+\b` over prose: 221 MB/s
+  // with the ramp, 203 without). Past the ramp candidates are far apart, or
+  // failing: one that fails goes on to the next bit of its block's mask,
+  // with no test for the scan to mispredict (`\b[0-9]+\b` over prose, where
+  // a digit is rare: 3.4 -> 14 GB/s; IPv4 extraction over a log, where most
+  // numbers are not addresses: 890 -> 1100 MB/s).
+  //
   // Out of line on purpose. Inlined into assert_find_span — which it was
   // while that had one call to it — the candidate loop shared the caller's
   // registers with every other rung and ran a quarter slower: IPv4
   // extraction over a log, 640 MB/s inlined and 850 as its own function
-  // (the same at every heap and code placement tried).
+  // (the same at every heap and code placement tried). And in two parts:
+  // with the block scan's call in it, the ramp's loop kept its operands on
+  // the stack.
+  static constexpr int kWordStartRamp = 4;
   REGEXLIB_NOINLINE int word_onepass_find(std::string_view t, int from,
                                           int &s_out, int &e_out,
                                           WalkBudget &budget) const {
-    const Plan::AnchoredOnePass &a = plan_->wop_;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const int n = static_cast<int>(t.size());
+    // (The start set off the walk's own start row: a compare with what one
+    // load gives, where the nibble table the blocks read wants shifts too.)
+    const auto &start_row = plan_->wop_.next[plan_->wop_.start];
     const bool bail_cr = onepass_walk_bails_cr();
-    for (int cand = from; cand < n; cand++) {
-      unsigned char b0 = p[cand];
-      if (b0 >= 128) return kWalkBail; // non-ASCII -> assert chain
-      if (!plan_->wop_start_[b0]) continue;          // body can't start here
-      if (cand > 0 && is_word_byte(p[cand - 1])) continue; // leading \b
-      int end_pos;
-      bool bail;
-      int acc = onepass_walk(a, p, n, cand, end_pos, bail, bail_cr);
-      if (bail) return kWalkBail;
-      if (acc > cand &&
-          (!plan_->wop_trail_wb_ || acc == n || !word_cp_at(t, acc, n))) {
-        s_out = cand;
-        e_out = acc;
-        return 1;
+    // (A remainder with no whole block past the ramp is all ramp: a short
+    // subject is then one call, as it was a byte at a time.)
+    const int ramp =
+        n - from < kWordStartRamp + 16 ? n : from + kWordStartRamp;
+    int cand = from;
+    for (; cand < ramp; cand++) {
+      const unsigned char c = p[cand];
+      if (c < 128 && (start_row[c] == Plan::AnchoredOnePass::kDeadState ||
+                      (cand > 0 && detail::ascii_word_byte(p[cand - 1]))))
+        continue; // not a candidate (a non-ASCII byte is the walk's to bail on)
+      int r = word_onepass_at(t, cand, s_out, e_out, budget, bail_cr);
+      if (r != 0) return r;
+    }
+    return word_onepass_scan(t, cand, s_out, e_out, budget);
+  }
+
+  // ... and past the ramp.
+  REGEXLIB_NOINLINE int word_onepass_scan(std::string_view t, int from,
+                                          int &s_out, int &e_out,
+                                          WalkBudget &budget) const {
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
+    const size_t n = t.size();
+    const uint8_t *starts = plan_->wop_start_.data();
+    const bool bail_cr = onepass_walk_bails_cr();
+    for (size_t off = static_cast<size_t>(from); off < n;) {
+      WordStarts ws = word_start_block(p, n, off, starts);
+      off = ws.at + 16; // (a block short of 16 positions ends the subject)
+      for (; ws.mask; ws.pop()) {
+        int r = word_onepass_at(t, static_cast<int>(ws.first()), s_out, e_out,
+                                budget, bail_cr);
+        if (r != 0) return r;
       }
-      if (!budget.spend(end_pos - cand)) return kWalkBail; // linearity guard
     }
     return 0;
+  }
+
+  // One candidate of word_onepass_find: the walk from `cand` — which bails
+  // on a non-ASCII byte, the first included — and the trailing `\b` at its
+  // last accept. 1 (a match, s/e set), 0 (none starts here) or kWalkBail.
+  REGEXLIB_ALWAYS_INLINE int word_onepass_at(std::string_view t, int cand,
+                                             int &s_out, int &e_out,
+                                             WalkBudget &budget,
+                                             bool bail_cr) const {
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
+    const int n = static_cast<int>(t.size());
+    int end_pos;
+    bool bail;
+    int acc = onepass_walk(plan_->wop_, p, n, cand, end_pos, bail, bail_cr);
+    if (bail) return kWalkBail; // non-ASCII -> assert chain
+    // (The byte at the accept is ASCII: the walk read it.)
+    if (acc > cand &&
+        (!plan_->wop_trail_wb_ || acc == n ||
+         !detail::ascii_word_byte(p[acc]))) {
+      s_out = cand;
+      e_out = acc;
+      return 1;
+    }
+    return budget.spend(end_pos - cand) ? 0 : kWalkBail; // linearity guard
   }
 
   // (onepass_unbounded_, onepass_require_end_) must be read as a PAIR: with

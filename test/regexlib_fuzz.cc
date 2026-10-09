@@ -953,6 +953,52 @@ void invariant_fuzz_onepass_repeat(int iters) {
   }
 }
 
+// --- WordOnePass's candidates: the `\b`-led shapes the word scan drives. ---
+//
+// The find takes its candidates from a scan that answers for a block of
+// sixteen positions at a time (word_start_block): a byte of the body's start
+// set after a byte that is not a word byte. What that scan can get wrong is
+// positional — the lane carried from one block into the next, the partial
+// block at the end, where the entry ramp hands over — and gen_subject's
+// dozen bytes never leave the ramp. These
+// subjects run to several blocks, of tokens that start a candidate at every
+// alignment: ones that match, ones that fail a byte or two in, and runs with
+// no candidate at all.
+std::string gen_word_start() {
+  static const char *HEAD[] = {"[0-9]", "[a-c]", "\\d", "[A-C]",
+                               "[xy]",  "[a-c1-3]", "\\w", "[_a]"};
+  static const char *BODY[] = {"+",       "{1,3}",          "[a-c]+",
+                               "[0-9]*x", "(?:\\.[0-9]{1,2}){2}",
+                               "\\w+",    "{2}",            "[a-c]{0,2}[0-9]"};
+  static const char *TAIL[] = {"\\b", "\\b", "\\b", "x?", "[0-9]?"};
+  return std::string("\\b") + HEAD[U(0, 7)] + BODY[U(0, 7)] + TAIL[U(0, 4)];
+}
+
+void invariant_fuzz_word_start(int iters) {
+  static const char *UNITS[] = {"a",  "b",   "c",   "A",    "1",     "2",
+                                "9",  "x",   "_",   " ",    ".",     "-",
+                                "\n", ", ",  "12",  "1.2",  "ab1",   "a.b",
+                                " 3", ".9.", "x1 ", "\r\n", "1.2.3", "B2"};
+  for (int it = 0; it < iters; it++) {
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 4; s++) {
+      std::string subj;
+      // Word-dense, sparse, or mostly separators; now and then a stretch
+      // with no candidate, longer than a block.
+      const int n = U(0, 70), bias = U(0, 2);
+      for (int i = 0; i < n; i++) {
+        if (U(0, 24) == 0)
+          subj += std::string(static_cast<size_t>(U(1, 40)),
+                              U(0, 1) ? ' ' : 'q');
+        subj += UNITS[bias == 0 ? U(0, 23) : bias == 1 ? U(9, 13) : U(0, 8)];
+        if (bias != 0 && U(0, 3) == 0) subj += UNITS[U(0, 23)];
+      }
+      subjects.push_back(subj);
+    }
+    check_pattern(gen_word_start(), subjects);
+  }
+}
+
 // US (CodePoint) differential against the EGC forced Pike: find_all, search,
 // match and find_iter of `pat` built in CodePoint mode must give the spans
 // and groups the grapheme Pike gives. The oracle is valid on subjects whose
@@ -2340,6 +2386,8 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A fifth: some twenty subjects per pattern, most of them short, each
   // pattern checked twice (the EGC battery plus the US differential).
   invariant_fuzz_multi_literal(share(inv / 5));
+  // A tenth: four subjects of up to a few hundred bytes per pattern.
+  invariant_fuzz_word_start(share(inv / 10));
 }
 
 int main(int argc, char **argv) {

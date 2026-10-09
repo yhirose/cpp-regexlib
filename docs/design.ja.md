@@ -291,7 +291,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | `LiteralAlt` | `literal_alt_` 非空 | Teddy 複数リテラルスキャン、見つかった fingerprint で始まるリテラルの順序付き verify |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——u16 行、accept バイトは依存チェーン外。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
-| WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
+| WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。候補は短いスカラーの入口ランプのあと、ブロック単位で取る（`word_start_block`。スキャンの節を参照）。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る（§2「線形性」） |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；one-pass 歩行と `+cap` は同上。ただし CRLF collapse プランは除く（`byte_walk_ok`：そのバイトプログラムは CR-LF の対を 1 要素と数え、歩行の表は 2 要素と数える） |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
@@ -447,8 +447,8 @@ suffix tier の候補ループ（scalar 検証の absorb ベイルが候補毎 O
 1 つの走査は、その全ステップで**1 つの予算**を共有します（ステップ毎の予算は
 マッチのたびにリセットされ O(マッチ数 × n) を許してしまう）。それ以外のプレフィルタに
 予算は不要：検証が O(1)/パターン長で頭打ち（literal、Teddy、アンカーフラグ）か、
-admission の形状ゲートが構造的に抑える（var-pre 接尾の 1 atom 規則、語
-スキャンの語ごと候補 1 つ）ためです。
+admission の形状ゲートが構造的に抑える（var-pre 接尾の 1 atom 規則、
+`assert_word_find` の語ごと候補 1 つ）ためです。
 
 unbounded one-pass 候補ドライバは同じ予算に**採算規則**を重ねます
 （`WalkBudget::spend_profitable`）。候補＋検証型ドライバが単一パスの chain に勝つか
@@ -927,7 +927,21 @@ located-span 連鎖へフォールバック。mustache `\{\{\s*(\w+)\s*\}\}` を
 検証はストライド内の各ヒットで走り、棄却された候補は次の ctz から続行（ループ再起動
 なし）——なので、以下の候補+検証型プレフィルタ（`find_substr` の比較、`(?i)` fold
 比較、融合 collapse 検証）は probe バイトが頻出でも偽陽性1つにつきビットスキャン
-1回しか払いません。
+1回しか払いません。`find_substr_if` は呼び出し側の棄却条件を同じ検証に載せます
+（assert tier の末尾 `\b`。ある文字の出現の大半はここで落ちます）。
+
+**ニブル表のスキャン（`run_scan`、`word_start_block`）。** 任意の ASCII *集合*への
+所属判定は、16 レーンの表引き 2 回（下位ニブル → 行、上位ニブル → ビット。
+`PSHUFB`/`TBL`）で、集合の中身によらず厳密です。これらは `scan64` の隣に独立した
+ループとして置いています（`scan64` のストライドは疎なプローブ向けで、表引きに要る
+SSSE3 の実行時判定も持たないため）：`run_scan`（one-pass 歩行の自己ループのラン。
+1 ブロック以内で終わるものが多い）と `word_start_block`
+（WordOnePass の候補——本体の開始集合のバイトで、直前が語バイトでないもの——を
+16 位置のマスクで返す。前のブロックの最終レーンを繰り越す。候補が稀な主題で
+~14 GB/s、置き換え前の 1 バイトずつのループは ~3.4）。このマスクを受け取る find は、
+先頭の 4 位置だけ先に 1 バイトずつ見ます（`word_onepass_find`）：マッチの直後は
+次の候補が 1〜2 バイト先にあることが多く、予測の当たる分岐なら歩行はすぐ開始位置を
+得られますが、マスクだとその計算を待たされるためです。
 
 **どこで走るか。** DFA tier は前進スキャンの開始状態にスキップを畳み込む：まず
 リテラル接頭 **memmem**（`find_substr`、`prefix_` / `byte_prefix_`）、無ければ
@@ -1166,7 +1180,7 @@ subject のリテラル走査がバイト毎 DFA に落ちる（memmem を元か
   リテラルと末尾リテラルを同じ方法で選び（`plan_assert_anchor`。こちらは以前は
   接尾優先だったので、`Sherlock [a-z]+e\b` は `e` を探していました：
   ~0.35 → ~30 GB/s）、選んだアンカーと語スキャンの順序も決めます
-  （`wop_after_anchor_`：`\bq[a-z]+e\b` は `q` の memchr になり ~3.3 → ~23 GB/s）。
+  （`wop_after_anchor_`：`\bq[a-z]+e\b` は `q` の memchr で ~29 GB/s、語スキャンは ~14）。
   Sherlock corpus での効果：`e[a-z]{3,}q` ~0.4 → ~34 GB/s、`a.{16}z` ~0.4 → ~35、
   `a[^.]*!` ~0.33 → ~9.3、`s[a-z]*\?` ~0.67 → ~16——いずれもクラス始まりの双子の
   数パーセント以内です。
@@ -1192,11 +1206,12 @@ one-pass のドライバは
   代わりに `assert_suffix_find` が末尾リテラルを `memmem` し、各出現を anchored assert
   スキャンで確認、可変長の開始を逆走査で復元する。さらに `\b \w{n,m} <lit> \b`
   （`\b\w+n\b`、`\b\w+ing\b`）という厳密形には **DFA を一切使わない**語スキャン高速形：
-  リテラルを `memmem` し、末尾 `\b`（次のコードポイントが非word）を確認、word コードポイント
+  リテラルを `memmem` し、末尾 `\b`（次のコードポイントが非word）をスキャンの中で確認し
+  （`find_substr_if`。`assert_suffix_find` の安い棄却も同じ）、word コードポイント
   を左へ歩いて run の開始を求め（`assert_word_find`）、`\w` の run 長が `{n,m}` に収まるか
   検査する。assert tier は単一コードポイントクラスタ（コードポイント == グラフェム）しか
   扱わず、ここの `\w` は素の Word 述語ちょうどなので、この歩きは正規表現を再現する（健全）。
-  `\b\w+n\b` を ~190 → ~776 MB/s（rure/RE2 超え）に。
+  `\b\w+n\b` を ~190 → ~1,100 MB/s（rure/RE2 超え）に。
 - **assert tier 先頭リテラル**（`assert_.prefix`）— assertion パターンが固定text では
   ないが**最初の消費アトム**が固定 ASCII リテラル（その前はゼロ幅 assertion のみ：
   `\.([a-z]+)$`、`^foo(\w+)`、`\bID(\d+)`。先頭のリテラル文字の並び全体を取る）の
