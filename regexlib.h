@@ -8674,10 +8674,10 @@ private:
       // needed".
       icase_prefix_.fast_pair = false;
       icase_prefix_.pair_leads.clear();
-      // Pair partner: the rarest char at any OTHER index. Worth it only when
-      // the fast char is common enough that its stops dominate (cf.
-      // pair_probe; the (?i) threshold is lower because each stop also pays
-      // the candidate-window walk). The guard unions every prefix char's
+      // Pair partner: the rarest char at any OTHER index. Taken only when
+      // the fast char is common enough that its stops dominate (each stop
+      // also pays the candidate-window walk; a case-sensitive literal
+      // always scans as a pair — see pair_probe). The guard unions every prefix char's
       // pre-image leads; cap its size so the per-search memchr guard stays
       // a couple of passes.
       if (fast_c >= 5 && prefix_.text.size() >= 2) {
@@ -9003,8 +9003,7 @@ private:
           t[static_cast<size_t>('a' + i)] = freq[i];
           // Capitals run ~1-4 per-mille in prose (vs their lowercase tens):
           // score them accordingly so a capital beats every common
-          // lowercase as the probe AND stays below the pair_probe threshold
-          // (a capital probe is rare enough that the single-byte scan wins).
+          // lowercase as the probe.
           t[static_cast<size_t>('A' + i)] =
               static_cast<unsigned char>((freq[i] >> 5) + 1);
         }
@@ -9622,8 +9621,8 @@ private:
                           // and grapheme-cluster start)
       size_t probe = 0;   // offset of the rarest byte in text (see
                           // find_substr): memchr that byte, then verify
-      size_t probe2 = 0;  // pair-probe partner offset (== probe when the
-                          // single-byte scan wins; see pair_probe)
+      size_t probe2 = 0;  // pair-probe partner offset (== probe for a
+                          // one-byte text; see pair_probe)
       bool active() const { return !text.empty(); }
       bool icase = false; // grapheme prefix only: text is a lowercased ASCII
                           // literal matched case-insensitively
@@ -9752,7 +9751,7 @@ private:
     struct SuffixPrefilter {
       std::string lit;  // required literal byte suffix (empty = inactive)
       size_t probe = 0; // offset of the rarest byte in lit
-      size_t probe2 = 0; // pair-probe partner (== probe when single; pair_probe)
+      size_t probe2 = 0; // pair-probe partner (== probe for one byte; pair_probe)
       // The pre-suffix is variable-length (e.g. `[a-zA-Z]+ing`): a given suffix
       // occurrence's match start has more than one possible end (greedy
       // ambiguity), so suffix_find must re-expand forward from the reverse-found
@@ -10811,22 +10810,28 @@ private:
   };
 
   // Picks the second byte of a pair probe for `needle` given the primary
-  // `probe` (its rarest byte). Returns `probe` itself when pair scanning is
-  // not worthwhile: the primary byte is already rare enough that the extra
-  // per-block load would cost more than the avoided stops. Otherwise the
-  // rarest byte at any other position. O(m), called per find — needles are
-  // short and the table lookups are trivial next to the scan they configure.
+  // `probe` (its rarest byte): the rarest byte at any other position, or
+  // `probe` itself for a one-byte needle, which has no other. O(m), at plan
+  // time.
+  //
+  // Every needle of two bytes or more scans as a pair. A single probe used
+  // to serve when the table called the rarest byte rare (capitals, digits,
+  // punctuation, the rare lowercase letters): the pair's second load per
+  // block costs a fifth to a third of the cruise rate where the byte really
+  // is rare. But rare is the table's word about English prose, and a
+  // subject is whatever it is: `fox` over a list of random words stops at
+  // an `x` every 26 bytes, and ran at 3.1 GB/s where the pair runs at 18.6
+  // (`qux`: 3.6 -> 50.6). The pair costs prose 0.70x at worst (`zqj`,
+  // absent: 87 -> 61 GB/s; `Sherlock` 64 -> 51); the single probe cost the
+  // word list 0.07x. (Looking at the second byte only where the first hit
+  // was tried, and got neither: `Sherlock` 52, `fox` 10.5.)
   static size_t pair_probe(const std::string &s, size_t probe) {
     return pair_probe(reinterpret_cast<const unsigned char *>(s.data()),
                       s.size(), probe);
   }
   static size_t pair_probe(const unsigned char *needle, size_t m,
                            size_t probe) {
-    // Threshold: the pair's extra per-block load halves the cruise rate, so
-    // it only pays when the single probe would stop every few hundred bytes.
-    // Per-mille commonness >= 16 (the genuinely common lowercase letters)
-    // marks that regime; capitals, digits and punctuation stay single-probe.
-    if (m < 2 || Plan::byte_commonness(needle[probe]) < 16) return probe;
+    if (m < 2) return probe;
     size_t best = probe;
     int bestc = 256;
     for (size_t i = 0; i < m; i++) {
@@ -11023,9 +11028,9 @@ private:
   }
 
   // Substring search: locate `needle` (length m) in hay[0,n). scan64 finds the
-  // rare probe byte (needle[probe]) — or, when that byte is common, the two
-  // rarest bytes at their needle distance (pair_probe / PredPair) — and a full
-  // compare (bytes_eq) verifies each candidate. This is RE2/rure's rare-byte
+  // two rarest bytes at their needle distance (pair_probe / PredPair) — a
+  // one-byte needle's one byte — and a full compare (bytes_eq) verifies each
+  // candidate. This is RE2/rure's rare-byte
   // literal scan, at scan64's 64-bytes-per-iteration rate. Returns the match
   // start or nullptr.
   static const unsigned char *find_substr(const unsigned char *hay, size_t n,

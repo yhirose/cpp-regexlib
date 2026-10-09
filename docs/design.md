@@ -1033,13 +1033,16 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   entries, since the same table prices anchors against each other below), then
   compare the candidate in place to verify (`bytes_eq`: inline up to 16
   bytes, `memcmp` beyond; both legs ride `scan64_visit`; zero dependencies). An all-ASCII
-  prefix (`prefix_.ascii`) is `memmem`-skippable on *any* UTF-8 subject. When
-  the rarest byte is itself **common** (per-mille frequency ≥ 16 — the
-  genuinely common lowercase letters: `ing`, `Holmes`), the scan upgrades to a
-  **two-byte pair probe** (`PredPair` — rure's memmem shape): stop only where
-  *both* of the needle's two rarest bytes appear at their exact needle
-  distance, multiplying the two densities — an order of magnitude fewer stops
-  (`ing` on the Sherlock corpus: 8033 → 2934) for one extra load per block.
+  prefix (`prefix_.ascii`) is `memmem`-skippable on *any* UTF-8 subject. A
+  needle of two bytes or more scans with a **two-byte pair probe**
+  (`PredPair` — rure's memmem shape): stop only where *both* of the needle's
+  two rarest bytes appear at their exact needle distance, multiplying the two
+  densities — an order of magnitude fewer stops (`ing` on the Sherlock
+  corpus: 8033 → 2934) for one extra load per block. (Always, not only when
+  the frequency table calls the rarest byte common: the table describes
+  English prose, and on any other subject a "rare" byte can stop the scan
+  every few bytes — `fox` over a word list ran at 0.07x of the pair's rate,
+  where the pair costs prose at most 0.70x.)
   The pair distance is capped (48) so the extra readahead keeps the vector
   loops, and the partner is picked **at plan time** (`pair_probe` → the
   `probe2` fields), not per call — a per-find recomputation costs per match.

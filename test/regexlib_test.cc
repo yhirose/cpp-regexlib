@@ -92,6 +92,13 @@ struct PlanProbe {
     }
     return static_cast<int64_t>(slots);
   }
+  // Whether the literal prefix scans as a pair of bytes (false: for one
+  // byte, or the plan has no prefix).
+  static bool prefix_pair(const Regex &re) {
+    const auto &pf = re.plan_->byte_prefix_.active() ? re.plan_->byte_prefix_
+                                                     : re.plan_->prefix_;
+    return pf.active() && pf.probe != pf.probe2;
+  }
   // The Teddy searcher: the type (a test deals one straight from a list of
   // fingerprints), and the plan's (ok: the pattern has one).
   using Teddy = Regex::Teddy;
@@ -3108,6 +3115,23 @@ void test_assert_literal_prefilter() {
 // by a trailing always-true lookahead) on PURE-ASCII subjects, across find_all /
 // scan / search / test, for sparse, common-first-byte, and near-miss literals.
 void test_ascii_literal_prefilter() {
+  // A literal of two bytes or more scans as a pair of its bytes, whatever
+  // the frequency table says of the rarest one — the table knows prose, and
+  // the subject may be anything. One byte has no partner.
+  for (const char *lit : {"fox", "Sherlock", "zq", "the", "Mr\\."})
+    CHECK(PlanProbe::prefix_pair(Regex(lit)) &&
+          PlanProbe::prefix_pair(make_us(lit)));
+  CHECK(!PlanProbe::prefix_pair(Regex("x")) &&
+        !PlanProbe::prefix_pair(make_us("x")));
+  // ... and finds what it found as a single probe, where the "rare" byte is
+  // everywhere: at a hit's own distance from a near miss, at the edges.
+  {
+    const std::string t = "x fox xx fax ox fo foxfox xof f.x fox";
+    const std::vector<size_t> want = {2, 5, 19, 22, 22, 25, 34, 37};
+    CHECK(finds_agree(Regex("fox"), want, t) &&
+          finds_agree(make_us("fox"), want, t));
+    CHECK(flat_spans(Regex("fox"), std::string(200, 'x') + "fo", false).empty());
+  }
   auto ok = [](const std::string &subj, const std::string &pat) {
     Regex bare(pat);
     Regex pike = pike_twin(pat); // lookahead -> grapheme Pike
