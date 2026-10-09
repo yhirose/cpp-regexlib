@@ -97,6 +97,12 @@ struct PlanProbe {
   // them, by the scan this build and CPU pick or (`walk`) a position at a
   // time. A set is the nibble table the scan reads.
   static bool word_onepass(const Regex &re) { return re.plan_->wop_.ok; }
+  // How many states the walk table of the `^body` tier (or, `word`, of the
+  // `\b body` one) has; 0 without the table.
+  static size_t walk_states(const Regex &re, bool word) {
+    const auto &a = word ? re.plan_->wop_ : re.plan_->aop_;
+    return a.ok ? a.states() : 0;
+  }
   static std::vector<size_t> word_starts(std::string_view s, size_t off,
                                          const NibbleSet &starts, bool walk) {
     const auto *p = reinterpret_cast<const unsigned char *>(s.data());
@@ -4322,6 +4328,22 @@ void test_onepass_leftmost_first() {
     Regex re = make_us(R"((x)(?:ab)?(?:abc)?)");
     auto m = re.search("xabc");
     CHECK(m.matched() && m.end() == 3);
+  }
+  { // A walk table of more states than sixteen bits could number rows for:
+    // a state is the offset of its row (states * 128). The `^body` tier in
+    // both units, and the `\b body` one.
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(R"(^[0-9]{600}x?$)", 0, unit);
+      CHECK(PlanProbe::walk_states(re, /*word=*/false) > 600);
+      const std::string d(600, '7');
+      CHECK(re.test(d) && re.test(d + "x") && re.search(d).end() == 600);
+      CHECK(!re.test(d + "7") && !re.test(d.substr(1)) && !re.test(d + "xx"));
+      CHECK(!re.test(std::string(599, '7') + "a"));
+    }
+    const Regex word(R"(\b[0-9]{600}\b)");
+    CHECK(PlanProbe::walk_states(word, /*word=*/true) > 600);
+    const std::string d(600, '7'), s = "x " + d + " " + d + "7 " + d + ".";
+    CHECK(finds_agree(word, {2, 602, 1205, 1805}, s));
   }
   { // AnchoredOnePass `^body` (no $): cut table -> leftmost-first end
     Regex re(R"(^x(?:ab)?(?:abc)?)");

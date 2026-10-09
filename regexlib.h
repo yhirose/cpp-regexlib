@@ -1490,6 +1490,18 @@ inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
 #define REGEXLIB_NOINLINE
 #endif
 
+// A value the optimizer is not to see through: what went into it stays one
+// sum, computed where it is written, and is not regrouped with what it is
+// added to next. For the one walk whose every byte waits on the load before
+// it (onepass_walk_impl) — where the regrouping is free to the compiler and
+// a sixth of the time to the walk. Elsewhere it is nothing, and the
+// compiler's own grouping stands.
+#if defined(__GNUC__) || defined(__clang__)
+#define REGEXLIB_OPAQUE(v) __asm__("" : "+r"(v))
+#else
+#define REGEXLIB_OPAQUE(v) ((void)0)
+#endif
+
 namespace reg {
 
 // Named capture groups: group name -> group index (1-based; index 0 is the whole
@@ -6900,15 +6912,26 @@ private:
 
     // The compact one-pass walk table shared by the AnchoredOnePass and
     // WordOnePass tiers (and built by compact_onepass_table below): the
-    // body's determinized cp-automaton as u16 rows with per-state accept
+    // body's determinized cp-automaton as rows of 128 with per-state accept
     // bytes — see the member comments at aop_ / wop_ for the tier semantics.
+    //
+    // A state is the offset of its row in `next` (its index times 128,
+    // premultiplied as the LazyDfa's are), and that is what an entry holds:
+    // each byte's load waits on the load before it, and an index had to be
+    // shifted into a row's place in between (a UUID validated: 56 -> 45 ns;
+    // onepass_walk_impl has the rest of it).
     struct AnchoredOnePass {
-      std::vector<std::array<uint16_t, 128>> next; // 0xFFFF = dead
-      std::vector<uint8_t> accept;
-      int start = 0;
+      std::vector<uint32_t> next;  // [row + byte]: the next row, or dead
+      std::vector<uint8_t> accept; // [row >> 7]
+      uint32_t start = 0;          // the start state's row
       bool ok = false;
       bool require_end = false;
-      static constexpr uint16_t kDeadState = 0xFFFF;
+      static constexpr uint32_t kDeadState = 0xFFFFFFFFu;
+      size_t states() const { return accept.size(); }
+      const uint32_t *row(size_t state) const {
+        return next.data() + (state << 7);
+      }
+      const uint32_t *start_row() const { return next.data() + start; }
     };
 
     // [Tier: AnchoredOnePass] admission. The validation shape `^body$` (or
@@ -6967,13 +6990,13 @@ private:
     }
 
     // Determinize `body`'s code-point automaton and compact it for the
-    // one-pass walk tiers (see AnchoredOnePass): u16 rows, per-state accept
+    // one-pass walk tiers (see AnchoredOnePass): rows of 128, per-state accept
     // bytes. `cut` selects the leftmost-first-cut flavour (see
     // build_cp_onepass) — true when the walk's last accept must be the
     // leftmost-first end, false when the FULL accept set is needed
     // (require_end's accept-at-n, WordOnePass's trailing-\b filtering).
-    // State count is bounded by CpOnePass::kMaxStates (4096), so u16 ids
-    // always fit. False when the body exceeds the one-pass build's caps.
+    // False when the body exceeds the one-pass build's caps (at most
+    // CpOnePass::kMaxStates states, 4096).
     bool compact_onepass_table(const detail::Node &body, AnchoredOnePass &out,
                                bool cut) const {
       detail::Program bp = detail::Compiler::compile(
@@ -6981,17 +7004,20 @@ private:
           /*cp=*/true);
       detail::CpOnePass op = detail::build_cp_onepass(bp, icase_, dotall_, cut);
       if (!op.ok) return false;
-      out.next.resize(op.states.size());
+      static_assert((uint64_t{detail::CpOnePass::kMaxStates} << 7) <
+                        AnchoredOnePass::kDeadState,
+                    "a row's offset is told from the dead entry");
+      out.next.resize(op.states.size() << 7);
       out.accept.resize(op.states.size());
       for (size_t i = 0; i < op.states.size(); i++) {
-        for (int b = 0; b < 128; b++) {
+        for (size_t b = 0; b < 128; b++) {
           int nx = op.states[i].next[b];
-          out.next[i][b] = nx < 0 ? AnchoredOnePass::kDeadState
-                                  : static_cast<uint16_t>(nx);
+          out.next[(i << 7) + b] = nx < 0 ? AnchoredOnePass::kDeadState
+                                          : static_cast<uint32_t>(nx) << 7;
         }
         out.accept[i] = op.states[i].can_match ? 1 : 0;
       }
-      out.start = op.start;
+      out.start = static_cast<uint32_t>(op.start) << 7;
       return true;
     }
 
@@ -7093,10 +7119,10 @@ private:
         // Bodies that can resume on a non-word byte after a complete match —
         // \b(?:a\.)+a\b, \b\d+\.?\d+\b — are rejected here and stay on the
         // assert-DFA chain, which evaluates `\b` at every accept boundary.
-        for (size_t i = 0; i < wop_.next.size(); i++) {
+        for (size_t i = 0; i < wop_.states(); i++) {
           if (!wop_.accept[i]) continue;
           for (int b = 0; b < 128; b++)
-            if (wop_.next[i][b] != AnchoredOnePass::kDeadState &&
+            if (wop_.row(i)[b] != AnchoredOnePass::kDeadState &&
                 !is_word_byte(static_cast<unsigned char>(b)))
               return;
         }
@@ -7111,7 +7137,7 @@ private:
       // scan's pace.
       int set = 0;
       for (int b = 0; b < 128; b++) {
-        if (wop_.next[wop_.start][b] == AnchoredOnePass::kDeadState) continue;
+        if (wop_.start_row()[b] == AnchoredOnePass::kDeadState) continue;
         detail::nibble_set_add(wop_start_, static_cast<unsigned char>(b));
         set += byte_commonness(static_cast<unsigned char>(b));
       }
@@ -9599,8 +9625,8 @@ private:
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
-    // determinized cp-automaton compacted for the walk — u16 rows (256 B per
-    // state, vs CpOnePass's 1.5 KB: the body is capture-stripped, so no
+    // determinized cp-automaton compacted for the walk — rows of 128 (512 B
+    // per state, vs CpOnePass's 2.6 KB: the body is capture-stripped, so no
     // capture masks exist) and a parallel per-state accept byte the loop
     // reads OFF the next-state dependency chain. require_end distinguishes
     // `^body$` (uncut table; the walk's last accept must land exactly at n)
@@ -16427,26 +16453,35 @@ private:
   // longest accept — the caller's accept-at-n / trailing-`\b` condition
   // picks the unique valid one), -1 if none. `end_pos` reports where the walk stopped
   // (for WordOnePass's budget accounting) and `bail` is set on a non-ASCII
-  // byte (the callers' kWalkBail). One u16 table load per byte; the accept
-  // byte is read off the dependency chain. Straight-line and static, so it
-  // inlines into both call sites.
+  // byte (the callers' kWalkBail). One table load per byte, of the row the
+  // next one is read from; the accept byte is read off the dependency chain.
+  // Straight-line and static, so it inlines into both call sites.
   template <bool BailCr>
   static int onepass_walk_impl(const Plan::AnchoredOnePass &a,
                                const unsigned char *p, int n, int start,
                                int &end_pos, bool &bail) {
-    const auto *nx = a.next.data();
+    const uint32_t *nx = a.next.data();
     const uint8_t *ac = a.accept.data();
-    int st = a.start, acc = -1, pos = start;
+    // (The row is a size_t: narrower, it is widened again on the chain every
+    // byte waits on.)
+    size_t st = a.start;
+    int acc = -1, pos = start;
     bail = false;
     for (;; pos++) {
-      if (ac[st]) acc = pos;
+      if (ac[st >> 7]) acc = pos;
       if (pos == n) break;
       unsigned char b = p[pos];
       if (b >= 128 || (BailCr && b == '\r')) {
         bail = true;
         break;
       }
-      uint16_t e = nx[st][b];
+      // The row is all that one load hands the next. The byte's place goes
+      // into the table's address, which waits on nothing — and is kept from
+      // being added to the row first, which would put that add between the
+      // two loads (a UUID validated: 45 ns so, 39 this way).
+      const uint32_t *col = nx + b;
+      REGEXLIB_OPAQUE(col);
+      uint32_t e = col[st];
       if (e == Plan::AnchoredOnePass::kDeadState) break;
       st = e;
     }
@@ -16556,7 +16591,7 @@ private:
     const int n = static_cast<int>(t.size());
     // (The start set off the walk's own start row: a compare with what one
     // load gives, where the nibble table the blocks read wants shifts too.)
-    const auto &start_row = plan_->wop_.next[plan_->wop_.start];
+    const uint32_t *start_row = plan_->wop_.start_row();
     const bool bail_cr = onepass_walk_bails_cr();
     // (A remainder with no whole block past the ramp is all ramp: a short
     // subject is then one call, as it was a byte at a time.)
