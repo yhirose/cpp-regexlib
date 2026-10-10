@@ -174,12 +174,20 @@ struct PlanProbe {
   // Plan::plan_byte_classes): it works, a column per byte, and is a plan
   // that forgot a program.
   static bool unplanned_dfa(const Regex &re) {
-    const Regex::FindCache &c = re.thread_cache();
-    for (const std::optional<Regex::LazyDfa> *d :
-         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
-          &c.blfa_, &c.inrev_})
-      if (*d && (*d)->unplanned) return true;
-    return false;
+    bool any = false;
+    each_lazy(re.thread_cache(), [&](const Regex::LazyDfa &d, bool) {
+      any = any || d.unplanned;
+    });
+    return any;
+  }
+  // `f(dfa, reverse)` for each lazy DFA a cache has built.
+  template <class F> static void each_lazy(const Regex::FindCache &c, F f) {
+    const std::pair<const std::optional<Regex::LazyDfa> *, bool> all[] = {
+        {&c.fu_, false},  {&c.rv_, true},    {&c.lfu_, false},
+        {&c.lfa_, false}, {&c.bfu_, false},  {&c.brv_, true},
+        {&c.blfu_, false}, {&c.blfa_, false}, {&c.inrev_, true}};
+    for (const auto &[d, reverse] : all)
+      if (*d) f(**d, reverse);
   }
   // The lazy DFAs of a cache, built small: `bytes` of cache each, and
   // `min_clears` refills before a fill has to have paid for itself (see
@@ -254,27 +262,23 @@ struct PlanProbe {
   };
   static DfaStats dfa_stats(const Regex::FindCache &c) {
     DfaStats s;
-    for (const std::optional<Regex::LazyDfa> *d :
-         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
-          &c.blfa_, &c.inrev_}) {
-      if (!*d) continue;
+    each_lazy(c, [&s](const Regex::LazyDfa &d, bool reverse) {
       s.built++;
-      s.clears += (*d)->clears;
-      s.quit = s.quit || (*d)->quit;
-      s.bytes = std::max(s.bytes, (*d)->bytes());
-      s.states = std::max(s.states, (*d)->states.size());
-      s.stride = std::max(s.stride, (*d)->stride);
-      const bool rev = d == &c.rv_ || d == &c.brv_ || d == &c.inrev_;
-      size_t &entries = rev ? s.rev_entries : s.fwd_entries;
-      entries = std::max(entries, (*d)->states.size() * (*d)->stride);
-    }
+      s.clears += d.clears;
+      s.quit = s.quit || d.quit;
+      s.bytes = std::max(s.bytes, d.bytes());
+      s.states = std::max(s.states, d.states.size());
+      s.stride = std::max(s.stride, d.stride);
+      size_t &entries = reverse ? s.rev_entries : s.fwd_entries;
+      entries = std::max(entries, d.tr.size());
+    });
     return s;
   }
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
   }
   // The assert DFAs of a cache, one entry a table that was built: the bytes
-  // it holds (what limits::kAssertDfaBytes bounds), and whether it is full.
+  // it holds (what the cache's budget bounds), and whether it is full.
   static std::vector<std::pair<size_t, bool>>
   assert_tables(const Regex::FindCache &c) {
     std::vector<std::pair<size_t, bool>> v;
@@ -3768,26 +3772,28 @@ void test_dfa_cache() {
 
   // The assert DFAs have the budget too, and a full table is kept as it is.
   // The pattern has a state per window of fifteen bytes, more than a table
-  // has room for: the scans that fill one agree with the Pike, and so do the
-  // scans of another subject after — whose misses are answered by the
-  // fallback, and leave a full table holding what it held.
+  // of 64 KB has room for: the scans that fill one agree with the Pike, and
+  // so do the scans of another subject after — whose misses are answered by
+  // the fallback, and leave a full table holding what it held.
   {
     const char *pat = R"(\b[ab]*a[ab]{14}\b)";
-    const std::string s = noise(60000, "aaaaaaabbbbbbbb ", 3);
-    const std::string s2 = noise(60000, "aaaaaaabbbbbbbb ", 4);
+    const size_t budget = size_t{64} << 10;
+    const std::string s = noise(4000, "aaaaaaabbbbbbbb ", 3);
+    const std::string s2 = noise(4000, "aaaaaaabbbbbbbb ", 4);
     const Regex pike = pike_twin(pat);
     const std::vector<size_t> want = spans(pike, s), want2 = spans(pike, s2);
     CHECK(!want.empty() && !want2.empty() && want != want2);
     for (bool us : {false, true}) {
       Regex re = us ? make_us(pat) : Regex(pat);
       Regex::FindCache fc;
+      PlanProbe::dfa_cache(re, fc, budget, 3);
       CHECK(spans(re, s, &fc) == want);
       const auto filled = PlanProbe::assert_tables(fc);
       size_t full = 0;
       for (const auto &t : filled) {
         full += t.second;
         // (Over by a start state per context at most, and the pc-sets.)
-        CHECK(t.first < reg::limits::kAssertDfaBytes + (size_t{64} << 10));
+        CHECK(t.first < 2 * budget);
       }
       CHECK(full > 0);
       CHECK(spans(re, s2, &fc) == want2);
@@ -4400,7 +4406,7 @@ void test_onepass_leftmost_first() {
     CHECK(m.matched() && m.end() == 3);
   }
   { // A walk table of more states than sixteen bits could number rows for:
-    // a state is the offset of its row (states * 128). The `^body` tier in
+    // a state is the offset of its row, in bytes. The `^body` tier in
     // both units, and the `\b body` one.
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(R"(^[0-9]{600}x?$)", 0, unit);
@@ -4419,14 +4425,11 @@ void test_onepass_leftmost_first() {
     // state as an offset in bytes, and 600 states are 1.5 MB of them.
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(R"(^([0-9]{600})(x?)$)", 0, unit);
+      CHECK(PlanProbe::onepass_slots(re) > 0);
       const std::string d(600, '7');
-      auto m = re.search(d + "x");
-      CHECK(m.matched() && m.end() == 601);
-      CHECK(m.group(1).begin() == 0 && m.group(1).end() == 600);
-      CHECK(m.group(2).begin() == 600 && m.group(2).end() == 601);
-      m = re.search(d);
-      CHECK(m.matched() && m.group(1).end() == 600 && m.group(2).end() == 600);
-      CHECK(!re.search(d + "7").matched() && !re.search(d + "xx").matched());
+      CHECK(finds_agree(re, {0, 601, 0, 600, 600, 601}, d + "x"));
+      CHECK(finds_agree(re, {0, 600, 0, 600, 600, 600}, d));
+      CHECK(finds_agree(re, {}, d + "7") && finds_agree(re, {}, d + "xx"));
     }
   }
   { // AnchoredOnePass `^body` (no $): cut table -> leftmost-first end
