@@ -4205,7 +4205,10 @@ struct CpOnePass {
     // never tests as a member, so a run stops there and the per-byte loop
     // bails as usual.
     bool loop_ok = false;
-    detail::NibbleSet loop_tbl{};
+    // (Aligned, so that the scan's one load of it never straddles a cache
+    // line. Unaligned it does or does not as the heap places the states —
+    // one placement in four — and dense `\w+` is 3% slower when it does.)
+    alignas(16) detail::NibbleSet loop_tbl{};
     // Candidate-skip admission for the position-scan driver: every byte in
     // this state's self-loop set also takes the START state here. Then a
     // walk begun anywhere inside one of this state's runs reaches this state
@@ -4213,10 +4216,13 @@ struct CpOnePass {
     // and is identical from there — so when that first walk fails, every
     // start inside the run fails too and scan_onepass_find skips them.
     bool restart_ok = false;
-    // Packed per-byte transition for the hot walks: the next state id plus
-    // the two flags the per-byte loop needs — whether this (state, byte)
-    // writes a slot (kStepWrite -> consult mask[b]) and whether the NEXT
-    // state accepts (kStepAccept -> update the last-accept tracking). One
+    // Packed per-byte transition for the hot walks: the next state — as its
+    // OFFSET in `states`, in bytes, so that a walk has nothing to multiply
+    // between one step's load and the next (five groups of a UUID, searched:
+    // 117 ns with an id there, 80 so) — plus the two flags the per-byte loop
+    // needs: whether this (state, byte) writes a slot (kStepWrite -> consult
+    // mask[b]) and whether the NEXT state accepts (kStepAccept -> update the
+    // last-accept tracking). One
     // dependent load per byte instead of three (next[b], the mask_nonzero
     // bitmap and the next state's can_match live on three cache lines).
     // kStepDead = no transition. 256 entries: [128, 256) hold kStepDead, so
@@ -4235,6 +4241,14 @@ struct CpOnePass {
   int start = 0;
   bool ok = false;
   static constexpr int kMaxStates = 4096;
+  static_assert(kMaxStates * sizeof(State) <= kStepIdMask,
+                "a state's offset fits the step's field");
+  // The state a step leads to.
+  const State *to(uint32_t step) const {
+    return reinterpret_cast<const State *>(
+        reinterpret_cast<const unsigned char *>(states.data()) +
+        (step & kStepIdMask));
+  }
   // Capture slots (=> <=32 groups): the per-transition slot bitmap is one
   // uint64_t bit per slot.
   static constexpr int kMaxSlots = 64;
@@ -4435,7 +4449,8 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
     for (int b = 0; b < 128; b++) {
       int nx = S.next[b];
       if (nx < 0) continue;
-      uint32_t v = static_cast<uint32_t>(nx);
+      uint32_t v = static_cast<uint32_t>(static_cast<size_t>(nx) *
+                                         sizeof(CpOnePass::State));
       if (S.mask[b] != 0) v |= CpOnePass::kStepWrite;
       if (op.states[nx].can_match) v |= CpOnePass::kStepAccept;
       S.step[b] = v;
@@ -16355,7 +16370,7 @@ private:
       if (v & detail::CpOnePass::kStepWrite)
         for (uint64_t m = S->mask[b]; m; m &= m - 1)
           saves[detail::bit_ctz64(m)] = pos;
-      S = states + (v & detail::CpOnePass::kStepIdMask);
+      S = op.to(v);
       pos++;
     }
     if (!S->can_match) return false;
@@ -16486,7 +16501,7 @@ private:
     for (;;) {
       if (pos == n) break;
       unsigned char b = p[pos];
-      // One packed load per byte: id + write flag + next-accept flag. A
+      // One packed load per byte: next state + write flag + next-accept flag. A
       // non-ASCII byte reads kStepDead from step[128..255] (see State::step).
       uint32_t v = S->step[b];
       if (v == detail::CpOnePass::kStepDead) {
@@ -16499,8 +16514,7 @@ private:
       if (v & detail::CpOnePass::kStepWrite)
         for (uint64_t m = S->mask[b]; m; m &= m - 1)
           saves[detail::bit_ctz64(m)] = pos;
-      const detail::CpOnePass::State *nxt =
-          states + (v & detail::CpOnePass::kStepIdMask);
+      const detail::CpOnePass::State *nxt = op.to(v);
       pos++;
       if (v & detail::CpOnePass::kStepAccept) {
         acc_pos = pos;
@@ -16856,8 +16870,7 @@ private:
         }
         if (pos + 1 < n && !(v0 & detail::CpOnePass::kStepAccept)) {
           const unsigned char b1 = p[pos + 1];
-          const uint32_t v1 =
-              op.states[v0 & detail::CpOnePass::kStepIdMask].step[b1];
+          const uint32_t v1 = op.to(v0)->step[b1];
           if (v1 == detail::CpOnePass::kStepDead) {
             if (b1 >= 0x80) return local_bail(budget, OnePassWalk{}, pos);
             continue;

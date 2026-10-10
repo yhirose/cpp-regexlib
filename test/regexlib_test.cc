@@ -4371,6 +4371,20 @@ void test_onepass_leftmost_first() {
     const std::string d(600, '7'), s = "x " + d + " " + d + "7 " + d + ".";
     CHECK(finds_agree(word, {2, 602, 1205, 1805}, s));
   }
+  { // The capture walk's table at the same size: a step holds its next
+    // state as an offset in bytes, and 600 states are 1.5 MB of them.
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(R"(^([0-9]{600})(x?)$)", 0, unit);
+      const std::string d(600, '7');
+      auto m = re.search(d + "x");
+      CHECK(m.matched() && m.end() == 601);
+      CHECK(m.group(1).begin() == 0 && m.group(1).end() == 600);
+      CHECK(m.group(2).begin() == 600 && m.group(2).end() == 601);
+      m = re.search(d);
+      CHECK(m.matched() && m.group(1).end() == 600 && m.group(2).end() == 600);
+      CHECK(!re.search(d + "7").matched() && !re.search(d + "xx").matched());
+    }
+  }
   { // AnchoredOnePass `^body` (no $): cut table -> leftmost-first end
     Regex re(R"(^x(?:ab)?(?:abc)?)");
     auto m = re.search("xabc");
