@@ -249,9 +249,18 @@ to build its DFA first is typically 2–3× quicker (`/\*.*?\*/` in CodePoint
 mode: 11.4 → 3.6 µs), up to 6× over Unicode classes.
 
 The assert DFAs (`AssertDfa` and its byte / reverse kin) keep their own
-representation — 257- or 129-wide rows of packed edges. The same layout
-measured ×1.3–1.6 on their forward scan in a prototype; it has not been
-applied.
+representation — 257- or 129-wide rows, a column per byte — but there too a
+state is the offset of its row, in one array, and the input's place goes
+into the address first (`AssertStateTable`). Their flags belong to the
+edge, not to the state — whether a boundary accepts depends on the byte
+after it — so an edge is a pair (`AssertEdge`): the destination's row, and
+the flags beside it, read by a second load that nothing waits on. Packed
+into the row's word, as they were, they are an AND between each load and
+the next. `\b[a-z]+\d\b` tested over prose it does not match: 408 MB/s
+with an id to mask and scale, 730 as a row to mask, 892 as a pair. A
+prototype of the lazy DFA's whole layout, byte classes included, measured
+×1.3–1.6 on the forward scan before any of this; what the classes add on
+top of it has not been measured.
 
 ### Tier dispatch
 
