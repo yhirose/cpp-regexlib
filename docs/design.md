@@ -583,8 +583,14 @@ CodePoint mode, building a state costs ~1.9 µs and the Pike ~50 ns a byte,
 so the two break even near 40 bytes a state; for a small ASCII pattern,
 nearer 7.)
 
-The assert DFAs are not byte-budgeted: they keep a state cap
-(`limits::kMaxDfaStates`), and fall back to their uncached scans past it.
+The assert DFAs have the same budget (`limits::kAssertDfaBytes`, counting a
+table's edges and its interned states) and a simpler rule: a full table is
+kept, not cleared, and takes no more states. What it has built still
+answers; a step that would need a new state answers `kCap`, and the scan
+falls back to its uncached twin. (They too were bounded in states once,
+65,536 of them — and a table past that bound still took one more state on
+every scan that reached a miss: `\b[ab]*a[ab]{18}\b` over 4 KB subjects held
+293 MB after 4,000 scans and was still growing. It holds 13 MB now.)
 
 ---
 

@@ -273,6 +273,18 @@ struct PlanProbe {
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
   }
+  // The assert DFAs of a cache, one entry a table that was built: the bytes
+  // it holds (what limits::kAssertDfaBytes bounds), and whether it is full.
+  static std::vector<std::pair<size_t, bool>>
+  assert_tables(const Regex::FindCache &c) {
+    std::vector<std::pair<size_t, bool>> v;
+    auto one = [&v](const auto &d) {
+      if (d) v.emplace_back(d->tbl.bytes, d->tbl.full());
+    };
+    one(c.afu_), one(c.alfu_), one(c.alfa_), one(c.arv_);
+    one(c.bafu_), one(c.balfu_), one(c.balfa_), one(c.barv_);
+    return v;
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -3751,6 +3763,38 @@ void test_dfa_cache() {
       Stats st = PlanProbe::dfa_stats(fc);
       CHECK((reverse ? st.rev_entries : st.fwd_entries) > 65536);
       CHECK(st.clears == 0 && !st.quit);
+    }
+  }
+
+  // The assert DFAs have the budget too, and a full table is kept as it is.
+  // The pattern has a state per window of fifteen bytes, more than a table
+  // has room for: the scans that fill one agree with the Pike, and so do the
+  // scans of another subject after — whose misses are answered by the
+  // fallback, and leave a full table holding what it held.
+  {
+    const char *pat = R"(\b[ab]*a[ab]{14}\b)";
+    const std::string s = noise(60000, "aaaaaaabbbbbbbb ", 3);
+    const std::string s2 = noise(60000, "aaaaaaabbbbbbbb ", 4);
+    const Regex pike = pike_twin(pat);
+    const std::vector<size_t> want = spans(pike, s), want2 = spans(pike, s2);
+    CHECK(!want.empty() && !want2.empty() && want != want2);
+    for (bool us : {false, true}) {
+      Regex re = us ? make_us(pat) : Regex(pat);
+      Regex::FindCache fc;
+      CHECK(spans(re, s, &fc) == want);
+      const auto filled = PlanProbe::assert_tables(fc);
+      size_t full = 0;
+      for (const auto &t : filled) {
+        full += t.second;
+        // (Over by a start state per context at most, and the pc-sets.)
+        CHECK(t.first < reg::limits::kAssertDfaBytes + (size_t{64} << 10));
+      }
+      CHECK(full > 0);
+      CHECK(spans(re, s2, &fc) == want2);
+      const auto after = PlanProbe::assert_tables(fc);
+      CHECK(after.size() == filled.size());
+      for (size_t i = 0; i < filled.size() && i < after.size(); i++)
+        if (filled[i].second) CHECK(after[i] == filled[i]);
     }
   }
 

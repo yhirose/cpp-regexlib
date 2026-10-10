@@ -1607,11 +1607,14 @@ constexpr size_t kDfaCacheBytes = size_t{8} << 20; // 8 MiB per DFA
 constexpr uint32_t kDfaMinClears = 3;
 constexpr uint64_t kDfaMinBytesPerState = 10;
 
-// State cap of the assertion DFAs (AssertDfa and its byte / reverse kin),
-// whose tables are not byte-budgeted: past it they answer kCap and the matcher
-// falls back. (At the cap a table's edges are 135 MB a byte-wide DFA, 68 MB
-// an ASCII-wide one: 8 bytes an edge.)
-constexpr int kMaxDfaStates = 1 << 16; // 65536 interned DFA states
+// The assertion DFAs (AssertDfa and its byte / reverse kin) are bounded as
+// the lazy DFA is, in bytes: a table's edges and its interned states. A full
+// table is kept, not cleared — what it has built still answers — and takes
+// no more states: a step that would need one answers kCap, and the matcher
+// falls back. (The patterns measured come to tens of states, some hundred
+// KB; the budget is for `\b[ab]*a[ab]{15}\b` and its kind, whose states
+// double with every repeat.)
+constexpr size_t kAssertDfaBytes = kDfaCacheBytes;
 
 // Bounded-backtracking (BitState) capture engine cap: it visits each (pc, pos)
 // at most once, so its work and its visited bitmap are O(prog_size * span). Cap
@@ -11667,9 +11670,9 @@ private:
   // four from parallel arrays — the flags have to be masked off the row
   // between each load and the next: an AND on the chain every byte waits on
   // (`(?m)^\w+` over prose: 485 MB/s so, 575 as a pair). Negative flags are
-  // no flags: -1 for an edge not yet computed, and kCap (-2) from a step
-  // whose table is over its cap; `>= 0` means "cached", and the loops test
-  // kCap before reading flag bits.
+  // no flags: -1 for an edge not yet computed, and kEdgeCap (the DFAs' kCap)
+  // from a step to a state its table has no room for; `>= 0` means "cached",
+  // and the loops test kCap before reading flag bits.
   struct AssertEdge {
     int row;
     int flags;
@@ -11678,6 +11681,7 @@ private:
     kEdgeAccept = 1,
     kEdgeFront = 2,
     kEdgeDead = 4,
+    kEdgeCap = -2,
   };
 
   // The interned-state table shared by the four assertion DFAs (AssertDfa /
@@ -11706,15 +11710,20 @@ private:
     std::vector<uint8_t> dead; // per-state dead bit (empty pc-set)
     std::array<int, 16> start_rows; // start row per context (0..15)
     bool lf;                        // ordered+cut vs sorted set
+    // What `limits::kAssertDfaBytes` bounds: the edges, and the pc-sets
+    // (each held twice, as a key of `intern` and in `states`).
+    size_t bytes = 0;
 
     explicit AssertStateTable(bool leftmost_first) : lf(leftmost_first) {
       start_rows.fill(-1);
     }
 
     // Intern (raw pc-set, ctx) -> the state's row, allocating a fresh row of
-    // edges for a new state. lf keeps the priority order as identity and the
-    // cut bit; non-lf sorts to a canonical set.
-    int intern_state(std::vector<int> pcs, int ctx) {
+    // edges for a new state — or -1, when the state is new and the table is
+    // full (a start state is always taken: there is one per context). lf
+    // keeps the priority order as identity and the cut bit; non-lf sorts to a
+    // canonical set.
+    int intern_state(std::vector<int> pcs, int ctx, bool start = false) {
       if (!lf) {
         std::sort(pcs.begin(), pcs.end());
         pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
@@ -11722,7 +11731,9 @@ private:
       auto key = std::make_pair(std::move(pcs), ctx);
       auto it = intern.find(key);
       if (it != intern.end()) return it->second;
+      if (full() && !start) return -1;
       int row = static_cast<int>(states.size()) * Width;
+      bytes += Width * sizeof(AssertEdge) + 2 * key.first.size() * sizeof(int);
       intern.emplace(key, row);
       dead.push_back(key.first.empty() ? 1 : 0);
       states.push_back(std::move(key.first));
@@ -11731,10 +11742,23 @@ private:
       return row;
     }
 
-    // The edge to `row` with this boundary's accept/front bits.
-    AssertEdge pack(int row, bool acc, bool frnt) const {
+    // What every miss path ends in. The edge to the state (pcs, ctx), with
+    // this boundary's accept/front bits — or kEdgeCap for its flags, when
+    // the table has no room for that state ...
+    AssertEdge edge_to(const std::vector<int> &pcs, int ctx, bool acc,
+                       bool frnt) {
+      const int row = intern_state(pcs, ctx);
+      if (row < 0) return AssertEdge{0, kEdgeCap};
       return AssertEdge{row, (acc ? kEdgeAccept : 0) | (frnt ? kEdgeFront : 0) |
                                  (is_dead(row) ? kEdgeDead : 0)};
+    }
+    // ... and that edge cached, as the one the state at `row` has on `input`.
+    AssertEdge link(int row, int input, const std::vector<int> &pcs, int ctx,
+                    bool acc, bool frnt) {
+      const AssertEdge e = edge_to(pcs, ctx, acc, frnt);
+      // (Indexed after the intern: the vector may have grown.)
+      if (e.flags >= 0) edges[static_cast<size_t>(row + input)] = e;
+      return e;
     }
 
     // Cached start state for `ctx` (the closure of {0}); avoids a per-scan map
@@ -11743,18 +11767,15 @@ private:
       if (static_cast<unsigned>(ctx) < start_rows.size() &&
           start_rows[ctx] != -1)
         return start_rows[ctx];
-      int row = intern_state({0}, ctx);
+      int row = intern_state({0}, ctx, /*start=*/true);
       if (static_cast<unsigned>(ctx) < start_rows.size()) start_rows[ctx] = row;
       return row;
     }
 
-    // What a miss asks of the state at `row`, and where it leaves its answer.
+    // What a miss asks of the state at `row`.
     size_t index(int row) const { return static_cast<size_t>(row / Width); }
     const std::vector<int> &pcs(int row) const { return states[index(row)]; }
     int ctx(int row) const { return ctxs[index(row)]; }
-    AssertEdge &edge(int row, int input) {
-      return edges[static_cast<size_t>(row + input)];
-    }
     // The edge of the state at `row` on `input`, as cached (flags -1 if it
     // is not): the step every byte of a scan waits on (see REGEXLIB_OPAQUE;
     // the scans carry the row as an int, which the cast keeps from being
@@ -11771,8 +11792,11 @@ private:
     }
 
     bool is_dead(int row) const { return dead[index(row)] != 0; }
-    bool over_cap() const {
-      return static_cast<int>(states.size()) > limits::kMaxDfaStates;
+    // No room for another state's row (see limits::kAssertDfaBytes). A full
+    // table still answers, and still learns the edges between the states it
+    // has; only a step to a state it has not is refused (see intern_state).
+    bool full() const {
+      return bytes + Width * sizeof(AssertEdge) > limits::kAssertDfaBytes;
     }
   };
 
@@ -11793,7 +11817,7 @@ private:
     AssertStateTable<257> tbl;       // interned states + cached transitions
     std::vector<char> seen;          // closure scratch (per program inst)
     std::vector<int> closed, rawnext;
-    static constexpr int kCap = -2;
+    static constexpr int kCap = kEdgeCap;
 
     AssertDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
               bool leftmost_first = false)
@@ -11836,11 +11860,7 @@ private:
       int newctx = (input == kAssertEnd)
                        ? 0
                        : re->ctx_of_byte(static_cast<unsigned char>(input));
-      int ns = tbl.intern_state(rawnext, newctx);
-      AssertEdge e = tbl.pack(ns, a, false);
-      tbl.edge(s, input) = e; // indexed after intern (vectors may have grown)
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return e;
+      return tbl.link(s, input, rawnext, newctx, a, false);
     }
 
     // Leftmost-first transition: ordered+cut boundary closure (no reseed; the
@@ -11903,11 +11923,7 @@ private:
         }
         newctx = re->ctx_of_byte(b);
       }
-      int ns = tbl.intern_state(rawnext, newctx);
-      AssertEdge e = tbl.pack(ns, a, f);
-      tbl.edge(s, input) = e; // indexed after intern (vectors may have grown)
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return e;
+      return tbl.link(s, input, rawnext, newctx, a, f);
     }
   };
 
@@ -11929,7 +11945,7 @@ private:
     AssertStateTable<129> tbl;       // interned states + cached ASCII transitions
     std::vector<char> seen;          // closure scratch (per program inst)
     std::vector<int> closed, rawnext, tmp;
-    static constexpr int kCap = -2;
+    static constexpr int kCap = kEdgeCap;
     static constexpr int kEndIdx = 128;
 
     ByteAssertDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
@@ -12034,11 +12050,7 @@ private:
         }
         newctx = re->bctx_of_cp(static_cast<char32_t>(b));
       }
-      int ns = tbl.intern_state(rawnext, newctx);
-      AssertEdge e = tbl.pack(ns, a, f);
-      tbl.edge(s, idx) = e;
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return e;
+      return tbl.link(s, idx, rawnext, newctx, a, f);
     }
 
     template <bool LF>
@@ -12062,9 +12074,7 @@ private:
       if constexpr (!LF) {
         if (reseed) rawnext.push_back(0);
       }
-      int ns = tbl.intern_state(rawnext, re->bctx_of_cp(cp));
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return tbl.pack(ns, a, f);
+      return tbl.edge_to(rawnext, re->bctx_of_cp(cp), a, f);
     }
   };
 
@@ -12106,7 +12116,7 @@ private:
     AssertStateTable<129> tbl;       // interned states + cached left transitions
     std::vector<char> seen;          // closure scratch (per program inst)
     std::vector<int> closed, rawnext, tmp;
-    static constexpr int kCap = -2;
+    static constexpr int kCap = kEdgeCap;
     static constexpr int kBeginIdx = 128;
 
     // Reverse DFA is boolean: sorted set identity, no cut bit (lf = false).
@@ -12156,11 +12166,7 @@ private:
             rawnext.push_back(pc + 1);
         newr = re->rctx_of_cp(static_cast<char32_t>(b));
       }
-      int ns = tbl.intern_state(rawnext, newr);
-      AssertEdge e = tbl.pack(ns, a, false);
-      tbl.edge(s, idx) = e;
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return e;
+      return tbl.link(s, idx, rawnext, newr, a, false);
     }
 
     // A non-ASCII code point ending at byte `pos` (its bytes are consumed in
@@ -12196,9 +12202,7 @@ private:
               re->plan_->inst_matches_byte(*prog, prog->insts[pc], p[k]))
             rawnext.push_back(pc + 1);
       }
-      int ns = tbl.intern_state(rawnext, re->rctx_of_cp(cp));
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return tbl.pack(ns, a, false);
+      return tbl.edge_to(rawnext, re->rctx_of_cp(cp), a, false);
     }
   };
 
@@ -12247,7 +12251,7 @@ private:
     AssertStateTable<257> tbl; // interned states + cached left transitions
     std::vector<char> seen;    // closure scratch (per program inst)
     std::vector<int> closed, rawnext;
-    static constexpr int kCap = -2;
+    static constexpr int kCap = kEdgeCap;
     static constexpr int kBeginIdx = 256;
 
     // Reverse DFA is boolean: sorted set identity, no cut bit (lf = false).
@@ -12285,11 +12289,7 @@ private:
             rawnext.push_back(pc + 1);
         newr = re->rctx_of_byte(b);
       }
-      int ns = tbl.intern_state(rawnext, newr);
-      AssertEdge e = tbl.pack(ns, a, false);
-      tbl.edge(s, idx) = e;
-      if (tbl.over_cap()) return AssertEdge{0, kCap};
-      return e;
+      return tbl.link(s, idx, rawnext, newr, a, false);
     }
   };
 
@@ -12305,9 +12305,9 @@ private:
 
   // Assertion-aware forward scan over prog_ (ASCII tier), via the cached
   // unanchored (re-seeding) AssertDfa: the end of the FIRST match at or after
-  // `from`, or -1 — the boolean test() tier. On a DFA state-cap overflow
-  // (effectively impossible for assert programs, which have no Loop), falls
-  // back to the uncached scan.
+  // `from`, or -1 — the boolean test() tier. On kCap (a table with no room
+  // for the next state: see limits::kAssertDfaBytes) falls back to the
+  // uncached scan.
   int assert_fwd_scan(FindCache &fc, std::string_view text, int from) const {
     int n = static_cast<int>(text.size());
     const unsigned char *p =
@@ -12372,8 +12372,7 @@ private:
   // (`(?s:.)*?`+pattern). The prefix expresses unanchoredness, so the scan
   // logic is the same: record the last accepting boundary; commit early when
   // the match is the highest-priority thread (front); stop when the ordered set
-  // dies. On a DFA cap (effectively impossible: assert programs have no Loop)
-  // falls back to the slow set simulation. (Defined inline; AssertDfa is a
+  // dies. On kCap falls back to the slow set simulation. (Defined inline; AssertDfa is a
   // complete type in the body.)
   int assert_fwd_scan_lf(FindCache &fc, std::string_view text, int from,
                          bool anchored) const {
@@ -12458,7 +12457,7 @@ private:
   // same boundary flags are evaluated at each visited boundary regardless of
   // scan direction. Runs on the cached AssertRevDfa (the find loop pays one
   // reverse scan per match); falls back to the uncached set simulation on a
-  // state-cap overflow.
+  // full table (kCap).
   // `walked` (optional) reports the bytes scanned leftward — the cost of a
   // FAILED candidate's reverse verify, for the prefilters' walk budgets.
   int assert_reverse_start(FindCache &fc, std::string_view text, int e,
@@ -12488,7 +12487,7 @@ private:
     return leftmost;
   }
 
-  // Uncached assertion-aware reverse scan (set simulation), the state-cap
+  // Uncached assertion-aware reverse scan (set simulation), the kCap
   // fallback for both assert_reverse_start (grapheme/ASCII: rev_prog_,
   // cp_flags=false) and assert_byte_reverse_start (byte: byte_rev_prog_,
   // cp_flags=true) — the mirror of assert_fwd_scan_slow. Given a match ending
@@ -12897,7 +12896,7 @@ private:
   // ByteAssertDfa (DFA speed on the ASCII bulk, decode-per-code-point on the
   // rare non-ASCII): the end byte offset of the FIRST match at or after
   // `from`, or -1 — the boolean test() tier. Falls back to the uncached scan
-  // on a state-cap overflow.
+  // on a full table (kCap).
   int assert_byte_fwd_scan(FindCache &fc, std::string_view text,
                            int from) const {
     int n = static_cast<int>(text.size());
@@ -12990,7 +12989,7 @@ private:
   // Reverse scan over byte_rev_prog_ via the cached ByteAssertRevDfa: leftmost
   // start s >= floor with [s, e) a match, or -1. Backward, code-point by code
   // point (ASCII fast / non-ASCII decode); the begin sentinel marks the text
-  // start. Falls back to the uncached scan on a state-cap overflow.
+  // start. Falls back to the uncached scan on a full table (kCap).
   int assert_byte_reverse_start(FindCache &fc, std::string_view text, int e,
                                 int floor, int *walked = nullptr) const {
     const unsigned char *p =
