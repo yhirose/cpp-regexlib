@@ -4079,6 +4079,55 @@ void test_walk_budget_linearity() {
     std::printf("  [info] walk-budget %-18s n=%zu completed in %.1f ms\n",
                 c.name, c.subj.size(), dt);
   }
+
+  // The assert prefilters again, over a FULL table (see
+  // limits::kDfaCacheBytes; the cache's budget is shrunk to fill one in a few
+  // dozen states). Every verify then leaves the DFA within a few bytes of
+  // its candidate, for the uncached scan — which starts over, and walks as
+  // far as the DFA would have. It is that walk the budget is charged:
+  // charged for the DFA's few bytes, these never bail, and take minutes.
+  {
+    auto random_of = [](const char *alphabet, size_t n) {
+      const size_t k = std::strlen(alphabet);
+      std::string s;
+      unsigned x = 12345;
+      for (size_t i = 0; i < n; i++) {
+        x = x * 1664525u + 1013904223u;
+        s += alphabet[(x >> 16) % k];
+      }
+      return s;
+    };
+    const std::string ab = random_of("ab", 100000);
+    const std::string abing = "Z" + random_of("abing", 100000);
+    Case full[] = {
+        // every `a` a candidate, every forward verify a walk to the end
+        {"full-prefix", R"(a[ab]*a[ab]{12}\d\b)", ab, 0},
+        {"full-prefix-byte", R"(a[ab]*a[ab]{12}\d\b)", ab + "\xc3\xa9", 0},
+        // every `ing` a candidate, every reverse verify a walk to the floor
+        {"full-suffix", "(?m)^[abing]{12}a[abing]*ing", abing, 0},
+        {"full-suffix-byte", "(?m)^[abing]{12}a[abing]*ing",
+         abing + "\xc3\xa9", 0},
+    };
+    for (auto &c : full) {
+      Regex re(c.pat);
+      Regex::FindCache fc;
+      PlanProbe::dfa_cache(re, fc, size_t{64} << 10, 3);
+      auto t0 = std::chrono::steady_clock::now();
+      size_t n = 0;
+      for (auto m : re.find_all(c.subj, fc))
+        (void)m, n++;
+      double dt = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+      CHECK(n == c.want);
+      size_t tables_full = 0;
+      for (const auto &t : PlanProbe::assert_tables(fc))
+        tables_full += t.second;
+      CHECK(tables_full > 0);
+      std::printf("  [info] walk-budget %-18s n=%zu completed in %.1f ms\n",
+                  c.name, c.subj.size(), dt);
+    }
+  }
 }
 
 // The one-pass walk tiers must be exactly leftmost-first, not longest-match.

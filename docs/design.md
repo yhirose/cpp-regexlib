@@ -592,6 +592,13 @@ falls back to its uncached twin. (They too were bounded in states once,
 every scan that reached a miss: `\b[ab]*a[ab]{18}\b` over 4 KB subjects held
 293 MB after 4,000 scans and was still growing. It holds 13 MB now.)
 
+A scan that falls back starts over, so what a candidate's failed verify
+costs is the fallback's walk, and that is what the walk budget (see
+"Linearity") is charged. Charged only for the bytes the DFA covered before
+its table gave out — a few, once the table is full — the prefilters never
+bailed: `a[ab]*a[ab]{12}\d\b` over 262 KB of a's and b's, every `a` a
+candidate and every verify a walk to the end, took 7.6 s. It takes 64 ms.
+
 ---
 
 ## 3. Compiler & bytecode

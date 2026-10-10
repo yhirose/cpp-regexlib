@@ -12378,7 +12378,12 @@ private:
   }
 
   // `reach` (optional) reports the last boundary examined — the byte cost of
-  // a FAILED anchored verify, for the prefilters' walk budgets.
+  // a FAILED anchored verify, for the prefilters' walk budgets. On kEdgeCap
+  // it is the fallback's to report: that scan starts over at `from`, and
+  // what a verify costs is what was walked, not where the table gave out. (A
+  // full table answers kEdgeCap within a few bytes of every candidate; charged
+  // for those bytes alone, `a[ab]*a[ab]{12}\d\b` over 262 KB of a's and b's
+  // took 7.6 s — every `a` a candidate, every verify a walk to the end.)
   int assert_fwd_scan_lf(AssertDfa &d, std::string_view text, int from,
                          int *reach = nullptr) const {
     int n = static_cast<int>(text.size());
@@ -12390,11 +12395,9 @@ private:
     for (;; sp++) {
       int input = (sp < n) ? p[sp] : kAssertEnd;
       const AssertEdge ed = d.step_lf(s, input);
-      if (ed.flags == kEdgeCap) {
-        if (reach) *reach = sp;
+      if (ed.flags == kEdgeCap)
         return assert_fwd_scan_lf_slow(*d.prog, d.match_pc, text, from,
-                                       /*cp_flags=*/false);
-      }
+                                       /*cp_flags=*/false, reach);
       if (ed.flags & kEdgeAccept) e = sp;
       if (ed.flags & kEdgeFront) {
         if (reach) *reach = sp;
@@ -12411,10 +12414,10 @@ private:
   // Uncached leftmost-first assert forward scan (ordered set simulation with
   // cut), the cap fallback for both assert_fwd_scan_lf (grapheme/ASCII,
   // cp_flags=false) and assert_byte_fwd_scan_lf (byte, cp_flags=true). The two
-  // differed only in the empty-width flag unit.
+  // differed only in the empty-width flag unit. `reach` as theirs.
   int assert_fwd_scan_lf_slow(const detail::Program &prog, int mpc,
-                              std::string_view text, int from,
-                              bool cp_flags) const {
+                              std::string_view text, int from, bool cp_flags,
+                              int *reach = nullptr) const {
     int n = static_cast<int>(text.size());
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -12427,12 +12430,16 @@ private:
     cur.clear();
     dfa_closure_assert_lf(prog, {0}, cur, seen, eflags(from), mpc);
     int e = -1;
-    for (int sp = from;; sp++) {
+    int sp = from;
+    for (;; sp++) {
       // The cut appends mpc last, so it is present iff it is the back element.
       bool accept = !cur.empty() && cur.back() == mpc;
       bool front = !cur.empty() && cur.front() == mpc;
       if (accept) e = sp;
-      if (front) return sp;
+      if (front) { // committed
+        e = sp;
+        break;
+      }
       if (sp == n) break;
       seeds.clear();
       unsigned char b = p[sp];
@@ -12445,6 +12452,7 @@ private:
       cur.swap(next);
       if (cur.empty()) break;
     }
+    if (reach) *reach = sp;
     return e;
   }
 
@@ -12456,7 +12464,8 @@ private:
   // reverse scan per match); falls back to the uncached set simulation on a
   // full table (kCap).
   // `walked` (optional) reports the bytes scanned leftward — the cost of a
-  // FAILED candidate's reverse verify, for the prefilters' walk budgets.
+  // FAILED candidate's reverse verify, for the prefilters' walk budgets (the
+  // fallback's own, on kEdgeCap: see assert_fwd_scan_lf).
   int assert_reverse_start(FindCache &fc, std::string_view text, int e,
                            int floor, int *walked = nullptr) const {
     const unsigned char *p =
@@ -12468,12 +12477,10 @@ private:
     for (;;) {
       int idx = (pos == 0) ? AssertRevDfa::kBeginIdx : p[pos - 1];
       const AssertEdge ed = d.step_left(s, idx);
-      if (ed.flags == kEdgeCap) {
-        if (walked) *walked = e - pos;
+      if (ed.flags == kEdgeCap)
         return assert_reverse_start_slow(plan_->rev_prog_.prog,
                                          plan_->rev_prog_.match_pc(), text, e,
-                                         floor, /*cp_flags=*/false);
-      }
+                                         floor, /*cp_flags=*/false, walked);
       if (ed.flags & kEdgeAccept) leftmost = pos; // [pos, e) is a match
       if (pos == floor || pos == 0) break;
       if (ed.flags & kEdgeDead) break; // dead set: no earlier start can revive
@@ -12489,10 +12496,10 @@ private:
   // cp_flags=false) and assert_byte_reverse_start (byte: byte_rev_prog_,
   // cp_flags=true) — the mirror of assert_fwd_scan_slow. Given a match ending
   // at `e`, returns its leftmost start >= floor, or -1. Anchored at `e`, so no
-  // re-seed.
+  // re-seed. `walked` as theirs.
   int assert_reverse_start_slow(const detail::Program &prog, int mpc,
                                 std::string_view text, int e, int floor,
-                                bool cp_flags) const {
+                                bool cp_flags, int *walked = nullptr) const {
     int n = static_cast<int>(text.size());
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -12512,7 +12519,8 @@ private:
         leftmost = e;
         break;
       } // empty match [e, e)
-    for (int pos = e; pos > floor; pos--) {
+    int pos = e;
+    for (; pos > floor; pos--) {
       seeds.clear();
       for (int pc : cur)
         if (pc != mpc &&
@@ -12529,6 +12537,7 @@ private:
           break;
         }
     }
+    if (walked) *walked = e - pos;
     return leftmost;
   }
 
@@ -12964,11 +12973,9 @@ private:
         ed = d.step_cp_lf(s, text, sp, cp_len);
         adv = cp_len;
       }
-      if (ed.flags == kEdgeCap) {
-        if (reach) *reach = sp;
+      if (ed.flags == kEdgeCap)
         return assert_fwd_scan_lf_slow(*d.prog, d.match_pc, text, from,
-                                       /*cp_flags=*/true);
-      }
+                                       /*cp_flags=*/true, reach);
       if (ed.flags & kEdgeAccept) e = sp;
       if (ed.flags & kEdgeFront) {
         if (reach) *reach = sp;
@@ -13009,12 +13016,10 @@ private:
         ed = d.step_left_cp(s, text, pos, cp_len);
         adv = cp_len;
       }
-      if (ed.flags == kEdgeCap) {
-        if (walked) *walked = e - pos;
+      if (ed.flags == kEdgeCap)
         return assert_reverse_start_slow(plan_->byte_rev_prog_.prog,
                                          plan_->byte_rev_prog_.match_pc(), text,
-                                         e, floor, /*cp_flags=*/true);
-      }
+                                         e, floor, /*cp_flags=*/true, walked);
       if (ed.flags & kEdgeAccept) leftmost = pos; // [pos, e) is a match
       if (pos == floor || pos == 0) break;
       if (ed.flags & kEdgeDead) break; // dead set
