@@ -219,12 +219,16 @@ be small and to be read once.
   ones are the first columns of every row and sit in one or two cache
   lines. A row used to be 256 entries — 1 KB — whatever the pattern.
 - **A state's id is the offset of its row.** All rows live back to back in one
-  array, and a step is `tr[s + cls[byte]]`: an add and a load on the
-  dependency chain, nothing to scale. The entry in front of a row holds the
-  state's flags (accept, the leftmost-first commit, dead, and "this is the
-  start state"); the scans load them off that chain and test them with one
-  mask. They are deliberately not packed into the id (an AND on the chain
-  measured ~12% slower).
+  array, and a step is `tr[s + cls[byte]]`: a load on the dependency chain,
+  nothing to scale — and nothing to add, because the scans put the column
+  into the table's address first, which waits on nothing, and keep the
+  compiler from summing row and column between the two loads
+  (`REGEXLIB_OPAQUE`; `[a-z]+[0-9]` tested over prose it does not match,
+  746 → 894 MB/s). The entry in front of a row holds the state's flags
+  (accept, the leftmost-first commit, dead, and "this is the start state");
+  the scans load them off that chain and test them with one mask. They are
+  deliberately not packed into the id (an AND on the chain measured ~12%
+  slower).
 - **States are interned through a hash set into contiguous storage**, each
   state's program counters packed as byte-sized differences. A state of a
   Unicode-class pattern holds its program counters by the hundred, and they

@@ -249,6 +249,8 @@ struct PlanProbe {
     bool quit = false;   // any
     size_t bytes = 0, states = 0;
     unsigned stride = 0; // the widest row: the flags + one entry per class
+    // The largest table, in entries: of the forward DFAs, and of the reverse.
+    size_t fwd_entries = 0, rev_entries = 0;
   };
   static DfaStats dfa_stats(const Regex::FindCache &c) {
     DfaStats s;
@@ -262,6 +264,9 @@ struct PlanProbe {
       s.bytes = std::max(s.bytes, (*d)->bytes());
       s.states = std::max(s.states, (*d)->states.size());
       s.stride = std::max(s.stride, (*d)->stride);
+      const bool rev = d == &c.rv_ || d == &c.brv_ || d == &c.inrev_;
+      size_t &entries = rev ? s.rev_entries : s.fwd_entries;
+      entries = std::max(entries, (*d)->states.size() * (*d)->stride);
     }
     return s;
   }
@@ -3725,6 +3730,27 @@ void test_dfa_cache() {
         st = PlanProbe::dfa_stats(r2);
         CHECK(clears ? (st.clears > 0 && !st.quit) : st.quit);
       }
+    }
+  }
+
+  // A table of more entries than sixteen bits could index: a state is the
+  // offset of its row, and a scan carries it whole. The first pattern's
+  // forward DFA has a state per window of fifteen bytes; the second one's
+  // reverse DFA has (its one match ends at the `z`, and the scan back from
+  // there to the leftmost start passes every window of the subject).
+  for (bool reverse : {false, true}) {
+    const char *pat = reverse ? "[ab][a-e ]{14}[a-d][a-e ]*z"
+                              : "(?:[ab]|[bc])[a-e ]{14}[a-d]";
+    const std::string s = noise(40000, "abcd e", 2) + "z";
+    const std::vector<size_t> want = spans(pike_twin(pat), s);
+    CHECK(!want.empty());
+    for (bool us : {false, true}) {
+      Regex re = us ? make_us(pat) : Regex(pat);
+      Regex::FindCache fc;
+      CHECK(spans(re, s, &fc) == want);
+      Stats st = PlanProbe::dfa_stats(fc);
+      CHECK((reverse ? st.rev_entries : st.fwd_entries) > 65536);
+      CHECK(st.clears == 0 && !st.quit);
     }
   }
 

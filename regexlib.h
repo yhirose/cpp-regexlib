@@ -1492,10 +1492,16 @@ inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
 
 // A value the optimizer is not to see through: what went into it stays one
 // sum, computed where it is written, and is not regrouped with what it is
-// added to next. For the one walk whose every byte waits on the load before
-// it (onepass_walk_impl) — where the regrouping is free to the compiler and
-// a sixth of the time to the walk. Elsewhere it is nothing, and the
-// compiler's own grouping stands.
+// added to next. For the table walks, whose every byte waits on the load
+// before it: a state there is the offset of its row, the byte's column is
+// added to the TABLE's address — which waits on nothing — and that sum is
+// made opaque, so that the row is added to it in the load itself. Left to
+// regroup, GCC and Clang both add row and column first, between the two
+// loads; that is free to the compiler and a sixth of the walk's time or
+// more (each walk gives its own figure). The row is not carried narrower
+// than it is used, for the same reason: it would be widened again on that
+// chain. Elsewhere the macro is nothing, and the compiler's own grouping
+// stands. (The walks say it through detail::walk_column.)
 #if defined(__GNUC__) || defined(__clang__)
 #define REGEXLIB_OPAQUE(v) __asm__("" : "+r"(v))
 #else
@@ -1645,6 +1651,17 @@ constexpr int kBoolFloorBytes = 32;
 //------------------------------------------------------------------------------
 
 namespace detail {
+
+// The column a table walk reads its next state from: `table + column`, kept
+// one sum, so that the state's row is added to it in the load itself (see
+// REGEXLIB_OPAQUE).
+template <class T>
+REGEXLIB_ALWAYS_INLINE inline const T *walk_column(const T *table,
+                                                   size_t column) {
+  const T *col = table + column;
+  REGEXLIB_OPAQUE(col);
+  return col;
+}
 
 // Portable count-trailing-zeros. GCC/Clang expose __builtin_ctz{,ll}; MSVC
 // (and clang-cl, which also defines _MSC_VER) provide _BitScanForward{,64} via
@@ -13120,8 +13137,9 @@ private:
   // for `[a-z]+ing`, ~100 for a Unicode `\w`, whose ASCII columns come first
   // (classes are numbered in byte order) and so sit together at the row's
   // head. A state's id IS the offset of its row (premultiplied), which makes
-  // a step `tr[s + cls[byte]]`: one add and one load on the dependency chain,
-  // into a table several times denser in cache than a 1 KB row per state.
+  // a step `tr[s + cls[byte]]`: one load on the dependency chain (the scans
+  // keep the add off it — see REGEXLIB_OPAQUE), into a table several times
+  // denser in cache than a 1 KB row per state.
   // The entry in front of a row holds the state's flags (accept / front /
   // dead), which the scans read OFF that chain, next to the columns they are
   // about to load.
@@ -13968,7 +13986,7 @@ private:
   // reusable across calls.
   int dfa_reverse_scan(LazyDfa &d, std::string_view text, int e, int floor,
                        int *low_out = nullptr) const {
-    uint32_t s = d.start();
+    size_t s = d.start();
     const uint32_t *tr = d.tr.data();
     uint32_t f = tr[s - 1];
     int leftmost = (f & LazyDfa::kAccept) ? e : -1; // empty match [e, e)
@@ -13978,17 +13996,17 @@ private:
     int mark = e; // stepped bytes are reported to `d` from here down
     if (!(f & LazyDfa::kDead))
       while (pos > floor) {
-        // Consume the byte left of pos.
-        uint32_t nx = tr[size_t{s} + d.cls[p[pos - 1]]];
+        // Consume the byte left of pos (as dfa_forward_lf_scan).
+        uint32_t nx = detail::walk_column(tr, d.cls[p[pos - 1]])[s];
         if (nx == LazyDfa::kUnknown) {
-          nx = d.next(s, p[pos - 1], mark - pos);
+          nx = d.next(static_cast<uint32_t>(s), p[pos - 1], mark - pos);
           if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
           mark = pos;
           tr = d.tr.data(); // the table moved, or was cleared and restarted
         }
         s = nx;
         pos--;
-        f = tr[size_t{s} - 1];
+        f = tr[s - 1];
         if (f & LazyDfa::kAccept) leftmost = pos;
         if (f & LazyDfa::kDead) break;
       }
@@ -14620,7 +14638,7 @@ private:
   template <bool First>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
                           int &reach_out) const {
-    uint32_t s = d.start();
+    size_t s = d.start();
     const uint32_t *tr = d.tr.data();
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -14645,16 +14663,18 @@ private:
     int reach = from; // one past the last byte consumed
     if (stops & LazyDfa::kStart) i = mark = dfa_start_skip(d, p, n, i);
     while (i < n) {
-      uint32_t nx = tr[size_t{s} + d.cls[p[i]]];
+      // The state is all that one load hands the next (see REGEXLIB_OPAQUE;
+      // `[a-z]+[0-9]` tested over prose it does not match: 746 MB/s -> 894).
+      uint32_t nx = detail::walk_column(tr, d.cls[p[i]])[s];
       if (nx == LazyDfa::kUnknown) {
-        nx = d.next(s, p[i], i - mark);
+        nx = d.next(static_cast<uint32_t>(s), p[i], i - mark);
         if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
         mark = i;
         tr = d.tr.data(); // the table moved, or was cleared and restarted
       }
       s = nx;
       reach = ++i; // consumed p[i]
-      f = tr[size_t{s} - 1];
+      f = tr[s - 1];
       if (f & LazyDfa::kAccept) e = i;
       if (f & stops) {
         if (f & ends) break;
@@ -16479,9 +16499,7 @@ private:
       // into the table's address, which waits on nothing — and is kept from
       // being added to the row first, which would put that add between the
       // two loads (a UUID validated: 45 ns so, 39 this way).
-      const uint32_t *col = nx + b;
-      REGEXLIB_OPAQUE(col);
-      uint32_t e = col[st];
+      uint32_t e = detail::walk_column(nx, b)[st];
       if (e == Plan::AnchoredOnePass::kDeadState) break;
       st = e;
     }
