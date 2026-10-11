@@ -136,7 +136,7 @@ struct PlanProbe {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
-           !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
+           !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
            !p.first_bytes_.ok && !p.cap_bitstate_;
   }
@@ -169,17 +169,6 @@ struct PlanProbe {
     }
     return '!';
   }
-  // Whether a lazy DFA of the thread's cache of `re` was built over a
-  // program the plan had computed no byte classes for (see
-  // Plan::plan_byte_classes): it works, a column per byte, and is a plan
-  // that forgot a program.
-  static bool unplanned_dfa(const Regex &re) {
-    bool any = false;
-    each_lazy(re.thread_cache(), [&](const Regex::LazyDfa &d, bool) {
-      any = any || d.unplanned;
-    });
-    return any;
-  }
   // `f(dfa, reverse)` for each lazy DFA a cache has built.
   template <class F> static void each_lazy(const Regex::FindCache &c, F f) {
     const std::pair<const std::optional<Regex::LazyDfa> *, bool> all[] = {
@@ -204,17 +193,18 @@ struct PlanProbe {
   static void dfa_cache(const Regex &re, size_t bytes, uint32_t min_clears) {
     dfa_cache(re, re.thread_cache(), bytes, min_clears);
   }
-  // Whether the plan's byte classes are exact, for each program it computed
-  // them for: classes numbered in byte order, and no instruction that tells
-  // two bytes of one class apart (checked against lazy_inst_matches, the
-  // question the lazy DFA asks). `max_insts` skips a program too long to be
-  // worth the walk here.
+  // Whether the byte classes are exact, for each program of the plan a lazy
+  // DFA runs over: classes numbered in byte order, and no instruction that
+  // tells two bytes of one class apart (checked against lazy_inst_matches,
+  // the question the lazy DFA asks). `max_insts` skips a program too long to
+  // be worth the walk here.
   static bool classes_exact(const Regex &re, size_t max_insts = ~size_t{0}) {
     using Op = reg::detail::Inst::Op;
     const auto &p = *re.plan_;
-    auto ok = [&](const reg::detail::Program &prog,
-                  const Regex::Plan::ByteClasses &bc) {
-      if (!bc.n || prog.insts.size() > max_insts) return true;
+    auto ok = [&](const reg::detail::Program &prog) {
+      if (prog.insts.empty() || prog.insts.size() > max_insts) return true;
+      const Regex::Plan::ByteClasses bc = p.byte_classes(prog, !p.dfa_ok_);
+      if (!bc.n) return true; // not a program a lazy DFA runs over
       int rep[256];
       std::fill(std::begin(rep), std::end(rep), -1);
       unsigned next = 0;
@@ -241,13 +231,20 @@ struct PlanProbe {
       }
       return true;
     };
-    return ok(p.prog_, p.prog_classes_) &&
-           ok(p.rev_prog_.prog, p.rev_prog_.classes) &&
-           ok(p.lf_prog_.prog, p.lf_prog_.classes) &&
-           ok(p.byte_prog_.prog, p.byte_prog_.classes) &&
-           ok(p.byte_rev_prog_.prog, p.byte_rev_prog_.classes) &&
-           ok(p.byte_lf_prog_.prog, p.byte_lf_prog_.classes) &&
-           ok(p.inner_.pre_rev.prog, p.inner_.pre_rev.classes);
+    return ok(p.prog_) && ok(p.rev_prog_.prog) && ok(p.lf_prog_.prog) &&
+           ok(p.byte_prog_.prog) && ok(p.byte_rev_prog_.prog) &&
+           ok(p.byte_lf_prog_.prog) && ok(p.inner_.pre_rev.prog);
+  }
+  // The widest row a lazy DFA of the plan's main programs has: the flags
+  // and an entry per byte class.
+  static unsigned widest_row(const Regex &re) {
+    const auto &p = *re.plan_;
+    unsigned w = 0;
+    for (const reg::detail::Program *prog :
+         {&p.prog_, &p.rev_prog_.prog, &p.lf_prog_.prog, &p.byte_prog_.prog})
+      if (!prog->insts.empty())
+        w = std::max(w, p.byte_classes(*prog, !p.dfa_ok_).n + 1);
+    return w;
   }
   // What the lazy DFAs of a cache came to: how many were built, the refills
   // and give-ups among them, and the largest one's size.
@@ -256,7 +253,6 @@ struct PlanProbe {
     unsigned clears = 0; // summed
     bool quit = false;   // any
     size_t bytes = 0, states = 0;
-    unsigned stride = 0; // the widest row: the flags + one entry per class
     // The largest table, in entries: of the forward DFAs, and of the reverse.
     size_t fwd_entries = 0, rev_entries = 0;
   };
@@ -268,7 +264,6 @@ struct PlanProbe {
       s.quit = s.quit || d.quit;
       s.bytes = std::max(s.bytes, d.bytes());
       s.states = std::max(s.states, d.states.size());
-      s.stride = std::max(s.stride, d.stride);
       size_t &entries = reverse ? s.rev_entries : s.fwd_entries;
       entries = std::max(entries, d.tr.size());
     });
@@ -276,18 +271,6 @@ struct PlanProbe {
   }
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
-  }
-  // The assert DFAs of a cache, one entry a table that was built: the bytes
-  // it holds (what the cache's budget bounds), and whether it is full.
-  static std::vector<std::pair<size_t, bool>>
-  assert_tables(const Regex::FindCache &c) {
-    std::vector<std::pair<size_t, bool>> v;
-    auto one = [&v](const auto &d) {
-      if (d) v.emplace_back(d->tbl.bytes, d->tbl.full());
-    };
-    one(c.afu_), one(c.alfu_), one(c.alfa_), one(c.arv_);
-    one(c.bafu_), one(c.balfu_), one(c.balfa_), one(c.barv_);
-    return v;
   }
 };
 } // namespace detail
@@ -3457,8 +3440,10 @@ void test_assert_dfa() {
   // after the lone \n (3) — three, matching a non-ASCII subject.
   CHECK(find_all(Regex("(?m)^", Multiline), "\r\n\n").size() == 3);
 
-  // Assert patterns on non-ASCII subjects take the cached byte assert tier
-  // (ByteAssertDfa / ByteAssertRevDfa); they must agree with the forced Pike,
+  // Assert patterns on non-ASCII subjects take the byte assert tier (the
+  // lazy DFAs over the byte programs, with look, forward and reverse — a
+  // non-ASCII code point is a step they take whole); they must agree with
+  // the forced Pike,
   // including multiline ^/$ across CR-LF and accented letters. é=U+00E9,
   // α=U+03B1.
   const std::string E = "\xC3\xA9", A = "\xCE\xB1";
@@ -3645,9 +3630,9 @@ void test_dfa_cache() {
     Regex::FindCache fc;
     const std::string s = "sing a song of bringing things, king; ring-a-ding";
     CHECK(spans(re, s, &fc) == spans(pike_twin("[a-z]+ing"), s));
-    Stats st = PlanProbe::dfa_stats(fc);
-    CHECK(st.built > 0);
-    CHECK(st.stride >= 5 && st.stride <= 24);
+    CHECK(PlanProbe::dfa_stats(fc).built > 0);
+    const unsigned width = PlanProbe::widest_row(re);
+    CHECK(width >= 5 && width <= 24);
   }
   // ... and the classes are exact: `\w` and `\d` overlap, a negated class
   // splits the rest, and every byte of a multi-byte code point keeps its
@@ -3678,23 +3663,6 @@ void test_dfa_cache() {
     CHECK(PlanProbe::classes_exact(make_us(pat)));
     CHECK(PlanProbe::classes_exact(Regex(pat, IgnoreCase)));
     CHECK(PlanProbe::classes_exact(make_us(pat, IgnoreCase)));
-    // ... and every lazy DFA these build, on subjects that send them down
-    // each family, found its classes in the plan.
-    for (unsigned flags : {0u, static_cast<unsigned>(IgnoreCase)})
-      for (bool us : {false, true}) {
-        Regex re = us ? make_us(pat, flags) : Regex(pat, flags);
-        for (std::string_view subj :
-             {"ab12 sing x9z foo@bar.com 7-8 caf\xc3\xa9 na\xc3\xafve",
-              "plain ascii: king 12-34 a.c abc xxz\t\x01 foo ab",
-              "\xe6\xbc\xa2\xe6\xbc\xa2 Stra\xc3\x9f" "e kW 99-1 \r\n ab"}) {
-          (void)re.test(subj);
-          (void)re.search(subj);
-          (void)re.match(subj);
-          for (auto m : re.find_all(subj)) (void)m;
-          for (auto m : re.find_iter(subj)) (void)m;
-        }
-        CHECK(!PlanProbe::unplanned_dfa(re));
-      }
   }
 
   // A DFA with more states than its cache holds keeps running: the cache is
@@ -3770,11 +3738,10 @@ void test_dfa_cache() {
     }
   }
 
-  // The assert DFAs have the budget too, and a full table is kept as it is.
-  // The pattern has a state per window of fifteen bytes, more than a table
-  // of 64 KB has room for: the scans that fill one agree with the Pike, and
-  // so do the scans of another subject after — whose misses are answered by
-  // the fallback, and leave a full table holding what it held.
+  // An assert plan's DFAs are the same DFAs, under the same budget. The
+  // pattern has a state per window of fifteen bytes, more than a cache of
+  // 64 KB has room for: the scans that overflow it agree with the Pike, and
+  // so do the scans of another subject after, on whatever the first left.
   {
     const char *pat = R"(\b[ab]*a[ab]{14}\b)";
     const size_t budget = size_t{64} << 10;
@@ -3788,19 +3755,9 @@ void test_dfa_cache() {
       Regex::FindCache fc;
       PlanProbe::dfa_cache(re, fc, budget, 3);
       CHECK(spans(re, s, &fc) == want);
-      const auto filled = PlanProbe::assert_tables(fc);
-      size_t full = 0;
-      for (const auto &t : filled) {
-        full += t.second;
-        // (Over by a start state per context at most, and the pc-sets.)
-        CHECK(t.first < 2 * budget);
-      }
-      CHECK(full > 0);
+      const Stats st = PlanProbe::dfa_stats(fc);
+      CHECK(st.clears > 0 || st.quit);
       CHECK(spans(re, s2, &fc) == want2);
-      const auto after = PlanProbe::assert_tables(fc);
-      CHECK(after.size() == filled.size());
-      for (size_t i = 0; i < filled.size() && i < after.size(); i++)
-        if (filled[i].second) CHECK(after[i] == filled[i]);
     }
   }
 
@@ -4120,10 +4077,8 @@ void test_walk_budget_linearity() {
                       std::chrono::steady_clock::now() - t0)
                       .count();
       CHECK(n == c.want);
-      size_t tables_full = 0;
-      for (const auto &t : PlanProbe::assert_tables(fc))
-        tables_full += t.second;
-      CHECK(tables_full > 0);
+      const auto st = PlanProbe::dfa_stats(fc);
+      CHECK(st.clears > 0 || st.quit);
       std::printf("  [info] walk-budget %-18s n=%zu completed in %.1f ms\n",
                   c.name, c.subj.size(), dt);
     }

@@ -57,21 +57,22 @@ struct PlanProbe {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
-           !p.assert_lf_prog_.ok() && !p.assert_.anchor_gatefree &&
+           !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
            !p.first_bytes_.ok && !p.cap_bitstate_;
   }
-  // Whether the plan's byte classes are exact, for each program it computed
-  // them for: classes numbered in byte order, and no instruction that tells
-  // two bytes of one class apart (checked against lazy_inst_matches, the
-  // question the lazy DFA asks). `max_insts` skips a program too long to be
-  // worth the walk here.
+  // Whether the byte classes are exact, for each program of the plan a lazy
+  // DFA runs over: classes numbered in byte order, and no instruction that
+  // tells two bytes of one class apart (checked against lazy_inst_matches,
+  // the question the lazy DFA asks). `max_insts` skips a program too long to
+  // be worth the walk here.
   static bool classes_exact(const Regex &re, size_t max_insts = ~size_t{0}) {
     using Op = reg::detail::Inst::Op;
     const auto &p = *re.plan_;
-    auto ok = [&](const reg::detail::Program &prog,
-                  const Regex::Plan::ByteClasses &bc) {
-      if (!bc.n || prog.insts.size() > max_insts) return true;
+    auto ok = [&](const reg::detail::Program &prog) {
+      if (prog.insts.empty() || prog.insts.size() > max_insts) return true;
+      const Regex::Plan::ByteClasses bc = p.byte_classes(prog, !p.dfa_ok_);
+      if (!bc.n) return true; // not a program a lazy DFA runs over
       int rep[256];
       std::fill(std::begin(rep), std::end(rep), -1);
       unsigned next = 0;
@@ -98,25 +99,9 @@ struct PlanProbe {
       }
       return true;
     };
-    return ok(p.prog_, p.prog_classes_) &&
-           ok(p.rev_prog_.prog, p.rev_prog_.classes) &&
-           ok(p.lf_prog_.prog, p.lf_prog_.classes) &&
-           ok(p.byte_prog_.prog, p.byte_prog_.classes) &&
-           ok(p.byte_rev_prog_.prog, p.byte_rev_prog_.classes) &&
-           ok(p.byte_lf_prog_.prog, p.byte_lf_prog_.classes) &&
-           ok(p.inner_.pre_rev.prog, p.inner_.pre_rev.classes);
-  }
-  // Whether a lazy DFA of the thread's cache of `re` was built over a
-  // program the plan had computed no byte classes for (see
-  // Plan::plan_byte_classes): it works, a column per byte, and is a plan
-  // that forgot a program.
-  static bool unplanned_dfa(const Regex &re) {
-    const Regex::FindCache &c = re.thread_cache();
-    for (const std::optional<Regex::LazyDfa> *d :
-         {&c.fu_, &c.rv_, &c.lfu_, &c.lfa_, &c.bfu_, &c.brv_, &c.blfu_,
-          &c.blfa_, &c.inrev_})
-      if (*d && (*d)->unplanned) return true;
-    return false;
+    return ok(p.prog_) && ok(p.rev_prog_.prog) && ok(p.lf_prog_.prog) &&
+           ok(p.byte_prog_.prog) && ok(p.byte_rev_prog_.prog) &&
+           ok(p.byte_lf_prog_.prog) && ok(p.inner_.pre_rev.prog);
   }
   // The lazy DFAs of a cache, built small: `bytes` of cache each, and
   // `min_clears` refills before a fill has to have paid for itself (see
@@ -558,13 +543,6 @@ void check_scan(const reg::Regex &re, const std::string &subj,
   }
   if (i != all.size())
     fail("scan() yielded fewer matches than find_all", pat, subj);
-  // Every lazy DFA this pattern has built on this thread so far — by the
-  // searches above and the scan just run — found its byte classes in the
-  // plan.
-  if (reg::detail::PlanProbe::unplanned_dfa(re))
-    fail("a lazy DFA was built over a program without plan classes", pat,
-         subj);
-
   // split() must yield exactly all.size()+1 pieces whose concatenation, with
   // each matched text spliced back in order, reconstructs the subject.
   std::vector<std::string> pieces;

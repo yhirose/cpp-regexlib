@@ -1604,13 +1604,6 @@ constexpr long kStepsBase = 1 << 20;   // slack so short subjects never trip
 // refilled kDfaMinClears times, a fill that covered fewer than
 // kDfaMinBytesPerState subject bytes per state it built. See docs/design.md.
 //
-// The assertion DFAs (AssertDfa and its byte / reverse kin) have the same
-// budget, over a table's edges and its interned states, and a simpler rule:
-// a full table is kept, not cleared — what it has built still answers — and
-// takes no more states. A step that would need one answers kEdgeCap, and the
-// matcher falls back. (The patterns measured come to tens of states, some
-// hundred KB; the budget is for `\b[ab]*a[ab]{15}\b` and its kind, whose
-// states double with every repeat.)
 constexpr size_t kDfaCacheBytes = size_t{8} << 20; // 8 MiB per DFA
 constexpr uint32_t kDfaMinClears = 3;
 constexpr uint64_t kDfaMinBytesPerState = 10;
@@ -1664,6 +1657,23 @@ REGEXLIB_ALWAYS_INLINE inline const T *walk_column(const T *table,
   const T *col = table + column;
   REGEXLIB_OPAQUE(col);
   return col;
+}
+
+// The flags of the state a walk has just stepped to, where a state is the
+// offset of its row and the flags are the entry in front of the row: the
+// row's address is made a value of its own, and the flags are read through
+// it. Read as table[state - 1] they are a second load indexed by the state
+// the moment it arrives, beside the next step's own — and the two can get
+// in each other's way, a cycle of every byte (the lazy DFA's look scans; a
+// boolean one over prose it does not match: 865 MB/s so, 1,035 with the
+// address taken first). Not a rule: the same scans without look, the same
+// instructions but for this, run at full speed either way over a long
+// subject and a little quicker the plain way over a short one.
+template <class T>
+REGEXLIB_ALWAYS_INLINE inline T walk_flags(const T *table, size_t state) {
+  const T *row = table + state;
+  REGEXLIB_OPAQUE(row);
+  return row[-1];
 }
 
 // Portable count-trailing-zeros. GCC/Clang expose __builtin_ctz{,ll}; MSVC
@@ -3139,6 +3149,11 @@ struct Inst {
   int x = 0, y = 0;         // Split / Jmp / Loop targets; or an operand (below)
   int n = 0;                // Save slot (also Loop progress slot)
 
+  // One of the empty-width assertions (AssertBOL .. AssertEndTextNL).
+  bool is_assert() const {
+    return op >= Op::AssertBOL && op <= Op::AssertEndTextNL;
+  }
+
   int lit_idx() const { return x; } // Char  -> Program::lits
 
   int cls_idx() const { return x; } // Class -> Program::classes
@@ -4278,10 +4293,7 @@ inline CpOnePass build_cp_onepass(const Program &prog, bool icase,
   int psz = static_cast<int>(prog.insts.size());
   if (prog.nslots > CpOnePass::kMaxSlots) return op;
   for (const auto &in : prog.insts)
-    if (in.op == Op::Look || in.op == Op::Loop || in.op == Op::AssertBOL ||
-        in.op == Op::AssertEOL || in.op == Op::AssertWB ||
-        in.op == Op::AssertNWB || in.op == Op::AssertBeginText ||
-        in.op == Op::AssertEndText || in.op == Op::AssertEndTextNL)
+    if (in.op == Op::Look || in.op == Op::Loop || in.is_assert())
       return op; // assertions/lookaround/loops are not one-pass here
   op.nslots = prog.nslots;
 
@@ -5028,10 +5040,7 @@ struct PlanProbe;
 class Regex {
   friend struct detail::PlanProbe;
 
-  // Forward declarations: the assert DFA types are defined later in the class,
-  // but the assert-scan overloads below take them by reference.
-  struct AssertDfa;
-  struct ByteAssertDfa;
+  struct LazyDfa; // defined below; the scans above it take one by reference
 
   // Failed-walk byte budget for the candidate+verify prefilters — the
   // linearity guard behind kWalkBail. The candidate loops re-verify from each
@@ -5323,10 +5332,12 @@ public:
       // gives the leftmost-first end; captures resolved by the assert-aware
       // bitstate.
       if (assert_byte_path_ok(text)) {
-        int e = assert_byte_fwd_scan_lf(cache, text, 0, /*anchored=*/true);
-        if (e < 0) return MatchResult{};
-        return plan_->byte_assert_cap_ ? run_captures_bytes(text, 0, e, sc)
-                                : build_dfa_result(text, 0, e);
+        int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
+        if (e == -1) return MatchResult{};
+        if (e != LazyDfa::kCap)
+          return plan_->byte_assert_cap_ ? run_captures_bytes(text, 0, e, sc)
+                                         : build_dfa_result(text, 0, e);
+        // kCap — fall through to the code-point Pike VM.
       }
       // [Tier: Pike/cp] the US baseline: anchored code-point Pike VM.
       auto seg = detail::segment_cp(text);
@@ -5397,26 +5408,29 @@ public:
     // the leftmost-first end, the assertion-aware bitstate resolves groups on
     // [0, e) over cp_prog_ — replacing the grapheme Pike.
     if (plan_->assert_cap_ && assert_find_ok(text, fna)) {
-      int e = assert_fwd_scan_lf(cache, text, 0, /*anchored=*/true);
-      if (e >= 0) return run_captures_bytes(text, 0, e, sc);
-      return MatchResult{};
+      int e = look_forward_lf(dfa_fwda(cache, /*byte=*/false), text, 0);
+      if (e == -1) return MatchResult{};
+      if (e != LazyDfa::kCap) return run_captures_bytes(text, 0, e, sc);
+      // kCap — fall through to the Pike VM below.
     }
 
     // [Tier: Assert/Ascii] capture-free, anchored at 0: leftmost-first end
-    // from 0 via the anchored lf assert DFA (alfa over the bare pattern).
+    // from 0 via the anchored lf DFA (lfa over the bare pattern, with look).
     if (plan_->ncap_ == 0 && assert_find_ok(text, fna)) {
-      int e = assert_fwd_scan_lf(cache, text, 0, /*anchored=*/true);
-      if (e >= 0) return build_dfa_result(text, 0, e);
-      return MatchResult{};
+      int e = look_forward_lf(dfa_fwda(cache, /*byte=*/false), text, 0);
+      if (e == -1) return MatchResult{};
+      if (e != LazyDfa::kCap) return build_dfa_result(text, 0, e);
+      // kCap — fall through to the Pike VM below.
     }
 
     // [Tier: Assert/Byte] capture-free, non-ASCII, anchored at 0:
-    // leftmost-first end via the anchored lf byte assert DFA (balfa over the
-    // bare byte_prog_).
+    // leftmost-first end via the anchored lf byte DFA (blfa over the bare
+    // byte_prog_, with look).
     if (assert_byte_path_ok(text)) {
-      int e = assert_byte_fwd_scan_lf(cache, text, 0, /*anchored=*/true);
-      if (e >= 0) return build_dfa_result(text, 0, e);
-      return MatchResult{};
+      int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
+      if (e == -1) return MatchResult{};
+      if (e != LazyDfa::kCap) return build_dfa_result(text, 0, e);
+      // kCap — fall through to the Pike VM below.
     }
     // [Tier: Pike] the proven baseline: anchored grapheme Pike VM.
     auto seg = detail::segment(text);
@@ -5585,8 +5599,8 @@ private:
     if (caches.size() > 1024) {
       // Bounded eviction. A bare clear() would free EVERY FindCache — including
       // one an outer frame already holds a reference into: search() keeps
-      // `cache.sc_` live across assert_find_span, which re-enters thread_cache()
-      // (the assert DFA scans re-fetch it), and the re-entrant call could tip
+      // `cache.sc_` live across a find that re-enters thread_cache() (the
+      // assert scans re-fetched it, once), and the re-entrant call could tip
       // the map past the cap and clear it underneath the outer Scratch& — a
       // use-after-free the fuzzer caught at exactly 1025 entries. Erase only the
       // OTHER entries instead: unordered_map::erase leaves references to the
@@ -6399,7 +6413,6 @@ private:
       } else {
         walk_driver_ = WalkDriver::Scan;
       }
-      plan_byte_classes();
       // The lazy DFAs' start skips and the walk's scan, now that every
       // searcher behind them is planned.
       // (A CodePoint plan's programs are byte programs: it has the one.)
@@ -6690,10 +6703,10 @@ private:
     // Assertion tiers: the byte assert programs + assert prefilters, then the
     // grapheme/code-point assert lf program and the assert-capture program.
     void plan_assert_tiers(const detail::Node &root) {
-      // Assertion byte tier: build the UTF-8 byte programs so the cached
-      // code-point-aware ByteAssertDfa serves an assert pattern (dfa_assert_ok_,
-      // not dfa_ok_) on the byte program. It decodes UTF-8 per code point and
-      // evaluates assertions code-point-wise, which is correct for BOTH a
+      // Assertion byte tier: build the UTF-8 byte programs so the lazy DFA,
+      // stepping with look, serves an assert pattern (dfa_assert_ok_, not
+      // dfa_ok_) on the byte program. It weighs every boundary by the code
+      // points on its two sides, which is correct for BOTH a
       // non-ASCII EGC subject (where byte == grapheme) AND for **US mode** on any
       // subject (US matching IS code-point matching) — so US reuses this tier
       // instead of falling to the code-point Pike. Captures included: the assert
@@ -6702,8 +6715,7 @@ private:
       // leading literal) live here too, so they serve both the byte tier and the
       // ASCII grapheme tier below.
       if (dfa_assert_ok_ && !dfa_ok_ && rev_prog_.ok()) {
-        compile_byte_trio(root, detail::strip_captures(root),
-                          byte_assert_lf_prog_);
+        compile_byte_trio(root, detail::strip_captures(root), byte_lf_prog_);
         byte_assert_path_ = true;
         byte_assert_cap_ = ncap_ > 0;
         if (!us_)
@@ -6717,11 +6729,11 @@ private:
       // Assertion tier leftmost-first program: the unanchored `(?s:.)*?`+pattern
       // over the code-point/grapheme program, capture-free. Built for every
       // DFA-assert pattern (dfa_assert_ok_, not dfa_ok_), not just longest-safe
-      // ones — the ordered+cut AssertDfa over it yields the leftmost-first end
+      // ones — the ordered+cut lazy DFA over it yields the leftmost-first end
       // for any assert pattern, so longest-unsafe assert-alternations no longer
       // need the Pike VM.
       if (!us_ && dfa_assert_ok_ && !dfa_ok_ && rev_prog_.ok()) {
-        assert_lf_prog_.prog = detail::Compiler::compile(
+        lf_prog_.prog = detail::Compiler::compile(
             detail::wrap_unanchored(detail::strip_captures(root)), /*ncap=*/0,
             /*us=*/false, /*reverse=*/false, dotall_, /*cp=*/false,
             /*icase=*/icase_);
@@ -9307,11 +9319,8 @@ private:
       dfa_assert_ok_ = true;
       for (size_t i = 0; i < prog_.insts.size(); i++) {
         Op op = prog_.insts[i].op;
-        bool is_assert = op == Op::AssertBOL || op == Op::AssertEOL ||
-                         op == Op::AssertWB || op == Op::AssertNWB ||
-                         op == Op::AssertBeginText || op == Op::AssertEndText ||
-                         op == Op::AssertEndTextNL;
-        if (is_assert) dfa_ok_ = false; // assertions need the context-aware scan
+        // assertions need the context-aware scan
+        if (prog_.insts[i].is_assert()) dfa_ok_ = false;
 
         // Lookaround / Loop break even the assertion-aware DFA -> Pike VM. \Z
         // (AssertEndTextNL) needs absolute position (sp == n-1 before a final
@@ -9434,9 +9443,20 @@ private:
     // distinct set of them — every letter of a literal is one, every `\w`
     // the same one.
     //
-    // A walked program with an assertion, a lookaround or a guarded loop is
-    // not one a LazyDfa runs over: it gets none (n == 0).
-    ByteClasses byte_classes(const detail::Program &prog) const {
+    // A walked program with a lookaround or a guarded loop is not one a
+    // LazyDfa runs over: it gets none (n == 0).
+    //
+    // Asked by the DFA itself, of its own program, when its first scan
+    // starts (LazyDfa::columns): a plan builds none of this, and most plans
+    // never step most of the DFAs they could.
+    //
+    // `look`: the program has assertions, and its DFA steps with look. What
+    // an assertion asks of an ASCII byte is told apart too (LazyDfa::side:
+    // a word byte, a line break), so that a
+    // transition can be cached by the byte's class there as well — and no
+    // ASCII byte shares a class with a byte of a longer code point, whose
+    // step is never cached.
+    ByteClasses byte_classes(const detail::Program &prog, bool look) const {
       using Op = detail::Inst::Op;
       static thread_local detail::ByteTests tests;
       tests.events.clear();
@@ -9496,7 +9516,9 @@ private:
           case Op::Jmp:
           case Op::Save:
           case Op::Match: break;
-          default: return ByteClasses{}; // not a lazy-DFA program
+          default:
+            if (look && in.is_assert()) break;
+            return ByteClasses{}; // not a lazy-DFA program
           }
         }
         std::sort(masks.begin(), masks.end());
@@ -9504,39 +9526,16 @@ private:
         for (const Mask &m : masks)
           tests.ascii_set(m);
       }
+      if (look) {
+        tests.ascii_set(pred_ascii(CharClass::Pred::Word));
+        tests.range('\n', '\r'); // the ASCII line breaks: \n \v \f \r
+        tests.range(0x80, 0xFF);
+      }
       ByteClasses bc = tests.classes();
       if (listed)
         for (const detail::ClassBlock *blk : prog.byte_blocks)
           detail::refine_byte_classes(bc, blk->classes);
       return bc;
-    }
-
-    // The classes of every program a LazyDfa can be built over, by the
-    // FindCache slot that builds it. Once per plan, so that building a DFA —
-    // which every thread does for itself — costs a 256-byte copy. And only
-    // for those programs: a plan served without a LazyDfa (a pure literal's
-    // memmem, the assert DFAs, the Pike alone) is left as it was — for what
-    // the work costs a first construction, and for what it leaves behind
-    // (the scans that follow a construction ran measurably slower for their
-    // first dozen passes with it done: a 10 us literal scan, 13 -> 17 us).
-    // A LazyDfa built over a program left out here still works, a column
-    // per byte (see its constructor); the fuzzer fails a run that builds one.
-    void plan_byte_classes() {
-      if (literal_only_) return; // Rung::Literal, and match()'s memcmp
-      auto classes = [&](Compiled &c) {
-        if (c.ok()) c.classes = byte_classes(c.prog);
-      };
-      if (dfa_ok_) { // the US / ASCII DFA families
-        prog_classes_ = byte_classes(prog_); // fu, lfa
-        classes(rev_prog_);                  // rv
-        classes(lf_prog_);                   // lfu
-      }
-      if (byte_path_) { // the EGC byte family
-        classes(byte_prog_);     // bfu, blfa
-        classes(byte_rev_prog_); // brv
-        classes(byte_lf_prog_);  // blfu
-      }
-      classes(inner_.pre_rev); // inrev
     }
 
     // Does the consuming instruction `in` (Char/Class/Any) match grapheme `g`?
@@ -9588,7 +9587,6 @@ private:
     }
 
     detail::Program prog_;
-    ByteClasses prog_classes_; // prog_'s, for the lazy DFA (see byte_classes)
     detail::Program cp_prog_; // US: code-point program for the Pike VM (see ctor)
 
     // !us_ captures: cp_prog_ is built and bitstate-eligible (dfa_ok_, so no
@@ -9600,7 +9598,7 @@ private:
 
     // !us_ assert-capture: a `$`/`^`/`\b`-anchored capture pattern
     // (dfa_assert_ok_, not dfa_ok_, ncap_ > 0). The assertion-aware DFA locates
-    // the span (assert_find_span over the capture-stripped assert_lf_prog_) and
+    // the span (assert_find_span over the capture-stripped lf_prog_) and
     // the assertion-aware bitstate over cp_prog_ resolves groups — replacing the
     // grapheme Pike VM on an ASCII subject. cp_prog_ here carries assert ops
     // (unlike the dfa_ok_ cap_bitstate_ case).
@@ -10020,7 +10018,6 @@ private:
     // program built" flag.
     struct Compiled {
       detail::Program prog;
-      ByteClasses classes; // for the programs a LazyDfa runs over
       int match_pc() const { return static_cast<int>(prog.insts.size()) - 1; }
       bool ok() const { return !prog.insts.empty(); }
     };
@@ -10208,23 +10205,13 @@ private:
     // match thread is live, the match cut removes the (lowest-priority) prefix
     // loop, so no later start position can override the leftmost match. This
     // replaces the per-position re-seed shortcut, which broke leftmost-first
-    // priority across start positions. Built for regular (dfa_ok_) ASCII
-    // patterns.
+    // priority across start positions. Built for regular (dfa_ok_) patterns,
+    // and — capture-stripped, over the grapheme program — for the assert
+    // patterns the ASCII assert tier serves (assert_ascii_tier), whose
+    // leftmost-first end (incl. longest-unsafe alternations) then comes from
+    // the DFA too, no Pike VM.
     Compiled lf_prog_;
-
-    // Unanchored leftmost-first ASSERT program (`(?s:.)*?`+pattern over the
-    // code-point/grapheme program): the assert tier's lf forward scan runs the
-    // ordered+cut AssertDfa over this, so the leftmost-first end of an assert
-    // pattern (incl. longest-unsafe alternations) comes from the DFA, no Pike VM.
-    Compiled assert_lf_prog_;
-
-    // Non-ASCII assert tier leftmost-first program: the unanchored
-    // any-BYTE-prefixed UTF-8 byte program (lf_byte_prefix over the byte
-    // assert program). The ordered+cut ByteAssertDfa over it gives the
-    // leftmost-first end of an assert pattern on a non-ASCII subject
-    // (mid-code-point prefix seeds can never match a UTF-8 continuation byte, so
-    // byte-level unanchoring is sound under code-point stepping).
-    Compiled byte_assert_lf_prog_;
+    bool assert_ascii_tier() const { return !dfa_ok_ && lf_prog_.ok(); }
 
     // EGC byte path: UTF-8 byte programs (forward + reverse), compiled like
     // UnicodeScalar mode, used to run a non-ASCII subject whose every grapheme
@@ -10235,17 +10222,19 @@ private:
 
     // Unanchored leftmost-first byte program (`(?s:.)*?`+pattern, us=true), for
     // the non-ASCII byte tier's lf forward scan (mirror of lf_prog_ over the byte
-    // DFA).
+    // DFA) — an assert plan's byte tier as well (mid-code-point prefix seeds
+    // can never match a UTF-8 continuation byte, so byte-level unanchoring is
+    // sound under the code-point steps of look).
     Compiled byte_lf_prog_;
     bool byte_path_ = false;
     bool byte_crlf_collapse_ =
         false; // byte programs are CRLF-collapsed (capture-free only)
 
-    // Assertion byte tier: byte_prog_/byte_rev_prog_/byte_assert_lf_prog_ built
-    // for a dfa_assert_ok_ (non-dfa_ok_) pattern, so the cached code-point-aware
-    // ByteAssertDfa (leftmost-first) serves it instead of the Pike — for a
+    // Assertion byte tier: byte_prog_/byte_rev_prog_/byte_lf_prog_ built
+    // for a dfa_assert_ok_ (non-dfa_ok_) pattern, so the lazy DFA over them
+    // (leftmost-first, with look) serves it instead of the Pike — for a
     // non-ASCII EGC subject (byte == grapheme) and for US mode on any subject
-    // (US matching == code-point matching == what the byte assert DFA computes).
+    // (US matching == code-point matching == what that DFA computes).
     bool byte_assert_path_ = false;
     // The byte assert tier pattern has capture groups (ncap_ > 0): the assert DFA
     // locates the span, the bounded bitstate over cp_prog_ resolves the groups.
@@ -11374,16 +11363,16 @@ private:
   }
 
   //----------------------------------------------------------------------------
-  // Lazy DFA engines: the empty-width flag machinery, the assertion-aware
-  // DFAs (AssertDfa / ByteAssertDfa / ByteAssertRevDfa) with their scans,
-  // and the leftmost-first LazyDfa that serves test()/search()/find.
+  // Lazy DFA engines: the empty-width flag machinery, the assert tier's
+  // scans, and the LazyDfa that serves test()/search()/find.
   //
-  // Valid only for a "regular" program: no lookaround, no empty-loop guard, and
-  // no positional assertions (^ $ \b) — those make a transition depend on more
-  // than the current byte. A DFA state is the set of consuming/Match program
-  // counters reachable by the capture-free ε-closure; states and their
-  // byte-transitions are interned and built on demand. The subject is scanned
-  // one byte per step, re-seeding the start so the search is unanchored.
+  // Valid only for a program with no lookaround and no empty-loop guard. A
+  // DFA state is the set of consuming/Match program counters reachable by
+  // the capture-free ε-closure; states and their byte-transitions are
+  // interned and built on demand. The subject is scanned one byte per step,
+  // re-seeding the start so the search is unanchored. Positional assertions
+  // (^ $ \b) make a transition depend on more than the current byte: a
+  // program that has them is stepped with LOOK (see LazyDfa).
   //----------------------------------------------------------------------------
 
   // Empty-width assertion condition bits, evaluated at a boundary (see
@@ -11451,53 +11440,6 @@ private:
     }
   }
 
-  // Left-context bits carried by a cached AssertDfa state: what kind of byte
-  // precedes the boundary. (kEOTNL/\Z needs absolute position and is excluded
-  // from the cached path — patterns with \Z are not dfa_assert_ok_.)
-  // kCtxPrevLB: the preceding byte is a line-break byte (\n \r \v \f), for the
-  // multiline ^ anchor (which fires after any line-break grapheme in the ASCII
-  // tier, where detail::segment() does not fuse CR-LF — see empty_flags).
-  // kCtxPrevCR: the preceding code point is exactly U+000D (CR), used only by
-  // the non-ASCII byte tier to exclude a CR-LF cluster's interior from the
-  // multiline anchors (segment() FUSES CR-LF on a non-ASCII subject — see
-  // byte_assert_flags).
-  enum Ctx { kCtxStart = 1, kCtxPrevWord = 2, kCtxPrevLB = 4, kCtxPrevCR = 8 };
-
-  int ctx_of_byte(unsigned char b) const {
-    int c = 0; // not at text start
-    if (is_word_byte(b)) c |= kCtxPrevWord;
-    if (is_line_break_byte(b)) c |= kCtxPrevLB;
-    return c;
-  }
-
-  // Empty-width flags at a boundary, from the left context and the byte about
-  // to be consumed (input == kAssertEnd for the end-of-text boundary). The
-  // cached analogue of empty_flags — produces the identical assert behavior for
-  // the forward scan, with the byte's position-edge role carried by the context
-  // (start) / the end sentinel. Multiline ^/$ fire on any line-break byte.
-  static constexpr int kAssertEnd = 256;
-
-  int assert_flags_from(int ctx, int input) const {
-    bool end = input == kAssertEnd;
-    unsigned char ib = static_cast<unsigned char>(input);
-    // ASCII tier, so no CR-LF fusing: l_cr / r_lf go in false (cf. empty_flags,
-    // which also explains folding multiline_ into the r_lb argument).
-    return bflags(ctx & kCtxStart, ctx & kCtxPrevWord, ctx & kCtxPrevLB,
-                  /*l_cr=*/false, end, !end && is_word_byte(ib),
-                  /*r_lb=*/plan_->multiline_ && !end && is_line_break_byte(ib),
-                  /*r_lf=*/false);
-  }
-
-  // Left context for the non-ASCII byte tier: properties of the previous CODE
-  // POINT (not byte). For ASCII code points (b < 0x80) byte == code point.
-  int bctx_of_cp(char32_t cp) const {
-    int c = 0;
-    if (detail::is_word_cp(cp)) c |= kCtxPrevWord;
-    if (detail::is_line_break_cp(cp)) c |= kCtxPrevLB;
-    if (cp == U'\r') c |= kCtxPrevCR;
-    return c;
-  }
-
   // The empty-width flags at a boundary, from the LEFT code point's properties
   // (l_start = the boundary is the text start, so there is no left code point)
   // and the RIGHT code point's (r_end = the text end). Direction-independent:
@@ -11526,75 +11468,38 @@ private:
     return f;
   }
 
-  // Empty-width flags for the byte tier, from the left code-point context and
-  // the next code point's properties (or end). The forward-scan adapter over
-  // bflags; next_lf marks next == U+000A (for the CR-LF interior test).
-  int byte_assert_flags(int ctx, bool end, bool next_word, bool next_lb,
-                        bool next_lf) const {
-    return bflags(ctx & kCtxStart, ctx & kCtxPrevWord, ctx & kCtxPrevLB,
-                  ctx & kCtxPrevCR, end, next_word, next_lb, next_lf);
-  }
-
-  // Code-point-aware empty-width flags at byte boundary `sp` (the non-ASCII
-  // byte tier's uncached reverse / fallback). Decodes the code point ending at
-  // sp and the one starting at sp. A byte interior to a multi-byte code point
-  // (a UTF-8 continuation byte) is no boundary, so no assertion fires there
-  // (return 0) — matters for empty-matching patterns whose reseed seeds the
-  // assert everywhere.
+  // Code-point-aware empty-width flags at byte boundary `sp`: the code point
+  // ending at sp against the one starting there. A byte interior to a
+  // multi-byte code point (a UTF-8 continuation byte) is no boundary, so no
+  // assertion fires there (return 0).
   int empty_flags_cp(std::string_view t, int sp, int n) const {
-    const char *d = t.data();
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     if (sp > 0 && sp < n && (p[sp] & 0xC0) == 0x80) return 0; // mid-code-point
-    char32_t prev_cp = 0, next_cp = 0;
-    bool has_prev = sp > 0, has_next = sp < n;
-    if (has_prev) {
-      unsigned char b = p[sp - 1];
-      if (b < 0x80) {
-        prev_cp = b;
-      } else {
-        int i = sp - 1;
-        while (i > 0 && (p[i] & 0xC0) == 0x80)
-          i--;
-        size_t bytes;
-        char32_t cp;
-        prev_cp = unicode::utf8::decode_codepoint(d + i, n - i, bytes, cp)
-                      ? cp
-                      : static_cast<char32_t>(b);
-      }
-    }
-    if (has_next) {
-      unsigned char b = p[sp];
-      if (b < 0x80) {
-        next_cp = b;
-      } else {
-        size_t bytes;
-        char32_t cp;
-        next_cp = unicode::utf8::decode_codepoint(d + sp, n - sp, bytes, cp)
-                      ? cp
-                      : static_cast<char32_t>(b);
-      }
-    }
-    int ctx = (sp == 0) ? kCtxStart : bctx_of_cp(prev_cp);
-    bool next_word = has_next && detail::is_word_cp(next_cp);
-    bool next_lb = has_next && detail::is_line_break_cp(next_cp);
-    return byte_assert_flags(ctx, /*end=*/!has_next, next_word, next_lb,
-                             has_next && next_cp == U'\n');
+    const bool has_prev = sp > 0, has_next = sp < n;
+    const char32_t prev = has_prev ? cp_before(t, sp).cp : 0;
+    const char32_t next = has_next ? cp_at(t, sp).cp : 0;
+    return bflags(!has_prev, has_prev && detail::is_word_cp(prev),
+                  has_prev && detail::is_line_break_cp(prev),
+                  has_prev && prev == U'\r', !has_next,
+                  has_next && detail::is_word_cp(next),
+                  has_next && detail::is_line_break_cp(next),
+                  has_next && next == U'\n');
   }
 
-  // Assertion-aware ε-closure: like dfa_closure, but also follows an
-  // Op::Assert* edge when its condition holds in `flags`. Used by the assertion
-  // DFA scans. `visited(pc)` returns true if `pc` was already reached this call
-  // (and otherwise records it); the two public overloads below differ only in
-  // that visited-set mechanism, so the traversal lives here once.
-  template <class Visited>
-  void dfa_closure_assert_impl(const detail::Program &prog,
-                               std::vector<int> stk, std::vector<int> &out,
-                               int flags, Visited visited) const {
+  // Assertion-aware ε-closure: like Plan::dfa_closure, but also follows an
+  // Op::Assert* edge when its condition holds in `flags` — what a lazy DFA's
+  // states are closed with (a dfa_ok_ program has no such edge, and is
+  // closed with no flags). `stk` holds the seeds and is the work stack: it
+  // comes back empty. The caller clears `seen` before the call.
+  void dfa_closure_assert(const detail::Program &prog, std::vector<int> &stk,
+                          std::vector<int> &out, std::vector<char> &seen,
+                          int flags) const {
     using Op = detail::Inst::Op;
     while (!stk.empty()) {
       int pc = stk.back();
       stk.pop_back();
-      if (visited(pc)) continue;
+      if (seen[pc]) continue;
+      seen[pc] = 1;
       const detail::Inst &in = prog.insts[pc];
       switch (in.op) {
       case Op::Jmp: stk.push_back(in.x); break;
@@ -11617,929 +11522,12 @@ private:
     }
   }
 
-  // Plain overload: a `char` visited-vector cleared to 0 before the call.
-  void dfa_closure_assert(const detail::Program &prog, std::vector<int> stk,
-                          std::vector<int> &out, std::vector<char> &seen,
-                          int flags) const {
-    dfa_closure_assert_impl(prog, std::move(stk), out, flags, [&](int pc) {
-      if (seen[pc]) return true;
-      seen[pc] = 1;
-      return false;
-    });
-  }
-
-  // Generation-stamped overload: `seen[pc] == gen` marks a pc visited this call,
-  // so the caller bumps `gen` instead of clearing the whole vector —
-  // O(reachable) per boundary instead of O(program). The byte programs for
-  // \w/\p{L} are huge (~5000 insts), so an uncached per-position scan that
-  // clears `seen` every byte is dominated by the clear; this removes it.
-  void dfa_closure_assert(const detail::Program &prog, std::vector<int> stk,
-                          std::vector<int> &out, std::vector<uint32_t> &seen,
-                          uint32_t gen, int flags) const {
-    dfa_closure_assert_impl(prog, std::move(stk), out, flags, [&](int pc) {
-      if (seen[pc] == gen) return true;
-      seen[pc] = gen;
-      return false;
-    });
-  }
-
-  // A per-thread generation-stamped `seen` for the uncached assert scans: grown
-  // to the program size, never cleared per position. Returns the gen to use
-  // after a bump; re-zeroes only on the (≈never) 32-bit wrap.
-  static std::vector<uint32_t> &stamp_seen(size_t n, uint32_t &gen_out) {
-    static thread_local std::vector<uint32_t> seen;
-    static thread_local uint32_t gen = 0;
-    if (seen.size() < n) seen.assign(n, 0);
-    if (++gen == 0) { // wrapped: reset so stale stamps cannot alias
-      std::fill(seen.begin(), seen.end(), 0);
-      gen = 1;
-    }
-    gen_out = gen;
-    return seen;
-  }
-
-  // An edge of the ASSERT DFAs (the plain LazyDfa keeps its flags per state,
-  // in its own layout — see there): the destination's row (see
-  // AssertStateTable), and beside it the flags the scan loops test at every
-  // byte — accept, leftmost-first front (match is the highest-priority
-  // thread), and dead (empty state set). A step is two loads from one cache
-  // line, and the next step waits on the first alone. Packed into one word —
-  // as they were, to make a step ONE load where an older layout made three or
-  // four from parallel arrays — the flags have to be masked off the row
-  // between each load and the next: an AND on the chain every byte waits on
-  // (`(?m)^\w+` over prose: 485 MB/s so, 575 as a pair). Negative flags are
-  // no flags: -1 for an edge not yet computed, and kEdgeCap from a step to a
-  // state its table has no room for; `>= 0` means "cached", and the loops
-  // test kEdgeCap before reading flag bits.
-  struct AssertEdge {
-    int row;
-    int flags;
-  };
-  enum : int {
-    kEdgeAccept = 1,
-    kEdgeFront = 2,
-    kEdgeDead = 4,
-    kEdgeCap = -2,
-  };
-
-  // The interned-state table shared by the four assertion DFAs (AssertDfa /
-  // ByteAssertDfa / ByteAssertRevDfa / AssertRevDfa). A DFA state is (raw pc-set, context):
-  // leftmost-first DFAs key on the ORDERED set (priority is identity, already
-  // deduped by the closure), the longest/boolean/reverse DFAs sort for a
-  // canonical set. The table owns the intern map, the per-state pc-sets and
-  // contexts, the cached edges (see AssertEdge), and the start-state cache.
-  // `Width` is the transition fan-out: 257 (full byte + end sentinel) for the
-  // grapheme tier, 129 (ASCII byte + sentinel) for the byte tiers, which
-  // cache only ASCII and route non-ASCII through an uncached step_cp. Each
-  // DFA holds one of these plus its own hot step logic.
-  // A state is known to the DFAs and their scans by its ROW — the offset of
-  // its edges in `edges`, premultiplied as the LazyDfa's — so a step neither
-  // multiplies nor adds between one load and the next (see cached()).
-  template <int Width>
-  struct AssertStateTable {
-    std::map<std::pair<std::vector<int>, int>, int> intern; // -> row
-    std::vector<std::vector<int>> states;       // raw pc-set (ordered if lf)
-    std::vector<int> ctxs;                       // context per state
-    // Cached transitions (see AssertEdge): the destination's row, with
-    // kEdgeAccept/kEdgeFront for the pre-input boundary and kEdgeDead of the
-    // destination. Rows back to back, `Width` edges each: [row + input].
-    std::vector<AssertEdge> edges;
-    static constexpr size_t kRowBytes = Width * sizeof(AssertEdge);
-    std::array<int, 16> start_rows; // start row per context (0..15)
-    bool lf;                        // ordered+cut vs sorted set
-    // What `budget` bounds: the edges, and the pc-sets (each held twice, as
-    // a key of `intern` and in `states`). The budget is the cache's (see
-    // FindCache::built), as the lazy DFAs' is.
-    size_t bytes = 0;
-    size_t budget = limits::kDfaCacheBytes;
-    // The key a miss looks up, kept for its capacity: no allocation unless
-    // the state is new (as LazyDfa::key_).
-    std::pair<std::vector<int>, int> key_;
-
-    explicit AssertStateTable(bool leftmost_first) : lf(leftmost_first) {
-      start_rows.fill(-1);
-    }
-
-    // Intern (raw pc-set, ctx) -> the state's row, allocating a fresh row of
-    // edges for a new state — or -1, when the state is new and the table is
-    // full (a start state is always taken: there is one per context). lf
-    // keeps the priority order as identity and the cut bit; non-lf sorts to a
-    // canonical set.
-    int intern_state(const std::vector<int> &pcs, int ctx,
-                     bool start = false) {
-      std::vector<int> &set = key_.first;
-      set.assign(pcs.begin(), pcs.end());
-      key_.second = ctx;
-      if (!lf) {
-        std::sort(set.begin(), set.end());
-        set.erase(std::unique(set.begin(), set.end()), set.end());
-      }
-      auto it = intern.lower_bound(key_);
-      if (it != intern.end() && !(key_ < it->first)) return it->second;
-      if (full() && !start) return -1;
-      int row = static_cast<int>(states.size()) * Width;
-      bytes += kRowBytes + 2 * set.size() * sizeof(int);
-      intern.emplace_hint(it, key_, row);
-      states.push_back(set);
-      ctxs.push_back(ctx);
-      edges.resize(edges.size() + Width, AssertEdge{0, -1});
-      return row;
-    }
-
-    // What every miss path ends in. The edge to the state (pcs, ctx), with
-    // this boundary's accept/front bits and kEdgeDead for an empty set — or
-    // kEdgeCap for its flags, when the table has no room for that state ...
-    AssertEdge edge_to(const std::vector<int> &pcs, int ctx, bool acc,
-                       bool frnt) {
-      const int row = intern_state(pcs, ctx);
-      if (row < 0) return AssertEdge{0, kEdgeCap};
-      return AssertEdge{row, (acc ? kEdgeAccept : 0) | (frnt ? kEdgeFront : 0) |
-                                 (pcs.empty() ? kEdgeDead : 0)};
-    }
-    // ... and that edge cached, as the one the state at `row` has on `input`.
-    AssertEdge link(int row, int input, const std::vector<int> &pcs, int ctx,
-                    bool acc, bool frnt) {
-      const AssertEdge e = edge_to(pcs, ctx, acc, frnt);
-      // (Indexed after the intern: the vector may have grown.)
-      if (e.flags != kEdgeCap) edges[static_cast<size_t>(row + input)] = e;
-      return e;
-    }
-
-    // Cached start state for `ctx` (the closure of {0}); avoids a per-scan map
-    // lookup + `{0}` allocation on every re-entry at the start.
-    int start_row(int ctx) {
-      if (static_cast<unsigned>(ctx) < start_rows.size() &&
-          start_rows[ctx] != -1)
-        return start_rows[ctx];
-      int row = intern_state({0}, ctx, /*start=*/true);
-      if (static_cast<unsigned>(ctx) < start_rows.size()) start_rows[ctx] = row;
-      return row;
-    }
-
-    // What a miss asks of the state at `row`.
-    size_t index(int row) const { return static_cast<size_t>(row / Width); }
-    const std::vector<int> &pcs(int row) const { return states[index(row)]; }
-    int ctx(int row) const { return ctxs[index(row)]; }
-    // The edge of the state at `row` on `input`, as cached (flags -1 if it
-    // is not): the step every byte of a scan waits on (see REGEXLIB_OPAQUE;
-    // the scans carry the row as an int, which the cast keeps from being
-    // sign-extended on that chain). The column is made opaque once for each
-    // of the two loads: as one, they share one sum of row and column, made
-    // between this step's load and the last one's.
-    // `\b[a-z]+\d\b` tested over prose it does not match: 408 MB/s as
-    // edges[id][input] with the flags in the id, 892 so.
-    REGEXLIB_ALWAYS_INLINE AssertEdge cached(int row, int input) const {
-      const AssertEdge *col = detail::walk_column(edges.data(), input);
-      const AssertEdge *fcol = detail::walk_column(edges.data(), input);
-      const uint32_t r = static_cast<uint32_t>(row);
-      return AssertEdge{col[r].row, fcol[r].flags};
-    }
-
-    // No room for another state's row (see limits::kDfaCacheBytes). A full
-    // table still answers, and still learns the edges between the states it
-    // has; only a step to a state it has not is refused (see intern_state).
-    bool full() const { return bytes + kRowBytes > budget; }
-  };
-
-  // Cached assertion-aware DFA (ASCII tier). A state is (raw pc-set,
-  // left-context bits); the transition on a byte first closes the raw set with
-  // the boundary's empty-width flags (derived from the context and that byte),
-  // records whether that boundary accepts, then consumes the byte to the next
-  // raw set. Transitions and accept bits are cached, so after warmup each step
-  // is a table load — DFA speed for \b/^$/\A/\z patterns (which the uncached
-  // scan / Pike could not give, recomputing the closure every position). Input
-  // kAssertEnd is the end boundary. No \Z (kEOTNL needs absolute position; such
-  // patterns are not dfa_assert_ok_).
-  struct AssertDfa {
-    const Regex *re;
-    const detail::Program *prog;
-    int match_pc;
-    bool reseed;
-    AssertStateTable<257> tbl;       // interned states + cached transitions
-    std::vector<char> seen;          // closure scratch (per program inst)
-    std::vector<int> closed, rawnext;
-
-    AssertDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
-              bool leftmost_first = false)
-        : re(&r), prog(&p), match_pc(mpc), reseed(rs), tbl(leftmost_first),
-          seen(p.insts.size(), 0) {}
-
-    int start_row(int ctx) { return tbl.start_row(ctx); }
-
-    // Returns the edge (see AssertEdge), or kEdgeCap as its flags.
-    AssertEdge step(int s, int input) {
-      const AssertEdge nx = tbl.cached(s, input);
-      return nx.flags >= 0 ? nx : next(s, input);
-    }
-
-    // next() deliberately keeps its own copy of the miss path instead of
-    // sharing next_impl<false> with next_lf: routing it through the template
-    // measured ~3-4% slower on assert-heavy patterns (`\b(?:[0-9]{1,3}\.){3}
-    // [0-9]{1,3}\b` over a log corpus, P-core pinned A/B), which is the shape
-    // this tier exists to make fast. next_lf still uses the template.
-    AssertEdge next(int s, int input) {
-      int flags = re->assert_flags_from(tbl.ctx(s), input);
-      std::fill(seen.begin(), seen.end(), 0);
-      closed.clear();
-      re->dfa_closure_assert(*prog, tbl.pcs(s), closed, seen, flags);
-      bool a = false;
-      for (int pc : closed)
-        if (pc == match_pc) {
-          a = true;
-          break;
-        }
-      rawnext.clear();
-      if (input != kAssertEnd) {
-        unsigned char b = static_cast<unsigned char>(input);
-        for (int pc : closed)
-          if (pc != match_pc &&
-              re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-            rawnext.push_back(pc + 1);
-        if (reseed) rawnext.push_back(0);
-      }
-      int newctx = (input == kAssertEnd)
-                       ? 0
-                       : re->ctx_of_byte(static_cast<unsigned char>(input));
-      return tbl.link(s, input, rawnext, newctx, a, false);
-    }
-
-    // Leftmost-first transition: ordered+cut boundary closure (no reseed; the
-    // `(?s:.)*?` prefix in the program expresses unanchoredness). `accept` =
-    // the match is reachable at this boundary; `front` = it is the
-    // highest-priority thread (the cut put it last with nothing consuming ahead
-    // of it -> commit).
-    AssertEdge step_lf(int s, int input) {
-      const AssertEdge nx = tbl.cached(s, input);
-      return nx.flags >= 0 ? nx : next_lf(s, input);
-    }
-
-    AssertEdge next_lf(int s, int input) {
-      return next_impl</*LF=*/true>(s, input);
-    }
-
-    // Advance the closed set `in` over byte `b` into `out`: every pc that
-    // consumes it steps to pc+1. match_pc consumes nothing. Priority order is
-    // preserved, which is what the leftmost-first states rely on.
-    void advance_on(const std::vector<int> &in, unsigned char b,
-                    std::vector<int> &out) {
-      out.clear();
-      for (int pc : in)
-        if (pc != match_pc &&
-            re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-          out.push_back(pc + 1);
-    }
-
-    // The cache-miss path shared by both transition kinds: close the state's raw
-    // set at this boundary, record whether it accepts, consume the byte, intern
-    // the destination. Only the closure (ordered+cut vs plain), how accept is
-    // read off it, and the unanchored re-seed differ.
-    template <bool LF> AssertEdge next_impl(int s, int input) {
-      int flags = re->assert_flags_from(tbl.ctx(s), input);
-      std::fill(seen.begin(), seen.end(), 0);
-      closed.clear();
-      bool a = false, f = false;
-      if constexpr (LF) {
-        re->dfa_closure_assert_lf(*prog, tbl.pcs(s), closed, seen, flags,
-                                  match_pc);
-        // The cut appends match_pc last (and stops), so it is present iff it is
-        // the back element; front iff it is also the front (highest priority).
-        a = !closed.empty() && closed.back() == match_pc;
-        f = !closed.empty() && closed.front() == match_pc;
-      } else {
-        re->dfa_closure_assert(*prog, tbl.pcs(s), closed, seen, flags);
-        for (int pc : closed)
-          if (pc == match_pc) {
-            a = true;
-            break;
-          }
-      }
-      rawnext.clear();
-      int newctx = 0;
-      if (input != kAssertEnd) {
-        unsigned char b = static_cast<unsigned char>(input);
-        advance_on(closed, b, rawnext);
-        if constexpr (!LF) {
-          if (reseed) rawnext.push_back(0);
-        }
-        newctx = re->ctx_of_byte(b);
-      }
-      return tbl.link(s, input, rawnext, newctx, a, f);
-    }
-  };
-
-  // Cached assertion-aware DFA over a UTF-8 byte program (the non-ASCII tier).
-  // A state is (raw byte-program pc-set, left code-point context). Transitions
-  // on the 128 ASCII bytes and the end sentinel are cached in `tbl` (an
-  // ASCII byte is a whole code point, so close-with-flags + consume is one O(1)
-  // step — the same speed as the ASCII AssertDfa, which dominates a
-  // mostly-ASCII subject such as natural-language prose). A non-ASCII code
-  // point is handled by step_cp: decode it, evaluate the boundary flags from
-  // its code-point properties, then consume its bytes through the byte program
-  // (uncached, but rare). The mid-code-point byte consumes use a flags=0
-  // closure (no assertion fires interior to a code point).
-  struct ByteAssertDfa {
-    const Regex *re;
-    const detail::Program *prog;
-    int match_pc;
-    bool reseed;
-    AssertStateTable<129> tbl;       // interned states + cached ASCII transitions
-    std::vector<char> seen;          // closure scratch (per program inst)
-    std::vector<int> closed, rawnext, tmp;
-    static constexpr int kEndIdx = 128;
-
-    ByteAssertDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
-                  bool leftmost_first = false)
-        : re(&r), prog(&p), match_pc(mpc), reseed(rs), tbl(leftmost_first),
-          seen(p.insts.size(), 0) {}
-
-    int start_row(int ctx) { return tbl.start_row(ctx); }
-
-    // ASCII byte (0..127) or the end sentinel (kEndIdx). Cached. Returns the
-    // edge (see AssertEdge), or kEdgeCap as its flags.
-    AssertEdge step_ascii(int s, int idx) {
-      const AssertEdge nx = tbl.cached(s, idx);
-      return nx.flags >= 0 ? nx : step_ascii_impl</*LF=*/false>(s, idx);
-    }
-
-    // A non-ASCII code point at text[sp..]. Evaluates the boundary before it,
-    // consumes its bytes, returns the next state. Uncached (rare). Sets cp_len.
-    AssertEdge step_cp(int s, std::string_view text, int sp, int &cp_len) {
-      return step_cp_impl</*LF=*/false>(s, text, sp, cp_len);
-    }
-
-    // --- Leftmost-first transitions (ordered + match cut, no reseed) ---
-
-    AssertEdge step_ascii_lf(int s, int idx) {
-      const AssertEdge nx = tbl.cached(s, idx);
-      return nx.flags >= 0 ? nx : step_ascii_impl</*LF=*/true>(s, idx);
-    }
-
-    // A non-ASCII code point at text[sp..], leftmost-first. Uncached (rare).
-    AssertEdge step_cp_lf(int s, std::string_view text, int sp, int &cp_len) {
-      return step_cp_impl</*LF=*/true>(s, text, sp, cp_len);
-    }
-
-    // --- Shared miss paths. LF selects the ordered+cut closure (and drops the
-    // unanchored re-seed, which the lf program's own prefix supplies). ---
-
-    // Close tbl.pcs(s) at the boundary described by the next code point's
-    // properties (or end), leaving the closed set in `closed`. `a` = the
-    // boundary accepts; `f` (LF only) = the match is the highest-priority
-    // thread there.
-    template <bool LF>
-    void close_at(int s, bool end, bool nw, bool nlb, bool nlf, bool &a,
-                  bool &f) {
-      int flags = re->byte_assert_flags(tbl.ctx(s), end, nw, nlb, nlf);
-      std::fill(seen.begin(), seen.end(), 0);
-      closed.clear();
-      a = f = false;
-      if constexpr (LF) {
-        re->dfa_closure_assert_lf(*prog, tbl.pcs(s), closed, seen, flags,
-                                  match_pc);
-        a = !closed.empty() &&
-            closed.back() == match_pc; // cut puts match_pc last
-        f = !closed.empty() && closed.front() == match_pc; // highest priority
-      } else {
-        re->dfa_closure_assert(*prog, tbl.pcs(s), closed, seen, flags);
-        for (int pc : closed)
-          if (pc == match_pc) {
-            a = true;
-            break;
-          }
-      }
-    }
-
-    // Interior ε-close of `in` into `out`, ignoring assertions: a position
-    // inside a code point is no boundary, so nothing can fire there. The LF
-    // form is priority-preserving (and needs no cut interior to a code point).
-    template <bool LF>
-    void close_no_assert(const std::vector<int> &in, std::vector<int> &out) {
-      std::fill(seen.begin(), seen.end(), 0);
-      out.clear();
-      if constexpr (LF)
-        re->dfa_closure_assert_lf(*prog, in, out, seen, /*flags=*/0, match_pc);
-      else
-        re->dfa_closure_assert(*prog, in, out, seen, /*flags=*/0);
-    }
-
-    // Advance the closed set `in` over byte `b` into `out`: every pc that
-    // consumes it steps to pc+1. match_pc consumes nothing, and priority order
-    // carries through — what the leftmost-first states rely on.
-    void advance_on(const std::vector<int> &in, unsigned char b,
-                    std::vector<int> &out) {
-      out.clear();
-      for (int pc : in)
-        if (pc != match_pc &&
-            re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-          out.push_back(pc + 1);
-    }
-
-    template <bool LF> AssertEdge step_ascii_impl(int s, int idx) {
-      bool end = idx == kEndIdx;
-      unsigned char b = static_cast<unsigned char>(idx);
-      bool a, f;
-      close_at<LF>(s, end, !end && is_word_byte(b),
-                   !end && is_line_break_byte(b), !end && b == '\n', a, f);
-      rawnext.clear();
-      int newctx = 0;
-      if (!end) {
-        advance_on(closed, b, rawnext);
-        if constexpr (!LF) {
-          if (reseed) rawnext.push_back(0);
-        }
-        newctx = re->bctx_of_cp(static_cast<char32_t>(b));
-      }
-      return tbl.link(s, idx, rawnext, newctx, a, f);
-    }
-
-    template <bool LF>
-    AssertEdge step_cp_impl(int s, std::string_view text, int sp, int &cp_len) {
-      const char *d = text.data();
-      int n = static_cast<int>(text.size());
-      char32_t cp;
-      size_t bytes = unicode::utf8::decode_or_byte(d + sp, n - sp, cp);
-      cp_len = static_cast<int>(bytes);
-      bool a, f;
-      close_at<LF>(s, /*end=*/false, detail::is_word_cp(cp),
-                   detail::is_line_break_cp(cp), cp == U'\n', a, f);
-      const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
-      // Consume the code point's bytes through the byte program, ε-closing
-      // between bytes since interior positions are no boundary.
-      advance_on(closed, p[sp], rawnext);
-      for (int k = 1; k < cp_len; k++) {
-        close_no_assert<LF>(rawnext, tmp);
-        advance_on(tmp, p[sp + k], rawnext);
-      }
-      if constexpr (!LF) {
-        if (reseed) rawnext.push_back(0);
-      }
-      return tbl.edge_to(rawnext, re->bctx_of_cp(cp), a, f);
-    }
-  };
-
-  // Right code-point context carried by a ByteAssertRevDfa state (the code
-  // point to the RIGHT of the boundary, already consumed scanning backward).
-  enum RCtx { kRWord = 1, kRLb = 2, kRLf = 4, kREnd = 8 };
-
-  int rctx_of_cp(char32_t cp) const {
-    int c = 0;
-    if (detail::is_word_cp(cp)) c |= kRWord;
-    if (detail::is_line_break_cp(cp)) c |= kRLb;
-    if (cp == U'\n') c |= kRLf;
-    return c;
-  }
-
-  int rctx_at(std::string_view text, int e) const {
-    int n = static_cast<int>(text.size());
-    if (e == n) return kREnd;
-    const char *d = text.data();
-    size_t bytes;
-    char32_t cp;
-    if (!unicode::utf8::decode_codepoint(d + e, n - e, bytes, cp))
-      cp = static_cast<unsigned char>(d[e]);
-    return rctx_of_cp(cp);
-  }
-
-  // Cached assertion-aware DFA over the reversed byte program (byte_rev_prog_),
-  // for locating a match's leftmost start by scanning backward from its end.
-  // The mirror of ByteAssertDfa: a state is (raw reversed pc-set, right
-  // code-point context); a transition consumes the code point to the LEFT (so
-  // the boundary's flags use left=input, right=context); the begin sentinel
-  // marks the text start. Caching amortizes the high per-position fan-out of a
-  // \w/\p{L} byte automaton, which an uncached reverse scan pays at every
-  // position (the find bottleneck).
-  struct ByteAssertRevDfa {
-    const Regex *re;
-    const detail::Program *prog;
-    int match_pc;
-    AssertStateTable<129> tbl;       // interned states + cached left transitions
-    std::vector<char> seen;          // closure scratch (per program inst)
-    std::vector<int> closed, rawnext, tmp;
-    static constexpr int kBeginIdx = 128;
-
-    // Reverse DFA is boolean: sorted set identity, no cut bit (lf = false).
-    ByteAssertRevDfa(const Regex &r, const detail::Program &p, int mpc)
-        : re(&r), prog(&p), match_pc(mpc), tbl(/*lf=*/false),
-          seen(p.insts.size(), 0) {}
-
-    int start_row(int rctx) { return tbl.start_row(rctx); }
-
-    void close_at(int s, bool l_start, bool lw, bool llb, bool lcr, bool &a) {
-      int rctx = tbl.ctx(s);
-      int flags = re->bflags(l_start, lw, llb, lcr, rctx & kREnd, rctx & kRWord,
-                             rctx & kRLb, rctx & kRLf);
-      std::fill(seen.begin(), seen.end(), 0);
-      closed.clear();
-      re->dfa_closure_assert(*prog, tbl.pcs(s), closed, seen, flags);
-      a = false;
-      for (int pc : closed)
-        if (pc == match_pc) {
-          a = true;
-          break;
-        }
-    }
-
-    void close_no_assert(const std::vector<int> &in, std::vector<int> &out) {
-      std::fill(seen.begin(), seen.end(), 0);
-      out.clear();
-      re->dfa_closure_assert(*prog, in, out, seen, /*flags=*/0);
-    }
-
-    // Left byte b (0..127) or the begin sentinel (kBeginIdx). Cached. Returns
-    // the edge (see AssertEdge), or kEdgeCap as its flags.
-    AssertEdge step_left(int s, int idx) {
-      const AssertEdge nx = tbl.cached(s, idx);
-      if (nx.flags >= 0) return nx;
-      bool begin = idx == kBeginIdx;
-      unsigned char b = static_cast<unsigned char>(idx);
-      bool a;
-      close_at(s, begin, !begin && is_word_byte(b),
-               !begin && is_line_break_byte(b), !begin && b == '\r', a);
-      rawnext.clear();
-      int newr = 0;
-      if (!begin) {
-        for (int pc : closed)
-          if (pc != match_pc &&
-              re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-            rawnext.push_back(pc + 1);
-        newr = re->rctx_of_cp(static_cast<char32_t>(b));
-      }
-      return tbl.link(s, idx, rawnext, newr, a, false);
-    }
-
-    // A non-ASCII code point ending at byte `pos` (its bytes are consumed in
-    // reverse order through the reversed byte program). Uncached (rare). Sets
-    // cp_len.
-    AssertEdge step_left_cp(int s, std::string_view text, int pos,
-                            int &cp_len) {
-      const char *d = text.data();
-      const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
-      int n = static_cast<int>(text.size());
-      int i = pos - 1;
-      while (i > 0 && (p[i] & 0xC0) == 0x80)
-        i--; // lead byte of the left cp
-      size_t bytes;
-      char32_t cp;
-      if (!unicode::utf8::decode_codepoint(d + i, n - i, bytes, cp))
-        cp = p[pos - 1];
-      cp_len = pos - i;
-      bool a;
-      close_at(s, /*l_start=*/false, detail::is_word_cp(cp),
-               detail::is_line_break_cp(cp), cp == U'\r', a);
-      // Consume the left cp's bytes in reverse order: p[pos-1] .. p[i].
-      rawnext.clear();
-      for (int pc : closed)
-        if (pc != match_pc &&
-            re->plan_->inst_matches_byte(*prog, prog->insts[pc], p[pos - 1]))
-          rawnext.push_back(pc + 1);
-      for (int k = pos - 2; k >= i; k--) {
-        close_no_assert(rawnext, tmp);
-        rawnext.clear();
-        for (int pc : tmp)
-          if (pc != match_pc &&
-              re->plan_->inst_matches_byte(*prog, prog->insts[pc], p[k]))
-            rawnext.push_back(pc + 1);
-      }
-      return tbl.edge_to(rawnext, re->rctx_of_cp(cp), a, false);
-    }
-  };
-
-  // Right-context bits of an ASCII-tier byte (byte == code point, so no
-  // decode). kRLf is deliberately omitted: the ASCII tier does not fuse
-  // CR-LF, so the bit would only split interned states without changing any
-  // flag (rassert_flags passes the CR-LF arguments as false).
-  int rctx_of_byte(unsigned char b) const {
-    int c = 0;
-    if (is_word_byte(b)) c |= kRWord;
-    if (is_line_break_byte(b)) c |= kRLb;
-    return c;
-  }
-
-  // Right-context bits of the byte at boundary `e` for the ASCII reverse
-  // assert DFA.
-  int rctx_at_byte(std::string_view text, int e) const {
-    if (e == static_cast<int>(text.size())) return kREnd;
-    return rctx_of_byte(static_cast<unsigned char>(text[e]));
-  }
-
-  // Empty-width flags at a boundary from the LEFT byte (the reverse scan's
-  // input; l_start = the boundary is the text start) and the RIGHT byte's
-  // context bits. The reverse-scan adapter over bflags, mirroring
-  // byte_assert_flags: the CR-LF-interior arguments are hard false because
-  // the ASCII tier does not fuse CR-LF (multiline ^/$ fire on any line-break
-  // byte), and kEOTNL is omitted because \Z patterns are not
-  // dfa_assert_ok_.
-  int rassert_flags(bool l_start, bool l_word, bool l_lb, int rctx) const {
-    return bflags(l_start, l_word, l_lb, /*l_cr=*/false, rctx & kREnd,
-                  rctx & kRWord, rctx & kRLb, /*r_lf=*/false);
-  }
-
-  // Cached assertion-aware DFA over the reversed grapheme/ASCII program
-  // (rev_prog_), for locating a match's leftmost start by scanning backward
-  // from its end — the ASCII-tier mirror of ByteAssertRevDfa (no code-point
-  // decode: the tier only runs on ASCII subjects). Caching matters because the
-  // find loop pays a reverse scan PER MATCH; the uncached set simulation
-  // (assert_reverse_start_slow) recomputes the closure and clears its visited
-  // vector at every position, dominating dense-match assert finds (e.g.
-  // `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b` over a log corpus).
-  struct AssertRevDfa {
-    const Regex *re;
-    const detail::Program *prog;
-    int match_pc;
-    AssertStateTable<257> tbl; // interned states + cached left transitions
-    std::vector<char> seen;    // closure scratch (per program inst)
-    std::vector<int> closed, rawnext;
-    static constexpr int kBeginIdx = 256;
-
-    // Reverse DFA is boolean: sorted set identity, no cut bit (lf = false).
-    AssertRevDfa(const Regex &r, const detail::Program &p, int mpc)
-        : re(&r), prog(&p), match_pc(mpc), tbl(/*lf=*/false),
-          seen(p.insts.size(), 0) {}
-
-    int start_row(int rctx) { return tbl.start_row(rctx); }
-
-    // Left byte b (0..255) or the begin sentinel (kBeginIdx). Cached. Returns
-    // the edge (see AssertEdge), or kEdgeCap as its flags.
-    AssertEdge step_left(int s, int idx) {
-      const AssertEdge nx = tbl.cached(s, idx);
-      if (nx.flags >= 0) return nx;
-      bool begin = idx == kBeginIdx;
-      unsigned char b = static_cast<unsigned char>(idx);
-      int flags = re->rassert_flags(begin, !begin && is_word_byte(b),
-                                    !begin && is_line_break_byte(b),
-                                    tbl.ctx(s));
-      std::fill(seen.begin(), seen.end(), 0);
-      closed.clear();
-      re->dfa_closure_assert(*prog, tbl.pcs(s), closed, seen, flags);
-      bool a = false;
-      for (int pc : closed)
-        if (pc == match_pc) {
-          a = true;
-          break;
-        }
-      rawnext.clear();
-      int newr = 0;
-      if (!begin) {
-        for (int pc : closed)
-          if (pc != match_pc &&
-              re->plan_->inst_matches_byte(*prog, prog->insts[pc], b))
-            rawnext.push_back(pc + 1);
-        newr = re->rctx_of_byte(b);
-      }
-      return tbl.link(s, idx, rawnext, newr, a, false);
-    }
-  };
-
-  // --- Assertion-tier scans: the locate / verify drivers over the assert
-  // DFAs above. ASCII grapheme tier first; the non-ASCII byte tier follows
-  // under its own banner. ---
-
-  // Left context bits at boundary `sp` (for the cached AssertDfa start state).
-  int ctx_at(std::string_view text, int sp) const {
-    if (sp == 0) return kCtxStart;
-    return ctx_of_byte(static_cast<unsigned char>(text[sp - 1]));
-  }
-
-  // Assertion-aware forward scan over prog_ (ASCII tier), via the cached
-  // unanchored (re-seeding) AssertDfa: the end of the FIRST match at or after
-  // `from`, or -1 — the boolean test() tier. On kCap (a table with no room
-  // for the next state: see limits::kDfaCacheBytes) falls back to the
-  // uncached scan.
-  int assert_fwd_scan(FindCache &fc, std::string_view text, int from) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    AssertDfa &d = fc.afu(*this);
-    int s = d.start_row(ctx_at(text, from));
-    for (int sp = from;; sp++) {
-      int input = (sp < n) ? p[sp] : kAssertEnd;
-      const AssertEdge ed = d.step(s, input);
-      if (ed.flags == kEdgeCap)
-        return assert_fwd_scan_slow(plan_->prog_, plan_->match_pc(), text, from,
-                                    /*cp_flags=*/false);
-      if (ed.flags & kEdgeAccept) return sp;
-      if (sp == n) break;
-      s = ed.row;
-    }
-    return -1;
-  }
-
-  // Uncached assertion-aware forward scan (set simulation), the cap fallback
-  // for both assert_fwd_scan (grapheme/ASCII: prog_, cp_flags=false) and
-  // assert_byte_fwd_scan (byte: byte_prog_, cp_flags=true): the unanchored
-  // (re-seeding) first-match end, or -1. Closes the active set with each
-  // boundary's empty-width flags (`eflags`).
-  int assert_fwd_scan_slow(const detail::Program &prog, int mpc,
-                           std::string_view text, int from,
-                           bool cp_flags) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    // Empty-width flags differ only by unit: code-point boundaries for the byte
-    // program, byte boundaries for the grapheme/ASCII program.
-    auto eflags = [&](int sp) {
-      return cp_flags ? empty_flags_cp(text, sp, n) : empty_flags(text, sp, n);
-    };
-    static thread_local std::vector<char> seen;
-    static thread_local std::vector<int> cur, seeds, next;
-    seen.assign(prog.insts.size(), 0);
-    cur.clear();
-    dfa_closure_assert(prog, {0}, cur, seen, eflags(from));
-    for (int sp = from;; sp++) {
-      for (int pc : cur)
-        if (pc == mpc) return sp;
-      if (sp == n) break;
-      seeds.clear();
-      for (int pc : cur)
-        if (pc != mpc && plan_->inst_matches_byte(prog, prog.insts[pc], p[sp]))
-          seeds.push_back(pc + 1);
-      seeds.push_back(0); // unanchored re-seed
-      std::fill(seen.begin(), seen.end(), 0);
-      next.clear();
-      dfa_closure_assert(prog, seeds, next, seen, eflags(sp + 1));
-      cur.swap(next);
-    }
-    return -1;
-  }
-
-  // Leftmost-first assertion forward scan (ordered states + match cut). Returns
-  // the leftmost-first match end (>= from), -1 if none. `anchored` selects the
-  // bare lf DFA (alfa over prog_) for match(); else the unanchored alfu over
-  // assert_lf_prog_
-  // (`(?s:.)*?`+pattern). The prefix expresses unanchoredness, so the scan
-  // logic is the same: record the last accepting boundary; commit early when
-  // the match is the highest-priority thread (front); stop when the ordered set
-  // dies. On kCap falls back to the slow set simulation. (Defined inline; AssertDfa is a
-  // complete type in the body.)
-  int assert_fwd_scan_lf(FindCache &fc, std::string_view text, int from,
-                         bool anchored) const {
-    return assert_fwd_scan_lf(anchored ? fc.alfa(*this) : fc.alfu(*this), text,
-                              from);
-  }
-
-  // `reach` (optional) reports the last boundary examined — the byte cost of
-  // a FAILED anchored verify, for the prefilters' walk budgets. On kEdgeCap
-  // it is the fallback's to report: that scan starts over at `from`, and
-  // what a verify costs is what was walked, not where the table gave out. (A
-  // full table answers kEdgeCap within a few bytes of every candidate; charged
-  // for those bytes alone, `a[ab]*a[ab]{12}\d\b` over 262 KB of a's and b's
-  // took 7.6 s — every `a` a candidate, every verify a walk to the end.)
-  int assert_fwd_scan_lf(AssertDfa &d, std::string_view text, int from,
-                         int *reach = nullptr) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    int s = d.start_row(ctx_at(text, from));
-    int e = -1;
-    int sp = from;
-    for (;; sp++) {
-      int input = (sp < n) ? p[sp] : kAssertEnd;
-      const AssertEdge ed = d.step_lf(s, input);
-      if (ed.flags == kEdgeCap)
-        return assert_fwd_scan_lf_slow(*d.prog, d.match_pc, text, from,
-                                       /*cp_flags=*/false, reach);
-      if (ed.flags & kEdgeAccept) e = sp;
-      if (ed.flags & kEdgeFront) {
-        if (reach) *reach = sp;
-        return sp; // match is highest priority -> committed leftmost-first
-      }
-      if (sp == n) break;
-      if (ed.flags & kEdgeDead) break; // ordered set died -> no extension
-      s = ed.row;
-    }
-    if (reach) *reach = sp;
-    return e;
-  }
-
-  // Uncached leftmost-first assert forward scan (ordered set simulation with
-  // cut), the cap fallback for both assert_fwd_scan_lf (grapheme/ASCII,
-  // cp_flags=false) and assert_byte_fwd_scan_lf (byte, cp_flags=true). The two
-  // differed only in the empty-width flag unit. `reach` as theirs.
-  int assert_fwd_scan_lf_slow(const detail::Program &prog, int mpc,
-                              std::string_view text, int from, bool cp_flags,
-                              int *reach = nullptr) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    auto eflags = [&](int sp) {
-      return cp_flags ? empty_flags_cp(text, sp, n) : empty_flags(text, sp, n);
-    };
-    static thread_local std::vector<char> seen;
-    static thread_local std::vector<int> cur, seeds, next;
-    seen.assign(prog.insts.size(), 0);
-    cur.clear();
-    dfa_closure_assert_lf(prog, {0}, cur, seen, eflags(from), mpc);
-    int e = -1;
-    int sp = from;
-    for (;; sp++) {
-      // The cut appends mpc last, so it is present iff it is the back element.
-      bool accept = !cur.empty() && cur.back() == mpc;
-      bool front = !cur.empty() && cur.front() == mpc;
-      if (accept) e = sp;
-      if (front) { // committed
-        e = sp;
-        break;
-      }
-      if (sp == n) break;
-      seeds.clear();
-      unsigned char b = p[sp];
-      for (int pc : cur)
-        if (pc != mpc && plan_->inst_matches_byte(prog, prog.insts[pc], b))
-          seeds.push_back(pc + 1);
-      std::fill(seen.begin(), seen.end(), 0);
-      next.clear();
-      dfa_closure_assert_lf(prog, seeds, next, seen, eflags(sp + 1), mpc);
-      cur.swap(next);
-      if (cur.empty()) break;
-    }
-    if (reach) *reach = sp;
-    return e;
-  }
-
-  // Assertion-aware reverse scan over rev_prog_: given a match ends at `e`,
-  // scan leftward and return the leftmost start s (>= floor) with [s, e) a
-  // match, or -1. Empty-width flags are absolute-position properties, so the
-  // same boundary flags are evaluated at each visited boundary regardless of
-  // scan direction. Runs on the cached AssertRevDfa (the find loop pays one
-  // reverse scan per match); falls back to the uncached set simulation on a
-  // full table (kCap).
-  // `walked` (optional) reports the bytes scanned leftward — the cost of a
-  // FAILED candidate's reverse verify, for the prefilters' walk budgets (the
-  // fallback's own, on kEdgeCap: see assert_fwd_scan_lf).
-  int assert_reverse_start(FindCache &fc, std::string_view text, int e,
-                           int floor, int *walked = nullptr) const {
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    AssertRevDfa &d = fc.arv(*this);
-    int s = d.start_row(rctx_at_byte(text, e));
-    int leftmost = -1;
-    int pos = e;
-    for (;;) {
-      int idx = (pos == 0) ? AssertRevDfa::kBeginIdx : p[pos - 1];
-      const AssertEdge ed = d.step_left(s, idx);
-      if (ed.flags == kEdgeCap)
-        return assert_reverse_start_slow(plan_->rev_prog_.prog,
-                                         plan_->rev_prog_.match_pc(), text, e,
-                                         floor, /*cp_flags=*/false, walked);
-      if (ed.flags & kEdgeAccept) leftmost = pos; // [pos, e) is a match
-      if (pos == floor || pos == 0) break;
-      if (ed.flags & kEdgeDead) break; // dead set: no earlier start can revive
-      s = ed.row;
-      pos--;
-    }
-    if (walked) *walked = e - pos;
-    return leftmost;
-  }
-
-  // Uncached assertion-aware reverse scan (set simulation), the kCap
-  // fallback for both assert_reverse_start (grapheme/ASCII: rev_prog_,
-  // cp_flags=false) and assert_byte_reverse_start (byte: byte_rev_prog_,
-  // cp_flags=true) — the mirror of assert_fwd_scan_slow. Given a match ending
-  // at `e`, returns its leftmost start >= floor, or -1. Anchored at `e`, so no
-  // re-seed. `walked` as theirs.
-  int assert_reverse_start_slow(const detail::Program &prog, int mpc,
-                                std::string_view text, int e, int floor,
-                                bool cp_flags, int *walked = nullptr) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    // Empty-width flags differ only by unit: code-point boundaries for the byte
-    // program, byte boundaries for the grapheme/ASCII program.
-    auto eflags = [&](int sp) {
-      return cp_flags ? empty_flags_cp(text, sp, n) : empty_flags(text, sp, n);
-    };
-    static thread_local std::vector<int> cur, seeds, next;
-    uint32_t gen;
-    std::vector<uint32_t> &seen = stamp_seen(prog.insts.size(), gen);
-    cur.clear();
-    dfa_closure_assert(prog, {0}, cur, seen, gen, eflags(e));
-    int leftmost = -1;
-    for (int pc : cur)
-      if (pc == mpc) {
-        leftmost = e;
-        break;
-      } // empty match [e, e)
-    int pos = e;
-    for (; pos > floor; pos--) {
-      seeds.clear();
-      for (int pc : cur)
-        if (pc != mpc &&
-            plan_->inst_matches_byte(prog, prog.insts[pc], p[pos - 1]))
-          seeds.push_back(pc + 1);
-      next.clear();
-      stamp_seen(prog.insts.size(), gen); // bump the generation
-      dfa_closure_assert(prog, seeds, next, seen, gen, eflags(pos - 1));
-      cur.swap(next);
-      if (cur.empty()) break;
-      for (int pc : cur)
-        if (pc == mpc) {
-          leftmost = pos - 1;
-          break;
-        }
-    }
-    if (walked) *walked = e - pos;
-    return leftmost;
-  }
+  // --- Assertion-tier scans: the locate / verify drivers of an assert
+  // pattern. Its DFAs are the lazy DFAs, stepped with look (see LazyDfa):
+  // over the grapheme programs on an ASCII subject, over the UTF-8 byte
+  // programs (`byte`) on any other the tier serves. As every lazy-DFA scan
+  // does, they answer LazyDfa::kCap when the DFA gives up, and the caller
+  // goes to the Pike. ---
 
   // The flag-only assert verify: a fixed-literal hit at [ls, ls+m) is a match
   // iff some branch's leading anchors hold at ls and its trailing anchors at
@@ -12590,9 +11578,16 @@ private:
   // Fixed-text assert prefilter: memmem the literal; confirm the assertions with
   // an anchored assert-DFA verify at each hit (the matched text is exactly the
   // literal, so a verified match spans [ls, ls + |lit|)). `byte` selects the
-  // non-ASCII byte assert DFA. Returns the next match with start >= `from`.
-  bool assert_lit_find(FindCache &fc, std::string_view text, int from,
-                       int &s_out, int &e_out, bool byte) const {
+  // byte programs' DFA. Returns 1 with the next match that starts at or
+  // after `from`, 0 when there is none, or LazyDfa::kCap.
+  // (Out of line, as the three finds after it: each is a candidate loop
+  // around a literal scan, and that scan is inlined into it. All inlined
+  // into assert_find_span instead — which calls each once — the compiler
+  // left the scans as calls, one a candidate: `t[a-z]+ly\b` over prose,
+  // 8.7 GB/s -> 7.8.)
+  REGEXLIB_NOINLINE int assert_lit_find(FindCache &fc, std::string_view text,
+                                        int from, int &s_out, int &e_out,
+                                        bool byte) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
@@ -12602,29 +11597,26 @@ private:
     // Fast path: the assertions are flag-anchors around the literal, so each
     // memmem hit is verified by two empty_flags() reads (no DFA). Otherwise
     // fetch the anchored assert DFA once for the candidate loop.
-    ByteAssertDfa *bd =
-        (!plan_->assert_.anchor_ok && byte) ? &fc.balfa(*this) : nullptr;
-    AssertDfa *ad =
-        (!plan_->assert_.anchor_ok && !byte) ? &fc.alfa(*this) : nullptr;
+    LazyDfa *d = plan_->assert_.anchor_ok ? nullptr : &dfa_fwda(fc, byte);
     int scan = from;
     while (scan <= n) {
       const unsigned char *h =
           find_substr(p + scan, n - scan, lit, m, plan_->assert_.lit_probe,
                       plan_->assert_.lit_probe2);
-      if (!h) return false;
+      if (!h) return 0;
       int ls = static_cast<int>(h - p);
       int end = plan_->assert_.anchor_ok
                     ? (assert_anchor_verify(text, ls, m, byte) ? ls + m : -1)
-                    : (byte ? assert_byte_fwd_scan_lf(*bd, text, ls)
-                            : assert_fwd_scan_lf(*ad, text, ls));
+                    : look_forward_lf(*d, text, ls);
+      if (end == LazyDfa::kCap) return end;
       if (end == ls + m) { // assertions hold here -> a match of the fixed text
         s_out = ls;
         e_out = end;
-        return true;
+        return 1;
       }
       scan = ls + 1; // assertions failed here; try the next occurrence
     }
-    return false;
+    return 0;
   }
 
   // Leading-literal assert prefilter: memmem the prefix for a candidate start
@@ -12632,23 +11624,24 @@ private:
   // (every assertion) and returns its leftmost-first end. memmem yields starts
   // in left-to-right order and every match starts with the prefix, so the first
   // verifying occurrence is the leftmost-first match — sound for any pattern
-  // whose first consuming atom is this literal. `byte` selects the non-ASCII
-  // byte assert DFA. Returns the next match with start >= `from`.
-  // Returns 1 (found, s_out/e_out set), 0 (no more matches), or kWalkBail
-  // when the failed-verify walk `budget` runs out (linearity guard: a body
-  // that can absorb its own prefix byte re-walks overlapping tails from
-  // every candidate — the caller falls back to the unfiltered linear scan).
-  int assert_prefix_find(FindCache &fc, std::string_view text, int from,
-                         int &s_out, int &e_out, bool byte,
-                         WalkBudget &budget) const {
+  // whose first consuming atom is this literal. `byte` selects the byte
+  // programs' DFA. Returns the next match with start >= `from`.
+  // Returns 1 (found, s_out/e_out set), 0 (no more matches), LazyDfa::kCap,
+  // or kWalkBail when the failed-verify walk `budget` runs out (linearity
+  // guard: a body that can absorb its own prefix byte re-walks overlapping
+  // tails from every candidate — the caller falls back to the unfiltered
+  // linear scan).
+  REGEXLIB_NOINLINE int assert_prefix_find(FindCache &fc,
+                                           std::string_view text, int from,
+                                           int &s_out, int &e_out, bool byte,
+                                           WalkBudget &budget) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
         reinterpret_cast<const unsigned char *>(plan_->assert_.prefix.data());
     int n = static_cast<int>(text.size());
     int m = static_cast<int>(plan_->assert_.prefix.size());
-    ByteAssertDfa *bd = byte ? &fc.balfa(*this) : nullptr;
-    AssertDfa *ad = byte ? nullptr : &fc.alfa(*this);
+    LazyDfa &d = dfa_fwda(fc, byte);
     int scan = from;
     while (scan + m <= n) {
       const unsigned char *h =
@@ -12658,8 +11651,8 @@ private:
       if (!h) return 0;
       int ls = static_cast<int>(h - p);
       int reach = ls;
-      int end = byte ? assert_byte_fwd_scan_lf(*bd, text, ls, &reach)
-                     : assert_fwd_scan_lf(*ad, text, ls, &reach);
+      int end = look_forward_lf(d, text, ls, &reach);
+      if (end == LazyDfa::kCap) return end;
       if (end >= 0) { // assertions hold and the body matches from ls
         s_out = ls;
         e_out = end;
@@ -12693,8 +11686,8 @@ private:
   // length) per real candidate, the rest skipped by the memmem and the trailing
   // check. Correct on any subject the assert tier serves (single-cp clusters or
   // ASCII, so code point == grapheme).
-  bool assert_word_find(std::string_view text, int from, int &s_out,
-                        int &e_out) const {
+  REGEXLIB_NOINLINE bool assert_word_find(std::string_view text, int from,
+                                          int &s_out, int &e_out) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
@@ -12745,24 +11738,26 @@ private:
   // context). The end is then re-taken by an anchored forward scan from the
   // start: a greedy pre-part (e.g. `.*` in `.*\B.?b`) can extend the match past
   // the seed literal to a later one, so the literal only pins the start (rure's
-  // ReverseSuffix; cf. suffix_find). `byte` selects the non-ASCII byte DFAs.
+  // ReverseSuffix; cf. suffix_find). `byte` selects the byte programs' DFAs.
   // Leftmost-first sound: matches end with the literal, memmem hits every end in
   // order, and the one-cp-atom pre-part gate keeps the first reverse-verified
   // occurrence at the leftmost start (same argument as suffix_find).
-  // Returns 1 (found), 0 (no more matches), or kWalkBail when the
-  // failed-candidate walk `budget` runs out — a failed candidate's reverse
+  // Returns 1 (found), 0 (no more matches), LazyDfa::kCap, or kWalkBail when
+  // the failed-candidate walk `budget` runs out — a failed candidate's reverse
   // verify walks from its seed end toward the floor, and the floor only
   // advances on success, so dense failing seeds after one match can re-walk
   // the same gap (the caller falls back to the unfiltered linear scan).
-  int assert_suffix_find(FindCache &fc, std::string_view text, int from,
-                         int &s_out, int &e_out, bool byte,
-                         WalkBudget &budget) const {
+  REGEXLIB_NOINLINE int assert_suffix_find(FindCache &fc,
+                                           std::string_view text, int from,
+                                           int &s_out, int &e_out, bool byte,
+                                           WalkBudget &budget) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
         reinterpret_cast<const unsigned char *>(plan_->assert_.suffix.data());
     int n = static_cast<int>(text.size());
     int m = static_cast<int>(plan_->assert_.suffix.size());
+    LazyDfa &rv = dfa_rev(fc, byte), &fwda = dfa_fwda(fc, byte);
     int scan = from;
     while (scan + m <= n) {
       // Cheap `\b` reject: a word byte right after a word-ending literal fails
@@ -12779,95 +11774,96 @@ private:
       if (!h) return 0;
       int ls = static_cast<int>(h - p);
       int e = ls + m; // a match would end here (literal is the last atom)
-      int walked = 0;
-      int s = byte
-                  ? assert_byte_reverse_start(fc, text, e, /*floor=*/from,
-                                              &walked)
-                  : assert_reverse_start(fc, text, e, /*floor=*/from, &walked);
+      int low = e; // the reverse verify walked [low, e)
+      int s = look_reverse(rv, text, e, /*floor=*/from, &low);
+      if (s == LazyDfa::kCap) return s;
       if (s >= 0 && s < e) {
-        int ge = byte ? assert_byte_fwd_scan_lf(fc, text, s, /*anchored=*/true)
-                      : assert_fwd_scan_lf(fc, text, s, /*anchored=*/true);
+        int ge = look_forward_lf(fwda, text, s);
+        if (ge == LazyDfa::kCap) return ge;
         if (ge < e) ge = e; // defensive: never shorter than the seed
         s_out = s;
         e_out = ge;
         return 1;
       }
-      if (!budget.spend(walked))
+      if (!budget.spend(e - low))
         return kWalkBail; // adversarial overlap -> plain scan
       scan = ls + 1; // assertions / leading context failed; next occurrence
     }
     return 0;
   }
 
+  // The assert find: the leftmost-first match at or after `from` as [s, e).
+  // Returns 1 (found), 0 (no match remains) or LazyDfa::kCap. `byte` selects
+  // the byte programs' DFAs over the grapheme programs' (see above).
   // `walk_budget` (optional) is the caller's loop-wide failed-walk allowance
   // for the literal prefilters (see kWalkBail): the fill / iterator loops own
   // one budget across all their calls — a per-call budget would reset at
   // every match and still admit O(matches × n). A null budget (one-shot
   // search/match callers) uses a per-call local. On exhaustion the literal
   // prefilters are skipped and the unfiltered (linear) scan below answers.
-  bool assert_find_span(FindCache &fc, std::string_view text, int from, int &s,
-                        int &e, WalkBudget *walk_budget = nullptr) const {
+  int assert_find_span(FindCache &fc, std::string_view text, int from, int &s,
+                       int &e, bool byte,
+                       WalkBudget *walk_budget = nullptr) const {
+    // What a scan that found nothing answers: nothing, or that it gave up.
+    const auto none = [](int r) { return r == LazyDfa::kCap ? r : 0; };
     // Text-begin-anchored (e.g. the `^...$` validation shape): every match
     // starts at 0, so a find from a later floor cannot succeed, and from == 0
-    // is answered by the bare ANCHORED assert DFA (alfa, shared with match())
-    // — its state set dies at the first mismatching byte, where the unanchored
-    // lf scan's `(?s:.)*?` prefix thread would walk the rest of the subject.
-    // The reverse start-scan is provably redundant (the start is 0), and the
-    // literal prefilters above can only postpone the same single anchored run.
+    // is answered by the bare ANCHORED DFA (shared with match()) — its state
+    // set dies at the first mismatching byte, where the unanchored lf scan's
+    // `(?s:.)*?` prefix thread would walk the rest of the subject. The
+    // reverse start-scan is provably redundant (the start is 0), and the
+    // literal prefilters below can only postpone the same single anchored
+    // run.
     if (plan_->text_anchored_) {
-      if (from > 0) return false;
+      if (from > 0) return 0;
       // [Tier: AnchoredOnePass] one deterministic walk decides the whole
-      // find (anchored_onepass_try). ASCII subject guaranteed by the
-      // caller's gate; a non-ASCII byte (defensive) falls through to the
-      // assert DFA.
-      {
-        int e1 = 0;
-        int r = anchored_onepass_try(text, e1);
-        if (r >= 0) {
-          if (r == 0) return false;
-          s = 0;
-          e = e1;
-          return true;
-        }
-      }
-      int e0 = assert_fwd_scan_lf(fc, text, 0, /*anchored=*/true);
-      if (e0 < 0) return false;
+      // find (anchored_onepass_try): sound on any subject — a non-ASCII
+      // byte bails to the DFA below.
+      int e0 = 0;
+      const int r = anchored_onepass_try(text, e0);
+      if (r == 0) return 0;
+      if (r < 0) e0 = look_forward_lf(dfa_fwda(fc, byte), text, 0);
+      if (e0 < 0) return none(e0);
       s = 0;
       e = e0;
-      return true;
+      return 1;
     }
     if (!plan_->assert_.lit.empty())
-      return assert_lit_find(fc, text, from, s, e, /*byte=*/false);
+      return assert_lit_find(fc, text, from, s, e, byte);
     if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
     WalkBudget local_budget(text.size());
     WalkBudget &budget = walk_budget ? *walk_budget : local_budget;
-    // [Tier: WordOnePass] one walk per candidate replaces the assert DFA's
-    // forward scan + per-match reverse start recovery. It looks at every
-    // byte, so a literal anchor the plan priced below it goes first
-    // (wop_after_anchor_) and the word scan is what its budget bail falls to.
-    if (plan_->wop_.ok && !plan_->wop_after_anchor_) {
+    // [Tier: WordOnePass] one walk per candidate replaces the forward scan +
+    // per-match reverse start recovery (ASCII subjects: the walk has no byte
+    // form). It looks at every byte, so a literal anchor the plan priced
+    // below it goes first (wop_after_anchor_) and the word scan is what its
+    // budget bail falls to.
+    const bool wop = plan_->wop_.ok && !byte;
+    if (wop && !plan_->wop_after_anchor_) {
       int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
       // budget / non-ASCII -> the assert chain below
     }
     if (!plan_->assert_.suffix.empty()) {
-      int r = assert_suffix_find(fc, text, from, s, e, /*byte=*/false, budget);
-      if (r != kWalkBail) return r > 0;
+      int r = assert_suffix_find(fc, text, from, s, e, byte, budget);
+      if (r != kWalkBail) return r;
       // budget hit -> the unfiltered scan below
     } else if (!plan_->assert_.prefix.empty()) {
-      int r = assert_prefix_find(fc, text, from, s, e, /*byte=*/false, budget);
-      if (r != kWalkBail) return r > 0;
+      int r = assert_prefix_find(fc, text, from, s, e, byte, budget);
+      if (r != kWalkBail) return r;
     }
-    if (plan_->wop_.ok && plan_->wop_after_anchor_) {
+    if (wop && plan_->wop_after_anchor_) {
       int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
     }
-    int e0 = assert_fwd_scan_lf(fc, text, from, /*anchored=*/false);
-    if (e0 < 0) return false;
-    s = assert_reverse_start(fc, text, e0, /*floor=*/from);
-    if (s < 0) return false; // should not happen (e0 came from a real match)
+    // Leftmost-first end from the ordered+cut forward DFA; the boolean
+    // reverse scan recovers the leftmost start.
+    const int e0 = look_forward_lf(dfa_fwd(fc, byte), text, from);
+    if (e0 < 0) return none(e0);
+    s = look_reverse(dfa_rev(fc, byte), text, e0, /*floor=*/from);
+    if (s < 0) return none(s); // (-1: not of an end a real match gave)
     e = e0;
-    return true;
+    return 1;
   }
 
   // Whether the assertion-aware DFA find serves this (pattern, subject): a
@@ -12876,207 +11872,7 @@ private:
   // stage. `fna` is the dispatch site's precomputed first-non-ASCII index, so
   // the gate adds no extra O(n) classification pass.
   bool assert_find_ok(std::string_view text, size_t fna) const {
-    return plan_->assert_lf_prog_.ok() && ascii_grapheme_ok(text, fna);
-  }
-
-  // --- Non-ASCII assertion byte tier (over byte_prog_, code-point-aware) ---
-
-  // Start context for the cached ByteAssertDfa at boundary `sp`: properties of
-  // the code point ending at sp (or kCtxStart at the text start).
-  int bctx_at(std::string_view text, int sp) const {
-    if (sp == 0) return kCtxStart;
-    const char *d = text.data();
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
-    int n = static_cast<int>(text.size());
-    int i = sp - 1;
-    while (i > 0 && (p[i] & 0xC0) == 0x80)
-      i--; // back to the lead byte
-    size_t bytes;
-    char32_t cp;
-    if (!unicode::utf8::decode_codepoint(d + i, n - i, bytes, cp))
-      cp = p[sp - 1];
-    return bctx_of_cp(cp);
-  }
-
-  // Forward scan over byte_prog_ via the cached unanchored (re-seeding)
-  // ByteAssertDfa (DFA speed on the ASCII bulk, decode-per-code-point on the
-  // rare non-ASCII): the end byte offset of the FIRST match at or after
-  // `from`, or -1 — the boolean test() tier. Falls back to the uncached scan
-  // on a full table (kCap).
-  int assert_byte_fwd_scan(FindCache &fc, std::string_view text,
-                           int from) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    ByteAssertDfa &d = fc.bafu(*this);
-    int s = d.start_row(bctx_at(text, from));
-    for (int sp = from;;) {
-      AssertEdge ed;
-      int adv;
-      if (sp == n) {
-        ed = d.step_ascii(s, ByteAssertDfa::kEndIdx);
-        adv = 0;
-      } else if (p[sp] < 0x80) {
-        ed = d.step_ascii(s, p[sp]);
-        adv = 1;
-      } else {
-        int cp_len = 1;
-        ed = d.step_cp(s, text, sp, cp_len);
-        adv = cp_len;
-      }
-      if (ed.flags == kEdgeCap)
-        return assert_fwd_scan_slow(plan_->byte_prog_.prog, plan_->byte_prog_.match_pc(), text, from,
-                                    /*cp_flags=*/true);
-      if (ed.flags & kEdgeAccept) return sp;
-      if (sp == n) break;
-      s = ed.row;
-      sp += adv;
-    }
-    return -1;
-  }
-
-  // Leftmost-first forward scan over the byte assert program (ordered + match
-  // cut). `anchored` selects balfa (bare byte_prog_) for match(); else balfu
-  // over byte_assert_lf_prog_ (any-byte `.*?`-prefixed). Returns the
-  // leftmost-first end byte offset (>= from) or -1. Mirror of
-  // assert_byte_fwd_scan; commits on `front`.
-  // Thin wrapper for once-per-call callers; loop callers fetch the DFA once and
-  // call the reference overload directly — thread_cache() is too costly to
-  // re-enter per candidate (a pool warm + map hash lookup + bind every time, on
-  // the order of the whole scan when candidates are dense, e.g. an anchored
-  // fixed-text literal).
-  int assert_byte_fwd_scan_lf(FindCache &fc, std::string_view text, int from,
-                              bool anchored) const {
-    return assert_byte_fwd_scan_lf(
-        anchored ? fc.balfa(*this) : fc.balfu(*this), text, from);
-  }
-
-  int assert_byte_fwd_scan_lf(ByteAssertDfa &d, std::string_view text,
-                              int from, int *reach = nullptr) const {
-    int n = static_cast<int>(text.size());
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    int s = d.start_row(bctx_at(text, from));
-    int e = -1;
-    int sp = from;
-    for (;;) {
-      AssertEdge ed;
-      int adv;
-      if (sp == n) {
-        ed = d.step_ascii_lf(s, ByteAssertDfa::kEndIdx);
-        adv = 0;
-      } else if (p[sp] < 0x80) {
-        ed = d.step_ascii_lf(s, p[sp]);
-        adv = 1;
-      } else {
-        int cp_len = 1;
-        ed = d.step_cp_lf(s, text, sp, cp_len);
-        adv = cp_len;
-      }
-      if (ed.flags == kEdgeCap)
-        return assert_fwd_scan_lf_slow(*d.prog, d.match_pc, text, from,
-                                       /*cp_flags=*/true, reach);
-      if (ed.flags & kEdgeAccept) e = sp;
-      if (ed.flags & kEdgeFront) {
-        if (reach) *reach = sp;
-        return sp; // match highest priority -> committed leftmost-first
-      }
-      if (sp == n) break;
-      if (ed.flags & kEdgeDead) break; // ordered set died
-      s = ed.row;
-      sp += adv;
-    }
-    if (reach) *reach = sp;
-    return e;
-  }
-
-  // Reverse scan over byte_rev_prog_ via the cached ByteAssertRevDfa: leftmost
-  // start s >= floor with [s, e) a match, or -1. Backward, code-point by code
-  // point (ASCII fast / non-ASCII decode); the begin sentinel marks the text
-  // start. Falls back to the uncached scan on a full table (kCap).
-  int assert_byte_reverse_start(FindCache &fc, std::string_view text, int e,
-                                int floor, int *walked = nullptr) const {
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    ByteAssertRevDfa &d = fc.barv(*this);
-    int s = d.start_row(rctx_at(text, e));
-    int leftmost = -1;
-    int pos = e;
-    for (;;) {
-      AssertEdge ed;
-      int adv;
-      if (pos == 0) {
-        ed = d.step_left(s, ByteAssertRevDfa::kBeginIdx);
-        adv = 0;
-      } else if (p[pos - 1] < 0x80) {
-        ed = d.step_left(s, p[pos - 1]);
-        adv = 1;
-      } else {
-        int cp_len = 1;
-        ed = d.step_left_cp(s, text, pos, cp_len);
-        adv = cp_len;
-      }
-      if (ed.flags == kEdgeCap)
-        return assert_reverse_start_slow(plan_->byte_rev_prog_.prog,
-                                         plan_->byte_rev_prog_.match_pc(), text,
-                                         e, floor, /*cp_flags=*/true, walked);
-      if (ed.flags & kEdgeAccept) leftmost = pos; // [pos, e) is a match
-      if (pos == floor || pos == 0) break;
-      if (ed.flags & kEdgeDead) break; // dead set
-      s = ed.row;
-      pos -= adv;
-    }
-    if (walked) *walked = e - pos;
-    return leftmost;
-  }
-
-  bool assert_byte_find_span(FindCache &fc, std::string_view text, int from,
-                             int &s, int &e,
-                             WalkBudget *walk_budget = nullptr) const {
-    // Text-begin-anchored: from > 0 cannot match, from == 0 is answered by
-    // the bare anchored byte assert DFA (balfa, shared with match()) — see
-    // assert_find_span.
-    if (plan_->text_anchored_) {
-      if (from > 0) return false;
-      // [Tier: AnchoredOnePass] (see anchored_onepass_try): sound on any
-      // subject — a non-ASCII byte bails to the byte assert DFA below.
-      {
-        int e1 = 0;
-        int r = anchored_onepass_try(text, e1);
-        if (r >= 0) {
-          if (r == 0) return false;
-          s = 0;
-          e = e1;
-          return true;
-        }
-      }
-      int e0 = assert_byte_fwd_scan_lf(fc, text, 0, /*anchored=*/true);
-      if (e0 < 0) return false;
-      s = 0;
-      e = e0;
-      return true;
-    }
-    if (!plan_->assert_.lit.empty())
-      return assert_lit_find(fc, text, from, s, e, /*byte=*/true);
-    if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
-    WalkBudget local_budget(text.size());
-    WalkBudget &budget = walk_budget ? *walk_budget : local_budget;
-    if (!plan_->assert_.suffix.empty()) {
-      int r = assert_suffix_find(fc, text, from, s, e, /*byte=*/true, budget);
-      if (r != kWalkBail) return r > 0;
-      // budget hit -> the unfiltered scan below
-    } else if (!plan_->assert_.prefix.empty()) {
-      int r = assert_prefix_find(fc, text, from, s, e, /*byte=*/true, budget);
-      if (r != kWalkBail) return r > 0;
-    }
-    // Leftmost-first end from the ordered+cut byte assert DFA; the boolean
-    // reverse scan recovers the leftmost start. No longest-safe predicate.
-    int e0 = assert_byte_fwd_scan_lf(fc, text, from, /*anchored=*/false);
-    if (e0 < 0) return false;
-    s = assert_byte_reverse_start(fc, text, e0, /*floor=*/from);
-    if (s < 0) return false;
-    e = e0;
-    return true;
+    return plan_->assert_ascii_tier() && ascii_grapheme_ok(text, fna);
   }
 
   // Whether the non-ASCII assertion byte tier serves this (pattern, subject):
@@ -13133,26 +11929,10 @@ private:
   // reached match cuts the alternatives that come after it. A plain last-accept
   // forward scan over states built this way therefore yields the leftmost-first
   // end (greedy a+ keeps its higher-priority continue thread; lazy a+? and
-  // `a|ab` stop at the cut), so no longest-safe predicate is needed. Only
-  // Char/Class/Any/Match/ Split/Jmp/Save appear here — dfa_ok_ excludes
-  // Loop/Look/Assert.
-  //
-  // These programs are dfa_ok_, so they carry no Op::Assert* at all — which
-  // makes this exactly dfa_closure_assert_lf with no condition bits set, and it
-  // forwards there rather than keeping a second copy of the ordered walk. (The
-  // byte tier's close_no_assert<LF> leans on the same equivalence.)
-  void dfa_closure_lf(const detail::Program &prog,
-                      const std::vector<int> &seeds, std::vector<int> &out,
-                      std::vector<char> &seen, int match_pc) const {
-    dfa_closure_assert_lf(prog, seeds, out, seen, /*flags=*/0, match_pc);
-  }
-
-  // Leftmost-first ε-closure WITH assertions: dfa_closure_lf plus the
-  // Op::Assert* edges of dfa_closure_assert (followed iff their empty-width
-  // condition holds in `flags`). Ordered DFS pre-order (Split.x before
-  // Split.y), Save skipped, cut at the first Match — so a priority-ordered
-  // assert DFA yields the leftmost-first end without a longest-safe predicate.
-  // Caller clears `seen` before the call.
+  // `a|ab` stop at the cut), so no longest-safe predicate is needed.
+  // An Op::Assert* edge is followed iff its empty-width condition holds in
+  // `flags` (a dfa_ok_ program has none, and is closed with no flags). The
+  // caller clears `seen` before the call.
   void dfa_closure_assert_lf(const detail::Program &prog,
                              const std::vector<int> &seeds,
                              std::vector<int> &out, std::vector<char> &seen,
@@ -13194,6 +11974,43 @@ private:
 
   struct Scratch; // reusable Pike VM buffers, defined below
 
+  // A code point of the subject and the bytes it takes. (By value, in two
+  // registers: a length handed back through a reference pins it — and what
+  // the caller computes from it — to the caller's stack.)
+  struct Decoded {
+    char32_t cp;
+    int len;
+  };
+
+  // The code point that starts at byte `at` (< n). A byte that starts none
+  // stands in for itself, one byte long.
+  static Decoded cp_at(std::string_view text, int at) {
+    char32_t cp = static_cast<unsigned char>(text[static_cast<size_t>(at)]);
+    if (cp < 0x80) return {cp, 1};
+    const size_t len = unicode::utf8::decode_or_byte(
+        text.data() + at, text.size() - static_cast<size_t>(at), cp);
+    return {cp, static_cast<int>(len)};
+  }
+
+  // The code point that ends at byte `at` (> 0): back over the continuation
+  // bytes to a lead byte. Where that is no code point, the bytes stepped
+  // over count as one, standing for the last of them.
+  static Decoded cp_before(std::string_view text, int at) {
+    const unsigned char *p =
+        reinterpret_cast<const unsigned char *>(text.data());
+    if (p[at - 1] < 0x80) return {p[at - 1], 1};
+    int i = at - 1;
+    while (i > 0 && (p[i] & 0xC0) == 0x80)
+      i--;
+    size_t bytes;
+    char32_t cp;
+    if (!unicode::utf8::decode_codepoint(text.data() + i,
+                                         text.size() - static_cast<size_t>(i),
+                                         bytes, cp))
+      cp = p[at - 1];
+    return {cp, at - i};
+  }
+
   // Shared lazy-DFA driver. A state is a set of program counters — sorted and
   // de-duplicated, or in priority order with the match cut when `lf` — and
   // byte transitions are built on demand. A state is accepting if it contains
@@ -13221,6 +12038,20 @@ private:
   // fill that took fewer than limits::kDfaMinBytesPerState subject bytes per
   // state built means states are being built about as fast as bytes are
   // read, and that is the Pike's work done the slow way.
+  //
+  // LOOK. A program with empty-width assertions (`\b`, `^`, `$`, `\A`, `\z`)
+  // runs on the same table, the way RE2's and regex-automata's do. Whether
+  // an assertion holds at a boundary takes the code points on both sides of
+  // it, so a state also carries what stands BEHIND it (its context: the
+  // text's edge, or what the code point just consumed is — see kEdge) and
+  // holds its pcs unclosed; the step over the next code point closes them
+  // under the assertions that hold between the two, notes whether that
+  // boundary accepts, and then consumes. A state's accept and front flags
+  // therefore speak for the boundary BEFORE the code point that led to it: a
+  // look scan sees a match one step late, and steps once more over the
+  // text's edge, which has a column of its own (`edge`). What a non-ASCII
+  // code point is cannot be read off its bytes, so the step over one is
+  // taken whole and never cached (the ASCII bulk of a subject is).
   struct LazyDfa {
     // Pointers (not references) so LazyDfa is a regular movable value type: it
     // lives inside std::optional in a FindCache and, in future, inside a pooled
@@ -13235,6 +12066,7 @@ private:
         false; // leftmost-first: ordered (priority) states + match cut, so
                // the scan needs no longest-safe predicate. States are NOT
                // sorted (order is identity) and the closure cuts at Match.
+    bool look; // the program has assertions (see LOOK above)
     bool use_prefilter =
         true;             // first-byte dead-skip; off on the EGC byte path,
                           // whose first_bytes_.set (from the grapheme program,
@@ -13245,7 +12077,8 @@ private:
     bool quit = false;    // gave up (see above): every miss answers kQuit.
                           // What is cached still answers, so a scan that
                           // stays on built transitions is still a DFA scan.
-    bool unplanned = false; // built over a program without plan classes
+    bool reverse = false; // look: steps right to left (a reverse program),
+                          // so the context is what stands to the RIGHT
 
     static constexpr uint32_t kUnknown = 0xFFFFFFFFu; // transition not built
     static constexpr uint32_t kQuit = 0xFFFFFFFEu;    // next(): gave up
@@ -13258,9 +12091,24 @@ private:
     static constexpr uint32_t kStart = 8;  // the start state: where a forward
                                            // scan may skip ahead (see
                                            // dfa_start_skip)
+    // Look: what a code point — or the text's edge — is to the boundary
+    // beside it. A state's context, and the input of a step.
+    // (Not "half of a CR-LF", though in a Grapheme plan the pair is one
+    // cluster with no line boundary inside: a subject that holds one is
+    // given to these DFAs only with a pattern for which an anchor that
+    // fires there changes nothing — see Plan::crlf_byte_safe.)
+    static constexpr uint8_t kEdge = 1, kWord = 2, kBreak = 4;
+    static constexpr int kContexts = 8;
+    // A look state's key ends in one byte: its context, and above it the
+    // kAccept / kFront of the boundary behind it.
+    static constexpr int kTagFlags = 3;
 
+    // The columns (see columns()): nothing of the table is read before a
+    // scan has asked for its start state, which is where they are made.
     uint8_t cls[256];    // byte -> column of its class
     uint32_t stride = 0; // entries per state: the flags + one per class
+                         // (+ the edge's, with look); 0 = not made yet
+    uint32_t edge = 0;   // look: the column of the text's edge
     // Rows back to back: [flags][column 0][column 1]... A state id is the
     // index of its column 0, so tr[s - 1] is its flags and tr[s + cls[b]] its
     // transition on byte b (kUnknown until built).
@@ -13277,8 +12125,9 @@ private:
     std::vector<State> states;
     std::vector<uint8_t> pcs;
     std::vector<uint32_t> slots;
-    uint32_t start_state = kUnknown; // invariant per DFA (cached); re-made
-                                     // by a clear
+    // The start state — one per context, with look ([0] alone without) —
+    // is invariant per DFA (cached); re-made after a clear.
+    uint32_t start_state[kContexts];
 
     // Bytes of table + states the cache may hold, and the refills allowed
     // before a fill has to pay. Set by the FindCache that builds the DFA.
@@ -13290,34 +12139,34 @@ private:
     uint64_t scanned = 0;
 
     std::vector<char> seen;        // closure scratch (per program inst)
-    std::vector<int> seeds_, out_; // next()'s scratch: no allocation per miss
+    std::vector<int> seeds_, out_; // a step's scratch: no allocation per miss
     std::vector<uint8_t> key_;     // ... and the packed form of out_
 
     // `reseed` is part of the DFA's identity: the transition tables for the
     // unanchored (re-seeding) and anchored runs differ, so each needs its own
     // LazyDfa. One instance is reused across every match in a find_all (and,
     // via FindCache, across find_all calls).
-    // `bc` is the program's byte classes, as the plan computed them.
-    LazyDfa(const Regex &r, const detail::Program &p, int mpc,
-            const Plan::ByteClasses &bc, bool rs, bool pf = true,
-            bool leftmost_first = false)
+    LazyDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
+            bool pf = true, bool leftmost_first = false)
         : re(&r), prog(&p), match_pc(mpc), reseed(rs), lf(leftmost_first),
-          use_prefilter(pf &&
+          look(!r.plan_->dfa_ok_),
+          use_prefilter(pf && !look &&
                         r.plan_->start_skip_ != Plan::StartSkip::None) {
-      // Nothing is allocated until the first scan (make_start): a rung
-      // fetches its DFAs before it knows whether it will step them.
-      if (bc.n) {
-        std::memcpy(cls, bc.cls.data(), sizeof cls);
-        stride = bc.n + 1;
-      } else {
-        // A program the plan computed no classes for (none is known to get
-        // here — see plan_byte_classes): a column per byte, which is always
-        // right.
-        for (int b = 0; b < 256; b++)
-          cls[b] = static_cast<uint8_t>(b);
-        stride = 257;
-        unplanned = true;
-      }
+      // Nothing is worked out or allocated until the first scan
+      // (make_start): a rung fetches its DFAs before it knows whether it
+      // will step them.
+      std::fill(std::begin(start_state), std::end(start_state), kUnknown);
+    }
+
+    // The table's columns: the byte classes of the program (see
+    // Plan::byte_classes — it has some: the plan builds a lazy DFA over no
+    // program with a lookaround or a guarded loop), and with look one more
+    // for the text's edge.
+    void columns() {
+      const Plan::ByteClasses bc = re->plan_->byte_classes(*prog, look);
+      std::memcpy(cls, bc.cls.data(), sizeof cls);
+      edge = bc.n;
+      stride = edge + 1 + look;
     }
 
     // The state's canonical key: a sorted set, or — leftmost-first — the
@@ -13383,21 +12232,36 @@ private:
       slots[i] = n;
     }
 
-    // The id of the state whose (canonical) pc list is `v`, or kUnknown.
-    // Leaves the list packed in key_ and its hash in `h`, for add().
-    uint32_t find(const std::vector<int> &v, uint32_t &h) {
+    // The id of the state whose (canonical) pc list is `v` — and, with look,
+    // whose tag is `tag` — or kUnknown. Leaves the key packed in key_ and
+    // its hash in `h`, for add().
+    uint32_t find(const std::vector<int> &v, uint8_t tag, uint32_t &h) {
       pack(v, key_);
+      if (look) key_.push_back(tag);
       h = hash_of(key_);
       return lookup(key_, h);
     }
 
-    // Append the state `v`, packed in key_ with hash `h` (find() just missed
-    // it), and return its id.
-    uint32_t add(const std::vector<int> &v, uint32_t h) {
-      uint32_t flags = 0;
-      if (v.empty()) flags |= kDead;
-      if (lf && !v.empty() && v.front() == match_pc) flags |= kFront;
-      if (std::find(v.begin(), v.end(), match_pc) != v.end()) flags |= kAccept;
+    // kAccept / kFront as a closed pc list has them: the match is in it, and
+    // — leftmost-first, where the closure cuts at the match and so puts it
+    // last — is all of it that outranks nothing.
+    uint32_t match_flags(const std::vector<int> &closed) const {
+      if (closed.empty()) return 0;
+      if (!lf)
+        return std::find(closed.begin(), closed.end(), match_pc) !=
+                       closed.end()
+                   ? kAccept
+                   : 0;
+      return (closed.back() == match_pc ? kAccept : 0) |
+             (closed.front() == match_pc ? kFront : 0);
+    }
+
+    // Append the state (`v`, `tag`), packed in key_ with hash `h` (find()
+    // just missed it), and return its id.
+    uint32_t add(const std::vector<int> &v, uint8_t tag, uint32_t h) {
+      const uint32_t flags =
+          (v.empty() ? kDead : 0) |
+          (look ? static_cast<uint32_t>(tag >> kTagFlags) : match_flags(v));
       states.push_back({static_cast<uint32_t>(pcs.size()),
                         static_cast<uint32_t>(key_.size()), h});
       pcs.insert(pcs.end(), key_.begin(), key_.end());
@@ -13435,90 +12299,212 @@ private:
       states.clear();
       pcs.clear();
       slots.assign(64, 0);
-      start_state = kUnknown;
+      std::fill(std::begin(start_state), std::end(start_state), kUnknown);
       scanned = 0;
       clears++;
     }
 
-    uint32_t start() {
-      // The start state (closure of {0}) is the same on every scan, so compute
-      // it once — find_all calls start() ~3x per match on the reused DFAs.
-      if (start_state != kUnknown) return start_state;
-      return make_start();
+    // The start state: the closure of {0} — or, with look, {0} itself behind
+    // the context `ctx`. The same on every scan, so computed once: find_all
+    // calls start() ~3x per match on the reused DFAs.
+    uint32_t start(uint8_t ctx = 0) {
+      if (start_state[ctx] != kUnknown) return start_state[ctx];
+      return make_start(ctx);
     }
 
-    REGEXLIB_NOINLINE uint32_t make_start() {
+    REGEXLIB_NOINLINE uint32_t make_start(uint8_t ctx) {
+      if (!stride) columns();
       if (slots.empty()) slots.assign(64, 0);
       std::vector<int> sp, seeds{0};
       seen.assign(prog->insts.size(), 0); // reused across calls
-      if (lf)
-        re->dfa_closure_lf(*prog, seeds, sp, seen, match_pc);
+      if (look)
+        sp = seeds;
       else
-        re->plan_->dfa_closure(*prog, seeds, sp, seen);
+        close(seeds, sp, /*flags=*/0);
       canonical(sp);
       uint32_t h;
-      uint32_t s = find(sp, h);
-      if (s == kUnknown) s = add(sp, h);
-      tr[s - 1] |= kStart;
-      return start_state = s;
+      uint32_t s = find(sp, ctx, h);
+      if (s == kUnknown) s = add(sp, ctx, h);
+      // (Not with look: its scans have no skip, and a context's start state
+      // is also what a re-seeding scan is in after any byte of that kind.)
+      if (!look) tr[s - 1] |= kStart;
+      return start_state[ctx] = s;
+    }
+
+    // The ε-closure of `in` into `out`, following the assertions that hold
+    // in `flags` (a program without look has none to follow). `in` is the
+    // closure's to use up.
+    void close(std::vector<int> &in, std::vector<int> &out, int flags) {
+      std::fill(seen.begin(), seen.end(), 0);
+      out.clear();
+      if (lf)
+        re->dfa_closure_assert_lf(*prog, in, out, seen, flags, match_pc);
+      else
+        re->dfa_closure_assert(*prog, in, out, seen, flags);
+    }
+
+    // `in` stepped over byte `b` into `out`: every pc that consumes it moves
+    // on. In the order given, which the leftmost-first states rely on.
+    void advance(const std::vector<int> &in, unsigned char b,
+                 std::vector<int> &out) const {
+      out.clear();
+      for (int pc : in)
+        if (pc != match_pc &&
+            re->plan_->lazy_inst_matches(*prog, prog->insts[pc], b))
+          out.push_back(pc + 1);
+    }
+
+    // The pcs of state `s` into `out`, in stored order; its tag is returned
+    // (look).
+    uint8_t unpack_state(uint32_t s, std::vector<int> &out) const {
+      const State st = states[(s - 1) / stride];
+      const uint8_t *q = pcs.data() + st.off, *end = q + st.len - look;
+      out.clear();
+      for (int pc = 0; q < end;)
+        out.push_back(pc = unpack(q, pc));
+      return look ? *end : 0;
+    }
+
+    // What every miss ends in: the state (out_, `tag`) a step leads to,
+    // interned — or kQuit, when the DFA gives up.
+    //
+    // A NEW state that does not fit clears the cache first, and then every
+    // id but the one returned is gone (`kept` is false: the state the step
+    // left has no row to note the transition in). The scan carries on from
+    // the returned state; either way it must re-read the table's address,
+    // which any new state can move.
+    uint32_t settle(uint8_t tag, bool &kept) {
+      canonical(out_);
+      kept = true;
+      uint32_t h;
+      uint32_t nxt = find(out_, tag, h);
+      if (nxt != kUnknown) return nxt;
+      if (full()) {
+        if (clears >= min_clears &&
+            scanned < limits::kDfaMinBytesPerState * states.size()) {
+          quit = true;
+          return kQuit;
+        }
+        clear();
+        kept = false;
+        if (!look) {
+          make_start(0); // every scan starts there, and skips there
+          nxt = find(out_, tag, h); // (the start state itself, possibly)
+          if (nxt != kUnknown) return nxt;
+        }
+      }
+      return add(out_, tag, h);
     }
 
     // NOTE: a state's flags (accept / front / dead) are deliberately NOT
     // packed into the transition value. They are per-STATE, and the scan loops load them OFF the step's
     // dependency chain (in parallel with the next step's load, from the same
     // row); packing them into the id would put an extra AND ON the chain —
-    // measured ~12% slower. The assert tables' flags are per-EDGE, and sit
-    // beside the row in each edge for the same reason (see AssertEdge).
+    // measured ~12% slower. (With look, too: what is true of the boundary
+    // behind a state is part of which state it is.)
 
     // The cache-miss path of a step: build the transition from state `s` on
     // byte `b`. `stepped` is how many subject bytes the scan has stepped
     // since it last reported (see `scanned`). Returns the destination state,
-    // or kQuit when the DFA has given up.
-    //
-    // A NEW state that does not fit clears the cache first, and then every
-    // id but the one returned is gone: the scan carries on from the returned
-    // state. Either way it must re-read the table's address, which any new
-    // state can move.
+    // or kQuit when the DFA has given up (see settle for what a clear does).
     REGEXLIB_NOINLINE uint32_t next(uint32_t s, unsigned char b, int stepped) {
       scanned += static_cast<uint64_t>(stepped);
       if (quit) return kQuit;
-      const State st = states[(s - 1) / stride];
-      seeds_.clear();
-      // In stored order: priority is preserved for the lf closure.
-      int pc = 0;
-      for (const uint8_t *q = pcs.data() + st.off, *end = q + st.len;
-           q < end;) {
-        pc = unpack(q, pc);
-        if (pc != match_pc &&
-            re->plan_->lazy_inst_matches(*prog, prog->insts[pc], b))
-          seeds_.push_back(pc + 1);
-      }
+      unpack_state(s, out_);
+      advance(out_, b, seeds_);
       if (reseed) seeds_.push_back(0); // unanchored start at lowest priority
-      std::fill(seen.begin(), seen.end(), 0);
-      out_.clear();
-      if (lf)
-        re->dfa_closure_lf(*prog, seeds_, out_, seen, match_pc);
-      else
-        re->plan_->dfa_closure(*prog, seeds_, out_, seen);
-      canonical(out_);
-      uint32_t h;
-      uint32_t nxt = find(out_, h);
-      if (nxt == kUnknown) {
-        if (full()) {
-          if (clears >= min_clears &&
-              scanned < limits::kDfaMinBytesPerState * states.size()) {
-            quit = true;
-            return kQuit;
-          }
-          clear();
-          make_start(); // every scan starts there, and skips there
-          nxt = find(out_, h); // (the start state itself, possibly)
-          return nxt != kUnknown ? nxt : add(out_, h);
-        }
-        nxt = add(out_, h);
-      }
-      tr[s + cls[b]] = nxt;
+      close(seeds_, out_, /*flags=*/0);
+      bool kept;
+      const uint32_t nxt = settle(/*tag=*/0, kept);
+      if (kept && nxt != kQuit) tr[s + cls[b]] = nxt;
       return nxt;
+    }
+
+    // --- Look ---
+
+    // What the code point `cp` is to a boundary beside it. (A line break
+    // only where a `^` or a `$` can ask: the context is part of which state
+    // a state is. And an ASCII one by the short way: every scan asks this
+    // of the code point it starts beside, and a verify is a few steps long.)
+    uint8_t side(char32_t cp) const {
+      const bool word =
+          cp < 0x80 ? detail::ascii_word_byte(static_cast<unsigned char>(cp))
+                    : detail::is_word_cp(cp);
+      return (word ? kWord : 0) |
+             (re->plan_->multiline_ && detail::is_line_break_cp(cp) ? kBreak
+                                                                    : 0);
+    }
+
+    // The context of a scan that starts at boundary `at`: what stands behind
+    // it.
+    uint8_t context(std::string_view text, int at) const {
+      if (at == (reverse ? static_cast<int>(text.size()) : 0)) return kEdge;
+      return side((reverse ? cp_at(text, at) : cp_before(text, at)).cp);
+    }
+
+    // The column of a look step from boundary `at`: the text's edge, or the
+    // class of the byte the step meets first.
+    uint32_t column(std::string_view text, int at) const {
+      const int n = static_cast<int>(text.size());
+      if (at == (reverse ? 0 : n)) return edge;
+      return cls[static_cast<unsigned char>(text[reverse ? at - 1 : at])];
+    }
+
+    // What a look step that missed comes back with: the destination state,
+    // as next() answers it, and the bytes it consumed. (Two registers: a
+    // length handed back through a reference would live on the scan's stack,
+    // and the scan's cursor would wait on it at every byte.)
+    struct Stepped {
+      uint32_t state;
+      int len;
+    };
+
+    // The cache-miss path of a look step from state `s` at boundary `at`:
+    // over the code point ahead, or over the text's edge (no bytes).
+    // `stepped` as next().
+    REGEXLIB_NOINLINE Stepped look_next(uint32_t s, std::string_view text,
+                                        int at, int stepped) {
+      scanned += static_cast<uint64_t>(stepped);
+      if (quit) return {kQuit, 0};
+      const unsigned char *p =
+          reinterpret_cast<const unsigned char *>(text.data());
+      // What the step consumes: the code point that starts at `at` — in
+      // reverse, the one that ends there — or nothing, at the text's edge.
+      const bool at_edge = column(text, at) == edge;
+      const Decoded ahead = at_edge   ? Decoded{0, 0}
+                            : reverse ? cp_before(text, at)
+                                      : cp_at(text, at);
+      const char32_t cp = ahead.cp;
+      const int len = ahead.len;
+      const uint8_t in = at_edge ? kEdge : side(cp);
+      const uint8_t ctx = unpack_state(s, seeds_) & (kContexts - 1);
+      // Close at this boundary: the context on one side, the input on the
+      // other.
+      const uint8_t l = reverse ? in : ctx, r = reverse ? ctx : in;
+      close(seeds_, out_,
+            re->bflags(l & kEdge, l & kWord, l & kBreak, /*l_cr=*/false,
+                       r & kEdge, r & kWord, r & kBreak, /*r_lf=*/false));
+      uint8_t tag = static_cast<uint8_t>(match_flags(out_) << kTagFlags);
+      // ... and consume the code point, its bytes in the order the scan
+      // meets them. No assertion holds between two of them: inside a code
+      // point is no boundary.
+      for (int k = 0; k < len; k++) {
+        if (k) close(seeds_, out_, /*flags=*/0);
+        advance(out_, p[reverse ? at - 1 - k : at + k], seeds_);
+      }
+      if (at_edge) {
+        seeds_.clear();
+      } else {
+        if (reseed) seeds_.push_back(0); // unanchored start, lowest priority
+        tag |= side(cp);
+      }
+      out_.swap(seeds_);
+      bool kept;
+      const uint32_t nxt = settle(tag, kept);
+      // Cached when the byte says all there is to know about the input.
+      if (kept && nxt != kQuit && (at_edge || (len == 1 && cp < 0x80)))
+        tr[s + column(text, at)] = nxt;
+      return {nxt, len};
     }
   };
 
@@ -13551,7 +12537,7 @@ private:
   //
   // !crlf_fused_lit_ is the one place this gate is STRICTER than the byte
   // path's. The DFAs behind it locate the span over the GRAPHEME programs
-  // (prog_, assert_lf_prog_ — compiled cp=false, where a Lit is ONE Op::Char
+  // (prog_, lf_prog_ — compiled cp=false, where a Lit is ONE Op::Char
   // interning the whole code-point string) while stepping BYTES, so a
   // parser-fused CR-LF literal is a two-code-point unit no byte can match and
   // the walk dies on it. crlf_byte_safe admits the pair because the BYTE
@@ -14051,9 +13037,15 @@ private:
   // such that the forward pattern matches [s, e); -1 if none in range, kCap if
   // the DFA gives up. Anchored at `e` (d.reseed must be false). `d` is
   // reusable across calls.
+  //
+  // `Look`: `d` is over a program with assertions (see LazyDfa). The scan is
+  // the same one; a state then says whether the boundary it was stepped FROM
+  // accepts, and the boundary at `floor` takes a step of its own, over what
+  // stands to its left.
+  template <bool Look = false>
   int dfa_reverse_scan(LazyDfa &d, std::string_view text, int e, int floor,
                        int *low_out = nullptr) const {
-    size_t s = d.start();
+    size_t s = Look ? d.start(d.context(text, e)) : d.start();
     const uint32_t *tr = d.tr.data();
     uint32_t f = tr[s - 1];
     int leftmost = (f & LazyDfa::kAccept) ? e : -1; // empty match [e, e)
@@ -14061,25 +13053,53 @@ private:
         reinterpret_cast<const unsigned char *>(text.data());
     int pos = e;
     int mark = e; // stepped bytes are reported to `d` from here down
-    if (!(f & LazyDfa::kDead))
+    if (!(f & LazyDfa::kDead)) {
       while (pos > floor) {
         // Consume the byte left of pos (as dfa_forward_lf_scan).
         uint32_t nx = detail::walk_column(tr, d.cls[p[pos - 1]])[s];
+        int len = 1;
         if (nx == LazyDfa::kUnknown) {
-          nx = d.next(static_cast<uint32_t>(s), p[pos - 1], mark - pos);
+          if constexpr (Look) {
+            const LazyDfa::Stepped st = d.look_next(static_cast<uint32_t>(s),
+                                                    text, pos, mark - pos);
+            nx = st.state;
+            len = st.len;
+          } else {
+            nx = d.next(static_cast<uint32_t>(s), p[pos - 1], mark - pos);
+          }
           if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
           mark = pos;
           tr = d.tr.data(); // the table moved, or was cleared and restarted
         }
         s = nx;
-        pos--;
-        f = tr[s - 1];
-        if (f & LazyDfa::kAccept) leftmost = pos;
+        const int at = pos;
+        pos -= len;
+        f = Look ? detail::walk_flags(tr, s) : tr[s - 1]; // (as forward)
+        if (f & LazyDfa::kAccept) leftmost = Look ? at : pos;
         if (f & LazyDfa::kDead) break;
       }
+      if constexpr (Look) {
+        if (!(f & LazyDfa::kDead)) {
+          const uint32_t nx = dfa_look_step(d, s, text, pos, mark - pos);
+          if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
+          mark = pos;
+          if (d.tr[nx - 1] & LazyDfa::kAccept) leftmost = pos;
+        }
+      }
+    }
     d.scanned += static_cast<uint64_t>(mark - pos);
     if (low_out) *low_out = pos; // lowest boundary examined (p[pos] onward)
     return leftmost;
+  }
+
+  // One step of a look scan that is not one of its loop's: from state `s`
+  // at boundary `at`, over the text's edge or over what the scan stops in
+  // front of. The state it leads to, whose flags speak for `at` — or kQuit.
+  uint32_t dfa_look_step(LazyDfa &d, size_t s, std::string_view text, int at,
+                         int stepped) const {
+    const uint32_t nx = d.tr[s + d.column(text, at)];
+    if (nx != LazyDfa::kUnknown) return nx;
+    return d.look_next(static_cast<uint32_t>(s), text, at, stepped).state;
   }
 
   // --- Rare-literal prefilter scans: suffix / ReverseInner / (?i) prefix ---
@@ -14680,6 +13700,33 @@ private:
     return e;
   }
 
+  // The same scans over a DFA whose program has assertions (see LazyDfa,
+  // LOOK): the leftmost-first end from `from`, the first accept, and the
+  // leftmost start of a match that ends at `e`.
+  // Out of line on purpose, each of them: a stepping loop that is inlined
+  // into the rung that calls it shares that function's registers, and keeps
+  // its own state on the stack (the boolean, inlined into the ladder's
+  // step: 740 MB/s over prose it does not match, 1,050 as a call).
+  REGEXLIB_NOINLINE int look_forward_lf(LazyDfa &d, std::string_view text,
+                                        int from,
+                                        int *reach_out = nullptr) const {
+    int reach = from;
+    int e = dfa_forward_lf_scan</*First=*/false, /*Look=*/true>(d, text, from,
+                                                                reach);
+    if (reach_out) *reach_out = reach;
+    return e;
+  }
+  REGEXLIB_NOINLINE int look_forward_first(LazyDfa &d, std::string_view text,
+                                           int from) const {
+    int reach = from;
+    return dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(d, text, from,
+                                                               reach);
+  }
+  REGEXLIB_NOINLINE int look_reverse(LazyDfa &d, std::string_view text, int e,
+                                     int floor, int *low_out = nullptr) const {
+    return dfa_reverse_scan</*Look=*/true>(d, text, e, floor, low_out);
+  }
+
   // The verify of a candidate, for either caller: the leftmost-first end
   // for one that reports a span, the first accept for a boolean.
   int dfa_forward_end(LazyDfa &d, std::string_view text, int from, bool span,
@@ -14702,10 +13749,15 @@ private:
                            : byte_prefilter_skip(p, n, i);
   }
 
-  template <bool First>
+  //
+  // `Look`: `d` is over a program with assertions (see LazyDfa). The scan is
+  // the same one; a state then says whether the boundary it was stepped FROM
+  // accepts, and the text's end takes a step of its own. (No start-state
+  // skip: the assert rungs put their literals in front of the scan.)
+  template <bool First, bool Look = false>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
                           int &reach_out) const {
-    size_t s = d.start();
+    size_t s = Look ? d.start(d.context(text, from)) : d.start();
     const uint32_t *tr = d.tr.data();
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -14724,7 +13776,8 @@ private:
     // start state, jump to the next position the pattern can begin at (the
     // prefix would otherwise consume the dead bytes one by one).
     const uint32_t stops =
-        ends | (d.use_prefilter || d.byte_pf ? LazyDfa::kStart : 0);
+        ends |
+        (!Look && (d.use_prefilter || d.byte_pf) ? LazyDfa::kStart : 0);
     int i = from;
     int mark = from; // stepped bytes are reported to `d` from here on
     int reach = from; // one past the last byte consumed
@@ -14733,21 +13786,41 @@ private:
       // The state is all that one load hands the next (see REGEXLIB_OPAQUE;
       // `[a-z]+[0-9]` tested over prose it does not match: 746 MB/s -> 894).
       uint32_t nx = detail::walk_column(tr, d.cls[p[i]])[s];
+      int len = 1;
       if (nx == LazyDfa::kUnknown) {
-        nx = d.next(static_cast<uint32_t>(s), p[i], i - mark);
+        if constexpr (Look) {
+          const LazyDfa::Stepped st =
+              d.look_next(static_cast<uint32_t>(s), text, i, i - mark);
+          nx = st.state;
+          len = st.len;
+        } else {
+          nx = d.next(static_cast<uint32_t>(s), p[i], i - mark);
+        }
         if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
         mark = i;
         tr = d.tr.data(); // the table moved, or was cleared and restarted
       }
       s = nx;
-      reach = ++i; // consumed p[i]
-      f = tr[s - 1];
-      if (f & LazyDfa::kAccept) e = i;
+      const int at = i;
+      reach = i += len; // consumed p[at..i)
+      // (Which way the flags are read is measured, per instantiation: see
+      // walk_flags. The look loops lose a cycle a byte to tr[s - 1]; this
+      // one loses 3-7% of a short test() to the other.)
+      f = Look ? detail::walk_flags(tr, s) : tr[s - 1];
+      if (f & LazyDfa::kAccept) e = Look ? at : i;
       if (f & stops) {
         if (f & ends) break;
         const int j = dfa_start_skip(d, p, n, i);
         mark += j - i; // jumped, not stepped
         i = j;
+      }
+    }
+    if constexpr (Look) {
+      if (!(f & ends)) {
+        const uint32_t nx = dfa_look_step(d, s, text, n, i - mark);
+        if (nx == LazyDfa::kQuit) return LazyDfa::kCap;
+        mark = i;
+        if (d.tr[nx - 1] & LazyDfa::kAccept) e = n;
       }
     }
     d.scanned += static_cast<uint64_t>(i - mark);
@@ -14994,15 +14067,14 @@ public:
     // DFA slot naming grammar — each name is built from these pieces:
     //   b...   over the UTF-8 BYTE programs (byte_prog_ family); no prefix =
     //          the grapheme/ASCII programs (prog_ family)
-    //   ...a...  ASSERT DFA (AssertDfa/ByteAssertDfa); no `a` = plain LazyDfa
     //   ...lf...  LEFTMOST-FIRST (ordered+cut states); no `lf` = boolean set
     //   ...u | ...a  Unanchored (search; over the `(?s:.)*?`-prefixed program
     //          or re-seeding) | Anchored (match(); over the bare program)
-    //   rv / barv  the REVERSE program's DFA (recovers a match start)
+    //   rv / brv   the REVERSE program's DFA (recovers a match start)
     //   inrev      reverse DFA of the ReverseInner prefilter's pre part
     // So: lfu = leftmost-first unanchored, blfa = byte leftmost-first
-    // anchored, bafu = byte assert unanchored (boolean), barv = byte assert
-    // reverse.
+    // anchored. An assert plan's DFAs are these: its programs carry the
+    // assertions, and a DFA over one steps with look (see LazyDfa).
     const Regex *owner_ = nullptr;
     uint64_t owner_gen_ = 0;           // identity guard against address reuse
     int pins_ = 0; // scans holding this entry of the thread's map across
@@ -15013,21 +14085,11 @@ public:
     std::optional<LazyDfa> blfu_,
         blfa_; // leftmost-first byte DFA (unanchored/anchored)
     std::optional<LazyDfa> inrev_; // ReverseInner: reverse(pre) DFA
-    std::optional<AssertDfa> afu_; // cached assertion DFA (reseed, test())
-    std::optional<AssertDfa> alfu_,
-        alfa_; // leftmost-first assert DFA (unanch/anch)
-    std::optional<AssertRevDfa> arv_; // cached reverse assertion DFA (ASCII)
-    std::optional<ByteAssertDfa>
-        bafu_; // cached assertion DFA over byte_prog_ (reseed, test())
-    std::optional<ByteAssertDfa> balfu_,
-        balfa_;                            // leftmost-first byte assert DFA
-    std::optional<ByteAssertRevDfa> barv_; // cached reverse assertion DFA
-    Scratch sc_;                           // reused Pike / backtracker buffers
-    // What this cache's DFAs are built with (see LazyDfa; the assert DFAs
-    // take the budget alone). The library never changes them — a rebind puts
-    // them back — and the test suite shrinks them (PlanProbe), after binding,
-    // to put every scan through the clear-and-refill, give-up and full-table
-    // paths.
+    Scratch sc_;                   // reused Pike / backtracker buffers
+    // What this cache's DFAs are built with (see LazyDfa). The library never
+    // changes them — a rebind puts them back — and the test suite shrinks
+    // them (PlanProbe), after binding, to put every scan through the
+    // clear-and-refill and give-up paths.
     size_t dfa_bytes_ = limits::kDfaCacheBytes;
     uint32_t dfa_min_clears_ = limits::kDfaMinClears;
     friend class Regex;
@@ -15038,9 +14100,6 @@ public:
       d->budget = dfa_bytes_;
       d->min_clears = dfa_min_clears_;
       return *d;
-    }
-    template <class AssertKind> void built(std::optional<AssertKind> &d) {
-      d->tbl.budget = dfa_bytes_;
     }
 
     // Bind to `re`; on a different (or first) Regex, drop the stale DFAs so
@@ -15064,14 +14123,6 @@ public:
       blfu_.reset();
       blfa_.reset();
       inrev_.reset();
-      afu_.reset();
-      alfu_.reset();
-      alfa_.reset();
-      arv_.reset();
-      bafu_.reset();
-      balfu_.reset();
-      balfa_.reset();
-      barv_.reset();
       dfa_bytes_ = limits::kDfaCacheBytes;
       dfa_min_clears_ = limits::kDfaMinClears;
     }
@@ -15085,8 +14136,7 @@ public:
     // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
     LazyDfa &fu(const Regex &re) {
       if (!fu_) {
-        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
-                    re.plan_->prog_classes_, /*reseed=*/true,
+        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
                     /*pf=*/!re.plan_->us_);
         built(fu_);
       }
@@ -15096,8 +14146,8 @@ public:
     LazyDfa &rv(const Regex &re) {
       if (!rv_) {
         rv_.emplace(re, re.plan_->rev_prog_.prog,
-                    re.plan_->rev_prog_.match_pc(),
-                    re.plan_->rev_prog_.classes, /*reseed=*/false);
+                    re.plan_->rev_prog_.match_pc(), /*reseed=*/false);
+        rv_->reverse = true;
         built(rv_);
       }
       return *rv_;
@@ -15117,7 +14167,7 @@ public:
         // byte first-byte set) instead, mirroring blfu. The two are exclusive:
         // use_prefilter reads prefix_.text (empty in US), byte_pf reads byte_prefix_.text.
         lfu_.emplace(re, re.plan_->lf_prog_.prog,
-                     re.plan_->lf_prog_.match_pc(), re.plan_->lf_prog_.classes,
+                     re.plan_->lf_prog_.match_pc(),
                      /*reseed=*/false, /*pf=*/!re.plan_->us_,
                      /*leftmost_first=*/true);
         if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_skips();
@@ -15128,8 +14178,7 @@ public:
 
     LazyDfa &lfa(const Regex &re) {
       if (!lfa_) {
-        lfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
-                     re.plan_->prog_classes_, /*reseed=*/false, /*pf=*/false,
+        lfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/false, /*pf=*/false,
                      /*leftmost_first=*/true);
         built(lfa_);
       }
@@ -15141,8 +14190,7 @@ public:
     LazyDfa &bfu(const Regex &re) {
       if (!bfu_) {
         bfu_.emplace(re, re.plan_->byte_prog_.prog,
-                     re.plan_->byte_prog_.match_pc(),
-                     re.plan_->byte_prog_.classes, /*reseed=*/true,
+                     re.plan_->byte_prog_.match_pc(), /*reseed=*/true,
                      /*pf=*/false);
         bfu_->byte_pf = re.plan_->byte_skips(); // sound byte-level dead-skip
         built(bfu_);
@@ -15153,9 +14201,9 @@ public:
     LazyDfa &brv(const Regex &re) {
       if (!brv_) {
         brv_.emplace(re, re.plan_->byte_rev_prog_.prog,
-                     re.plan_->byte_rev_prog_.match_pc(),
-                     re.plan_->byte_rev_prog_.classes, /*reseed=*/false,
+                     re.plan_->byte_rev_prog_.match_pc(), /*reseed=*/false,
                      /*pf=*/false);
+        brv_->reverse = true;
         built(brv_);
       }
       return *brv_;
@@ -15167,8 +14215,7 @@ public:
     LazyDfa &blfu(const Regex &re) {
       if (!blfu_) {
         blfu_.emplace(re, re.plan_->byte_lf_prog_.prog,
-                      re.plan_->byte_lf_prog_.match_pc(),
-                      re.plan_->byte_lf_prog_.classes, /*reseed=*/false,
+                      re.plan_->byte_lf_prog_.match_pc(), /*reseed=*/false,
                       /*pf=*/false, /*leftmost_first=*/true);
         blfu_->byte_pf = re.plan_->byte_skips();
         built(blfu_);
@@ -15181,8 +14228,7 @@ public:
     LazyDfa &blfa(const Regex &re) {
       if (!blfa_) {
         blfa_.emplace(re, re.plan_->byte_prog_.prog,
-                      re.plan_->byte_prog_.match_pc(),
-                      re.plan_->byte_prog_.classes, /*reseed=*/false,
+                      re.plan_->byte_prog_.match_pc(), /*reseed=*/false,
                       /*pf=*/false, /*leftmost_first=*/true);
         built(blfa_);
       }
@@ -15195,97 +14241,10 @@ public:
     LazyDfa &inrev(const Regex &re) {
       if (!inrev_) {
         inrev_.emplace(re, re.plan_->inner_.pre_rev.prog,
-                       re.plan_->inner_.pre_rev.match_pc(),
-                       re.plan_->inner_.pre_rev.classes, /*reseed=*/false);
+                       re.plan_->inner_.pre_rev.match_pc(), /*reseed=*/false);
         built(inrev_);
       }
       return *inrev_;
-    }
-
-    // Cached assertion DFA over prog_ (ASCII tier): unanchored (re-seeding)
-    // first-end scan, the boolean test() tier.
-    AssertDfa &afu(const Regex &re) {
-      if (!afu_) {
-        afu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
-                     /*reseed=*/true);
-        built(afu_);
-      }
-      return *afu_;
-    }
-
-    // Leftmost-first assert DFAs: alfu over the unanchored assert_lf_prog_
-    // (`(?s:.)*?`+pattern), alfa over the bare anchored prog_ (for match()).
-    AssertDfa &alfu(const Regex &re) {
-      if (!alfu_) {
-        alfu_.emplace(re, re.plan_->assert_lf_prog_.prog,
-                      re.plan_->assert_lf_prog_.match_pc(), /*reseed=*/false,
-                      /*leftmost_first=*/true);
-        built(alfu_);
-      }
-      return *alfu_;
-    }
-
-    AssertDfa &alfa(const Regex &re) {
-      if (!alfa_) {
-        alfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(),
-                      /*reseed=*/false, /*leftmost_first=*/true);
-        built(alfa_);
-      }
-      return *alfa_;
-    }
-
-    // Cached reverse assertion DFA over rev_prog_ (ASCII tier): recovers a
-    // match's leftmost start, one reverse scan per found match.
-    AssertRevDfa &arv(const Regex &re) {
-      if (!arv_) {
-        arv_.emplace(re, re.plan_->rev_prog_.prog,
-                     re.plan_->rev_prog_.match_pc());
-        built(arv_);
-      }
-      return *arv_;
-    }
-
-    // Cached assertion DFA over byte_prog_ (non-ASCII tier): unanchored
-    // (re-seeding) first-end scan, the boolean test() tier.
-    ByteAssertDfa &bafu(const Regex &re) {
-      if (!bafu_) {
-        bafu_.emplace(re, re.plan_->byte_prog_.prog,
-                      re.plan_->byte_prog_.match_pc(), /*reseed=*/true);
-        built(bafu_);
-      }
-      return *bafu_;
-    }
-
-    // Leftmost-first byte assert DFAs: balfu over byte_assert_lf_prog_
-    // (any-byte
-    // `.*?`-prefixed), balfa over the bare byte_prog_ (anchored, for match()).
-    ByteAssertDfa &balfu(const Regex &re) {
-      if (!balfu_) {
-        balfu_.emplace(re, re.plan_->byte_assert_lf_prog_.prog,
-                       re.plan_->byte_assert_lf_prog_.match_pc(),
-                       /*reseed=*/false, /*leftmost_first=*/true);
-        built(balfu_);
-      }
-      return *balfu_;
-    }
-
-    ByteAssertDfa &balfa(const Regex &re) {
-      if (!balfa_) {
-        balfa_.emplace(re, re.plan_->byte_prog_.prog,
-                       re.plan_->byte_prog_.match_pc(), /*reseed=*/false,
-                       /*leftmost_first=*/true);
-        built(balfa_);
-      }
-      return *balfa_;
-    }
-
-    ByteAssertRevDfa &barv(const Regex &re) {
-      if (!barv_) {
-        barv_.emplace(re, re.plan_->byte_rev_prog_.prog,
-                      re.plan_->byte_rev_prog_.match_pc());
-        built(barv_);
-      }
-      return *barv_;
     }
 
   public:
@@ -15539,17 +14498,27 @@ public:
   REGEXLIB_ALWAYS_INLINE static void ladder_downgrade(Ladder &l) {
     l.rung = l.below = Rung::Pike;
   }
-  // The DFAs of a DFA-family scan, by role: unanchored leftmost-first;
-  // anchored (verifies a candidate from its start); reverse (recovers the
-  // start).
+  // The DFAs of a scan, by role: unanchored leftmost-first; anchored
+  // (verifies a candidate from its start); reverse (recovers the start).
+  // `byte`: over the UTF-8 byte programs, not the grapheme ones.
+  LazyDfa &dfa_fwd(FindCache &fc, bool byte) const {
+    return byte ? fc.blfu(*this) : fc.lfu(*this);
+  }
+  LazyDfa &dfa_fwda(FindCache &fc, bool byte) const {
+    return byte ? fc.blfa(*this) : fc.lfa(*this);
+  }
+  LazyDfa &dfa_rev(FindCache &fc, bool byte) const {
+    return byte ? fc.brv(*this) : fc.rv(*this);
+  }
+  // ... of a DFA-family scan on the ladder `l`.
   LazyDfa &ladder_fwd(FindCache &fc, const Ladder &l) const {
-    return l.has(Ladder::kByteDfas) ? fc.blfu(*this) : fc.lfu(*this);
+    return dfa_fwd(fc, l.has(Ladder::kByteDfas));
   }
   LazyDfa &ladder_fwda(FindCache &fc, const Ladder &l) const {
-    return l.has(Ladder::kByteDfas) ? fc.blfa(*this) : fc.lfa(*this);
+    return dfa_fwda(fc, l.has(Ladder::kByteDfas));
   }
   LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
-    return l.has(Ladder::kByteDfas) ? fc.brv(*this) : fc.rv(*this);
+    return dfa_rev(fc, l.has(Ladder::kByteDfas));
   }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -16645,7 +15614,7 @@ private:
   }
 
   // [Tier: AnchoredOnePass] the ONE shared decision for every anchored entry
-  // point (assert_find_span / assert_byte_find_span / match / test — a
+  // point (assert_find_span / match / test — a
   // text-anchored pattern matches at 0 or nowhere): 1 = match ([0, e_out)),
   // 0 = definitive no-match (no accept, or `$` unsatisfied — require_end
   // demands the accept land exactly at n), -1 = not decided (table absent,
@@ -17125,8 +16094,9 @@ private:
   // of dfa_chain_step): the assert DFA locates the span — `byte` selects the
   // byte assert engine over the ASCII one — and the assert-aware capture
   // engine resolves the groups, if any. Returns the position to continue
-  // from, or -1 when no match remains. `wbudget` is the caller's loop-wide
-  // budget for the assert prefilters (see assert_find_span).
+  // from, -1 when no match remains, or LazyDfa::kCap. `wbudget` is the
+  // caller's loop-wide budget for the assert prefilters (see
+  // assert_find_span).
   template <class Out>
   REGEXLIB_ALWAYS_INLINE int assert_chain_step(FindCache &fc,
                                                std::string_view text, int from,
@@ -17136,9 +16106,8 @@ private:
                                                Out &out) const {
     if (from > static_cast<int>(text.size())) return -1;
     int s = 0, e = 0;
-    if (!(byte ? assert_byte_find_span(fc, text, from, s, e, &wbudget)
-               : assert_find_span(fc, text, from, s, e, &wbudget)))
-      return -1;
+    const int r = assert_find_span(fc, text, from, s, e, byte, &wbudget);
+    if (r <= 0) return r == LazyDfa::kCap ? r : -1;
     if (!emit_located(text, s, e, sc, saves, out)) return -1;
     if (plan_->ncap_ > 0 && Out::kGroups) { // the span as the groups have it
       s = saves[0];
@@ -17612,7 +16581,7 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     break;
   case kFamAssertAscii:
     l.set(Ladder::kAssert);
-    l.set(Ladder::kFindOk, p.assert_lf_prog_.ok());
+    l.set(Ladder::kFindOk, p.assert_ascii_tier());
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
     l.set(Ladder::kWalkOn, l.has(Ladder::kFindOk) && p.capture_scan_ok());
@@ -18149,13 +17118,17 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   }
   // The ASCII grapheme assert engine and the US byte assert engine resolve
   // captures here (EGC's byte assert engine is capture-free — see
-  // assert_byte_path_ok). The assert chain has no cap, and answers -1 for
-  // a cursor past the end.
+  // assert_byte_path_ok). The assert chain answers -1 for a cursor past the
+  // end; a DFA that gives up downgrades.
   case Rung::AssertChain:
     for (;;) {
       int nx = assert_chain_step(*scr.cache, text, c.pos,
                                  l.has(Ladder::kAssertByte), budget, *scr.sc,
                                  *scr.saves, out);
+      if (nx == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
       if (nx < 0) return Step::Over;
       c.pos = nx;
       const bool back = ladder_served(chain_once, budget, c.pos);
@@ -18170,9 +17143,10 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   case Rung::Bool: {
     int e2;
     if (l.has(Ladder::kAssert)) {
-      e2 = l.has(Ladder::kAssertByte)
-               ? assert_byte_fwd_scan(*scr.cache, text, 0)
-               : assert_fwd_scan(*scr.cache, text, 0);
+      e2 = look_forward_first(l.has(Ladder::kAssertByte)
+                                  ? scr.cache->bfu(*this)
+                                  : scr.cache->fu(*this),
+                              text, 0);
     } else {
       LazyDfa &dfa = l.has(Ladder::kByteDfas) ? scr.cache->bfu(*this)
                                               : scr.cache->fu(*this);

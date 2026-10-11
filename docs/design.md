@@ -200,9 +200,9 @@ be small and to be read once.
 
 - **A column per byte class, not per byte.** Two bytes that no instruction of
   the program tells apart always take the same transition, so they share a
-  column. The classes are computed once per program, when the plan is built
-  (`byte_classes`, kept in `ByteClasses` next to each program a `LazyDfa`
-  can run over), and without walking a byte automaton: the compiler lists
+  column. The classes are the DFA's own to work out, of its own program,
+  when its first scan starts (`byte_classes`, asked by `columns`), and
+  without walking a byte automaton: the compiler lists
   the byte ranges it emits (`byte_ranges`), and a large class block — a
   Unicode `\w` is ~470 distinct ranges in 5,000 instructions — carries the
   classes of its own ranges, worked out once per process where the block is
@@ -210,11 +210,12 @@ be small and to be read once.
   by the loose ranges (`refine_byte_classes`). A grapheme program is small
   and is walked, each distinct operand asked for the ASCII bytes it accepts
   (`ascii_mask`; that program is only ever stepped by bytes on an all-ASCII
-  subject: `lazy_inst_matches`). What a program's classes cost a first
-  construction is about half a microsecond, and only the programs a
-  `LazyDfa` can run over get them (`plan_byte_classes`: none for a pure
-  literal, an assert-only or a Pike-only plan); a DFA takes them with a
-  256-byte copy. `[a-zA-Z]+ing` has 6 classes, a pattern over a
+  subject: `lazy_inst_matches`). What a program's classes cost is about
+  half a microsecond, paid by the first scan of each DFA a thread steps: a
+  plan builds none, and most plans never step most of the DFAs they could.
+  (They were the plan's to build once, for every program a DFA might run
+  over; a first construction of `Sherlock\s+Holmes` took 27 µs so, and
+  takes 22.) `[a-zA-Z]+ing` has 6 classes, a pattern over a
   Unicode `\w` about 100; classes are numbered in byte order, so the ASCII
   ones are the first columns of every row and sit in one or two cache
   lines. A row used to be 256 entries — 1 KB — whatever the pattern.
@@ -228,7 +229,14 @@ be small and to be read once.
   (accept, the leftmost-first commit, dead, and "this is the start state");
   the scans load them off that chain and test them with one mask. They are
   deliberately not packed into the id (an AND on the chain measured ~12%
-  slower).
+  slower). A look scan (below) reads them through the row's address, taken
+  first (`walk_flags`): as `tr[s - 1]` they are a second load indexed by
+  the state the moment it arrives, beside the next step's own, and on the
+  machine measured the two got in each other's way for a cycle of every
+  byte (a boolean scan over prose: 865 MB/s, 1,035 so) — in that
+  instantiation of the scan and not in its twin without look, which has the
+  same instructions, runs at full speed either way, and is 3–7% quicker
+  over a short subject the plain way.
 - **States are interned through a hash set into contiguous storage**, each
   state's program counters packed as byte-sized differences. A state of a
   Unicode-class pattern holds its program counters by the hundred, and they
@@ -248,19 +256,68 @@ and sparse or absent in the rest, where the forward scan is all of it): `\w+` 16
 to build its DFA first is typically 2–3× quicker (`/\*.*?\*/` in CodePoint
 mode: 11.4 → 3.6 µs), up to 6× over Unicode classes.
 
-The assert DFAs (`AssertDfa` and its byte / reverse kin) keep their own
-representation — 257- or 129-wide rows, a column per byte — but there too a
-state is the offset of its row, in one array, and the input's place goes
-into the address first (`AssertStateTable`). Their flags belong to the
-edge, not to the state — whether a boundary accepts depends on the byte
-after it — so an edge is a pair (`AssertEdge`): the destination's row, and
-the flags beside it, read by a second load that nothing waits on. Packed
-into the row's word, as they were, they are an AND between each load and
-the next. `\b[a-z]+\d\b` tested over prose it does not match: 408 MB/s
-with an id to mask and scale, 730 as a row to mask, 892 as a pair. A
-prototype of the lazy DFA's whole layout, byte classes included, measured
-×1.3–1.6 on the forward scan before any of this; what the classes add on
-top of it has not been measured.
+### Look: assertions on the same table
+
+A program with `\b`, `^`, `$`, `\A` or `\z` in it is not `dfa_ok_`, and
+used to have DFAs of its own: four of them, over a table of 257- or
+129-wide rows with a pair of words to an edge, and an uncached set
+simulation for each to fall back to when its table filled. They are the
+lazy DFA now, stepped with **look** — the arrangement RE2 and
+`regex-automata` use.
+
+Whether an assertion holds at a boundary depends on the code points on both
+sides of it, so a transition cannot be a function of the state and the next
+byte unless the state knows what stands behind it. A look state therefore
+is a pc list **and a context**: the text's edge, or what the code point
+just consumed is to a boundary (a word character, a line break). And its
+pcs are held
+*unclosed*: the step over the next code point closes them under the
+assertions that hold between the context and that code point, notes whether
+the boundary accepts, and only then consumes (`look_next`). So a state's
+accept and front flags speak for the boundary *before* the code point that
+led to it. A look scan sees a match one step late, and takes one more step
+over the text's edge, which has a column of its own. That is all the scans
+differ by: the two loops (`dfa_forward_lf_scan`, `dfa_reverse_scan`) take
+`Look` as a template argument, and the plain instantiations are the code
+they were.
+
+- **Byte classes tell apart what an assertion asks.** The classes of a look
+  program are refined by the word bytes and the line breaks, so that a
+  transition is cached by the class of an ASCII byte there
+  too — a row of `\b[a-z]+\d\b` is 10 entries, 40 bytes, where it was
+  2,056 — and no ASCII byte shares a class with a byte of a longer code
+  point.
+- **A non-ASCII code point is one step, never cached.** What it is to a
+  boundary cannot be read off its bytes, so the miss path decodes it,
+  closes at the boundary by its properties, and feeds its bytes through the
+  program with a closure between them that follows no assertion (inside a
+  code point is no boundary). The scan advances by its length. This is what
+  the byte assert tier did; it is now the miss path of the same loop, and
+  the ASCII bulk of a non-ASCII subject runs at the table's speed.
+- **Direction is which side the context is on.** A reverse program's DFA
+  carries what stands to the *right*, and its input is the code point to
+  the left; the boundary's flags are the same function of the two sides
+  (`bflags`).
+- **A context does not say "half a CR-LF".** In a Grapheme plan the pair is
+  one cluster with no line boundary inside, and the DFAs the tier had
+  carried a bit for it. No subject they are given makes it matter: one that
+  holds a CR-LF reaches them only with a pattern for which an anchor that
+  fires inside the pair changes nothing (`crlf_byte_safe`), and CodePoint
+  mode has no clusters. (Headers with the bit forced on, forced off or
+  dropped passed every test and the fuzzer.) The literal-with-anchors
+  verify, which is given any subject, still applies the rule
+  (`empty_flags_cp`).
+
+What it comes to, HEAD against the four DFAs (MB/s, GCC 11 and Clang 22):
+`\b[a-z]+\d\b` tested over prose it does not match 1,089 → 1,088 and
+781 → 1,090; the same over the non-ASCII Sherlock text 651 → 1,078 and
+770 → 1,070; `(?m)^[A-Z][a-z]+ [a-z]+` found over prose 1,011 → 1,018 and
+747 → 1,036; `t[a-z]+ly\b`, a literal and a verify to a candidate,
+8.7 → 9.5 GB/s and 6.8 → 7.2. (GCC's old loop kept its state in a stack
+slot the processor renamed away; Clang's kept it in a register behind an
+AND.) Across the 32 assert rows measured the geometric mean is ×1.08 and
+×1.18, the slowest row 0.99 and 0.97; across the 94 general rows, ×1.00.
+The header is 1,026 lines shorter.
 
 ### Tier dispatch
 
@@ -270,7 +327,7 @@ Three tiers, picked structurally from the pattern:
 | --- | --- | --- |
 | **1** | capture-free ∧ DFA-able | Forward ordered+cut DFA finds the leftmost-first end `e`; the reverse scan finds the start `s`; return `[s, e)`. **No Pike.** Covers the ASCII grapheme tier, the UTF-8 byte tier (§4/§5), and `^ $ \b \A \z` via an assertion-aware DFA. Targets `\w+`, `[a-z]+`, literals, general alternation (`a\|ab`, `(?m)^…\|…$`). |
 | **2** | captures ∧ DFA-able | The lf DFA locates `[s, e)`, then a capture engine resolves groups *bounded by `e`* (§6). A pattern whose every group wraps the whole match (`(\w+)`) never reaches this tier: it is planned as its capture-free twin (§3, *Root groups*). |
-| **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the grapheme assert DFA (ASCII subject) or the **byte** assert DFA (`ByteAssertDfa`: a non-ASCII EGC subject, or **US mode on any subject** — see below). |
+| **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the lazy DFA over the grapheme programs (ASCII subject) or over the **byte** programs (a non-ASCII EGC subject, or **US mode on any subject** — see below), stepped with look. |
 | **3** | DFA-ineligible (lookaround / nested empty-loop), or a DFA that gave up on its cache | Pike VM over the whole subject, with the §7 prefilters. The fallback. |
 
 `dfa_ok_` = "regular" program (no lookaround, no `Op::Loop`); `dfa_assert_ok_`
@@ -280,16 +337,16 @@ assertion-DFA path: an assert-bearing capture pattern (not `dfa_ok_`) still gets
 a DFA-located span instead of the Pike, because the backtracker now evaluates
 assertions absolutely (`$` = real end-of-text, not the span end).
 
-**The byte assert tier is shared by EGC non-ASCII and US mode.** The
-`ByteAssertDfa` decodes the UTF-8 byte program one code point at a time and
-evaluates assertions code-point-wise — which is exactly what an EGC non-ASCII
+**The byte assert tier is shared by EGC non-ASCII and US mode.** The lazy
+DFA over the UTF-8 byte programs, stepping with look, weighs every boundary
+by the code points on its two sides — which is exactly what an EGC non-ASCII
 subject (byte == grapheme) *and* US matching (code points, no graphemes) both
 need. So US does not get a copied assert engine: a US `^ $ \b`-anchored pattern
-(capture or not) reuses `assert_byte_find_span` / `assert_prefix_find` /
-`ByteAssertDfa` on **any** subject, with the same prefilters and the same
+(capture or not) reuses `assert_find_span` / `assert_prefix_find` on **any**
+subject, with the same prefilters and the same
 `cp_prog_` bitstate capture resolution. `assert_byte_path_ok` is the only
 mode-aware gate (US: any subject; EGC: non-ASCII, no multi-code-point cluster).
-The EGC-ASCII grapheme assert DFA stays as a separate fast path. US captures
+On an ASCII subject an EGC plan steps its grapheme programs instead. US captures
 whose span overflows the bitstate still fall back to the code-point Pike.
 
 **Captures on this tier are US-only.** `assert_cap_` compiles `cp_prog_` for an
@@ -322,8 +379,8 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity) |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
-| `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | `AssertDfa` (start recovery via the cached `AssertRevDfa`) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | `ByteAssertDfa` / `ByteAssertRevDfa`, same prefilters; `+cap` is US-only (see above) |
+| `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
+| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap` is US-only (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
 Both ladders try their eligible tiers top-down and fall through when a DFA
@@ -583,21 +640,15 @@ CodePoint mode, building a state costs ~1.9 µs and the Pike ~50 ns a byte,
 so the two break even near 40 bytes a state; for a small ASCII pattern,
 nearer 7.)
 
-The assert DFAs have the same budget (counting a table's edges and its
-interned states; `AssertStateTable::full`) and a simpler rule: a full table is
-kept, not cleared, and takes no more states. What it has built still
-answers; a step that would need a new state answers `kCap`, and the scan
-falls back to its uncached twin. (They too were bounded in states once,
-65,536 of them — and a table past that bound still took one more state on
-every scan that reached a miss: `\b[ab]*a[ab]{18}\b` over 4 KB subjects held
-293 MB after 4,000 scans and was still growing. It holds 13 MB now.)
-
-A scan that falls back starts over, so what a candidate's failed verify
-costs is the fallback's walk, and that is what the walk budget (see
-"Linearity") is charged. Charged only for the bytes the DFA covered before
-its table gave out — a few, once the table is full — the prefilters never
-bailed: `a[ab]*a[ab]{12}\d\b` over 262 KB of a's and b's, every `a` a
-candidate and every verify a walk to the end, took 7.6 s. It takes 64 ms.
+An assert plan's DFAs are these DFAs, under this budget and this rule. (They
+had tables of their own once, bounded in states and then in bytes, that were
+kept when full and took no more states, the scan falling back to an uncached
+set simulation that started over. `a[ab]*a[ab]{12}\d\b` over 524 KB of a's
+and b's, every `a` a candidate: 110 ms so, 8.3 ms cleared and refilled.
+`\b[ab]*a[ab]{12}\b` found over 64 KB subjects: 4.8 ms a scan and 12.8 MB
+held, against 0.45 ms and 5.1 MB. A pattern that outgrows the cache however
+it is refilled goes to the Pike, which is slower than the set simulation was
+at finding every match: `\b[ab]*a[ab]{18}\b`, 4.9 → 6.7 ms a scan.)
 
 ---
 
@@ -786,7 +837,7 @@ non-ASCII byte.
 One caveat is the literal rule's own: the pair is byte-safe but **not**
 grapheme-program-safe. The parser fuses `\r\n` into one grapheme
 (`fuse_literal_graphemes`), and the *grapheme* programs (`prog_`,
-`assert_lf_prog_`, compiled `cp=false`) hold a literal as one `Op::Char`
+`lf_prog_`, compiled `cp=false`) hold a literal as one `Op::Char`
 interning the whole code-point string — so the pair is a two-code-point unit
 there, and the DFAs over those programs step **bytes**: no byte matches it and
 the walk dies. `crlf_byte_safe` admits it for the byte programs, which match it
@@ -864,8 +915,9 @@ it (exact ends, no forward re-expansion past the vetted window). Took
 ### The assertion byte tier
 
 `\b`/`^$`/`\A\z` patterns are `dfa_assert_ok_` (not `dfa_ok_`), served by an
-assertion-aware DFA. The same EGC-byte-path idea is built for them: a
-code-point-aware `ByteAssertDfa` runs a non-ASCII subject through the assert DFA,
+assertion-aware DFA (the lazy DFA with look). The same EGC-byte-path idea is
+built for them: over the byte programs it runs a non-ASCII subject, a code
+point a step,
 reusing the `crlf_byte_safe_` / `can_match_empty_` gate. The same DFA serves
 CodePoint mode on any subject, and one of its rules is the grapheme engine's
 alone: a multiline `^` / `$` does not fire *between* the `\r` and the `\n` of a
@@ -1346,7 +1398,7 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   position. When stripping the zero-width assertions leaves a single **fixed
   literal** (`fixed_text`, extracted recursively), the engine `memmem`s that
   literal and confirms each hit with the anchored assertion DFA, shared through
-  `assert_find_span` / `assert_byte_find_span`. Lifted
+  `assert_find_span`. Lifted
   `(?m)^Sherlock Holmes|Sherlock Holmes$` ~229 → ~12700 MB/s (≈ rure ~8000; RE2
   ~455). An assertion body that *ends* or *begins* in a literal is caught by
   the two prefilters below (which of them, when it does both, is the anchor
