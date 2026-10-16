@@ -64,6 +64,12 @@ struct PlanProbe {
     const auto &p = *re.plan_;
     return (p.us_ ? p.cp_prog_ : p.prog_).subs.size();
   }
+  // The literal and class pools of the Pike's program (as look_programs).
+  static std::pair<size_t, size_t> operand_pools(const Regex &re) {
+    const auto &p = *re.plan_;
+    const auto &prog = p.us_ ? p.cp_prog_ : p.prog_;
+    return {prog.lits.size(), prog.classes.size()};
+  }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
@@ -5046,6 +5052,32 @@ void test_lookaround_programs() {
   }
 }
 
+// A program's operand pools hold each distinct literal and class once, however
+// many instructions read it: a counted repeat's copies share their operands,
+// so what grows under expansion is the instructions alone. Each copy used to
+// add its own pool entry — a `[ab]{20000}` held twenty thousand copies of one
+// class.
+void test_operand_pools() {
+  using Pools = std::pair<size_t, size_t>; // {literals, classes}
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const auto pools = [unit](const char *pat) {
+      return PlanProbe::operand_pools(make_unit(unit, pat, 0));
+    };
+    CHECK(pools("[ab]{20000}") == Pools(0, 1));
+    CHECK(pools("(?:[ab]x){50}") == Pools(1, 1));
+    CHECK(pools("[ab]c[ab]c") == Pools(1, 1)); // equal, from different nodes
+    CHECK(pools("[ab][cd]x{3}y") == Pools(2, 2));
+    CHECK(pools("(?:\\w\\d[^\\s]){9}") == Pools(0, 3));
+    CHECK(pools("(?:\xC3\xA9x){50}") == Pools(2, 0));
+    CHECK(pools("xyx") == Pools(2, 0));
+    // The sharing changes nothing a match sees.
+    const Regex re = make_unit(unit, "(?:[ab]x){3}([ab]+)x", 0);
+    const auto m = re.search("zaxbxax" "ab" "x");
+    CHECK(m && m.begin() == 1 && m.group(1).str() == "ab");
+    CHECK(!re.test("axbxaxx"));
+  }
+}
+
 void test_out_of_range_utf8() {
   // A four-byte form past U+10FFFF (an F4 90.. or F5..F7 lead) is not UTF-8:
   // each of its bytes is a lone byte, never a code point indexing past the end
@@ -5430,6 +5462,7 @@ int main() {
   test_invalid_patterns();
   test_resource_limits();
   test_lookaround_programs();
+  test_operand_pools();
   test_out_of_range_utf8();
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();

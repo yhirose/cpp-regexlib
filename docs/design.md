@@ -710,6 +710,14 @@ struct Program {
 };
 ```
 
+A pool is a set: it holds each distinct literal or class once, however many
+instructions read it (`Compiler::intern_lit` / `intern_cls`). A counted repeat
+emits its body once per copy, and a pool entry per copy made `[ab]{20000}` hold
+twenty thousand copies of one class — some 130 bytes an instruction against the
+instruction's own 16; pooled once, what grows under expansion is the
+instructions alone (`(?:[ab]{20000}){10}`: 132 → 36 MB), which is what the size
+limit counts.
+
 The instruction stores only a small index, and since no operand index coexists
 with a control-flow target they all **overlap the `x` slot** (the op selects the
 meaning): `lit_idx()`/`cls_idx()`/`sub_idx()` all read `x`; `Byte` packs its

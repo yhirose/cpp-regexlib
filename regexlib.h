@@ -1968,12 +1968,34 @@ struct CharClass {
   struct UPropItem {
     detail::UProp prop;
     bool negate;
+    bool operator==(const UPropItem &o) const {
+      return prop == o.prop && negate == o.negate;
+    }
   };
 
   bool negate = false;
   std::vector<std::pair<char32_t, char32_t>> ranges;
   std::vector<Pred> preds;
   std::vector<UPropItem> uprops;
+
+  // The same class, member for member — what a program's class pool keeps
+  // one of (Compiler::intern_cls).
+  bool operator==(const CharClass &o) const {
+    return negate == o.negate && ranges == o.ranges && preds == o.preds &&
+           uprops == o.uprops;
+  }
+  size_t hash() const {
+    uint64_t h = negate ? 0x9E3779B97F4A7C15ull : 0;
+    const auto mix = [&h](uint64_t v) {
+      h = (h ^ v) * 0x100000001B3ull;
+      h ^= h >> 29;
+    };
+    for (const auto &r : ranges) mix((uint64_t{r.first} << 32) | r.second);
+    for (Pred p : preds) mix(0x10000000000ull | static_cast<unsigned>(p));
+    for (const auto &u : uprops)
+      mix(0x20000000000ull | (static_cast<uint64_t>(u.prop) << 1) | u.negate);
+    return static_cast<size_t>(h);
+  }
 
   void add_range(char32_t lo, char32_t hi) { ranges.emplace_back(lo, hi); }
 
@@ -3857,15 +3879,34 @@ struct Compiler {
     return push(std::move(i));
   }
 
-  // Intern a heavy operand into the program's pool, returning its index.
-  int intern_lit(std::u32string s) {
-    prog.lits.push_back(std::move(s));
-    return static_cast<int>(prog.lits.size()) - 1;
+  // A heavy operand's index in the program's pool. A pool is a set: it holds
+  // each distinct literal or class once, however many instructions read it.
+  // `x{n}` emits its body n times, and a pool entry per copy made a
+  // `[ab]{20000}` program hold twenty thousand copies of one class — some
+  // 130 bytes an instruction, the instruction itself 16. Pooled once, what
+  // grows under expansion is the instructions alone, which the size limit
+  // counts. (`*_seen_` maps a hash to the indices that have it.)
+  std::unordered_multimap<size_t, int> lit_seen_, cls_seen_;
+
+  template <class T>
+  static int pooled(std::vector<T> &pool,
+                    std::unordered_multimap<size_t, int> &seen, const T &v,
+                    size_t h) {
+    const auto range = seen.equal_range(h);
+    for (auto it = range.first; it != range.second; ++it)
+      if (pool[static_cast<size_t>(it->second)] == v) return it->second;
+    const int id = static_cast<int>(pool.size());
+    pool.push_back(v);
+    seen.emplace(h, id);
+    return id;
   }
 
-  int intern_cls(CharClass c) {
-    prog.classes.push_back(std::move(c));
-    return static_cast<int>(prog.classes.size()) - 1;
+  int intern_lit(const std::u32string &s) {
+    return pooled(prog.lits, lit_seen_, s, std::hash<std::u32string>{}(s));
+  }
+
+  int intern_cls(const CharClass &c) {
+    return pooled(prog.classes, cls_seen_, c, c.hash());
   }
 
   int intern_sub(std::shared_ptr<Program> p) {
