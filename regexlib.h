@@ -425,6 +425,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 254, NSUPER = 42, SB_SHIFT = 4, SB_MASK = 15;
 inline GeneralCategory get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -629,6 +630,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 131, NSUPER = 19, SB_SHIFT = 5, SB_MASK = 31;
 inline GraphemeBreak get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -708,6 +710,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 38, NSUPER = 5, SB_SHIFT = 6, SB_MASK = 63;
 inline Emoji get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -1377,7 +1380,9 @@ inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
              ((static_cast<char32_t>(s8[1] & 0x3F)) << 12) |
              ((static_cast<char32_t>(s8[2] & 0x3F)) << 6) |
              (static_cast<char32_t>(s8[3] & 0x3F));
-        return true;
+        // F4 90.. and F5..F7 leads would decode past U+10FFFF, off the end of
+        // every property table; they are invalid UTF-8, so a lone byte each.
+        return cp <= 0x10FFFF;
       }
     }
   }
@@ -1979,6 +1984,11 @@ struct Segmented {
   std::vector<size_t> byte_begin;        // size == graphemes.size() + 1
   std::string_view source;               // the original UTF-8 subject
   bool ascii = false; // all bytes < 0x80, so grapheme index == byte index
+  // The Pike's lookaround answers over this subject, one table per lookaround
+  // body (keyed by its Program): entry sp says whether the body matches at sp.
+  // Built on first use and kept with the segmentation, so the find_all runs
+  // over one subject share them.
+  mutable std::vector<std::pair<const void *, std::vector<bool>>> look_tables;
 };
 
 inline bool all_ascii(std::string_view s8) {
@@ -2131,8 +2141,8 @@ inline Node node_sans_kids(const Node &n) {
   return r;
 }
 
-// Reverse a sub-pattern so a lookbehind body can be matched right-to-left in a
-// single linear pass starting at the assertion position. Leaf nodes and
+// Reverse a sub-pattern so it can be matched right-to-left (a reverse program,
+// or a lookahead body, which the Pike scans leftward). Leaf nodes and
 // zero-width assertions are unchanged; only concatenation order flips.
 // Nested lookarounds are left intact — they are evaluated forward at the
 // current position regardless of the surrounding scan direction.
@@ -4044,16 +4054,17 @@ struct Compiler {
       i.op = Inst::Op::Look;
       i.look_behind = n.look_behind;
       i.look_negate = n.look_negate;
-      // The lookaround body is its own program (captures are not exported).
-      // A lookbehind body is reverse-compiled so it can be matched
-      // right-to-left from the assertion position in one linear pass; in byte
-      // (us_) or code-point (cp_) mode its units are emitted in reverse too,
-      // so the right-to-left scan matches them. A lookahead body is compiled
-      // forward.
-      bool body_rev = n.look_behind && (us_ || cp_);
+      // The lookaround body is its own program (captures are not exported),
+      // compiled to scan AWAY from the positions it answers for: the Pike
+      // runs it once over the whole subject to settle the assertion at every
+      // position (Regex::look_table). So a lookahead body is reverse-compiled
+      // — in byte (us_) or code-point (cp_) mode its units are emitted in
+      // reverse too, so the right-to-left scan matches them — and a
+      // lookbehind body is compiled forward.
+      const bool rev = !n.look_behind;
       i.x = intern_sub(std::make_shared<Program>(
-          compile(n.look_behind ? reverse_ast(n.kids[0]) : n.kids[0], 0, us_,
-                  body_rev, dotall_, cp_)));
+          compile(rev ? reverse_ast(n.kids[0]) : n.kids[0], 0, us_,
+                  rev && (us_ || cp_), dotall_, cp_)));
       push(std::move(i));
       break;
     }
@@ -4090,11 +4101,15 @@ struct Compiler {
     const Node &body = n.kids[0];
     int lo = n.rmin, hi = n.rmax;
 
-    // Emit `lo` mandatory copies, remembering where the last one starts.
+    // Emit `lo` mandatory copies, remembering where the last one starts. A body
+    // that emits nothing (`(?:)`, `a{0}`) emits nothing every time; stop after
+    // one, or nested counts (`(?:(?:){1000000}){1000000}`) loop lo*lo times
+    // without ever reaching push()'s instruction limit.
     int last_start = -1;
     for (int k = 0; k < lo; k++) {
       last_start = here();
       emit(body);
+      if (here() == last_start) break;
     }
 
     if (hi == -1 && node_nullable(body)) {
@@ -12738,7 +12753,11 @@ private:
       }
       lp = rp;
       have_prev = true;
-      if (off < n && p[off] < 0x80 && lp != GB::Prepend)
+      // An ASCII byte next closes the cluster unless it fuses — only after a
+      // Prepend, and not onto a control (GB5: U+0600 then `\t` is two clusters,
+      // and the `\t` may start the literal the caller is scanning for).
+      if (off < n && p[off] < 0x80 &&
+          !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(p[off])))
         break; // cluster closed; resume the fused scan
     }
     return off;
@@ -14894,11 +14913,11 @@ private:
   }
 
   // Evaluate a zero-width lookaround instruction at position `sp`: does the
-  // body match starting at sp (lookahead), or — for a lookbehind, whose body
-  // is reverse-compiled — some window ending at sp, scanned right-to-left?
+  // body match starting at sp (lookahead), or some window ending at sp
+  // (lookbehind)? Read from the body's table over the whole subject.
   bool eval_look(const detail::Program &prog, const detail::Inst &in,
                  const detail::Segmented &seg, int sp, int n) const {
-    return sub_match(*prog.subs[in.sub_idx()], seg, sp, n, in.look_behind);
+    return look_table(*prog.subs[in.sub_idx()], seg, n, in.look_behind)[sp];
   }
 
   // Follow ε-transitions (Jmp/Split/Save/asserts/lookaround), adding reachable
@@ -14988,38 +15007,46 @@ private:
     match_steps() += pops;
   }
 
-  // Boolean Pike-VM run for a lookaround body, anchored at `from`: succeeds
-  // if a thread reaches Match. A lookahead body consumes graphemes rightward
-  // from `from`; a lookbehind body (`behind`) is reverse-compiled and consumes
-  // them leftward, so it succeeds on any window ending at `from`. Captures are
-  // not tracked; linear in the number of graphemes scanned.
-  bool sub_match(const detail::Program &prog, const detail::Segmented &seg,
-                 int from, int n, bool behind) const {
+  // The answers of a lookaround body at every position of the subject, in
+  // one linear pass. Running the body anchored from each position the Pike
+  // asks about rescans the subject per position — O(n^2) for `(?=\w*z)\w`.
+  // Instead run the body (compiled to scan away from those positions, see
+  // the compiler) unanchored over the whole subject: a lookahead's body
+  // matches at sp iff its reverse, scanning leftward from some q >= sp,
+  // reaches Match at sp; a lookbehind's likewise rightward from some q <= sp.
+  // Seeding a fresh thread at every position makes it the usual boolean NFA
+  // simulation, O(n * program size). Captures are not tracked.
+  const std::vector<bool> &look_table(const detail::Program &body,
+                                      const detail::Segmented &seg, int n,
+                                      bool behind) const {
+    for (auto &t : seg.look_tables)
+      if (t.first == &body) return t.second;
     using Op = detail::Inst::Op;
+    const detail::Program &prog = body;
     int psz = static_cast<int>(prog.insts.size());
     std::vector<Thread> clist, nlist;
     clist.reserve(psz);
     nlist.reserve(psz);
     std::vector<int> visited(psz, -1);
-    int gen = 0;
-
-    gen++;
-    add_thread(prog, clist, visited, gen, 0, Saves(prog.nslots), seg, from,
-               n);
-
-    const int step = behind ? -1 : 1;
+    std::vector<bool> table(n + 1, false);
+    const Saves seed(prog.nslots);
+    // Rightward for a lookbehind, leftward for a lookahead.
+    const int step = behind ? 1 : -1;
     long budget = step_budget(n); // shared cumulative counter, not reset here
-    for (int sp = from; behind ? sp >= 0 : sp <= n; sp += step) {
-      if (clist.empty()) break;
+    int gen = 0;
+    for (int sp = behind ? 0 : n;; sp += step) {
       if (match_steps() > budget)
         throw RegexError(RegexError::Code::StepBudgetExceeded,
                          "regex match step budget exceeded");
+      // A window may start (lookbehind) or end (lookahead) here: seed it
+      // after the threads already under way, under their `gen`.
+      add_thread(prog, clist, visited, gen, 0, seed, seg, sp, n);
       int next_gen = ++gen;
       // The grapheme consumed next: the one at sp scanning right, the one
       // immediately left of sp scanning left.
       const std::u32string *g =
-          behind ? (sp > 0 ? &seg.graphemes[sp - 1] : nullptr)
-                 : (sp < n ? &seg.graphemes[sp] : nullptr);
+          behind ? (sp < n ? &seg.graphemes[sp] : nullptr)
+                 : (sp > 0 ? &seg.graphemes[sp - 1] : nullptr);
       for (auto &t : clist) {
         const detail::Inst &in = prog.insts[t.pc];
         switch (in.op) {
@@ -15030,14 +15057,16 @@ private:
             add_thread(prog, nlist, visited, next_gen, t.pc + 1, t.saves, seg,
                        sp + step, n);
           break;
-        case Op::Match: return true;
+        case Op::Match: table[sp] = true; break;
         default: break;
         }
       }
       std::swap(clist, nlist);
       nlist.clear();
+      if (sp == (behind ? n : 0)) break;
     }
-    return false;
+    seg.look_tables.emplace_back(&body, std::move(table));
+    return seg.look_tables.back().second;
   }
 
   // Pike VM match loop: finds the leftmost-first match at or after `start`. On
@@ -15066,10 +15095,12 @@ private:
     // The initial capture state is all-unset; since it is immutable and shared
     // copy-on-write, one instance is reused for every (re-)seed position.
     Saves seed(prog.nslots);
+    // Top-level search: reset the cumulative work counter. Before the seed
+    // closure, which may already evaluate a lookaround and charge the counter.
+    match_steps() = 0;
     gen++;
     add_thread(prog, clist, visited, gen, 0, seed, seg, start, n);
 
-    match_steps() = 0; // top-level search: reset the cumulative work counter
     long budget = step_budget(n);
     for (int sp = start; sp <= n; sp++) {
       if (clist.empty() && have) break;
@@ -17703,7 +17734,10 @@ public:
     suffix_ = un;
   }
 
-  void _build(const reg::MatchResult &r, int mark_count) {
+  // `prefix_begin`: where prefix() starts — the end of the previous match for
+  // a regex_iterator past its first match, else the subject start.
+  void _build(const reg::MatchResult &r, int mark_count,
+              size_t prefix_begin = 0) {
     groups_.clear();
     if (!r.matched()) return;
     const int total = mark_count + 1;
@@ -17721,9 +17755,9 @@ public:
       }
       groups_.push_back(sm);
     }
-    prefix_.first = base_;
+    prefix_.first = off(prefix_begin);
     prefix_.second = off(r.begin());
-    prefix_.matched = (r.begin() > 0);
+    prefix_.matched = (r.begin() > prefix_begin);
     suffix_.first = off(r.end());
     suffix_.second = subject_end_;
     suffix_.matched = (off(r.end()) != subject_end_);
@@ -17940,8 +17974,9 @@ inline std::string replace_core(std::string_view s, const basic_regex &re,
   // Lazy scan: stream matches (with first_only this stops at the first one).
   translate_errors([&] {
     for (auto m : re.native().find_iter(s)) {
-      if (!no_copy) out.append(s.substr(cursor, m.begin() - cursor));
-      std::string_view prefix = s.substr(0, m.begin());
+      // $` is the text since the previous match, as std's prefix() is.
+      std::string_view prefix = s.substr(cursor, m.begin() - cursor);
+      if (!no_copy) out.append(prefix);
       std::string_view suffix = s.substr(m.end());
       expand_format(out, fmt, m.str(), prefix, suffix, ng,
                     [&](int i) -> std::string_view {
@@ -18069,7 +18104,8 @@ private:
   void load() {
     if (at_end()) return;
     cur_._reset(begin_, end_);
-    cur_._build((*spans_)[idx_], static_cast<int>(re_->mark_count()));
+    cur_._build((*spans_)[idx_], static_cast<int>(re_->mark_count()),
+                idx_ ? (*spans_)[idx_ - 1].end() : 0);
   }
 
   BiIter begin_{}, end_{};

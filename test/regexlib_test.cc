@@ -2269,6 +2269,21 @@ void test_grapheme_aware() {
   // A character class matches a multi-code-point grapheme by its base code
   // point (Model 2): the family-emoji base is an emoji, not [a-z].
   CHECK(!Regex("[a-z]").test(family));
+
+  // A Prepend (U+0600) fuses with what follows (GB9b) but not with a control
+  // (GB5): `\t` after it starts a cluster of its own, which the fused literal
+  // and class scans must not walk past.
+  const std::string prepend = "\xD8\x80";
+  auto at = [](const reg::MatchResult &m, size_t b, size_t e) {
+    return m && m.begin() == b && m.end() == e;
+  };
+  CHECK(at(Regex("\\tab").search("xx" + prepend + "\tab"), 4, 7));
+  CHECK(at(Regex("\\tab\\w*").search("xx" + prepend + "\tabc yy"), 4, 8));
+  CHECK(at(Regex("\\w*\\tq").search("zz" + prepend + "\tq"), 4, 6));
+  CHECK(at(Regex("[^ab]+[\t;][ab]").search("q " + prepend + "\ta"), 0, 6));
+  // ... while U+0600 + `a` is one cluster, so no `ab` starts at the `a`.
+  CHECK(!Regex("ab").test(prepend + "ab"));
+  CHECK(Regex("b").search(prepend + "ab").begin() == 3);
 }
 
 // Regex::find_at(text, pos) is one stateless step of find_iter(): stepping it
@@ -3469,6 +3484,28 @@ void test_lookahead() {
   CHECK(Regex("\\d+(?! USD)").search("42 USD").str() == "4");
   // variable-length lookahead body
   CHECK(Regex("\\w+(?=\\s*;)").search("name   ;").str() == "name");
+}
+
+void test_lookaround_linear() {
+  // The Pike settles a lookaround at every position in one pass over the
+  // subject. Asking the body afresh at each position the Pike reached was
+  // O(n^2): `(?=\w*z)\w` exhausted the step budget on 1500 bytes.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const std::string a(20000, 'a');
+    CHECK(!make_unit(unit, "(?=\\w*z)\\w", 0).test(a));
+    CHECK(make_unit(unit, "(?=\\w*z)\\w", 0).search(a + "z").begin() == 0);
+    CHECK(!make_unit(unit, "(?<=z\\w*)a", 0).test(a));
+    CHECK(make_unit(unit, "(?<=z\\w*)a", 0).search("z" + a).begin() == 1);
+    // find_all shares the answers across its matches: 20001 matches here.
+    CHECK(make_unit(unit, "\\w(?=\\w*z)", 0).find_all(a + "z").size() ==
+          a.size());
+    CHECK(make_unit(unit, "(?<!b\\w*)a", 0).find_all(a).size() == a.size());
+    // A lookaround nested in a lookaround body, and one under a repeat.
+    CHECK(make_unit(unit, "(?=\\w*(?<=z)y)\\w", 0).search(a + "zy").begin() ==
+          0);
+    CHECK(!make_unit(unit, "(?=\\w*(?<=z)y)\\w", 0).test(a + "y"));
+    CHECK(make_unit(unit, "(?:(?!ab)\\w)+", 0).search("xxab").str() == "xx");
+  }
 }
 
 void test_unicode_properties() {
@@ -4927,6 +4964,42 @@ void test_resource_limits() {
   }
   // The same dense pattern on a short subject stays under budget and matches.
   CHECK(Regex("(a?){9000}").search("aaa").matched());
+  // A repeat of a body that compiles to nothing emits nothing, at once: the
+  // nested counts used to run lo*lo empty emits and never reach the limit.
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(Regex("(?:(?:){1000000}){1000000}x").search("ax").begin() == 1);
+    CHECK(Regex("(?:a{0}){1000000}").search("b").matched());
+    CHECK(Regex("(?:(?i)){1000000}").test(""));
+    CHECK(rejects("(?:(?:a{1000}){1000}){1000}"));
+    double dt = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+    CHECK(dt < 5000);
+  }
+}
+
+void test_out_of_range_utf8() {
+  // A four-byte form past U+10FFFF (an F4 90.. or F5..F7 lead) is not UTF-8:
+  // each of its bytes is a lone byte, never a code point indexing past the end
+  // of a property table (ASan: global-buffer-overflow).
+  using reg::unicode::GeneralCategory;
+  CHECK(reg::unicode::general_category(0x110000) == GeneralCategory::Cn);
+  CHECK(reg::unicode::general_category(0x1FFFFF) == GeneralCategory::Cn);
+  CHECK(!reg::unicode::is_letter(0x1FFFFF));
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const char *bad : {"\xF4\x90\x80\x80", "\xF5\x80\x80\x80",
+                            "\xF7\xBF\xBF\xBF"}) {
+      const std::string s = std::string(bad) + "b1";
+      CHECK(!make_unit(unit, "^.$", 0).test(bad));
+      CHECK(!make_unit(unit, "\\w", 0).test(bad));
+      auto m = make_unit(unit, "b\\d", 0).search(s);
+      CHECK(m && m.begin() == 4 && m.end() == 6);
+      CHECK(make_unit(unit, "(?<=\\W)b", 0).search(s).begin() == 4);
+    }
+  }
+  // U+10FFFF itself is the last code point, and still one.
+  CHECK(Regex("^.$").test("\xF4\x8F\xBF\xBF"));
 }
 
 void test_error_messages() {
@@ -4982,6 +5055,7 @@ int main() {
   test_ascii_icase_prefilter();
   test_assert_dfa();
   test_lookahead();
+  test_lookaround_linear();
   test_unicode_properties();
   test_lookbehind_fixed();
   test_lookbehind_variable();
@@ -5001,6 +5075,7 @@ int main() {
   test_iterator_survives_cache_eviction();
   test_invalid_patterns();
   test_resource_limits();
+  test_out_of_range_utf8();
   test_error_messages();
 
   std::printf("\nregexlib: %d passed, %d failed\n", g_pass, g_fail);
