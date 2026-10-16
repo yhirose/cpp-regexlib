@@ -1558,7 +1558,9 @@ bugs** — an accelerator that disagrees with the baseline — and the tempting 
 compiled program.
 
 The strategy (`test/regexlib_fuzz.cc`, fixed seed `0xC0FFEE`, run under
-ASan/UBSan) is layered:
+ASan/UBSan) is layered. (Sanitizers multiply the run time — ASan about 7×, UBSan
+5×, both 15× — so an ASan build draws a fifth of the iterations by default
+(`kDefaultIters`); `--iters` sets it either way.)
 
 - **Layer 1 — invariants that need no known-correct answer (fails CI).** Random
   patterns/subjects never crash, hang, or throw anything but `RegexError` at

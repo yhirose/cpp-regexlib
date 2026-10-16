@@ -1404,7 +1404,9 @@ Unicode レベル、空マッチ処理が異なる）。さらに、効くバグ
 assert）は罠：両者が同じディスパッチ・同じコンパイル済みプログラムを通るため**同じ
 誤った前提を共有**しうる。
 
-戦略（`test/regexlib_fuzz.cc`、固定 seed `0xC0FFEE`、ASan/UBSan 下で実行）は階層的:
+戦略（`test/regexlib_fuzz.cc`、固定 seed `0xC0FFEE`、ASan/UBSan 下で実行）は階層的
+（サニタイザは実行時間を ASan で約 7 倍、UBSan で約 5 倍、両方で約 15 倍にするため、
+ASan ビルドの既定の反復数は 5 分の 1 です（`kDefaultIters`）。`--iters` でどちらも指定できます）:
 
 - **層1 — 正解を知らずに検査できる不変条件ゲート（CI を落とす）。** ランダムなパターン/subject は
   クラッシュ/ハング/構築時 `RegexError` 以外の throw をせず、各マッチは自己整合：

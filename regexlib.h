@@ -3716,14 +3716,22 @@ inline std::vector<char32_t> class_key(const CharClass &cc, bool icase,
 // engines agree.
 inline const std::vector<std::vector<char32_t>> &case_fold_groups() {
   static const std::vector<std::vector<char32_t>> groups = [] {
+    // A code point folds to another only if the fold table lists it, so an
+    // orbit of two or more is a fold target together with the table entries
+    // that fold to it: built from the ~1500 entries, not from a scan of all
+    // 0x110000 code points (which cost a hash entry and a vector apiece).
     std::unordered_map<char32_t, std::vector<char32_t>> by_fold;
-    for (char32_t cp = 0; cp <= 0x10FFFF; cp++) {
-      if (cp >= 0xD800 && cp <= 0xDFFF) continue; // surrogates aren't scalars
-      by_fold[fold(cp)].push_back(cp);
+    for (const auto &e : unicode::_case_fold) {
+      auto &grp = by_fold[e[1]];
+      if (grp.empty()) grp.push_back(e[1]);
+      grp.push_back(e[0]);
     }
     std::vector<std::vector<char32_t>> g;
-    for (auto &kv : by_fold)
-      if (kv.second.size() >= 2) g.push_back(std::move(kv.second));
+    g.reserve(by_fold.size());
+    for (auto &kv : by_fold) {
+      std::sort(kv.second.begin(), kv.second.end());
+      g.push_back(std::move(kv.second));
+    }
     return g;
   }();
   return groups;

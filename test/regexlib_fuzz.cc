@@ -25,6 +25,19 @@
 //      17 minutes of the run under ASan. Nothing regexlib does is in those
 //      seconds.
 //
+//  Run time. The default budget (--iters 25000 per invariant_* function, 17
+//  of them) is sized for a Release build: about 0.35 s of CPU per hundred
+//  iterations, spread over the worker threads. Under AddressSanitizer the same
+//  work takes about 7x as long, under UBSan about 5x, under both about 15x
+//  (measured, one worker, 200 iterations: 2.3 s plain, 16.7 s ASan, 11.0 s
+//  UBSan, 33.8 s both) — every allocation, free and memset the engines make is
+//  instrumented, and they make many. A default run of the full budget under
+//  ASan+UBSan is then over twenty minutes on four cores. The sanitizer's job
+//  here is memory safety on the paths the fuzzer reaches, which a fifth of the
+//  draws reach as surely, so an ASan build defaults to a fifth of the budget
+//  (kDefaultIters); the plain build, which checks the invariants against the
+//  Pike reference over the full budget, is unchanged. --iters sets either.
+//
 //  Build (standalone):
 //    c++ -std=c++17 -Iinclude \
 //        test/regexlib_fuzz.cc -o regexlib_fuzz && ./regexlib_fuzz
@@ -42,6 +55,22 @@
 #include <vector>
 
 #include "regexlib.h"
+
+// Whether this build runs under AddressSanitizer (see "Run time" above).
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAsan = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAsan = true;
+#else
+constexpr bool kAsan = false;
+#endif
+#else
+constexpr bool kAsan = false;
+#endif
+
+// --iters, per invariant_* function, when the command line does not say.
+constexpr int kDefaultIters = kAsan ? 5000 : 25000;
 
 // The fuzzer's view into a Regex's plan (the header declares the peer and
 // befriends it): whether a Regex is served by the Pike VM and by nothing
@@ -2371,7 +2400,7 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
 int main(int argc, char **argv) {
   std::uint32_t base = 0xC0FFEE; // base seed
   int jobs = 0;                  // 0 => auto-detect cores
-  int inv = 25000;              // per invariant_* function; others scale to it
+  int inv = kDefaultIters;      // per invariant_* function; others scale to it
   bool std_diff = false;        // also compare against std::regex (INFO)
 
   for (int i = 1; i < argc; i++) {
@@ -2392,10 +2421,11 @@ int main(int argc, char **argv) {
                   "[--std-diff]\n"
                   "  --jobs      worker threads (default: detected cores)\n"
                   "  --seed      base RNG seed (default: 0xC0FFEE)\n"
-                  "  --iters     per invariant_* function (default: 25000)\n"
+                  "  --iters     per invariant_* function (default: %d%s)\n"
                   "  --std-diff  also count disagreements with std::regex "
                   "(informational;\n"
-                  "              slow: std::regex backtracks)\n");
+                  "              slow: std::regex backtracks)\n",
+                  kDefaultIters, kAsan ? ", a fifth of the budget under ASan" : "");
       return 0;
     } else {
       std::fprintf(stderr, "unknown arg: %s (try --help)\n", a.c_str());
@@ -2412,7 +2442,8 @@ int main(int argc, char **argv) {
   int parser_it = static_cast<int>(static_cast<long>(inv) * 6 / 5);
   int diff_it = static_cast<int>(static_cast<long>(inv) * 12 / 25);
 
-  std::printf("regexlib_fuzz: jobs=%d seed=0x%X iters=%d\n", jobs, base, inv);
+  std::printf("regexlib_fuzz: jobs=%d seed=0x%X iters=%d%s\n", jobs, base, inv,
+              kAsan && inv == kDefaultIters ? " (ASan default)" : "");
 
   std::vector<std::thread> pool;
   pool.reserve(jobs - 1);

@@ -11,6 +11,7 @@
 //  Or via CMake/ctest: `ctest -R regexlib_test`.
 //
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -5210,6 +5211,23 @@ void test_icase_class_ranges() {
   std::unordered_map<char32_t, std::vector<char32_t>> orbit; // fold -> members
   for (char32_t c = 0; c <= 0x10FFFF; c++)
     orbit[reg::unicode::simple_case_folding(c)].push_back(c);
+  // The orbits the engine uses (built from the fold table's entries) are the
+  // ones a scan of every code point finds.
+  {
+    std::vector<std::vector<char32_t>> want;
+    for (auto &kv : orbit)
+      if (kv.second.size() >= 2) want.push_back(kv.second);
+    std::vector<std::vector<char32_t>> got = reg::detail::case_fold_groups();
+    std::sort(want.begin(), want.end());
+    std::sort(got.begin(), got.end());
+    CHECK(got == want);
+    CHECK(got.size() > 1000);
+    for (const auto &grp : got)
+      for (char32_t m : grp)
+        CHECK(reg::detail::case_fold_orbit(m) != nullptr);
+    CHECK(reg::detail::case_fold_orbit('1') == nullptr);
+    CHECK(reg::detail::case_fold_orbit(0x10FFFF) == nullptr);
+  }
   struct Range {
     char32_t lo, hi;
   };
