@@ -16,6 +16,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "regexlib.h"
 
@@ -5198,6 +5200,80 @@ void test_invalid_utf8_tiers() {
         (std::vector<size_t>{0, 3, 6, 9}));
 }
 
+// Under IgnoreCase a class range holds a code point when ANY of its case
+// variants lies in the range. (Comparing the folds of the range's ends was no
+// such test: fold is not monotonic, so `(?i)[@-Z]` took `_` and `(?i)[Z-a]`
+// lost `A`, and the engines that bake the variants into bytes disagreed with
+// those that fold at match time.) The oracle is built from the fold table
+// itself, over every code point.
+void test_icase_class_ranges() {
+  std::unordered_map<char32_t, std::vector<char32_t>> orbit; // fold -> members
+  for (char32_t c = 0; c <= 0x10FFFF; c++)
+    orbit[reg::unicode::simple_case_folding(c)].push_back(c);
+  struct Range {
+    char32_t lo, hi;
+  };
+  const auto expected = [&](char32_t cp, const std::vector<Range> &rs,
+                            bool negate) {
+    bool in = false;
+    for (char32_t m : orbit[reg::unicode::simple_case_folding(cp)])
+      for (const Range &r : rs)
+        in = in || (m >= r.lo && m <= r.hi);
+    return negate ? !in : in;
+  };
+  const auto hex = [](char32_t c) {
+    char b[24];
+    std::snprintf(b, sizeof b, "\\x{%X}", static_cast<unsigned>(c));
+    return std::string(b);
+  };
+  struct Case {
+    std::vector<Range> rs;
+    bool negate;
+  };
+  const Case cases[] = {
+      {{{'@', 'Z'}}, false},          {{{'Z', 'a'}}, false},
+      {{{'0', 'Z'}}, false},          {{{'4', 't'}}, false},
+      {{{'3', 'E'}}, false},          {{{'a', 'z'}}, false},
+      {{{'A', 'Z'}}, false},          {{{'[', '`'}}, false},
+      {{{'R', '~'}}, true},           {{{'a', 'c'}, {'X', 'Z'}}, false},
+      {{{0x100, 0x17F}}, false},      {{{0x17F, 0x17F}}, false},
+      {{{0x212A, 0x212A}}, false},    {{{0x3A3, 0x3A3}}, false},
+      {{{0x1C4, 0x1CC}}, true},       {{{0x1E9E, 0x1E9E}}, false},
+      {{{'k', 'k'}}, true},           {{{0x0, 0x7F}}, false},
+  };
+  std::vector<char32_t> probe;
+  for (char32_t c = 0x20; c < 0x7F; c++) probe.push_back(c);
+  for (char32_t c : {0xDFu, 0xE9u, 0x100u, 0x130u, 0x131u, 0x17Fu, 0x1C4u,
+                     0x1C5u, 0x1C6u, 0x1CBu, 0x3A3u, 0x3C2u, 0x3C3u, 0x1E9Eu,
+                     0x212Au, 0x2126u, 0x3A9u, 0x3C9u, 0x10400u, 0x10428u})
+    probe.push_back(c);
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const Case &cs : cases) {
+      std::string cls = cs.negate ? "[^" : "[";
+      for (const Range &r : cs.rs) cls += hex(r.lo) + "-" + hex(r.hi);
+      cls += "]";
+      const Regex whole = make_unit(unit, "^" + cls + "$", reg::IgnoreCase);
+      const Regex part = make_unit(unit, cls, reg::IgnoreCase);
+      for (char32_t cp : probe) {
+        const bool want = expected(cp, cs.rs, cs.negate);
+        const std::string s = reg::unicode::utf8::encode_codepoint(cp);
+        const bool a = whole.test(s), b = part.test(s);
+        if ((a != want || b != want) && cp < 0x80)
+          std::printf("  icase class %s on U+%04X: want %d, got ^$ %d / bare %d\n",
+                      cls.c_str(), static_cast<unsigned>(cp), want, a, b);
+        CHECK(a == want);
+        CHECK(b == want);
+      }
+    }
+  }
+  // The cases that showed it.
+  CHECK(!make_us("[@-Z]", IgnoreCase).test("_"));
+  CHECK(!Regex("(?i)[@-Z]").test("_"));
+  CHECK(Regex("(?i)[Z-a]").test("A"));
+  CHECK(Regex("(?i)[4-t]").test("w"));
+  CHECK(Regex("(?i)^[4-t]+$").test("wW"));
+}
+
 void test_error_messages() {
   // Errors carry the offending position and a caret line.
   std::string e = error_of("ab**");
@@ -5274,6 +5350,7 @@ int main() {
   test_out_of_range_utf8();
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();
+  test_icase_class_ranges();
   test_error_messages();
 
   std::printf("\nregexlib: %d passed, %d failed\n", g_pass, g_fail);

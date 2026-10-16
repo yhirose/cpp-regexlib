@@ -1860,6 +1860,10 @@ inline bool is_space_cp(char32_t cp) { return unicode::is_white_space(cp); }
 
 inline char32_t fold(char32_t cp) { return unicode::simple_case_folding(cp); }
 
+// The case-fold orbit of `cp`: every code point that folds to the same value
+// (itself included), or null when it folds alone. Defined with case_fold_groups.
+inline const std::vector<char32_t> *case_fold_orbit(char32_t cp);
+
 // Unicode property classes for \p{...} / \P{...}.
 // clang-format off
 enum class UProp {
@@ -1981,19 +1985,25 @@ struct CharClass {
   // (no std::u32string wrapper). Equivalent to matches() on a 1-element
   // cluster.
   bool matches_cp(char32_t cp, bool icase) const {
-    char32_t fcp = icase ? detail::fold(cp) : cp;
+    // Under icase a range holds `cp` when any case variant of it does (the
+    // class is the union of the orbits its ranges touch, as the byte compiler
+    // builds it) — not when `cp`'s fold lies between the folds of the ends,
+    // which is no interval of anything: fold is not monotonic.
+    const std::vector<char32_t> *orbit =
+        icase ? detail::case_fold_orbit(cp) : nullptr;
     bool in = false;
     for (auto &r : ranges) {
       if (cp >= r.first && cp <= r.second) {
         in = true;
         break;
       }
-      if (icase) {
-        char32_t flo = detail::fold(r.first), fhi = detail::fold(r.second);
-        if (fcp >= flo && fcp <= fhi) {
-          in = true;
-          break;
-        }
+      if (orbit) {
+        for (char32_t m : *orbit)
+          if (m >= r.first && m <= r.second) {
+            in = true;
+            break;
+          }
+        if (in) break;
       }
     }
     if (!in)
@@ -3717,6 +3727,18 @@ inline const std::vector<std::vector<char32_t>> &case_fold_groups() {
     return g;
   }();
   return groups;
+}
+
+inline const std::vector<char32_t> *case_fold_orbit(char32_t cp) {
+  static const std::unordered_map<char32_t, const std::vector<char32_t> *>
+      by_fold = [] {
+        std::unordered_map<char32_t, const std::vector<char32_t> *> m;
+        for (const auto &grp : case_fold_groups())
+          m.emplace(fold(grp[0]), &grp);
+        return m;
+      }();
+  const auto it = by_fold.find(fold(cp));
+  return it == by_fold.end() ? nullptr : it->second;
 }
 
 struct Compiler {
