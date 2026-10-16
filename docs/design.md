@@ -721,6 +721,25 @@ and never reads `Inst` in the hot loop), so the win is compile time and memory �
 exactly where it was needed (`\w+` byte program: 359 → 159 KiB after the
 160→32→16-byte shrink).
 
+### Lookaround programs — one per lookaround, counted in the program
+
+A lookaround is a program of its own, which `Look` runs: compiled to scan
+*away* from the positions it answers for, and run by the Pike once over the
+whole subject to settle the assertion at every position (`Regex::look_table`,
+one table per program per subject). Its identity is its AST node: a counted
+repeat `x{n}` emits its body `n` times, but every copy of a lookaround in it
+is the same assertion, so `Compiler::sub_program` compiles it the first time
+and hands later copies the same program (`sub_of_`). One lookaround is one
+program to hold and one table to fill, however many copies the repeats make.
+
+The size limit counts what a program *runs*: `Compiler::size()` is its own
+instructions plus its lookaround programs', each counted once, and
+`limits::kMaxProgramInsts` bounds that; a lookaround body compiles within what
+the program around it has left. Before, each copy compiled its own program
+outside the limit — 25 bytes of `(?:(?=[ab]{20000})a){400}` took a gigabyte
+— and each filled its own table, so `(?:(?=[ab]{50})a){100}` settled one
+assertion a hundred times over every subject.
+
 ### UTF-8 range compilation
 
 In UnicodeScalar mode and on the byte path a class / `.` / `\d\w\s\p{…}` is a

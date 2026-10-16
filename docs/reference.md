@@ -512,11 +512,13 @@ pattern that exceeds any of these raises `RegexError` at construction:
 | Limit | Value |
 | --- | --- |
 | Pattern source length | 32 KiB |
-| Compiled program size | 262144 instructions |
+| Compiled program size | 262144 instructions, the lookaround programs it runs included |
 | Nesting depth | 200 |
 
 These bound compile cost (e.g. `a{1000000}`, nested `(x{50}){50}…`) and parser
-recursion (e.g. `((((…))))`). The nesting limit is kept conservative so the
+recursion (e.g. `((((…))))`). A lookaround is one program however many times a
+counted repeat copies it — `(?:(?=x)a){1000}` holds one — and each distinct
+lookaround counts toward the size of the program that runs it. The nesting limit is kept conservative so the
 recursive-descent parser stays within the smallest common thread stack
 (Windows' 1 MiB main-thread stack); hand-written patterns nest far below it.
 

@@ -3778,36 +3778,41 @@ struct Compiler {
                          bool cp = false, bool icase = false,
                          bool lf_byte_prefix = false) {
     Compiler c;
-    c.base_slots_ = 2 * (ncap + 1);
     c.us_ = us;
     c.cp_ = cp;
     c.reverse_ = reverse;
     c.dotall_ = dotall;
     c.icase_ = icase;
+    return c.build(root, ncap, lf_byte_prefix);
+  }
+
+  // The program for `root`, under the flags already set.
+  Program build(const Node &root, int ncap, bool lf_byte_prefix) {
+    base_slots_ = 2 * (ncap + 1);
     if (lf_byte_prefix) {
       Inst sp;
       sp.op = Inst::Op::Split;
       sp.x = 3; // enter the pattern (higher priority: lazy prefers to stop)
       sp.y = 1; // consume a byte (lower priority)
-      c.prog.insts.push_back(sp);
+      prog.insts.push_back(sp);
       Inst by;
       by.op = Inst::Op::Byte;
       by.set_byte(0x00, 0xFF);
-      c.prog.insts.push_back(by);
-      c.prog.byte_ranges.push_back(static_cast<uint16_t>(by.x));
+      prog.insts.push_back(by);
+      prog.byte_ranges.push_back(static_cast<uint16_t>(by.x));
       Inst jm;
       jm.op = Inst::Op::Jmp;
       jm.x = 0;
-      c.prog.insts.push_back(jm);
+      prog.insts.push_back(jm);
     }
-    c.emit_save(0); // start of whole match
-    c.emit(root);
-    c.emit_save(1); // end of whole match
+    emit_save(0); // start of whole match
+    emit(root);
+    emit_save(1); // end of whole match
     Inst m;
     m.op = Inst::Op::Match;
-    c.prog.insts.push_back(m);
-    c.prog.nslots = c.base_slots_ + c.loop_slots_;
-    return std::move(c.prog);
+    prog.insts.push_back(m);
+    prog.nslots = base_slots_ + loop_slots_;
+    return std::move(prog);
   }
 
   int here() const { return static_cast<int>(prog.insts.size()); }
@@ -3815,10 +3820,31 @@ struct Compiler {
   // The class blocks already on prog's lists (see append_block).
   std::vector<const ClassBlock *> listed_;
 
-  int push(Inst i) {
-    if (static_cast<int>(prog.insts.size()) >= limits::kMaxProgramInsts)
+  // A lookaround is a program of its own (Inst::Op::Look runs it), one per
+  // lookaround of the pattern: its AST node is its identity, so the copies
+  // of it that `x{n}` emits are one program — compiled once, held once, and
+  // settled over a subject once (Regex::look_table). `sub_of_` maps the node
+  // to it; `sub_insts_` is what those programs hold, each counted once.
+  std::unordered_map<const Node *, int> sub_of_;
+  int sub_insts_ = 0;
+
+  // What this program holds, in instructions: its own and its lookaround
+  // programs'. A program is everything it runs, so this — not its own count
+  // alone — is what the size limit bounds: `limit_`, which is
+  // limits::kMaxProgramInsts for a pattern and, for a lookaround body, what
+  // the program around it has left.
+  int limit_ = limits::kMaxProgramInsts;
+  int size() const { return here() + sub_insts_; }
+
+  // Make room for `n` more instructions, or throw ProgramTooLarge.
+  void room(size_t n) const {
+    if (static_cast<size_t>(size()) + n > static_cast<size_t>(limit_))
       throw RegexError(RegexError::Code::ProgramTooLarge,
                        "regex pattern too large (compiled program too big)");
+  }
+
+  int push(Inst i) {
+    room(1);
     prog.insts.push_back(std::move(i));
     return here() - 1;
   }
@@ -3845,6 +3871,32 @@ struct Compiler {
   int intern_sub(std::shared_ptr<Program> p) {
     prog.subs.push_back(std::move(p));
     return static_cast<int>(prog.subs.size()) - 1;
+  }
+
+  // The program of lookaround `n` (see sub_of_), compiled the first time it
+  // is emitted, in this program's mode and within what it has left. Its
+  // captures are not exported. It scans AWAY from the positions it answers
+  // for: the Pike runs it once over the whole subject to settle the
+  // assertion at every position (Regex::look_table). So a lookahead body is
+  // reverse-compiled — in byte (us_) or code-point (cp_) mode its units are
+  // emitted in reverse too, so the right-to-left scan matches them — and a
+  // lookbehind body is compiled forward.
+  int sub_program(const Node &n) {
+    const auto it = sub_of_.find(&n);
+    if (it != sub_of_.end()) return it->second;
+    const bool rev = !n.look_behind;
+    Compiler c;
+    c.us_ = us_;
+    c.cp_ = cp_;
+    c.reverse_ = rev && (us_ || cp_);
+    c.dotall_ = dotall_;
+    c.limit_ = limit_ - size();
+    Program body = rev ? c.build(reverse_ast(n.kids[0]), 0, false)
+                       : c.build(n.kids[0], 0, false);
+    sub_insts_ += static_cast<int>(body.insts.size()) + c.sub_insts_;
+    const int id = intern_sub(std::make_shared<Program>(std::move(body)));
+    sub_of_.emplace(&n, id);
+    return id;
   }
 
   void emit_save(int slot) {
@@ -4012,10 +4064,7 @@ struct Compiler {
   // so only Split/Jmp carry targets to fix up.
   void append_block(const ClassBlock &blk) {
     const std::vector<Inst> &block = blk.insts;
-    if (static_cast<int>(prog.insts.size() + block.size()) >=
-        limits::kMaxProgramInsts)
-      throw RegexError(RegexError::Code::ProgramTooLarge,
-                       "regex pattern too large (compiled program too big)");
+    room(block.size());
     int base = here();
     prog.insts.insert(prog.insts.end(), block.begin(), block.end());
     // What it tests goes on the program's lists the first time the block
@@ -4148,17 +4197,7 @@ struct Compiler {
       i.op = Inst::Op::Look;
       i.look_behind = n.look_behind;
       i.look_negate = n.look_negate;
-      // The lookaround body is its own program (captures are not exported),
-      // compiled to scan AWAY from the positions it answers for: the Pike
-      // runs it once over the whole subject to settle the assertion at every
-      // position (Regex::look_table). So a lookahead body is reverse-compiled
-      // — in byte (us_) or code-point (cp_) mode its units are emitted in
-      // reverse too, so the right-to-left scan matches them — and a
-      // lookbehind body is compiled forward.
-      const bool rev = !n.look_behind;
-      i.x = intern_sub(std::make_shared<Program>(
-          compile(rev ? reverse_ast(n.kids[0]) : n.kids[0], 0, us_,
-                  rev && (us_ || cp_), dotall_, cp_)));
+      i.x = sub_program(n);
       push(std::move(i));
       break;
     }

@@ -57,6 +57,13 @@ struct PlanProbe {
     default: return '-';
     }
   }
+  // The lookaround programs the Pike's program runs (the code-point program
+  // in CodePoint mode): one per lookaround of the pattern, however many
+  // copies of it a counted repeat makes.
+  static size_t look_programs(const Regex &re) {
+    const auto &p = *re.plan_;
+    return (p.us_ ? p.cp_prog_ : p.prog_).subs.size();
+  }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
@@ -4982,6 +4989,63 @@ void test_resource_limits() {
   }
 }
 
+// A lookaround is one program however many times a counted repeat copies it,
+// and the size limit counts the lookaround programs a program runs. A repeat
+// used to compile its lookaround once per copy, outside the limit: 25 bytes
+// of `(?:(?=[ab]{20000})a){400}` took a gigabyte and seconds to compile, and
+// `(?:(?=[ab]{50})a){100}` settled the same assertion a hundred times over
+// every subject and ran out of step budget on 20 KB.
+void test_lookaround_programs() {
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const auto rejected = [unit](const std::string &pat) {
+      try {
+        make_unit(unit, pat, 0);
+      } catch (const RegexError &e) {
+        return e.code() == RegexError::Code::ProgramTooLarge;
+      }
+      return false;
+    };
+    // One program per lookaround, whatever the repeats around it.
+    CHECK(PlanProbe::look_programs(make_unit(unit, "(?:(?=a)b){50}", 0)) == 1);
+    CHECK(PlanProbe::look_programs(make_unit(unit, "(?=a)b(?=a)", 0)) == 2);
+    CHECK(PlanProbe::look_programs(
+              make_unit(unit, "(?:(?<=a)(?:(?!b)c){3}){4}", 0)) == 2);
+    {
+      auto t0 = std::chrono::steady_clock::now();
+      CHECK(PlanProbe::look_programs(
+                make_unit(unit, "(?:(?=[ab]{20000})a){400}", 0)) == 1);
+      CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          t0)
+                .count() < 10);
+      const Regex re = make_unit(unit, "(?:(?=[ab]{200})a){400}", 0);
+      CHECK(re.search(std::string(600, 'a')).end() == 400);
+      CHECK(!re.test(std::string(598, 'a')));
+    }
+    // ... and settled over a subject once: a hundred copies cost one.
+    const std::string subj = std::string(20000, 'a') + "b";
+    for (const char *pat : {"(?:(?=[ab]{50})a){100}", "(?:(?<=a{9})a){1000}",
+                            "(?:a(?![^a]{3})){500}"}) {
+      bool threw = false;
+      try {
+        CHECK(make_unit(unit, pat, 0).search(subj).matched());
+      } catch (const RegexError &) { threw = true; }
+      CHECK(!threw);
+    }
+    // The limit counts what a program runs: lookarounds that are not copies
+    // of one another each hold their own instructions — written alike or not.
+    CHECK(!rejected("(?=[ab]{100000})a"));
+    CHECK(!rejected("(?=[ab]{100000})(?=[ab]{100000})a"));
+    CHECK(rejected("(?=[ab]{100000}0)(?=[ab]{100000}1)(?=[ab]{100000}2)a"));
+    std::string q;
+    for (int i = 0; i < 60; i++)
+      q += "(?=[ab]{20000}" + std::to_string(i % 10) + std::string(i / 10, 'x') +
+           ")";
+    CHECK(rejected(q + "a"));
+    // A lookaround in a lookaround is counted against the one around it.
+    CHECK(rejected("(?=(?=[ab]{200000})(?=[ab]{100000}x))a"));
+  }
+}
+
 void test_out_of_range_utf8() {
   // A four-byte form past U+10FFFF (an F4 90.. or F5..F7 lead) is not UTF-8:
   // each of its bytes is a lone byte, never a code point indexing past the end
@@ -5365,6 +5429,7 @@ int main() {
   test_iterator_survives_cache_eviction();
   test_invalid_patterns();
   test_resource_limits();
+  test_lookaround_programs();
   test_out_of_range_utf8();
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();
