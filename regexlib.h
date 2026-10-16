@@ -3821,7 +3821,7 @@ struct Compiler {
   // Op::Char each (single code point), so the Pike matches per code point. For
   // the reverse program the code-point order is flipped (paired with
   // reverse_ast's concat flip), matching the leftward code-point scan of a
-  // lookbehind body.
+  // lookahead body or a reverse program.
   void emit_cp_lit(const std::u32string &cps) {
     std::u32string seq = cps;
     if (reverse_) std::reverse(seq.begin(), seq.end());
@@ -12757,7 +12757,8 @@ private:
       // Prepend, and not onto a control (GB5: U+0600 then `\t` is two clusters,
       // and the `\t` may start the literal the caller is scanning for).
       if (off < n && p[off] < 0x80 &&
-          !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(p[off])))
+          (lp != GB::Prepend ||
+           !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(p[off]))))
         break; // cluster closed; resume the fused scan
     }
     return off;
@@ -14912,14 +14913,6 @@ private:
     return word_at(seg, sp - 1, n) != word_at(seg, sp, n);
   }
 
-  // Evaluate a zero-width lookaround instruction at position `sp`: does the
-  // body match starting at sp (lookahead), or some window ending at sp
-  // (lookbehind)? Read from the body's table over the whole subject.
-  bool eval_look(const detail::Program &prog, const detail::Inst &in,
-                 const detail::Segmented &seg, int sp, int n) const {
-    return look_table(*prog.subs[in.sub_idx()], seg, n, in.look_behind)[sp];
-  }
-
   // Follow ε-transitions (Jmp/Split/Save/asserts/lookaround), adding reachable
   // Char/Any/Class/Match threads to `list`, de-duplicating by pc.
   void add_thread(const detail::Program &prog, std::vector<Thread> &list,
@@ -14959,7 +14952,10 @@ private:
           stack.emplace_back(p + 1, std::move(sv));
         break;
       case Op::Look: {
-        bool ok = eval_look(prog, in, seg, sp, n);
+        // Does the body match starting at sp (lookahead), or some window
+        // ending at sp (lookbehind)? Read from its table over the subject.
+        bool ok =
+            look_table(*prog.subs[in.sub_idx()], seg, n, in.look_behind)[sp];
         if (in.look_negate ? !ok : ok) stack.emplace_back(p + 1, std::move(sv));
         break;
       }
@@ -15016,13 +15012,12 @@ private:
   // reaches Match at sp; a lookbehind's likewise rightward from some q <= sp.
   // Seeding a fresh thread at every position makes it the usual boolean NFA
   // simulation, O(n * program size). Captures are not tracked.
-  const std::vector<bool> &look_table(const detail::Program &body,
+  const std::vector<bool> &look_table(const detail::Program &prog,
                                       const detail::Segmented &seg, int n,
                                       bool behind) const {
     for (auto &t : seg.look_tables)
-      if (t.first == &body) return t.second;
+      if (t.first == &prog) return t.second;
     using Op = detail::Inst::Op;
-    const detail::Program &prog = body;
     int psz = static_cast<int>(prog.insts.size());
     std::vector<Thread> clist, nlist;
     clist.reserve(psz);
@@ -15065,7 +15060,7 @@ private:
       nlist.clear();
       if (sp == (behind ? n : 0)) break;
     }
-    seg.look_tables.emplace_back(&body, std::move(table));
+    seg.look_tables.emplace_back(&prog, std::move(table));
     return seg.look_tables.back().second;
   }
 
@@ -17736,8 +17731,7 @@ public:
 
   // `prefix_begin`: where prefix() starts — the end of the previous match for
   // a regex_iterator past its first match, else the subject start.
-  void _build(const reg::MatchResult &r, int mark_count,
-              size_t prefix_begin = 0) {
+  void _build(const reg::MatchResult &r, int mark_count, size_t prefix_begin) {
     groups_.clear();
     if (!r.matched()) return;
     const int total = mark_count + 1;
@@ -17822,7 +17816,7 @@ bool do_search(BiIter first, BiIter last, match_results<BiIter> &m,
     return re.native().search(sv);
   });
   m._reset(first, last);
-  m._build(r, static_cast<int>(re.mark_count()));
+  m._build(r, static_cast<int>(re.mark_count()), /*prefix_begin=*/0);
   return r.matched();
 }
 
