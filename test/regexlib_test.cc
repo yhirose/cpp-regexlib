@@ -11,11 +11,14 @@
 //  Or via CMake/ctest: `ctest -R regexlib_test`.
 //
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "regexlib.h"
 
@@ -53,6 +56,19 @@ struct PlanProbe {
     case Choice::Kind::Inner: return 'I';
     default: return '-';
     }
+  }
+  // The lookaround programs the Pike's program runs (the code-point program
+  // in CodePoint mode): one per lookaround of the pattern, however many
+  // copies of it a counted repeat makes.
+  static size_t look_programs(const Regex &re) {
+    const auto &p = *re.plan_;
+    return (p.us_ ? p.cp_prog_ : p.prog_).subs.size();
+  }
+  // The literal and class pools of the Pike's program (as look_programs).
+  static std::pair<size_t, size_t> operand_pools(const Regex &re) {
+    const auto &p = *re.plan_;
+    const auto &prog = p.us_ ? p.cp_prog_ : p.prog_;
+    return {prog.lits.size(), prog.classes.size()};
   }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
@@ -2269,6 +2285,21 @@ void test_grapheme_aware() {
   // A character class matches a multi-code-point grapheme by its base code
   // point (Model 2): the family-emoji base is an emoji, not [a-z].
   CHECK(!Regex("[a-z]").test(family));
+
+  // A Prepend (U+0600) fuses with what follows (GB9b) but not with a control
+  // (GB5): `\t` after it starts a cluster of its own, which the fused literal
+  // and class scans must not walk past.
+  const std::string prepend = "\xD8\x80";
+  auto at = [](const reg::MatchResult &m, size_t b, size_t e) {
+    return m && m.begin() == b && m.end() == e;
+  };
+  CHECK(at(Regex("\\tab").search("xx" + prepend + "\tab"), 4, 7));
+  CHECK(at(Regex("\\tab\\w*").search("xx" + prepend + "\tabc yy"), 4, 8));
+  CHECK(at(Regex("\\w*\\tq").search("zz" + prepend + "\tq"), 4, 6));
+  CHECK(at(Regex("[^ab]+[\t;][ab]").search("q " + prepend + "\ta"), 0, 6));
+  // ... while U+0600 + `a` is one cluster, so no `ab` starts at the `a`.
+  CHECK(!Regex("ab").test(prepend + "ab"));
+  CHECK(Regex("b").search(prepend + "ab").begin() == 3);
 }
 
 // Regex::find_at(text, pos) is one stateless step of find_iter(): stepping it
@@ -3469,6 +3500,28 @@ void test_lookahead() {
   CHECK(Regex("\\d+(?! USD)").search("42 USD").str() == "4");
   // variable-length lookahead body
   CHECK(Regex("\\w+(?=\\s*;)").search("name   ;").str() == "name");
+}
+
+void test_lookaround_linear() {
+  // The Pike settles a lookaround at every position in one pass over the
+  // subject. Asking the body afresh at each position the Pike reached was
+  // O(n^2): `(?=\w*z)\w` exhausted the step budget on 1500 bytes.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const std::string a(20000, 'a');
+    CHECK(!make_unit(unit, "(?=\\w*z)\\w", 0).test(a));
+    CHECK(make_unit(unit, "(?=\\w*z)\\w", 0).search(a + "z").begin() == 0);
+    CHECK(!make_unit(unit, "(?<=z\\w*)a", 0).test(a));
+    CHECK(make_unit(unit, "(?<=z\\w*)a", 0).search("z" + a).begin() == 1);
+    // find_all shares the answers across its matches: 20001 matches here.
+    CHECK(make_unit(unit, "\\w(?=\\w*z)", 0).find_all(a + "z").size() ==
+          a.size());
+    CHECK(make_unit(unit, "(?<!b\\w*)a", 0).find_all(a).size() == a.size());
+    // A lookaround nested in a lookaround body, and one under a repeat.
+    CHECK(make_unit(unit, "(?=\\w*(?<=z)y)\\w", 0).search(a + "zy").begin() ==
+          0);
+    CHECK(!make_unit(unit, "(?=\\w*(?<=z)y)\\w", 0).test(a + "y"));
+    CHECK(make_unit(unit, "(?:(?!ab)\\w)+", 0).search("xxab").str() == "xx");
+  }
 }
 
 void test_unicode_properties() {
@@ -4927,6 +4980,412 @@ void test_resource_limits() {
   }
   // The same dense pattern on a short subject stays under budget and matches.
   CHECK(Regex("(a?){9000}").search("aaa").matched());
+  // A repeat of a body that compiles to nothing emits nothing, at once: the
+  // nested counts used to run lo*lo empty emits and never reach the limit.
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(Regex("(?:(?:){1000000}){1000000}x").search("ax").begin() == 1);
+    CHECK(Regex("(?:a{0}){1000000}").search("b").matched());
+    CHECK(Regex("(?:(?i)){1000000}").test(""));
+    CHECK(rejects("(?:(?:a{1000}){1000}){1000}"));
+    double dt = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+    CHECK(dt < 5000);
+  }
+}
+
+// A lookaround is one program however many times a counted repeat copies it,
+// and the size limit counts the lookaround programs a program runs. A repeat
+// used to compile its lookaround once per copy, outside the limit: 25 bytes
+// of `(?:(?=[ab]{20000})a){400}` took a gigabyte and seconds to compile, and
+// `(?:(?=[ab]{50})a){100}` settled the same assertion a hundred times over
+// every subject and ran out of step budget on 20 KB.
+void test_lookaround_programs() {
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const auto rejected = [unit](const std::string &pat) {
+      try {
+        make_unit(unit, pat, 0);
+      } catch (const RegexError &e) {
+        return e.code() == RegexError::Code::ProgramTooLarge;
+      }
+      return false;
+    };
+    // One program per lookaround, whatever the repeats around it.
+    CHECK(PlanProbe::look_programs(make_unit(unit, "(?:(?=a)b){50}", 0)) == 1);
+    CHECK(PlanProbe::look_programs(make_unit(unit, "(?=a)b(?=a)", 0)) == 2);
+    CHECK(PlanProbe::look_programs(
+              make_unit(unit, "(?:(?<=a)(?:(?!b)c){3}){4}", 0)) == 2);
+    {
+      auto t0 = std::chrono::steady_clock::now();
+      CHECK(PlanProbe::look_programs(
+                make_unit(unit, "(?:(?=[ab]{20000})a){400}", 0)) == 1);
+      CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          t0)
+                .count() < 10);
+      const Regex re = make_unit(unit, "(?:(?=[ab]{200})a){400}", 0);
+      CHECK(re.search(std::string(600, 'a')).end() == 400);
+      CHECK(!re.test(std::string(598, 'a')));
+    }
+    // ... and settled over a subject once: a hundred copies cost one.
+    const std::string subj = std::string(20000, 'a') + "b";
+    for (const char *pat : {"(?:(?=[ab]{50})a){100}", "(?:(?<=a{9})a){1000}",
+                            "(?:a(?![^a]{3})){500}"}) {
+      bool threw = false;
+      try {
+        CHECK(make_unit(unit, pat, 0).search(subj).matched());
+      } catch (const RegexError &) { threw = true; }
+      CHECK(!threw);
+    }
+    // The limit counts what a program runs: lookarounds that are not copies
+    // of one another each hold their own instructions — written alike or not.
+    CHECK(!rejected("(?=[ab]{100000})a"));
+    CHECK(!rejected("(?=[ab]{100000})(?=[ab]{100000})a"));
+    CHECK(rejected("(?=[ab]{100000}0)(?=[ab]{100000}1)(?=[ab]{100000}2)a"));
+    std::string q;
+    for (int i = 0; i < 60; i++)
+      q += "(?=[ab]{20000}" + std::to_string(i % 10) + std::string(i / 10, 'x') +
+           ")";
+    CHECK(rejected(q + "a"));
+    // A lookaround in a lookaround is counted against the one around it.
+    CHECK(rejected("(?=(?=[ab]{200000})(?=[ab]{100000}x))a"));
+  }
+}
+
+// A program's operand pools hold each distinct literal and class once, however
+// many instructions read it: a counted repeat's copies share their operands,
+// so what grows under expansion is the instructions alone. Each copy used to
+// add its own pool entry — a `[ab]{20000}` held twenty thousand copies of one
+// class.
+void test_operand_pools() {
+  using Pools = std::pair<size_t, size_t>; // {literals, classes}
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const auto pools = [unit](const char *pat) {
+      return PlanProbe::operand_pools(make_unit(unit, pat, 0));
+    };
+    CHECK(pools("[ab]{20000}") == Pools(0, 1));
+    CHECK(pools("(?:[ab]x){50}") == Pools(1, 1));
+    CHECK(pools("[ab]c[ab]c") == Pools(1, 1)); // equal, from different nodes
+    CHECK(pools("[ab][cd]x{3}y") == Pools(2, 2));
+    CHECK(pools("(?:\\w\\d[^\\s]){9}") == Pools(0, 3));
+    CHECK(pools("(?:\xC3\xA9x){50}") == Pools(2, 0));
+    CHECK(pools("xyx") == Pools(2, 0));
+    // The sharing changes nothing a match sees.
+    const Regex re = make_unit(unit, "(?:[ab]x){3}([ab]+)x", 0);
+    const auto m = re.search("zaxbxax" "ab" "x");
+    CHECK(m && m.begin() == 1 && m.group(1).str() == "ab");
+    CHECK(!re.test("axbxaxx"));
+  }
+}
+
+void test_out_of_range_utf8() {
+  // A four-byte form past U+10FFFF (an F4 90.. or F5..F7 lead) is not UTF-8:
+  // each of its bytes is a lone byte, never a code point indexing past the end
+  // of a property table (ASan: global-buffer-overflow).
+  using reg::unicode::GeneralCategory;
+  CHECK(reg::unicode::general_category(0x110000) == GeneralCategory::Cn);
+  CHECK(reg::unicode::general_category(0x1FFFFF) == GeneralCategory::Cn);
+  CHECK(!reg::unicode::is_letter(0x1FFFFF));
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const char *bad : {"\xF4\x90\x80\x80", "\xF5\x80\x80\x80",
+                            "\xF7\xBF\xBF\xBF"}) {
+      const std::string s = std::string(bad) + "b1";
+      CHECK(!make_unit(unit, "^.$", 0).test(bad));
+      CHECK(make_unit(unit, "^.{4}$", 0).test(bad)); // four stray bytes
+      auto m = make_unit(unit, "b\\d", 0).search(s);
+      CHECK(m && m.begin() == 4 && m.end() == 6);
+      CHECK(make_unit(unit, "(?<=\\W)b", 0).search(s).begin() == 4);
+    }
+  }
+  // U+10FFFF itself is the last code point, and still one.
+  CHECK(Regex("^.$").test("\xF4\x8F\xBF\xBF"));
+}
+
+// The decoder takes exactly well-formed UTF-8 (RFC 3629).
+void test_utf8_decoder_strict() {
+  using reg::unicode::utf8::decode_before;
+  using reg::unicode::utf8::decode_codepoint;
+  using reg::unicode::utf8::decode_or_byte;
+  const auto decodes = [](const std::string &s, char32_t want) {
+    size_t bytes = 0;
+    char32_t cp = 0;
+    return decode_codepoint(s.data(), s.size(), bytes, cp) && cp == want &&
+           bytes == s.size();
+  };
+  const auto rejects_bytes = [](const std::string &s) {
+    size_t bytes = 0;
+    char32_t cp = 0;
+    return !decode_codepoint(s.data(), s.size(), bytes, cp);
+  };
+  CHECK(decodes("a", 'a'));
+  CHECK(decodes("\xC2\x80", 0x80));
+  CHECK(decodes("\xDF\xBF", 0x7FF));
+  CHECK(decodes("\xE0\xA0\x80", 0x800));
+  CHECK(decodes("\xED\x9F\xBF", 0xD7FF));
+  CHECK(decodes("\xEE\x80\x80", 0xE000));
+  CHECK(decodes("\xEF\xBF\xBF", 0xFFFF));
+  CHECK(decodes("\xF0\x90\x80\x80", 0x10000));
+  CHECK(decodes("\xF4\x8F\xBF\xBF", 0x10FFFF));
+  // A lone continuation byte, and a lead without its continuation bytes.
+  CHECK(rejects_bytes("\x80"));
+  CHECK(rejects_bytes("\xBF"));
+  CHECK(rejects_bytes("\xC3"));
+  CHECK(rejects_bytes("\xC3" "a"));
+  CHECK(rejects_bytes("\xE3\x81"));
+  CHECK(rejects_bytes("\xE3" "ab"));
+  CHECK(rejects_bytes("\xF0\x9F\x98"));
+  CHECK(rejects_bytes("\xF0\x9F" "ab"));
+  // Overlong forms.
+  CHECK(rejects_bytes("\xC0\xAF"));
+  CHECK(rejects_bytes("\xC1\xBF"));
+  CHECK(rejects_bytes("\xE0\x9F\xBF"));
+  CHECK(rejects_bytes("\xF0\x8F\xBF\xBF"));
+  // Surrogates, and past U+10FFFF.
+  CHECK(rejects_bytes("\xED\xA0\x80"));
+  CHECK(rejects_bytes("\xED\xBF\xBF"));
+  CHECK(rejects_bytes("\xF4\x90\x80\x80"));
+  CHECK(rejects_bytes("\xF5\x80\x80\x80"));
+  CHECK(rejects_bytes("\xF8\x88\x80\x80\x80"));
+  CHECK(rejects_bytes("\xFE"));
+  CHECK(rejects_bytes("\xFF"));
+  CHECK(rejects_bytes(""));
+  // A bad sequence is a byte of its own, and the next byte starts afresh.
+  {
+    const std::string s = "\xE3" "ab";
+    char32_t cp;
+    CHECK(decode_or_byte(s.data(), s.size(), cp) == 1 && cp == 0xE3);
+    CHECK(decode_or_byte(s.data() + 1, s.size() - 1, cp) == 1 && cp == 'a');
+  }
+  // valid_from is the same test as a decode_codepoint walk: every string of up
+  // to three bytes drawn from the bytes where the rules change, and long random
+  // ones around every length boundary.
+  {
+    const auto walk = [](const std::string &s) {
+      for (size_t off = 0; off < s.size();) {
+        size_t bytes;
+        char32_t cp;
+        if (!decode_codepoint(s.data() + off, s.size() - off, bytes, cp))
+          return false;
+        off += bytes;
+      }
+      return true;
+    };
+    const unsigned char edge[] = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F,
+                                  0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0,
+                                  0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1,
+                                  0xF3, 0xF4, 0xF5, 0xF7, 0xF8, 0xFF};
+    size_t strings = 0;
+    std::string s;
+    const auto each = [&](auto &&self, size_t depth) -> void {
+      if (!s.empty() || depth == 0) {
+        strings++;
+        CHECK(reg::unicode::utf8::valid_from(s.data(), s.size()) == walk(s));
+      }
+      if (depth == 0) return;
+      for (unsigned char b : edge) {
+        s.push_back(static_cast<char>(b));
+        self(self, depth - 1);
+        s.pop_back();
+      }
+    };
+    each(each, 4); // 27^4 = 531441 strings of one to four of the edge bytes
+    CHECK(strings > 500000);
+    unsigned x = 12345;
+    for (int i = 0; i < 20000; i++) {
+      std::string r(1 + (i % 40), 'a');
+      for (char &c : r) {
+        x = x * 1664525u + 1013904223u;
+        c = (x >> 24) % 4 ? static_cast<char>('a' + (x >> 16) % 26)
+                          : static_cast<char>(edge[(x >> 8) % sizeof edge]);
+      }
+      CHECK(reg::unicode::utf8::valid_from(r.data(), r.size()) == walk(r));
+    }
+    // From a code-point boundary part-way in.
+    const std::string t = "ab\xC3\xA9\xFFcd";
+    CHECK(!reg::unicode::utf8::valid_from(t.data(), t.size(), 2));
+    CHECK(reg::unicode::utf8::valid_from(t.data(), t.size(), 5));
+  }
+  // The element ending at a byte, read as a left-to-right scan reads it.
+  {
+    char32_t cp;
+    const std::string a = "x\xD8\x80\xBF"; // U+0600, then a stray BF
+    CHECK(decode_before(a.data(), 4, cp) == 1 && cp == 0xBF);
+    CHECK(decode_before(a.data(), 3, cp) == 2 && cp == 0x600);
+    const std::string b = "\xC3\xA9\x80"; // é, then a stray continuation
+    CHECK(decode_before(b.data(), 3, cp) == 1 && cp == 0x80);
+    CHECK(decode_before(b.data(), 2, cp) == 2 && cp == 0xE9);
+    const std::string c = "\xF0\x9F\x98\x80"; // one four-byte code point
+    CHECK(decode_before(c.data(), 4, cp) == 4 && cp == 0x1F600);
+    CHECK(decode_before(c.data(), 3, cp) == 1 && cp == 0x98);
+    const std::string d = "\xE3\x81"; // a truncated lead
+    CHECK(decode_before(d.data(), 2, cp) == 1 && cp == 0x81);
+  }
+}
+
+// A subject that is not UTF-8 reads as the Pike reads it — a stray byte is an
+// element of its own, and the next byte starts afresh — whichever tier a plan
+// would serve a well-formed one with. The byte automata cannot match a stray
+// byte, so every such subject has to reach the Pike; each pattern is checked
+// against its Pike-only twin on every short run of well- and ill-formed pieces.
+void test_invalid_utf8_tiers() {
+  const char *const pieces[] = {
+      "a",          "b",          "x",
+      "ing",        " ",          "\n",
+      "\r\n",       "\xC3\xA9",   "\xE3\x81\x82",
+      "\xD8\x80",   "\xCC\x81",   "\xF0\x9F\x98\x80",
+      "\xC3",        "\x80",        "\xE3\x81",
+      "\xBF",        "\xC0\xAF",   "\xED\xA0\x80",
+      "\xF4\x90\x80\x80", "\xFF",
+  };
+  const size_t np = sizeof pieces / sizeof *pieces;
+  const char *const pats[] = {
+      "x[^ ]",    "[^ ]+",      "\\bx",        "a\\b",        "\\B.",
+      "..",       "(.)(.*)",    "\\w+ing\\b",  "\\b\\w+ing\\b", "^.+$",
+      "x*",       "a|b|ing",    "abc|abx",    "(?i)ING",     "(a)(b)?",
+      "\\p{L}+",  "(?<=a)b",    "x(?=b)",     "(?m)^.",      "[a-z]+$",
+  };
+  std::vector<std::string> subjects{""};
+  for (size_t i = 0; i < np; i++) {
+    subjects.push_back(pieces[i]);
+    for (size_t j = 0; j < np; j++) {
+      subjects.push_back(std::string(pieces[i]) + pieces[j]);
+      for (size_t k = 0; k < np; k += 3)
+        subjects.push_back(std::string(pieces[i]) + pieces[j] + pieces[k]);
+    }
+  }
+  const auto spans = [](const Regex &re, const std::string &s) {
+    std::vector<size_t> v;
+    for (auto m : re.find_all(s)) {
+      v.push_back(m.begin());
+      v.push_back(m.end());
+    }
+    return v;
+  };
+  size_t bad = 0;
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const char *pat : pats) {
+      const Regex re = make_unit(unit, pat, 0);
+      const Regex pike = pike_twin(pat, 0, unit);
+      for (const std::string &s : subjects) {
+        const auto a = re.search(s), b = pike.search(s);
+        const bool ok =
+            re.test(s) == pike.test(s) && a.matched() == b.matched() &&
+            (!a || (a.begin() == b.begin() && a.end() == b.end())) &&
+            spans(re, s) == spans(pike, s) &&
+            re.match(s).matched() == pike.match(s).matched();
+        if (!ok && bad++ < 5)
+          std::printf("  invalid UTF-8: %s pattern %s, %zu-byte subject\n",
+                      unit == reg::MatchUnit::Grapheme ? "Grapheme"
+                                                       : "CodePoint",
+                      pat, s.size());
+        CHECK(ok);
+      }
+    }
+  }
+  // The cases that showed it: a byte automaton reading a stray byte as
+  // nothing, or a bad sequence as swallowing the byte after it.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    CHECK(make_unit(unit, "x[^ ]", 0).test("x\x80\xC3\xA9"));
+    CHECK(make_unit(unit, "^.+$", 0).test("x\xE3x"));
+    CHECK(make_unit(unit, "a\\b", 0).test("a\x80"));
+    CHECK(spans(make_unit(unit, "a", 0), "\xC3" "a" "\xE3" "a") ==
+          (std::vector<size_t>{1, 2, 3, 4}));
+  }
+  // A literal sits on a cluster boundary after a stray byte that follows a
+  // Prepend: U+0600 BF is one cluster, and the `abc` after it starts a new one.
+  CHECK(spans(Regex("abc"), "abc\xD8\x80\xBF" "abc") ==
+        (std::vector<size_t>{0, 3, 6, 9}));
+}
+
+// Under IgnoreCase a class range holds a code point when ANY of its case
+// variants lies in the range. (Comparing the folds of the range's ends was no
+// such test: fold is not monotonic, so `(?i)[@-Z]` took `_` and `(?i)[Z-a]`
+// lost `A`, and the engines that bake the variants into bytes disagreed with
+// those that fold at match time.) The oracle is built from the fold table
+// itself, over every code point.
+void test_icase_class_ranges() {
+  std::unordered_map<char32_t, std::vector<char32_t>> orbit; // fold -> members
+  for (char32_t c = 0; c <= 0x10FFFF; c++)
+    orbit[reg::unicode::simple_case_folding(c)].push_back(c);
+  // The orbits the engine uses (built from the fold table's entries) are the
+  // ones a scan of every code point finds.
+  {
+    std::vector<std::vector<char32_t>> want;
+    for (auto &kv : orbit)
+      if (kv.second.size() >= 2) want.push_back(kv.second);
+    std::vector<std::vector<char32_t>> got = reg::detail::case_fold_groups();
+    std::sort(want.begin(), want.end());
+    std::sort(got.begin(), got.end());
+    CHECK(got == want);
+    CHECK(got.size() > 1000);
+    for (const auto &grp : got)
+      for (char32_t m : grp)
+        CHECK(reg::detail::case_fold_orbit(m) != nullptr);
+    CHECK(reg::detail::case_fold_orbit('1') == nullptr);
+    CHECK(reg::detail::case_fold_orbit(0x10FFFF) == nullptr);
+  }
+  struct Range {
+    char32_t lo, hi;
+  };
+  const auto expected = [&](char32_t cp, const std::vector<Range> &rs,
+                            bool negate) {
+    bool in = false;
+    for (char32_t m : orbit[reg::unicode::simple_case_folding(cp)])
+      for (const Range &r : rs)
+        in = in || (m >= r.lo && m <= r.hi);
+    return negate ? !in : in;
+  };
+  const auto hex = [](char32_t c) {
+    char b[24];
+    std::snprintf(b, sizeof b, "\\x{%X}", static_cast<unsigned>(c));
+    return std::string(b);
+  };
+  struct Case {
+    std::vector<Range> rs;
+    bool negate;
+  };
+  const Case cases[] = {
+      {{{'@', 'Z'}}, false},          {{{'Z', 'a'}}, false},
+      {{{'0', 'Z'}}, false},          {{{'4', 't'}}, false},
+      {{{'3', 'E'}}, false},          {{{'a', 'z'}}, false},
+      {{{'A', 'Z'}}, false},          {{{'[', '`'}}, false},
+      {{{'R', '~'}}, true},           {{{'a', 'c'}, {'X', 'Z'}}, false},
+      {{{0x100, 0x17F}}, false},      {{{0x17F, 0x17F}}, false},
+      {{{0x212A, 0x212A}}, false},    {{{0x3A3, 0x3A3}}, false},
+      {{{0x1C4, 0x1CC}}, true},       {{{0x1E9E, 0x1E9E}}, false},
+      {{{'k', 'k'}}, true},           {{{0x0, 0x7F}}, false},
+  };
+  std::vector<char32_t> probe;
+  for (char32_t c = 0x20; c < 0x7F; c++) probe.push_back(c);
+  for (char32_t c : {0xDFu, 0xE9u, 0x100u, 0x130u, 0x131u, 0x17Fu, 0x1C4u,
+                     0x1C5u, 0x1C6u, 0x1CBu, 0x3A3u, 0x3C2u, 0x3C3u, 0x1E9Eu,
+                     0x212Au, 0x2126u, 0x3A9u, 0x3C9u, 0x10400u, 0x10428u})
+    probe.push_back(c);
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const Case &cs : cases) {
+      std::string cls = cs.negate ? "[^" : "[";
+      for (const Range &r : cs.rs) cls += hex(r.lo) + "-" + hex(r.hi);
+      cls += "]";
+      const Regex whole = make_unit(unit, "^" + cls + "$", reg::IgnoreCase);
+      const Regex part = make_unit(unit, cls, reg::IgnoreCase);
+      for (char32_t cp : probe) {
+        const bool want = expected(cp, cs.rs, cs.negate);
+        const std::string s = reg::unicode::utf8::encode_codepoint(cp);
+        const bool a = whole.test(s), b = part.test(s);
+        if ((a != want || b != want) && cp < 0x80)
+          std::printf("  icase class %s on U+%04X: want %d, got ^$ %d / bare %d\n",
+                      cls.c_str(), static_cast<unsigned>(cp), want, a, b);
+        CHECK(a == want);
+        CHECK(b == want);
+      }
+    }
+  }
+  // The cases that showed it.
+  CHECK(!make_us("[@-Z]", IgnoreCase).test("_"));
+  CHECK(!Regex("(?i)[@-Z]").test("_"));
+  CHECK(Regex("(?i)[Z-a]").test("A"));
+  CHECK(Regex("(?i)[4-t]").test("w"));
+  CHECK(Regex("(?i)^[4-t]+$").test("wW"));
 }
 
 void test_error_messages() {
@@ -4982,6 +5441,7 @@ int main() {
   test_ascii_icase_prefilter();
   test_assert_dfa();
   test_lookahead();
+  test_lookaround_linear();
   test_unicode_properties();
   test_lookbehind_fixed();
   test_lookbehind_variable();
@@ -5001,6 +5461,12 @@ int main() {
   test_iterator_survives_cache_eviction();
   test_invalid_patterns();
   test_resource_limits();
+  test_lookaround_programs();
+  test_operand_pools();
+  test_out_of_range_utf8();
+  test_utf8_decoder_strict();
+  test_invalid_utf8_tiers();
+  test_icase_class_ranges();
   test_error_messages();
 
   std::printf("\nregexlib: %d passed, %d failed\n", g_pass, g_fail);

@@ -425,6 +425,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 254, NSUPER = 42, SB_SHIFT = 4, SB_MASK = 15;
 inline GeneralCategory get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -629,6 +630,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 131, NSUPER = 19, SB_SHIFT = 5, SB_MASK = 31;
 inline GraphemeBreak get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -708,6 +710,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 38, NSUPER = 5, SB_SHIFT = 6, SB_MASK = 63;
 inline Emoji get_value(char32_t cp) {
+  if (cp > 0x10FFFF) return D;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -1347,39 +1350,44 @@ inline std::string encode_codepoint(char32_t cp) {
 // messages and named-group keys).
 inline std::string encode(char32_t cp) { return encode_codepoint(cp); }
 
+// Strict decode of the code point at the start of `s8` (RFC 3629): a lead byte
+// with exactly the continuation bytes it needs, no overlong form (C0, C1, E0
+// 80..9F, F0 80..8F), no surrogate (ED A0..BF), nothing past U+10FFFF (F4 90..,
+// F5..FF). Anything else is not a code point, and is false.
 inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
                              char32_t &cp) {
-  if (l) {
-    uint8_t b = s8[0];
-    if ((b & 0x80) == 0) {
-      bytes = 1;
-      cp = b;
-      return true;
-    } else if ((b & 0xE0) == 0xC0) {
-      if (l >= 2) {
-        bytes = 2;
-        cp = ((static_cast<char32_t>(s8[0] & 0x1F)) << 6) |
-             (static_cast<char32_t>(s8[1] & 0x3F));
-        return true;
-      }
-    } else if ((b & 0xF0) == 0xE0) {
-      if (l >= 3) {
-        bytes = 3;
-        cp = ((static_cast<char32_t>(s8[0] & 0x0F)) << 12) |
-             ((static_cast<char32_t>(s8[1] & 0x3F)) << 6) |
-             (static_cast<char32_t>(s8[2] & 0x3F));
-        return true;
-      }
-    } else if ((b & 0xF8) == 0xF0) {
-      if (l >= 4) {
-        bytes = 4;
-        cp = ((static_cast<char32_t>(s8[0] & 0x07)) << 18) |
-             ((static_cast<char32_t>(s8[1] & 0x3F)) << 12) |
-             ((static_cast<char32_t>(s8[2] & 0x3F)) << 6) |
-             (static_cast<char32_t>(s8[3] & 0x3F));
-        return true;
-      }
-    }
+  if (!l) return false;
+  const auto at = [&](size_t i) { return static_cast<unsigned char>(s8[i]); };
+  const auto cont = [&](size_t i) { return (at(i) & 0xC0) == 0x80; };
+  const unsigned b = at(0);
+  if (b < 0x80) {
+    bytes = 1;
+    cp = b;
+    return true;
+  }
+  if (b >= 0xC2 && b <= 0xDF) {
+    if (l < 2 || !cont(1)) return false;
+    bytes = 2;
+    cp = ((b & 0x1Fu) << 6) | (at(1) & 0x3Fu);
+    return true;
+  }
+  if (b >= 0xE0 && b <= 0xEF) {
+    if (l < 3 || !cont(1) || !cont(2)) return false;
+    const char32_t c = ((b & 0x0Fu) << 12) | ((at(1) & 0x3Fu) << 6) |
+                       (at(2) & 0x3Fu);
+    if (c < 0x800 || (c >= 0xD800 && c <= 0xDFFF)) return false;
+    bytes = 3;
+    cp = c;
+    return true;
+  }
+  if (b >= 0xF0 && b <= 0xF4) {
+    if (l < 4 || !cont(1) || !cont(2) || !cont(3)) return false;
+    const char32_t c = ((b & 0x07u) << 18) | ((at(1) & 0x3Fu) << 12) |
+                       ((at(2) & 0x3Fu) << 6) | (at(3) & 0x3Fu);
+    if (c < 0x10000 || c > 0x10FFFF) return false;
+    bytes = 4;
+    cp = c;
+    return true;
   }
   return false;
 }
@@ -1391,6 +1399,67 @@ inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
   size_t bytes;
   if (decode_codepoint(s8, l, bytes, cp)) return bytes;
   cp = static_cast<unsigned char>(s8[0]);
+  return 1;
+}
+
+// Is s8[from..n) well-formed UTF-8 (`from` a code-point boundary)? The same
+// RFC 3629 test as decode_codepoint, written out for speed: eight ASCII bytes
+// at a time, then the lead byte picks the check. A byte automaton matches code
+// points, so a stray byte is out of its reach; the engines serve a subject
+// that is not valid with the Pike, which reads each such byte as an element of
+// its own (decode_or_byte).
+inline bool valid_from(const char *s8, size_t n, size_t from = 0) {
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(s8);
+  const auto cont = [&](size_t i) { return (p[i] & 0xC0) == 0x80; };
+  for (size_t off = from; off < n;) {
+    uint64_t w;
+    while (off + 8 <= n) {
+      std::memcpy(&w, p + off, 8);
+      if (w & 0x8080808080808080ull) break;
+      off += 8;
+    }
+    if (off >= n) break;
+    const unsigned c = p[off];
+    if (c < 0x80) {
+      off++;
+    } else if (c < 0xC2) { // a continuation byte alone, or an overlong C0/C1
+      return false;
+    } else if (c < 0xE0) {
+      if (off + 2 > n || !cont(off + 1)) return false;
+      off += 2;
+    } else if (c < 0xF0) {
+      if (off + 3 > n || !cont(off + 1) || !cont(off + 2)) return false;
+      const unsigned b1 = p[off + 1];
+      if ((c == 0xE0 && b1 < 0xA0) || (c == 0xED && b1 > 0x9F))
+        return false; // overlong, surrogate
+      off += 3;
+    } else {
+      if (c > 0xF4 || off + 4 > n || !cont(off + 1) || !cont(off + 2) ||
+          !cont(off + 3))
+        return false;
+      const unsigned b1 = p[off + 1];
+      if ((c == 0xF0 && b1 < 0x90) || (c == 0xF4 && b1 > 0x8F))
+        return false; // overlong, past U+10FFFF
+      off += 4;
+    }
+  }
+  return true;
+}
+
+// The element that ENDS at byte `at` (> 0), read as decode_or_byte reads left to
+// right: the code point whose well-formed encoding ends exactly there, else the
+// single byte before `at` standing for itself. (A lead byte always begins an
+// element, so the nearest lead within four bytes is where a code point ending
+// at `at` would start; a longer or shorter sequence from it ends elsewhere.)
+// Returns its byte length.
+inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
+  size_t j = at - 1;
+  const size_t lo = at > 4 ? at - 4 : 0;
+  while (j > lo && (static_cast<unsigned char>(s8[j]) & 0xC0) == 0x80) j--;
+  size_t bytes;
+  if (decode_codepoint(s8 + j, at - j, bytes, cp) && j + bytes == at)
+    return bytes;
+  cp = static_cast<unsigned char>(s8[at - 1]);
   return 1;
 }
 
@@ -1791,6 +1860,10 @@ inline bool is_space_cp(char32_t cp) { return unicode::is_white_space(cp); }
 
 inline char32_t fold(char32_t cp) { return unicode::simple_case_folding(cp); }
 
+// The case-fold orbit of `cp`: every code point that folds to the same value
+// (itself included), or null when it folds alone. Defined with case_fold_groups.
+inline const std::vector<char32_t> *case_fold_orbit(char32_t cp);
+
 // Unicode property classes for \p{...} / \P{...}.
 // clang-format off
 enum class UProp {
@@ -1895,12 +1968,34 @@ struct CharClass {
   struct UPropItem {
     detail::UProp prop;
     bool negate;
+    bool operator==(const UPropItem &o) const {
+      return prop == o.prop && negate == o.negate;
+    }
   };
 
   bool negate = false;
   std::vector<std::pair<char32_t, char32_t>> ranges;
   std::vector<Pred> preds;
   std::vector<UPropItem> uprops;
+
+  // The same class, member for member — what a program's class pool keeps
+  // one of (Compiler::intern_cls).
+  bool operator==(const CharClass &o) const {
+    return negate == o.negate && ranges == o.ranges && preds == o.preds &&
+           uprops == o.uprops;
+  }
+  size_t hash() const {
+    uint64_t h = negate ? 0x9E3779B97F4A7C15ull : 0;
+    const auto mix = [&h](uint64_t v) {
+      h = (h ^ v) * 0x100000001B3ull;
+      h ^= h >> 29;
+    };
+    for (const auto &r : ranges) mix((uint64_t{r.first} << 32) | r.second);
+    for (Pred p : preds) mix(0x10000000000ull | static_cast<unsigned>(p));
+    for (const auto &u : uprops)
+      mix(0x20000000000ull | (static_cast<uint64_t>(u.prop) << 1) | u.negate);
+    return static_cast<size_t>(h);
+  }
 
   void add_range(char32_t lo, char32_t hi) { ranges.emplace_back(lo, hi); }
 
@@ -1912,19 +2007,25 @@ struct CharClass {
   // (no std::u32string wrapper). Equivalent to matches() on a 1-element
   // cluster.
   bool matches_cp(char32_t cp, bool icase) const {
-    char32_t fcp = icase ? detail::fold(cp) : cp;
+    // Under icase a range holds `cp` when any case variant of it does (the
+    // class is the union of the orbits its ranges touch, as the byte compiler
+    // builds it) — not when `cp`'s fold lies between the folds of the ends,
+    // which is no interval of anything: fold is not monotonic.
+    const std::vector<char32_t> *orbit =
+        icase ? detail::case_fold_orbit(cp) : nullptr;
     bool in = false;
     for (auto &r : ranges) {
       if (cp >= r.first && cp <= r.second) {
         in = true;
         break;
       }
-      if (icase) {
-        char32_t flo = detail::fold(r.first), fhi = detail::fold(r.second);
-        if (fcp >= flo && fcp <= fhi) {
-          in = true;
-          break;
-        }
+      if (orbit) {
+        for (char32_t m : *orbit)
+          if (m >= r.first && m <= r.second) {
+            in = true;
+            break;
+          }
+        if (in) break;
       }
     }
     if (!in)
@@ -1979,6 +2080,11 @@ struct Segmented {
   std::vector<size_t> byte_begin;        // size == graphemes.size() + 1
   std::string_view source;               // the original UTF-8 subject
   bool ascii = false; // all bytes < 0x80, so grapheme index == byte index
+  // The Pike's lookaround answers over this subject, one table per lookaround
+  // body (keyed by its Program): entry sp says whether the body matches at sp.
+  // Built on first use and kept with the segmentation, so the find_all runs
+  // over one subject share them.
+  mutable std::vector<std::pair<const void *, std::vector<bool>>> look_tables;
 };
 
 inline bool all_ascii(std::string_view s8) {
@@ -2131,8 +2237,8 @@ inline Node node_sans_kids(const Node &n) {
   return r;
 }
 
-// Reverse a sub-pattern so a lookbehind body can be matched right-to-left in a
-// single linear pass starting at the assertion position. Leaf nodes and
+// Reverse a sub-pattern so it can be matched right-to-left (a reverse program,
+// or a lookahead body, which the Pike scans leftward). Leaf nodes and
 // zero-width assertions are unchanged; only concatenation order flips.
 // Nested lookarounds are left intact — they are evaluated forward at the
 // current position regardless of the surrounding scan direction.
@@ -3632,17 +3738,37 @@ inline std::vector<char32_t> class_key(const CharClass &cc, bool icase,
 // engines agree.
 inline const std::vector<std::vector<char32_t>> &case_fold_groups() {
   static const std::vector<std::vector<char32_t>> groups = [] {
+    // A code point folds to another only if the fold table lists it, so an
+    // orbit of two or more is a fold target together with the table entries
+    // that fold to it: built from the ~1500 entries, not from a scan of all
+    // 0x110000 code points (which cost a hash entry and a vector apiece).
     std::unordered_map<char32_t, std::vector<char32_t>> by_fold;
-    for (char32_t cp = 0; cp <= 0x10FFFF; cp++) {
-      if (cp >= 0xD800 && cp <= 0xDFFF) continue; // surrogates aren't scalars
-      by_fold[fold(cp)].push_back(cp);
+    for (const auto &e : unicode::_case_fold) {
+      auto &grp = by_fold[e[1]];
+      if (grp.empty()) grp.push_back(e[1]);
+      grp.push_back(e[0]);
     }
     std::vector<std::vector<char32_t>> g;
-    for (auto &kv : by_fold)
-      if (kv.second.size() >= 2) g.push_back(std::move(kv.second));
+    g.reserve(by_fold.size());
+    for (auto &kv : by_fold) {
+      std::sort(kv.second.begin(), kv.second.end());
+      g.push_back(std::move(kv.second));
+    }
     return g;
   }();
   return groups;
+}
+
+inline const std::vector<char32_t> *case_fold_orbit(char32_t cp) {
+  static const std::unordered_map<char32_t, const std::vector<char32_t> *>
+      by_fold = [] {
+        std::unordered_map<char32_t, const std::vector<char32_t> *> m;
+        for (const auto &grp : case_fold_groups())
+          m.emplace(fold(grp[0]), &grp);
+        return m;
+      }();
+  const auto it = by_fold.find(fold(cp));
+  return it == by_fold.end() ? nullptr : it->second;
 }
 
 struct Compiler {
@@ -3674,36 +3800,41 @@ struct Compiler {
                          bool cp = false, bool icase = false,
                          bool lf_byte_prefix = false) {
     Compiler c;
-    c.base_slots_ = 2 * (ncap + 1);
     c.us_ = us;
     c.cp_ = cp;
     c.reverse_ = reverse;
     c.dotall_ = dotall;
     c.icase_ = icase;
+    return c.build(root, ncap, lf_byte_prefix);
+  }
+
+  // The program for `root`, under the flags already set.
+  Program build(const Node &root, int ncap, bool lf_byte_prefix) {
+    base_slots_ = 2 * (ncap + 1);
     if (lf_byte_prefix) {
       Inst sp;
       sp.op = Inst::Op::Split;
       sp.x = 3; // enter the pattern (higher priority: lazy prefers to stop)
       sp.y = 1; // consume a byte (lower priority)
-      c.prog.insts.push_back(sp);
+      prog.insts.push_back(sp);
       Inst by;
       by.op = Inst::Op::Byte;
       by.set_byte(0x00, 0xFF);
-      c.prog.insts.push_back(by);
-      c.prog.byte_ranges.push_back(static_cast<uint16_t>(by.x));
+      prog.insts.push_back(by);
+      prog.byte_ranges.push_back(static_cast<uint16_t>(by.x));
       Inst jm;
       jm.op = Inst::Op::Jmp;
       jm.x = 0;
-      c.prog.insts.push_back(jm);
+      prog.insts.push_back(jm);
     }
-    c.emit_save(0); // start of whole match
-    c.emit(root);
-    c.emit_save(1); // end of whole match
+    emit_save(0); // start of whole match
+    emit(root);
+    emit_save(1); // end of whole match
     Inst m;
     m.op = Inst::Op::Match;
-    c.prog.insts.push_back(m);
-    c.prog.nslots = c.base_slots_ + c.loop_slots_;
-    return std::move(c.prog);
+    prog.insts.push_back(m);
+    prog.nslots = base_slots_ + loop_slots_;
+    return std::move(prog);
   }
 
   int here() const { return static_cast<int>(prog.insts.size()); }
@@ -3711,10 +3842,31 @@ struct Compiler {
   // The class blocks already on prog's lists (see append_block).
   std::vector<const ClassBlock *> listed_;
 
-  int push(Inst i) {
-    if (static_cast<int>(prog.insts.size()) >= limits::kMaxProgramInsts)
+  // A lookaround is a program of its own (Inst::Op::Look runs it), one per
+  // lookaround of the pattern: its AST node is its identity, so the copies
+  // of it that `x{n}` emits are one program — compiled once, held once, and
+  // settled over a subject once (Regex::look_table). `sub_of_` maps the node
+  // to it; `sub_insts_` is what those programs hold, each counted once.
+  std::unordered_map<const Node *, int> sub_of_;
+  int sub_insts_ = 0;
+
+  // What this program holds, in instructions: its own and its lookaround
+  // programs'. A program is everything it runs, so this — not its own count
+  // alone — is what the size limit bounds: `limit_`, which is
+  // limits::kMaxProgramInsts for a pattern and, for a lookaround body, what
+  // the program around it has left.
+  int limit_ = limits::kMaxProgramInsts;
+  int size() const { return here() + sub_insts_; }
+
+  // Make room for `n` more instructions, or throw ProgramTooLarge.
+  void room(size_t n) const {
+    if (static_cast<size_t>(size()) + n > static_cast<size_t>(limit_))
       throw RegexError(RegexError::Code::ProgramTooLarge,
                        "regex pattern too large (compiled program too big)");
+  }
+
+  int push(Inst i) {
+    room(1);
     prog.insts.push_back(std::move(i));
     return here() - 1;
   }
@@ -3727,20 +3879,65 @@ struct Compiler {
     return push(std::move(i));
   }
 
-  // Intern a heavy operand into the program's pool, returning its index.
-  int intern_lit(std::u32string s) {
-    prog.lits.push_back(std::move(s));
-    return static_cast<int>(prog.lits.size()) - 1;
+  // A heavy operand's index in the program's pool. A pool is a set: it holds
+  // each distinct literal or class once, however many instructions read it.
+  // `x{n}` emits its body n times, and a pool entry per copy made a
+  // `[ab]{20000}` program hold twenty thousand copies of one class — some
+  // 130 bytes an instruction, the instruction itself 16. Pooled once, what
+  // grows under expansion is the instructions alone, which the size limit
+  // counts. (`*_seen_` maps a hash to the indices that have it.)
+  std::unordered_multimap<size_t, int> lit_seen_, cls_seen_;
+
+  template <class T>
+  static int pooled(std::vector<T> &pool,
+                    std::unordered_multimap<size_t, int> &seen, const T &v,
+                    size_t h) {
+    const auto range = seen.equal_range(h);
+    for (auto it = range.first; it != range.second; ++it)
+      if (pool[static_cast<size_t>(it->second)] == v) return it->second;
+    const int id = static_cast<int>(pool.size());
+    pool.push_back(v);
+    seen.emplace(h, id);
+    return id;
   }
 
-  int intern_cls(CharClass c) {
-    prog.classes.push_back(std::move(c));
-    return static_cast<int>(prog.classes.size()) - 1;
+  int intern_lit(const std::u32string &s) {
+    return pooled(prog.lits, lit_seen_, s, std::hash<std::u32string>{}(s));
+  }
+
+  int intern_cls(const CharClass &c) {
+    return pooled(prog.classes, cls_seen_, c, c.hash());
   }
 
   int intern_sub(std::shared_ptr<Program> p) {
     prog.subs.push_back(std::move(p));
     return static_cast<int>(prog.subs.size()) - 1;
+  }
+
+  // The program of lookaround `n` (see sub_of_), compiled the first time it
+  // is emitted, in this program's mode and within what it has left. Its
+  // captures are not exported. It scans AWAY from the positions it answers
+  // for: the Pike runs it once over the whole subject to settle the
+  // assertion at every position (Regex::look_table). So a lookahead body is
+  // reverse-compiled — in byte (us_) or code-point (cp_) mode its units are
+  // emitted in reverse too, so the right-to-left scan matches them — and a
+  // lookbehind body is compiled forward.
+  int sub_program(const Node &n) {
+    const auto it = sub_of_.find(&n);
+    if (it != sub_of_.end()) return it->second;
+    const bool rev = !n.look_behind;
+    Compiler c;
+    c.us_ = us_;
+    c.cp_ = cp_;
+    c.reverse_ = rev && (us_ || cp_);
+    c.dotall_ = dotall_;
+    c.limit_ = limit_ - size();
+    Program body = rev ? c.build(reverse_ast(n.kids[0]), 0, false)
+                       : c.build(n.kids[0], 0, false);
+    sub_insts_ += static_cast<int>(body.insts.size()) + c.sub_insts_;
+    const int id = intern_sub(std::make_shared<Program>(std::move(body)));
+    sub_of_.emplace(&n, id);
+    return id;
   }
 
   void emit_save(int slot) {
@@ -3811,7 +4008,7 @@ struct Compiler {
   // Op::Char each (single code point), so the Pike matches per code point. For
   // the reverse program the code-point order is flipped (paired with
   // reverse_ast's concat flip), matching the leftward code-point scan of a
-  // lookbehind body.
+  // lookahead body or a reverse program.
   void emit_cp_lit(const std::u32string &cps) {
     std::u32string seq = cps;
     if (reverse_) std::reverse(seq.begin(), seq.end());
@@ -3908,10 +4105,7 @@ struct Compiler {
   // so only Split/Jmp carry targets to fix up.
   void append_block(const ClassBlock &blk) {
     const std::vector<Inst> &block = blk.insts;
-    if (static_cast<int>(prog.insts.size() + block.size()) >=
-        limits::kMaxProgramInsts)
-      throw RegexError(RegexError::Code::ProgramTooLarge,
-                       "regex pattern too large (compiled program too big)");
+    room(block.size());
     int base = here();
     prog.insts.insert(prog.insts.end(), block.begin(), block.end());
     // What it tests goes on the program's lists the first time the block
@@ -4044,16 +4238,7 @@ struct Compiler {
       i.op = Inst::Op::Look;
       i.look_behind = n.look_behind;
       i.look_negate = n.look_negate;
-      // The lookaround body is its own program (captures are not exported).
-      // A lookbehind body is reverse-compiled so it can be matched
-      // right-to-left from the assertion position in one linear pass; in byte
-      // (us_) or code-point (cp_) mode its units are emitted in reverse too,
-      // so the right-to-left scan matches them. A lookahead body is compiled
-      // forward.
-      bool body_rev = n.look_behind && (us_ || cp_);
-      i.x = intern_sub(std::make_shared<Program>(
-          compile(n.look_behind ? reverse_ast(n.kids[0]) : n.kids[0], 0, us_,
-                  body_rev, dotall_, cp_)));
+      i.x = sub_program(n);
       push(std::move(i));
       break;
     }
@@ -4090,11 +4275,15 @@ struct Compiler {
     const Node &body = n.kids[0];
     int lo = n.rmin, hi = n.rmax;
 
-    // Emit `lo` mandatory copies, remembering where the last one starts.
+    // Emit `lo` mandatory copies, remembering where the last one starts. A body
+    // that emits nothing (`(?:)`, `a{0}`) emits nothing every time; stop after
+    // one, or nested counts (`(?:(?:){1000000}){1000000}`) loop lo*lo times
+    // without ever reaching push()'s instruction limit.
     int last_start = -1;
     for (int k = 0; k < lo; k++) {
       last_start = here();
       emit(body);
+      if (here() == last_start) break;
     }
 
     if (hi == -1 && node_nullable(body)) {
@@ -5295,9 +5484,13 @@ public:
     // Classify the subject once (first non-ASCII byte) and share it across the
     // gate below and every EGC gate in the ladder, instead of a fresh O(n)
     // SIMD pass per gate (assert_find_ok takes the index precomputed, by
-    // contract). A US plan's branch returns without reading it, so the ternary
-    // keeps US off the scan.
-    const size_t fna = plan_->us_ ? text.size() : first_nonascii(text);
+    // contract).
+    const size_t fna = first_nonascii(text);
+    // A CodePoint plan's byte automata serve well-formed UTF-8 only (see
+    // utf8::valid_from); anything else is the code-point Pike's.
+    const bool us_bytes =
+        !plan_->us_ || fna == text.size() ||
+        unicode::utf8::valid_from(text.data(), text.size(), fna);
     // [Tier: AnchoredOnePass+cap] `^body$` with captures: the one-pass walk
     // from the single candidate 0 yields the end AND the groups (see
     // onepass_anchored_start_) — the same gates AND the same front door as
@@ -5305,7 +5498,8 @@ public:
     // assert_find_ok, then capture_find_dispatch), which is where the walk's
     // soundness on the subject is decided; a bail falls to the ladder.
     if (plan_->onepass_anchored_start_ &&
-        (plan_->us_ ? assert_byte_path_ok(text) : assert_find_ok(text, fna))) {
+        (plan_->us_ ? us_bytes && assert_byte_path_ok(text)
+                    : assert_find_ok(text, fna))) {
       WalkBudget budget(text.size()); // unread: the anchored driver walks once
       int e = capture_find_dispatch(&cache, text, 0, sc.saves, budget,
                                     /*byte=*/plan_->us_);
@@ -5314,7 +5508,9 @@ public:
     }
     if (plan_->us_) {
       // [Tier: Dfa/US] anchored: the leftmost-first byte DFA gives the end.
-      if (plan_->dfa_match_free()) {
+      if (!us_bytes) {
+        // Not UTF-8: straight to the Pike below.
+      } else if (plan_->dfa_match_free()) {
         int end = dfa_forward_lf(cache.lfa(*this), text, 0);
         if (end >= 0) return build_dfa_result(text, 0, end);
         if (end == -1) return MatchResult{};
@@ -5331,7 +5527,7 @@ public:
       // [Tier: Assert/Byte] anchored at 0: the anchored lf byte assert DFA
       // gives the leftmost-first end; captures resolved by the assert-aware
       // bitstate.
-      if (assert_byte_path_ok(text)) {
+      if (us_bytes && assert_byte_path_ok(text)) {
         int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
         if (e == -1) return MatchResult{};
         if (e != LazyDfa::kCap)
@@ -11158,12 +11354,9 @@ private:
     }
     // Start: the code point ending just before h must not be a Prepend.
     if (h > 0 && static_cast<unsigned char>(t[h - 1]) >= 0x80) {
-      int j = h - 1; // walk back over continuation bytes to the lead byte
-      while (j > 0 && (static_cast<unsigned char>(t[j]) & 0xC0) == 0x80) j--;
       char32_t cp;
-      size_t bytes;
-      if (unicode::utf8::decode_codepoint(t.data() + j, n - j, bytes, cp) &&
-          unicode::_grapheme_break_properties::get_value(cp) == GB::Prepend)
+      unicode::utf8::decode_before(t.data(), static_cast<size_t>(h), cp);
+      if (unicode::_grapheme_break_properties::get_value(cp) == GB::Prepend)
         return false;
     }
     return true;
@@ -11992,23 +12185,15 @@ private:
     return {cp, static_cast<int>(len)};
   }
 
-  // The code point that ends at byte `at` (> 0): back over the continuation
-  // bytes to a lead byte. Where that is no code point, the bytes stepped
-  // over count as one, standing for the last of them.
+  // The code point that ends at byte `at` (> 0); a stray byte is its own
+  // element (see utf8::decode_before).
   static Decoded cp_before(std::string_view text, int at) {
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    if (p[at - 1] < 0x80) return {p[at - 1], 1};
-    int i = at - 1;
-    while (i > 0 && (p[i] & 0xC0) == 0x80)
-      i--;
-    size_t bytes;
+    const unsigned char c = static_cast<unsigned char>(text[at - 1]);
+    if (c < 0x80) return {c, 1};
     char32_t cp;
-    if (!unicode::utf8::decode_codepoint(text.data() + i,
-                                         text.size() - static_cast<size_t>(i),
-                                         bytes, cp))
-      cp = p[at - 1];
-    return {cp, at - i};
+    const size_t len = unicode::utf8::decode_before(
+        text.data(), static_cast<size_t>(at), cp);
+    return {cp, static_cast<int>(len)};
   }
 
   // Shared lazy-DFA driver. A state is a set of program counters — sorted and
@@ -12624,7 +12809,11 @@ private:
         continue;
       }
       char32_t cp;
-      size_t bytes = unicode::utf8::decode_or_byte(d + off, n - off, cp);
+      size_t bytes;
+      // Not UTF-8: the byte automaton cannot match the stray byte the Pike
+      // gives its own cluster, so the subject is not eligible.
+      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp))
+        return false;
       off += bytes;
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       if (have_prev && gb_fuses(lp, rp)) return false;
@@ -12692,7 +12881,9 @@ private:
     size_t prev_pos = s, off = s;
     while (off < n) {
       char32_t cp;
-      size_t bytes = unicode::utf8::decode_or_byte(d + off, n - off, cp);
+      size_t bytes;
+      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp))
+        return false; // a stray byte: see simple_from
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       bool fuse =
           have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF);
@@ -12729,7 +12920,11 @@ private:
                 : GB::Unassigned;
     while (off < n) {
       char32_t cp;
-      size_t bytes = unicode::utf8::decode_or_byte(d + off, n - off, cp);
+      size_t bytes;
+      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp)) {
+        bad = true; // a stray byte: see simple_from
+        return SIZE_MAX;
+      }
       off += bytes;
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       if (have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF)) {
@@ -12738,7 +12933,12 @@ private:
       }
       lp = rp;
       have_prev = true;
-      if (off < n && p[off] < 0x80 && lp != GB::Prepend)
+      // An ASCII byte next closes the cluster unless it fuses — only after a
+      // Prepend, and not onto a control (GB5: U+0600 then `\t` is two clusters,
+      // and the `\t` may start the literal the caller is scanning for).
+      if (off < n && p[off] < 0x80 &&
+          (lp != GB::Prepend ||
+           !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(p[off]))))
         break; // cluster closed; resume the fused scan
     }
     return off;
@@ -12845,6 +13045,22 @@ private:
   static size_t first_nonascii(std::string_view text) {
     return skip_to_nonascii(
         reinterpret_cast<const unsigned char *>(text.data()), text.size(), 0);
+  }
+
+  // A ladder that stands on the Pike. [Tier: Pike]
+  static Ladder pike_ladder(Want want) {
+    Ladder l;
+    l.want = want;
+    return l;
+  }
+
+  // Is this a CodePoint plan's subject with a stray byte in it? Its byte DFAs
+  // cannot match one, so such a scan starts on the Pike (see utf8::valid_from).
+  bool us_stray(std::string_view text) const {
+    if (!plan_->us_) return false;
+    const size_t i = first_nonascii(text);
+    return i < text.size() &&
+           !unicode::utf8::valid_from(text.data(), text.size(), i);
   }
 
   // The non-ASCII EGC byte path applies when the byte programs are built and
@@ -14613,7 +14829,9 @@ public:
     // `cache` null: this thread's, fetched by the first step that needs one.
     Finder(const Regex &re, std::string_view text, FindCache *cache)
         : re_(&re), text_(text), cache_(cache), l_(re.plan_->start_[0]),
-          budget_(text.size()) {}
+          budget_(text.size()) {
+      if (re.us_stray(text)) l_ = pike_ladder(l_.want);
+    }
 
     // The next match, handed to `out`; false when none remains. Over the
     // caller's scratch (the iterator's own, which lives as long as the scan
@@ -14893,14 +15111,6 @@ private:
     return word_at(seg, sp - 1, n) != word_at(seg, sp, n);
   }
 
-  // Evaluate a zero-width lookaround instruction at position `sp`: does the
-  // body match starting at sp (lookahead), or — for a lookbehind, whose body
-  // is reverse-compiled — some window ending at sp, scanned right-to-left?
-  bool eval_look(const detail::Program &prog, const detail::Inst &in,
-                 const detail::Segmented &seg, int sp, int n) const {
-    return sub_match(*prog.subs[in.sub_idx()], seg, sp, n, in.look_behind);
-  }
-
   // Follow ε-transitions (Jmp/Split/Save/asserts/lookaround), adding reachable
   // Char/Any/Class/Match threads to `list`, de-duplicating by pc.
   void add_thread(const detail::Program &prog, std::vector<Thread> &list,
@@ -14940,7 +15150,10 @@ private:
           stack.emplace_back(p + 1, std::move(sv));
         break;
       case Op::Look: {
-        bool ok = eval_look(prog, in, seg, sp, n);
+        // Does the body match starting at sp (lookahead), or some window
+        // ending at sp (lookbehind)? Read from its table over the subject.
+        bool ok =
+            look_table(*prog.subs[in.sub_idx()], seg, n, in.look_behind)[sp];
         if (in.look_negate ? !ok : ok) stack.emplace_back(p + 1, std::move(sv));
         break;
       }
@@ -14988,38 +15201,45 @@ private:
     match_steps() += pops;
   }
 
-  // Boolean Pike-VM run for a lookaround body, anchored at `from`: succeeds
-  // if a thread reaches Match. A lookahead body consumes graphemes rightward
-  // from `from`; a lookbehind body (`behind`) is reverse-compiled and consumes
-  // them leftward, so it succeeds on any window ending at `from`. Captures are
-  // not tracked; linear in the number of graphemes scanned.
-  bool sub_match(const detail::Program &prog, const detail::Segmented &seg,
-                 int from, int n, bool behind) const {
+  // The answers of a lookaround body at every position of the subject, in
+  // one linear pass. Running the body anchored from each position the Pike
+  // asks about rescans the subject per position — O(n^2) for `(?=\w*z)\w`.
+  // Instead run the body (compiled to scan away from those positions, see
+  // the compiler) unanchored over the whole subject: a lookahead's body
+  // matches at sp iff its reverse, scanning leftward from some q >= sp,
+  // reaches Match at sp; a lookbehind's likewise rightward from some q <= sp.
+  // Seeding a fresh thread at every position makes it the usual boolean NFA
+  // simulation, O(n * program size). Captures are not tracked.
+  const std::vector<bool> &look_table(const detail::Program &prog,
+                                      const detail::Segmented &seg, int n,
+                                      bool behind) const {
+    for (auto &t : seg.look_tables)
+      if (t.first == &prog) return t.second;
     using Op = detail::Inst::Op;
     int psz = static_cast<int>(prog.insts.size());
     std::vector<Thread> clist, nlist;
     clist.reserve(psz);
     nlist.reserve(psz);
     std::vector<int> visited(psz, -1);
-    int gen = 0;
-
-    gen++;
-    add_thread(prog, clist, visited, gen, 0, Saves(prog.nslots), seg, from,
-               n);
-
-    const int step = behind ? -1 : 1;
+    std::vector<bool> table(n + 1, false);
+    const Saves seed(prog.nslots);
+    // Rightward for a lookbehind, leftward for a lookahead.
+    const int step = behind ? 1 : -1;
     long budget = step_budget(n); // shared cumulative counter, not reset here
-    for (int sp = from; behind ? sp >= 0 : sp <= n; sp += step) {
-      if (clist.empty()) break;
+    int gen = 0;
+    for (int sp = behind ? 0 : n;; sp += step) {
       if (match_steps() > budget)
         throw RegexError(RegexError::Code::StepBudgetExceeded,
                          "regex match step budget exceeded");
+      // A window may start (lookbehind) or end (lookahead) here: seed it
+      // after the threads already under way, under their `gen`.
+      add_thread(prog, clist, visited, gen, 0, seed, seg, sp, n);
       int next_gen = ++gen;
       // The grapheme consumed next: the one at sp scanning right, the one
       // immediately left of sp scanning left.
       const std::u32string *g =
-          behind ? (sp > 0 ? &seg.graphemes[sp - 1] : nullptr)
-                 : (sp < n ? &seg.graphemes[sp] : nullptr);
+          behind ? (sp < n ? &seg.graphemes[sp] : nullptr)
+                 : (sp > 0 ? &seg.graphemes[sp - 1] : nullptr);
       for (auto &t : clist) {
         const detail::Inst &in = prog.insts[t.pc];
         switch (in.op) {
@@ -15030,14 +15250,16 @@ private:
             add_thread(prog, nlist, visited, next_gen, t.pc + 1, t.saves, seg,
                        sp + step, n);
           break;
-        case Op::Match: return true;
+        case Op::Match: table[sp] = true; break;
         default: break;
         }
       }
       std::swap(clist, nlist);
       nlist.clear();
+      if (sp == (behind ? n : 0)) break;
     }
-    return false;
+    seg.look_tables.emplace_back(&prog, std::move(table));
+    return seg.look_tables.back().second;
   }
 
   // Pike VM match loop: finds the leftmost-first match at or after `start`. On
@@ -15066,10 +15288,12 @@ private:
     // The initial capture state is all-unset; since it is immutable and shared
     // copy-on-write, one instance is reused for every (re-)seed position.
     Saves seed(prog.nslots);
+    // Top-level search: reset the cumulative work counter. Before the seed
+    // closure, which may already evaluate a lookaround and charge the counter.
+    match_steps() = 0;
     gen++;
     add_thread(prog, clist, visited, gen, 0, seed, seg, start, n);
 
-    match_steps() = 0; // top-level search: reset the cumulative work counter
     long budget = step_budget(n);
     for (int sp = start; sp <= n; sp++) {
       if (clist.empty() && have) break;
@@ -16620,7 +16844,8 @@ inline void Regex::ladder_plan(Plan &p) {
         ladder_repick(p, fl);
       }
     }
-    // A CodePoint plan's family does not depend on the subject. (Neither
+    // A CodePoint plan's family does not depend on the subject (only whether
+    // its byte DFAs may run does: us_stray). (Neither
     // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
     Ladder &us = p.us_ladder_[w];
     us.want = want;
@@ -16659,7 +16884,13 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
                                             Plan::IcaseScan &probe) const {
   const Plan &p = *plan_;
   const int w = ladder_caller(l);
-  if (p.us_) return ladder_adopt(p.us_ladder_[w], l);
+  if (p.us_) {
+    if (fna == kUnclassified) fna = first_nonascii(text);
+    if (fna < text.size() &&
+        !unicode::utf8::valid_from(text.data(), text.size(), fna))
+      return pike_ladder(l.want); // a stray byte: see us_stray
+    return ladder_adopt(p.us_ladder_[w], l);
+  }
   // [Tier: Dfa/EgcByte] fused literal-prefilter rungs (see egc_fused_ok for
   // the rationale). A cluster they cannot vet downgrades to the Pike from
   // the cursor.
@@ -16709,9 +16940,7 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
   } else if (assert_byte_path_ok(text, fna)) {
     f = kFamAssertByte;
   } else { // [Tier: Pike]
-    Ladder pike;
-    pike.want = l.want;
-    return pike;
+    return pike_ladder(l.want);
   }
   return ladder_adopt(p.family_[f][ladder_caller(l)], l);
 }
@@ -16796,6 +17025,7 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
         l = plan_->start_[2];
     }
   }
+  if (l.rung != Rung::Pike && us_stray(text)) l = pike_ladder(l.want);
   if (l.rung == Rung::Walk) {
     const Step st = ladder_walk<false>(text, scr, l, c, budget, chain_once, out);
     if (st != Step::Again) return st == Step::Yield;
@@ -17703,7 +17933,9 @@ public:
     suffix_ = un;
   }
 
-  void _build(const reg::MatchResult &r, int mark_count) {
+  // `prefix_begin`: where prefix() starts — the end of the previous match for
+  // a regex_iterator past its first match, else the subject start.
+  void _build(const reg::MatchResult &r, int mark_count, size_t prefix_begin) {
     groups_.clear();
     if (!r.matched()) return;
     const int total = mark_count + 1;
@@ -17721,9 +17953,9 @@ public:
       }
       groups_.push_back(sm);
     }
-    prefix_.first = base_;
+    prefix_.first = off(prefix_begin);
     prefix_.second = off(r.begin());
-    prefix_.matched = (r.begin() > 0);
+    prefix_.matched = (r.begin() > prefix_begin);
     suffix_.first = off(r.end());
     suffix_.second = subject_end_;
     suffix_.matched = (off(r.end()) != subject_end_);
@@ -17788,7 +18020,7 @@ bool do_search(BiIter first, BiIter last, match_results<BiIter> &m,
     return re.native().search(sv);
   });
   m._reset(first, last);
-  m._build(r, static_cast<int>(re.mark_count()));
+  m._build(r, static_cast<int>(re.mark_count()), /*prefix_begin=*/0);
   return r.matched();
 }
 
@@ -17940,8 +18172,9 @@ inline std::string replace_core(std::string_view s, const basic_regex &re,
   // Lazy scan: stream matches (with first_only this stops at the first one).
   translate_errors([&] {
     for (auto m : re.native().find_iter(s)) {
-      if (!no_copy) out.append(s.substr(cursor, m.begin() - cursor));
-      std::string_view prefix = s.substr(0, m.begin());
+      // $` is the text since the previous match, as std's prefix() is.
+      std::string_view prefix = s.substr(cursor, m.begin() - cursor);
+      if (!no_copy) out.append(prefix);
       std::string_view suffix = s.substr(m.end());
       expand_format(out, fmt, m.str(), prefix, suffix, ng,
                     [&](int i) -> std::string_view {
@@ -18069,7 +18302,8 @@ private:
   void load() {
     if (at_end()) return;
     cur_._reset(begin_, end_);
-    cur_._build((*spans_)[idx_], static_cast<int>(re_->mark_count()));
+    cur_._build((*spans_)[idx_], static_cast<int>(re_->mark_count()),
+                idx_ ? (*spans_)[idx_ - 1].end() : 0);
   }
 
   BiIter begin_{}, end_{};

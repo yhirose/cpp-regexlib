@@ -119,6 +119,9 @@ void test_replace_parity() {
       {R"((\w)(\w))", "abcd", "$2$1"},
       {R"(o)", "foo", "0"},
       {R"(\w+)", "hi there", "<$&>"},
+      // $` is the text since the previous match, not since the subject start.
+      {R"(x)", "xaxbx", "<$`>"},
+      {R"(,)", "a,b,,c", "[$`|$']"},
   };
   for (const Case &c : cases) {
     std::string s = c.subj;
@@ -165,6 +168,31 @@ void test_iterator() {
   CHECK(std_caps == rx_caps);
   CHECK(rx_caps.size() == 3);
   CHECK((rx_caps == std::vector<std::string>{"10", "20", "30"}));
+
+  // prefix() starts where the previous match ended, so the usual rebuild loop
+  // (prefix, replacement, ..., the last suffix) copies each byte once.
+  {
+    std::string t = "a,b,,c";
+    std::regex sre(",");
+    re::regex rre(",");
+    std::vector<std::pair<std::string, bool>> sp, rp;
+    for (auto it = std::sregex_iterator(t.begin(), t.end(), sre);
+         it != std::sregex_iterator(); ++it)
+      sp.emplace_back(it->prefix().str(), it->prefix().matched);
+    std::string rebuilt;
+    re::smatch last;
+    for (re::sregex_iterator it(t.begin(), t.end(), rre), end; it != end;
+         ++it) {
+      rp.emplace_back(it->prefix().str(), it->prefix().matched);
+      rebuilt += it->prefix().str() + ";";
+      last = *it;
+    }
+    rebuilt += last.suffix().str();
+    CHECK(sp == rp);
+    CHECK((rp == std::vector<std::pair<std::string, bool>>{
+               {"a", true}, {"b", true}, {"", false}}));
+    CHECK(rebuilt == "a;b;;c");
+  }
 }
 
 // --- sub_match comparison operators / conversions ---

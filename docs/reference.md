@@ -70,6 +70,12 @@ anchors, lookaround, named groups, the flags below (including `IgnoreCase`), and
 all method APIs behave the same; only the unit of `.`/classes and the boundary
 of offsets differ.
 
+What counts as UTF-8 is exactly RFC 3629: a lead byte with its continuation
+bytes, and no overlong form, surrogate, or value past U+10FFFF. Any other byte —
+a stray continuation byte, a lead byte whose continuation bytes are missing, the
+bytes of `C0 AF` or `ED A0 80` — is one element of its own (in either unit), and
+the byte after it starts afresh: `"\xE3" "ab"` is three elements, never one.
+
 **Why it exists — no non-ASCII cliff.** In grapheme mode, grapheme breaking is
 stateful, so any non-ASCII byte drops the whole subject off the lazy-DFA fast
 path onto the (slower) grapheme Pike VM. The CodePoint unit compiles the pattern
@@ -506,11 +512,13 @@ pattern that exceeds any of these raises `RegexError` at construction:
 | Limit | Value |
 | --- | --- |
 | Pattern source length | 32 KiB |
-| Compiled program size | 262144 instructions |
+| Compiled program size | 262144 instructions, the lookaround programs it runs included |
 | Nesting depth | 200 |
 
 These bound compile cost (e.g. `a{1000000}`, nested `(x{50}){50}…`) and parser
-recursion (e.g. `((((…))))`). The nesting limit is kept conservative so the
+recursion (e.g. `((((…))))`). A lookaround is one program however many times a
+counted repeat copies it — `(?:(?=x)a){1000}` holds one — and each distinct
+lookaround counts toward the size of the program that runs it. The nesting limit is kept conservative so the
 recursive-descent parser stays within the smallest common thread stack
 (Windows' 1 MiB main-thread stack); hand-written patterns nest far below it.
 

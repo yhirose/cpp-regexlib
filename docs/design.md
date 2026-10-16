@@ -376,7 +376,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — a state is the offset of its row (premultiplied, as the LazyDfa's), so each byte's one load waits on the load before it and nothing else; a row is 129 entries, the state's accept flag and then a column per ASCII byte — the flag is read off the dependency chain, and the odd width keeps one column of many rows out of one cache set (a 128-digit validator over varying subjects: 262 ns with 128-entry rows, 140 so); a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes, taken a block at a time (`word_start_block`, see the scan section) behind a short scalar entry ramp; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity) |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity). A subject with a stray byte (not RFC 3629 UTF-8; `us_stray`) starts on the code-point Pike instead — a byte automaton cannot match a byte that is no code point, and the Pike reads it as an element of its own |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
@@ -710,6 +710,14 @@ struct Program {
 };
 ```
 
+A pool is a set: it holds each distinct literal or class once, however many
+instructions read it (`Compiler::intern_lit` / `intern_cls`). A counted repeat
+emits its body once per copy, and a pool entry per copy made `[ab]{20000}` hold
+twenty thousand copies of one class — some 130 bytes an instruction against the
+instruction's own 16; pooled once, what grows under expansion is the
+instructions alone (`(?:[ab]{20000}){10}`: 132 → 36 MB), which is what the size
+limit counts.
+
 The instruction stores only a small index, and since no operand index coexists
 with a control-flow target they all **overlap the `x` slot** (the op selects the
 meaning): `lit_idx()`/`cls_idx()`/`sub_idx()` all read `x`; `Byte` packs its
@@ -720,6 +728,25 @@ throughput is insensitive to `Inst` size (the byte DFA runs off transition table
 and never reads `Inst` in the hot loop), so the win is compile time and memory —
 exactly where it was needed (`\w+` byte program: 359 → 159 KiB after the
 160→32→16-byte shrink).
+
+### Lookaround programs — one per lookaround, counted in the program
+
+A lookaround is a program of its own, which `Look` runs: compiled to scan
+*away* from the positions it answers for, and run by the Pike once over the
+whole subject to settle the assertion at every position (`Regex::look_table`,
+one table per program per subject). Its identity is its AST node: a counted
+repeat `x{n}` emits its body `n` times, but every copy of a lookaround in it
+is the same assertion, so `Compiler::sub_program` compiles it the first time
+and hands later copies the same program (`sub_of_`). One lookaround is one
+program to hold and one table to fill, however many copies the repeats make.
+
+The size limit counts what a program *runs*: `Compiler::size()` is its own
+instructions plus its lookaround programs', each counted once, and
+`limits::kMaxProgramInsts` bounds that; a lookaround body compiles within what
+the program around it has left. Before, each copy compiled its own program
+outside the limit — 25 bytes of `(?:(?=[ab]{20000})a){400}` took a gigabyte
+— and each filled its own table, so `(?:(?=[ab]{50})a){100}` settled one
+assertion a hundred times over every subject.
 
 ### UTF-8 range compilation
 
@@ -1558,7 +1585,9 @@ bugs** — an accelerator that disagrees with the baseline — and the tempting 
 compiled program.
 
 The strategy (`test/regexlib_fuzz.cc`, fixed seed `0xC0FFEE`, run under
-ASan/UBSan) is layered:
+ASan/UBSan) is layered. (Sanitizers multiply the run time — ASan about 7×, UBSan
+5×, both 15× — so an ASan build draws a fifth of the iterations by default
+(`kDefaultIters`); `--iters` sets it either way.)
 
 - **Layer 1 — invariants that need no known-correct answer (fails CI).** Random
   patterns/subjects never crash, hang, or throw anything but `RegexError` at

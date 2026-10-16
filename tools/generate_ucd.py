@@ -193,6 +193,7 @@ def emit_page_table(out, name, ctype, order, defval, values):
               % (nleaf, nsuper, shift, sb - 1))
     out.write(
         "inline %s get_value(char32_t cp) {\n"
+        "  if (cp > 0x10FFFF) return D;\n"
         "  unsigned bi = cp >> 7;\n"
         "  short d = _dir[bi >> SB_SHIFT];\n"
         "  short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);\n"
