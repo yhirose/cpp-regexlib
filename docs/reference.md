@@ -70,6 +70,12 @@ anchors, lookaround, named groups, the flags below (including `IgnoreCase`), and
 all method APIs behave the same; only the unit of `.`/classes and the boundary
 of offsets differ.
 
+What counts as UTF-8 is exactly RFC 3629: a lead byte with its continuation
+bytes, and no overlong form, surrogate, or value past U+10FFFF. Any other byte —
+a stray continuation byte, a lead byte whose continuation bytes are missing, the
+bytes of `C0 AF` or `ED A0 80` — is one element of its own (in either unit), and
+the byte after it starts afresh: `"\xE3" "ab"` is three elements, never one.
+
 **Why it exists — no non-ASCII cliff.** In grapheme mode, grapheme breaking is
 stateful, so any non-ASCII byte drops the whole subject off the lazy-DFA fast
 path onto the (slower) grapheme Pike VM. The CodePoint unit compiles the pattern

@@ -4992,7 +4992,7 @@ void test_out_of_range_utf8() {
                             "\xF7\xBF\xBF\xBF"}) {
       const std::string s = std::string(bad) + "b1";
       CHECK(!make_unit(unit, "^.$", 0).test(bad));
-      CHECK(!make_unit(unit, "\\w", 0).test(bad));
+      CHECK(make_unit(unit, "^.{4}$", 0).test(bad)); // four stray bytes
       auto m = make_unit(unit, "b\\d", 0).search(s);
       CHECK(m && m.begin() == 4 && m.end() == 6);
       CHECK(make_unit(unit, "(?<=\\W)b", 0).search(s).begin() == 4);
@@ -5000,6 +5000,202 @@ void test_out_of_range_utf8() {
   }
   // U+10FFFF itself is the last code point, and still one.
   CHECK(Regex("^.$").test("\xF4\x8F\xBF\xBF"));
+}
+
+// The decoder takes exactly well-formed UTF-8 (RFC 3629).
+void test_utf8_decoder_strict() {
+  using reg::unicode::utf8::decode_before;
+  using reg::unicode::utf8::decode_codepoint;
+  using reg::unicode::utf8::decode_or_byte;
+  const auto decodes = [](const std::string &s, char32_t want) {
+    size_t bytes = 0;
+    char32_t cp = 0;
+    return decode_codepoint(s.data(), s.size(), bytes, cp) && cp == want &&
+           bytes == s.size();
+  };
+  const auto rejects_bytes = [](const std::string &s) {
+    size_t bytes = 0;
+    char32_t cp = 0;
+    return !decode_codepoint(s.data(), s.size(), bytes, cp);
+  };
+  CHECK(decodes("a", 'a'));
+  CHECK(decodes("\xC2\x80", 0x80));
+  CHECK(decodes("\xDF\xBF", 0x7FF));
+  CHECK(decodes("\xE0\xA0\x80", 0x800));
+  CHECK(decodes("\xED\x9F\xBF", 0xD7FF));
+  CHECK(decodes("\xEE\x80\x80", 0xE000));
+  CHECK(decodes("\xEF\xBF\xBF", 0xFFFF));
+  CHECK(decodes("\xF0\x90\x80\x80", 0x10000));
+  CHECK(decodes("\xF4\x8F\xBF\xBF", 0x10FFFF));
+  // A lone continuation byte, and a lead without its continuation bytes.
+  CHECK(rejects_bytes("\x80"));
+  CHECK(rejects_bytes("\xBF"));
+  CHECK(rejects_bytes("\xC3"));
+  CHECK(rejects_bytes("\xC3" "a"));
+  CHECK(rejects_bytes("\xE3\x81"));
+  CHECK(rejects_bytes("\xE3" "ab"));
+  CHECK(rejects_bytes("\xF0\x9F\x98"));
+  CHECK(rejects_bytes("\xF0\x9F" "ab"));
+  // Overlong forms.
+  CHECK(rejects_bytes("\xC0\xAF"));
+  CHECK(rejects_bytes("\xC1\xBF"));
+  CHECK(rejects_bytes("\xE0\x9F\xBF"));
+  CHECK(rejects_bytes("\xF0\x8F\xBF\xBF"));
+  // Surrogates, and past U+10FFFF.
+  CHECK(rejects_bytes("\xED\xA0\x80"));
+  CHECK(rejects_bytes("\xED\xBF\xBF"));
+  CHECK(rejects_bytes("\xF4\x90\x80\x80"));
+  CHECK(rejects_bytes("\xF5\x80\x80\x80"));
+  CHECK(rejects_bytes("\xF8\x88\x80\x80\x80"));
+  CHECK(rejects_bytes("\xFE"));
+  CHECK(rejects_bytes("\xFF"));
+  CHECK(rejects_bytes(""));
+  // A bad sequence is a byte of its own, and the next byte starts afresh.
+  {
+    const std::string s = "\xE3" "ab";
+    char32_t cp;
+    CHECK(decode_or_byte(s.data(), s.size(), cp) == 1 && cp == 0xE3);
+    CHECK(decode_or_byte(s.data() + 1, s.size() - 1, cp) == 1 && cp == 'a');
+  }
+  // valid_from is the same test as a decode_codepoint walk: every string of up
+  // to three bytes drawn from the bytes where the rules change, and long random
+  // ones around every length boundary.
+  {
+    const auto walk = [](const std::string &s) {
+      for (size_t off = 0; off < s.size();) {
+        size_t bytes;
+        char32_t cp;
+        if (!decode_codepoint(s.data() + off, s.size() - off, bytes, cp))
+          return false;
+        off += bytes;
+      }
+      return true;
+    };
+    const unsigned char edge[] = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F,
+                                  0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0,
+                                  0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1,
+                                  0xF3, 0xF4, 0xF5, 0xF7, 0xF8, 0xFF};
+    size_t strings = 0;
+    std::string s;
+    const auto each = [&](auto &&self, size_t depth) -> void {
+      if (!s.empty() || depth == 0) {
+        strings++;
+        CHECK(reg::unicode::utf8::valid_from(s.data(), s.size()) == walk(s));
+      }
+      if (depth == 0) return;
+      for (unsigned char b : edge) {
+        s.push_back(static_cast<char>(b));
+        self(self, depth - 1);
+        s.pop_back();
+      }
+    };
+    each(each, 4); // 27^4 = 531441 strings of one to four of the edge bytes
+    CHECK(strings > 500000);
+    unsigned x = 12345;
+    for (int i = 0; i < 20000; i++) {
+      std::string r(1 + (i % 40), 'a');
+      for (char &c : r) {
+        x = x * 1664525u + 1013904223u;
+        c = (x >> 24) % 4 ? static_cast<char>('a' + (x >> 16) % 26)
+                          : static_cast<char>(edge[(x >> 8) % sizeof edge]);
+      }
+      CHECK(reg::unicode::utf8::valid_from(r.data(), r.size()) == walk(r));
+    }
+    // From a code-point boundary part-way in.
+    const std::string t = "ab\xC3\xA9\xFFcd";
+    CHECK(!reg::unicode::utf8::valid_from(t.data(), t.size(), 2));
+    CHECK(reg::unicode::utf8::valid_from(t.data(), t.size(), 5));
+  }
+  // The element ending at a byte, read as a left-to-right scan reads it.
+  {
+    char32_t cp;
+    const std::string a = "x\xD8\x80\xBF"; // U+0600, then a stray BF
+    CHECK(decode_before(a.data(), 4, cp) == 1 && cp == 0xBF);
+    CHECK(decode_before(a.data(), 3, cp) == 2 && cp == 0x600);
+    const std::string b = "\xC3\xA9\x80"; // é, then a stray continuation
+    CHECK(decode_before(b.data(), 3, cp) == 1 && cp == 0x80);
+    CHECK(decode_before(b.data(), 2, cp) == 2 && cp == 0xE9);
+    const std::string c = "\xF0\x9F\x98\x80"; // one four-byte code point
+    CHECK(decode_before(c.data(), 4, cp) == 4 && cp == 0x1F600);
+    CHECK(decode_before(c.data(), 3, cp) == 1 && cp == 0x98);
+    const std::string d = "\xE3\x81"; // a truncated lead
+    CHECK(decode_before(d.data(), 2, cp) == 1 && cp == 0x81);
+  }
+}
+
+// A subject that is not UTF-8 reads as the Pike reads it — a stray byte is an
+// element of its own, and the next byte starts afresh — whichever tier a plan
+// would serve a well-formed one with. The byte automata cannot match a stray
+// byte, so every such subject has to reach the Pike; each pattern is checked
+// against its Pike-only twin on every short run of well- and ill-formed pieces.
+void test_invalid_utf8_tiers() {
+  const char *const pieces[] = {
+      "a",          "b",          "x",
+      "ing",        " ",          "\n",
+      "\r\n",       "\xC3\xA9",   "\xE3\x81\x82",
+      "\xD8\x80",   "\xCC\x81",   "\xF0\x9F\x98\x80",
+      "\xC3",        "\x80",        "\xE3\x81",
+      "\xBF",        "\xC0\xAF",   "\xED\xA0\x80",
+      "\xF4\x90\x80\x80", "\xFF",
+  };
+  const size_t np = sizeof pieces / sizeof *pieces;
+  const char *const pats[] = {
+      "x[^ ]",    "[^ ]+",      "\\bx",        "a\\b",        "\\B.",
+      "..",       "(.)(.*)",    "\\w+ing\\b",  "\\b\\w+ing\\b", "^.+$",
+      "x*",       "a|b|ing",    "abc|abx",    "(?i)ING",     "(a)(b)?",
+      "\\p{L}+",  "(?<=a)b",    "x(?=b)",     "(?m)^.",      "[a-z]+$",
+  };
+  std::vector<std::string> subjects{""};
+  for (size_t i = 0; i < np; i++) {
+    subjects.push_back(pieces[i]);
+    for (size_t j = 0; j < np; j++) {
+      subjects.push_back(std::string(pieces[i]) + pieces[j]);
+      for (size_t k = 0; k < np; k += 3)
+        subjects.push_back(std::string(pieces[i]) + pieces[j] + pieces[k]);
+    }
+  }
+  const auto spans = [](const Regex &re, const std::string &s) {
+    std::vector<size_t> v;
+    for (auto m : re.find_all(s)) {
+      v.push_back(m.begin());
+      v.push_back(m.end());
+    }
+    return v;
+  };
+  size_t bad = 0;
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    for (const char *pat : pats) {
+      const Regex re = make_unit(unit, pat, 0);
+      const Regex pike = pike_twin(pat, 0, unit);
+      for (const std::string &s : subjects) {
+        const auto a = re.search(s), b = pike.search(s);
+        const bool ok =
+            re.test(s) == pike.test(s) && a.matched() == b.matched() &&
+            (!a || (a.begin() == b.begin() && a.end() == b.end())) &&
+            spans(re, s) == spans(pike, s) &&
+            re.match(s).matched() == pike.match(s).matched();
+        if (!ok && bad++ < 5)
+          std::printf("  invalid UTF-8: %s pattern %s, %zu-byte subject\n",
+                      unit == reg::MatchUnit::Grapheme ? "Grapheme"
+                                                       : "CodePoint",
+                      pat, s.size());
+        CHECK(ok);
+      }
+    }
+  }
+  // The cases that showed it: a byte automaton reading a stray byte as
+  // nothing, or a bad sequence as swallowing the byte after it.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    CHECK(make_unit(unit, "x[^ ]", 0).test("x\x80\xC3\xA9"));
+    CHECK(make_unit(unit, "^.+$", 0).test("x\xE3x"));
+    CHECK(make_unit(unit, "a\\b", 0).test("a\x80"));
+    CHECK(spans(make_unit(unit, "a", 0), "\xC3" "a" "\xE3" "a") ==
+          (std::vector<size_t>{1, 2, 3, 4}));
+  }
+  // A literal sits on a cluster boundary after a stray byte that follows a
+  // Prepend: U+0600 BF is one cluster, and the `abc` after it starts a new one.
+  CHECK(spans(Regex("abc"), "abc\xD8\x80\xBF" "abc") ==
+        (std::vector<size_t>{0, 3, 6, 9}));
 }
 
 void test_error_messages() {
@@ -5076,6 +5272,8 @@ int main() {
   test_invalid_patterns();
   test_resource_limits();
   test_out_of_range_utf8();
+  test_utf8_decoder_strict();
+  test_invalid_utf8_tiers();
   test_error_messages();
 
   std::printf("\nregexlib: %d passed, %d failed\n", g_pass, g_fail);
