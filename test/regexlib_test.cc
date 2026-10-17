@@ -5653,7 +5653,7 @@ void test_utf8_decoder_strict() {
       CHECK(reg::unicode::utf8::valid_from(r.data(), r.size()) == walk(r));
     }
     // From a code-point boundary part-way in.
-    const std::string t = "ab\xC3\xA9\xFFcd";
+    const std::string t = "ab\xC3\xA9\xFF" "cd";
     CHECK(!reg::unicode::utf8::valid_from(t.data(), t.size(), 2));
     CHECK(reg::unicode::utf8::valid_from(t.data(), t.size(), 5));
   }
