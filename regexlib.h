@@ -9889,11 +9889,11 @@ private:
     // never step most of the DFAs they could.
     //
     // `look`: the program has assertions, and its DFA steps with look. What
-    // an assertion asks of an ASCII byte is told apart too (LazyDfa::side:
-    // a word byte, a line break), so that a
-    // transition can be cached by the byte's class there as well — and no
-    // ASCII byte shares a class with a byte of a longer code point, which a
-    // step crosses by way of the states inside it (LazyDfa::look_next).
+    // an assertion of it asks of an ASCII byte is told apart too
+    // (LazyDfa::side: a word byte, a line break), so that a transition can
+    // be cached by the byte's class there as well — and no ASCII byte shares
+    // a class with a byte of a longer code point, which a step crosses by
+    // way of the states inside it (LazyDfa::look_next).
     ByteClasses byte_classes(const detail::Program &prog, bool look) const {
       using Op = detail::Inst::Op;
       static thread_local detail::ByteTests tests;
@@ -9965,8 +9965,8 @@ private:
           tests.ascii_set(m);
       }
       if (look) {
-        tests.ascii_set(pred_ascii(CharClass::Pred::Word));
-        tests.range('\n', '\r'); // the ASCII line breaks: \n \v \f \r
+        if (word_bounds_) tests.ascii_set(pred_ascii(CharClass::Pred::Word));
+        if (multiline_) tests.range('\n', '\r'); // \n \v \f \r
         tests.range(0x80, 0xFF);
       }
       ByteClasses bc = tests.classes();
@@ -12543,8 +12543,8 @@ private:
     // scan has asked for its start state, which is where they are made.
     uint8_t cls[256];    // byte -> column of its class
     uint32_t stride = 0; // entries per state: the flags + one per class
-                         // (+ with look, the edge's and one per kind of
-                         // code point); 0 = not made yet
+                         // (+ with look, the edge's, and unless bytewise
+                         // one per kind of code point); 0 = not made yet
     uint32_t edge = 0;   // look: the column of the text's edge
     // Rows back to back: [flags][column 0][column 1]... A state id is the
     // index of its column 0, so tr[s - 1] is its flags and tr[s + cls[b]] its
@@ -12595,30 +12595,31 @@ private:
       std::fill(std::begin(start_state), std::end(start_state), kUnknown);
     }
 
-    // The table's columns: the byte classes of the program (see
-    // Plan::byte_classes — it has some: the plan builds a lazy DFA over no
-    // program with a lookaround or a guarded loop), and with look one more
-    // for the text's edge and one per kind of code point (kind_column).
+    // The table's columns, and how a look DFA steps. The columns: the byte
+    // classes of the program (see Plan::byte_classes — it has some: the plan
+    // builds a lazy DFA over no program with a lookaround or a guarded
+    // loop), and with look one more for the text's edge and, unless
+    // `bytewise`, one per kind of code point (kind_column).
+    //
+    // Look over a program whose assertions see only the text's edges (no
+    // `\b`, `\B`, nor a `^` / `$` of (?m)) is `bytewise`: to them every code
+    // point is of one kind, and a boundary inside one the same as one
+    // between two, so a step over a code point is the steps over its bytes,
+    // each one transition by its class, as without look. Not when the DFA
+    // re-seeds and a start re-seeded inside a code point could match there
+    // with no byte (`\Aa|b*`): only steps over whole code points keep such a
+    // match where it can be.
     void columns() {
-      const Plan::ByteClasses bc = re->plan_->byte_classes(*prog, look);
+      const auto &plan = *re->plan_;
+      const Plan::ByteClasses bc = plan.byte_classes(*prog, look);
       std::memcpy(cls, bc.cls.data(), sizeof cls);
       edge = bc.n;
       seen.assign(prog->insts.size(), 0);
-      // Look over a program whose assertions see only the text's edges (no
-      // `\b`, `\B`, nor a `^` / `$` of (?m)): to them every code point is of
-      // one kind, and a boundary inside one is the same as one between two.
-      // So a step over a code point is the steps over its bytes, each one
-      // transition by its class, as without look — unless a start, re-seeded
-      // inside a code point, could match there with no byte (`\Aa|b*`),
-      // which only the steps over whole code points rule out (look_next).
-      const auto &plan = *re->plan_;
-      if (look && !plan.word_bounds_ && !plan.multiline_) {
+      bytewise = look && !plan.word_bounds_ && !plan.multiline_;
+      if (bytewise && reseed) {
         std::vector<int> start{0}, inside;
-        close(start, inside,
-              re->bflags(false, false, false, false, false, false, false,
-                         false));
-        bytewise = !reseed || std::find(inside.begin(), inside.end(),
-                                        match_pc) == inside.end();
+        close(start, inside, /*flags=*/0); // no assertion holds inside
+        bytewise = !(match_flags(inside) & kAccept);
       }
       stride = edge + 1 + (look ? 1 + (bytewise ? 0 : kKinds) : 0);
     }
@@ -12923,7 +12924,8 @@ private:
 
     // The kinds of code point — neither, kWord, kBreak (no line break is a
     // word character) — and the column a state steps on into one of kind
-    // `in`, or from inside one, out of it (see look_next).
+    // `in`, or from inside one, out of it (see look_next; not a bytewise
+    // row's).
     static constexpr uint32_t kKinds = 3;
     uint32_t kind_column(uint8_t in) const { return edge + 1 + (in >> 1); }
 
