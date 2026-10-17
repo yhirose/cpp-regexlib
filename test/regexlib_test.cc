@@ -2287,6 +2287,11 @@ void test_grapheme_aware() {
   // A character class matches a multi-code-point grapheme by its base code
   // point (Model 2): the family-emoji base is an emoji, not [a-z].
   CHECK(!Regex("[a-z]").test(family));
+  // ... and `\b` asks what `\w` does: e + U+0301 is a word character.
+  CHECK(Regex("\\w+\\b").search("caf" + combined).end() == 6);
+  CHECK(Regex("^\\b\\w+\\b$").test(combined + "t" + combined));
+  CHECK(!Regex("e\\B").test(combined.substr(0, 1) + "!"));
+  CHECK(Regex("\\b").search("!" + combined).begin() == 1);
 
   // A Prepend (U+0600) fuses with what follows (GB9b) but not with a control
   // (GB5): `\t` after it starts a cluster of its own, which the fused literal
@@ -4939,6 +4944,39 @@ void test_invalid_patterns() {
   CHECK(!rejects("(?<=a+)b")); // variable lookbehind is supported now
   CHECK(!rejects("a{2,3}"));
   CHECK(!rejects("(?<name>x)"));
+
+  // A hex escape takes the digits its form takes, exactly: \xHH two, \uHHHH
+  // four, \x{…} one to six up to U+10FFFF and a closing brace.
+  const auto code_of = [](const char *pat) {
+    try {
+      Regex r(pat);
+    } catch (const RegexError &e) {
+      return static_cast<int>(e.code());
+    }
+    return -1;
+  };
+  const int bad_escape = static_cast<int>(RegexError::Code::BadEscape);
+  for (const char *pat : {"\\xZ", "\\x4", "\\x{}", "\\x{41", "\\x{110000}",
+                          "\\x{100000041}", "\\x{1234567}", "\\u004", "\\uZZZZ"})
+    CHECK(code_of(pat) == bad_escape);
+  CHECK(Regex("^\\x41B$").test("AB")); // two digits, then a literal B
+  CHECK(!Regex("\\x41B").test("\xD0\x9B")); // not U+041B
+  CHECK(Regex("^\\x{41}\\u0042\\x{10FFFF}$").test("AB\xF4\x8F\xBF\xBF"));
+  // A one-letter \p name is the letter, whatever it is.
+  CHECK(code_of("\\p\xC5\x8C") ==
+        static_cast<int>(RegexError::Code::BadUnicodeProperty));
+  // A range joins two code points, in order; a '-' next to a set is itself.
+  CHECK(code_of("[z-a]") == static_cast<int>(RegexError::Code::BadCharRange));
+  CHECK(code_of("[\\x{20}-\\n]") ==
+        static_cast<int>(RegexError::Code::BadCharRange));
+  CHECK(Regex("^[a-\\d]+$").test("a-5"));
+  CHECK(!Regex("[a-\\d]").test("b"));
+  CHECK(Regex("^[\\w-.]+$").test("a-b.c"));
+  CHECK(Regex("^[\\d-z]+$").test("1-z"));
+  CHECK(!Regex("[\\d-z]").test("y"));
+  // A counted repeat's minimum is at most its maximum.
+  CHECK(code_of("a{3,1}") == static_cast<int>(RegexError::Code::BadRepeat));
+  CHECK(Regex("^a{3,3}$").test("aaa"));
 }
 
 void test_resource_limits() {
@@ -5123,6 +5161,28 @@ static_assert(can_find_iter<const char *>::value, "");
 static_assert(can_find_iter_cached<std::string &>::value, "");
 static_assert(can_split<std::string_view>::value, "");
 static_assert(can_find_all<std::string_view>::value, "");
+
+// A result of to_owned() holds the text of its own span and the groups that
+// lie in it: that of a group view keeps the groups nested in it and reads the
+// others as unmatched. A group view's result used to keep every group, with
+// spans outside its text, and its group(k).str() threw.
+void test_owned_group_views() {
+  const Regex re("((\\w)\\w*)-(\\w+)");
+  const std::string subj = "xx foo-barbaz yy";
+  for (auto m : re.find_iter(subj)) {
+    const auto all = m.to_owned(); // the whole match: every group
+    CHECK(all.str() == "foo-barbaz" && all.group(3).str() == "barbaz" &&
+          all.group(2).str() == "f");
+    const auto g1 = m.group(1).to_owned(); // `foo`, with `f` inside it
+    CHECK(g1.str() == "foo" && g1.begin() == 3 && g1.end() == 6);
+    CHECK(g1.group(2).str() == "f" && g1.group(2).begin() == 3);
+    CHECK(!g1.group(3).matched() && g1.group(3).str().empty());
+    const auto g3 = m.group(3).to_owned();
+    CHECK(g3.str() == "barbaz" && !g3.group(1).matched() &&
+          !g3.group(2).matched());
+    CHECK(!m.group(9).to_owned().matched());
+  }
+}
 
 void test_class_block_cache() {
   auto &cache = reg::detail::ClassBlockCache::instance();
@@ -5531,6 +5591,7 @@ int main() {
   test_resource_limits();
   test_lookaround_programs();
   test_operand_pools();
+  test_owned_group_views();
   test_class_block_cache();
   test_out_of_range_utf8();
   test_utf8_decoder_strict();

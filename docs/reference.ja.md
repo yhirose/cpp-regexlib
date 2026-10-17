@@ -90,16 +90,16 @@ ZWJ・結合列の正しさ）場合は既定の `Grapheme` を選んでくだ�
 | リテラル | 任意の文字。基底 + 結合文字は 1 つのリテラル書記素になる |
 | 任意 | `.`（DotAll でない限り改行を除く。下記参照） |
 | アンカー | `^`, `$`（Multiline では行基準） |
-| 文字クラス | `[abc]`, `[a-z]`, `[^…]`。内部に `\p{…}` と `[:posix:]` 可 |
+| 文字クラス | `[abc]`, `[a-z]`, `[^…]`。内部に `\p{…}` と `[:posix:]` 可。範囲は2つのコードポイントを順に結ぶ（`[z-a]` はエラー）。`[\w-.]` のように集合の隣の `-` は `-` そのもの |
 | 定義済みクラス | `\d \w \s` と `\D \W \S`（Unicode プロパティ準拠） |
 | POSIX クラス | `[[:alpha:]]`, `[[:digit:]]`, … （ブラケット内・下記参照） |
 | Unicode プロパティ | `\p{Name}`, `\P{Name}`, 1 文字形 `\pL` |
-| 量化子 | `* + ?`, `{n}`, `{n,m}`, `{n,}`。lazy 形 `*? +? ?? {n,m}?` |
+| 量化子 | `* + ?`, `{n}`, `{n,m}`（`n` ≤ `m`）, `{n,}`。lazy 形 `*? +? ?? {n,m}?` |
 | 選択 | `\|` |
 | グループ | `(…)` キャプチャ, `(?:…)` 非キャプチャ |
 | 名前付きグループ | `(?<name>…)`, `(?'name'…)` |
 | 単語境界 | `\b`, `\B` |
-| エスケープ | `\n \r \t \f \v \0`, `\xHH`, `\x{…}`, `\uHHHH`, エスケープしたメタ文字 |
+| エスケープ | `\n \r \t \f \v \0`, `\xHH`（16進2桁）, `\uHHHH`（4桁）, `\x{…}`（1〜6桁、U+10FFFF まで）, エスケープしたメタ文字 |
 | 先読み | `(?=…)`, `(?!…)` — 可変長 |
 | 後読み | `(?<=…)`, `(?<!…)` — 可変長 |
 | フラグ（インライン） | `(?i)`, `(?m)`, `(?s)` |
@@ -208,7 +208,7 @@ Java (20+) の `Pattern.namedGroups()` にもあります。
 | `m.str()` | マッチ文字列（`std::string_view`） |
 | `m.group(i)` / `m.group("name")` | サブグループ（`Match`。グループ 0 = 全体マッチ） |
 | `m.group_count()` | キャプチャグループ数 |
-| `m.to_owned()` | 所有 `MatchResult` へコピー（view のみ） |
+| `m.to_owned()` | 所有 `MatchResult` へコピー（view のみ）：自身の範囲と、その中のグループ |
 
 `group()` は再帰的に `Match` を返すので、`m.group(1).str()`・`m.group(1).begin()`・
 `m.group("name").matched()` が同じ書き味になります。未マッチ／範囲外のグループは
@@ -225,9 +225,10 @@ subject より長生きできる）を返し、この**同じ**メソッドサ�
 マッチずつ**進めるので、ループを途中で抜ければ残りの subject は走査しません ——
 早期打ち切り・ストリーミング・レンジ合成のための道具です。各反復は `Match` の view
 を yield します。これは subject を借用し**次の `++` まで有効**なので、残したいものは
-コピー（または `to_owned()`）してください。一時 `std::string` の subject は拒否
-されます（`find_iter(std::string&&)` は delete。view が dangle するため）。先に変数へ
-束ねてください。
+コピー（または `to_owned()`）してください。所有権を持つ一時オブジェクトの subject
+（`std::string`。const も含む。`std::string_view` に変換できる任意の文字列型）は
+コンパイルできません（view が dangle するため）。先に変数へ束ねてください。（`split` と
+借用版 `find_all` も同じです。`find_all` は代わりに `std::string&&` を受け取って所有します。）
 
 ```cpp
 for (auto m : re.find_iter(text)) {
@@ -371,7 +372,8 @@ for (const auto &doc : docs)
 含まれます。加えて `RegexError::code()` が構造化された `RegexError::Code`（RE2 流：
 `TrailingBackslash`, `BadEscape`, `BadCharClass`, `UnbalancedParen`, `BadGroup`,
 `BadInlineFlags`, `BadUnicodeProperty`, `NestingTooDeep`, `NothingToRepeat`,
-`ProgramTooLarge`, `PatternTooLong`, `StepBudgetExceeded`, `Internal`）を返し、
+`ProgramTooLarge`, `PatternTooLong`, `StepBudgetExceeded`, `Internal`,
+`BadRepeat`（`n` > `m` の `{n,m}`）, `BadCharRange`（`[z-a]`））を返し、
 メッセージを解析せず分岐できます。
 
 ## std::regex 互換 API
