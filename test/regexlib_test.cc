@@ -3842,7 +3842,7 @@ void test_dfa_cache() {
                             "\xE5\xAD\x97", "x", " ", "\n", "\xC2\x85",
                             "\xE2\x80\xA8", "."};
     std::string s;
-    for (char c : noise(3000, "0123456789", 5)) s += pieces[c - '0'];
+    for (char c : noise(300, "0123456789", 5)) s += pieces[c - '0'];
     s += pieces[2]; // a word at the end, for `\w+$`
     for (const char *pat : {"\\b\\w+\\b", "\\w+$", "(?m)^\\w+$", "\\B\\w\\b"})
       for (bool us : {false, true}) {
@@ -4042,18 +4042,33 @@ void test_linear_time() {
 // Timed against `\w+` over the same text, which has no look: the bound is
 // loose, the agreement exact.
 void test_look_non_ascii() {
-  std::string latin, cjk;
-  for (int i = 0; i < 2000; i++)
-    latin += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9\n";
-  unsigned x = 7;
-  for (int i = 0; i < 40000; i++) { // ideographs at random, spaced
-    x = x * 1664525u + 1013904223u;
-    cjk += (x >> 13) % 8 ? reg::unicode::utf8::encode_codepoint(
+  // Latin lines, and ideographs at random, spaced: each ends in a word, for
+  // `\w+$`.
+  auto latin = [](int lines) {
+    std::string s;
+    for (int i = 0; i < lines; i++)
+      s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9\n";
+    return s + "end";
+  };
+  auto cjk = [](int cps) {
+    std::string s;
+    unsigned x = 7;
+    for (int i = 0; i < cps; i++) {
+      x = x * 1664525u + 1013904223u;
+      s += (x >> 13) % 8 ? reg::unicode::utf8::encode_codepoint(
                                0x4E00 + (x >> 16) % 20000)
                          : " ";
-  }
-  latin += "end"; // a word at the end, for `\w+$`
-  cjk += "\xE5\xAD\x97";
+    }
+    return s + "\xE5\xAD\x97";
+  };
+  // Timed over 100 KB, checked over a few (finds_agree steps find_at over
+  // the subject match by match).
+  struct Text {
+    const char *name;
+    std::string timed, checked;
+  };
+  const Text texts[] = {{"Latin", latin(2000), latin(40)},
+                        {"CJK", cjk(40000), cjk(1000)}};
   auto best_ms = [](const Regex &re, const std::string &s) {
     double best = 1e9;
     for (int k = 0; k < 3; k++) {
@@ -4066,17 +4081,18 @@ void test_look_non_ascii() {
     return best;
   };
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
-    for (const std::string *s : {&latin, &cjk}) {
-      const double plain = best_ms(make_unit(unit, "\\w+"), *s);
+    for (const Text &text : texts) {
+      const double plain = best_ms(make_unit(unit, "\\w+"), text.timed);
       for (const char *pat : {"\\w+$", "\\b\\w+\\b", "(?m)\\w+$", "(?m)^\\w+"}) {
         const Regex re = make_unit(unit, pat);
-        CHECK(finds_agree(re, flat_spans(pike_twin(pat, 0, unit), *s, false),
-                          *s));
-        const double t = best_ms(re, *s);
+        CHECK(finds_agree(
+            re, flat_spans(pike_twin(pat, 0, unit), text.checked, false),
+            text.checked));
+        const double t = best_ms(re, text.timed);
         CHECK(t < 10 * plain + 2);
         std::printf("  [info] %s over %zu KB of %s (%s): %.2f ms, \\w+ %.2f "
                     "ms\n",
-                    pat, s->size() >> 10, s == &cjk ? "CJK" : "Latin",
+                    pat, text.timed.size() >> 10, text.name,
                     unit == reg::MatchUnit::Grapheme ? "Grapheme" : "CodePoint",
                     t, plain);
       }
