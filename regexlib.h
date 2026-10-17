@@ -22,6 +22,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1676,6 +1677,13 @@ constexpr long kStepsBase = 1 << 20;   // slack so short subjects never trip
 constexpr size_t kDfaCacheBytes = size_t{8} << 20; // 8 MiB per DFA
 constexpr uint32_t kDfaMinClears = 3;
 constexpr uint64_t kDfaMinBytesPerState = 10;
+
+// The process-wide cache of class byte sub-automata (detail::ClassBlockCache)
+// is bounded in bytes too, the least recently used block going first: every
+// distinct class a process compiles would otherwise stay for its lifetime. A
+// Unicode `\w`'s blocks (forward and reverse) are some 160 KiB together, so
+// this holds about fifty classes that size, and thousands of small ones.
+constexpr size_t kClassBlockCacheBytes = size_t{8} << 20; // 8 MiB
 
 // Bounded-backtracking (BitState) capture engine cap: it visits each (pc, pos)
 // at most once, so its work and its visited bitmap are O(prog_size * span). Cap
@@ -3410,7 +3418,9 @@ struct Program {
   // distinct ranges), each once, which bring their classes ready-made
   // (ClassBlock::classes). Every Op::Byte of the program is on one of the two.
   std::vector<uint16_t> byte_ranges;
-  std::vector<const ClassBlock *> byte_blocks;
+  // Shared with the class-block cache, which may drop a block a program
+  // still holds (ClassBlockCache).
+  std::vector<std::shared_ptr<const ClassBlock>> byte_blocks;
 };
 
 //------------------------------------------------------------------------------
@@ -3539,12 +3549,12 @@ using CpRanges = std::vector<std::pair<char32_t, char32_t>>;
 // by scanning 0..0x10FFFF and globally cached by `key` — \w/\d/\s/\p{...} are
 // predicate functions over general_category, not range tables, so this turns
 // them into ranges feedable to utf8_ranges. The scan is paid once per process.
-// Mutex-guarded like its sibling caches (utf8_ranges_cached /
-// class_block_cached): today every caller happens to sit inside emit_class's
-// lock, but that is a non-local accident no comment promises — a new caller
-// outside that lock would otherwise make concurrent Regex construction race
-// on the map. The returned reference stays valid because std::map never
-// relocates or erases existing nodes.
+// Mutex-guarded like the class-block cache (ClassBlockCache): today every
+// caller happens to sit inside that cache's lock, but that is a non-local
+// accident no comment promises — a new caller outside it would otherwise make
+// concurrent Regex construction race on the map. Bounded by its keys (the
+// predicates and Unicode properties), it never drops an entry, so the
+// returned reference stays valid: std::map never relocates existing nodes.
 inline const CpRanges &
 enum_cp_ranges(int key, const std::function<bool(char32_t)> &pred) {
   static std::map<int, CpRanges> cache;
@@ -3570,27 +3580,12 @@ enum_cp_ranges(int key, const std::function<bool(char32_t)> &pred) {
   return cache[key] = std::move(rs);
 }
 
-// utf8_ranges over a whole code-point set, memoized by that set. A Unicode
-// class
-// (\w, \p{L}, ...) expands to the same hundreds of UTF-8 byte-range sequences
-// every time it is emitted — and a single Regex emits each class TWICE (into
-// the forward and reverse byte programs), so the expansion (~70µs for \w's 742
-// ranges) is pure repeated work. The sequences are direction-independent
-// (build_class_block reverses per sequence at emit time), so one cache serves
-// both. Keyed on the normalized ranges, which subsumes \d/\s/\p{...} and
-// combined classes, not just single predicates. Mutex-guarded; the returned
-// reference stays valid because std::map never relocates or erases existing
-// nodes.
-inline const std::vector<ByteSeq> &utf8_ranges_cached(const CpRanges &rs) {
-  static std::map<CpRanges, std::vector<ByteSeq>> cache;
-  static std::mutex mu;
-  std::lock_guard<std::mutex> lk(mu);
-  auto it = cache.find(rs);
-  if (it != cache.end()) return it->second;
+// utf8_ranges over a whole code-point set.
+inline std::vector<ByteSeq> utf8_seqs(const CpRanges &rs) {
   std::vector<ByteSeq> seqs;
   for (auto &r : rs)
     utf8_ranges(r.first, r.second, seqs);
-  return cache[rs] = std::move(seqs);
+  return seqs;
 }
 
 // Build the byte sub-automaton for one code-point set as a standalone block of
@@ -3684,23 +3679,70 @@ inline ClassBlock build_class_block(const std::vector<ByteSeq> &seqs,
   return blk;
 }
 
-// A whole emitted class block, memoized by (code-point set, direction). A
+// The emitted class blocks, cached across every Regex of the process. A
 // Unicode class (\w, \p{L}) expands to the same thousands of instructions every
-// time it is emitted — and once per direction per Regex (forward + reverse byte
-// programs), plus once more for every occurrence in the pattern. Caching the
-// block turns each subsequent emission into a memcpy-append + a target rebase
-// (Inst is trivially copyable since the operand-pool split), independent of how
-// large the class expands. Mutex-guarded; the returned reference stays valid
-// because std::map never relocates or erases existing nodes.
-inline const ClassBlock &class_block_cached(const CpRanges &rs, bool reverse) {
-  static std::map<std::pair<CpRanges, bool>, ClassBlock> cache;
-  static std::mutex mu;
-  std::lock_guard<std::mutex> lk(mu);
-  auto key = std::make_pair(rs, reverse);
-  auto it = cache.find(key);
-  if (it != cache.end()) return it->second;
-  return cache[key] = build_class_block(utf8_ranges_cached(rs), reverse);
-}
+// time it is emitted — once per direction per Regex, plus once more for every
+// occurrence in the pattern — so after the first, an emission is a
+// memcpy-append and a target rebase (Compiler::append_block), however large
+// the class. A program holds the blocks it lists by shared_ptr
+// (Program::byte_blocks), so the cache can let a block go while programs still
+// use it: it is bounded in bytes (limits::kClassBlockCacheBytes) and drops the
+// least recently used. (It was three unbounded maps — sets to byte sequences,
+// sets to blocks, classes to blocks — holding every distinct class a process
+// had compiled for its lifetime: a server compiling its users' patterns grew
+// without bound.) Mutex-guarded; a block is built under the lock.
+class ClassBlockCache {
+public:
+  // A block's key: class_key for a parsed class — its first element is the
+  // class's negate, 0 or 1 — or {2, reverse, lo, hi, ...} for a code-point set.
+  using Key = std::vector<char32_t>;
+
+  static ClassBlockCache &instance() {
+    static ClassBlockCache cache;
+    return cache;
+  }
+
+  // The block for `key`, built by `build()` if the cache does not hold it.
+  template <class Build>
+  std::shared_ptr<const ClassBlock> get(Key key, Build build) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = at_.find(key);
+    if (it != at_.end()) {
+      lru_.splice(lru_.begin(), lru_, it->second); // most recent first
+      return it->second->block;
+    }
+    auto block = std::make_shared<const ClassBlock>(build());
+    const size_t held = 2 * key.size() * sizeof(char32_t) + sizeof(ClassBlock) +
+                        block->insts.size() * sizeof(Inst) +
+                        block->ranges.size() * sizeof(uint16_t);
+    lru_.push_front({key, block, held});
+    at_.emplace(std::move(key), lru_.begin());
+    bytes_ += held;
+    while (bytes_ > limits::kClassBlockCacheBytes && lru_.size() > 1) {
+      bytes_ -= lru_.back().bytes;
+      at_.erase(lru_.back().key);
+      lru_.pop_back();
+    }
+    return block;
+  }
+
+  // What the cache holds, in bytes (what kClassBlockCacheBytes bounds).
+  size_t bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return bytes_;
+  }
+
+private:
+  struct Entry {
+    Key key;
+    std::shared_ptr<const ClassBlock> block;
+    size_t bytes;
+  };
+  std::list<Entry> lru_; // most recently used first
+  std::map<Key, std::list<Entry>::iterator> at_;
+  size_t bytes_ = 0;
+  mutable std::mutex mu_;
+};
 
 // A cheap, collision-free key for a CharClass (+ icase + direction), used to
 // memoize its emitted byte block without expanding it to code-point ranges
@@ -4103,7 +4145,8 @@ struct Compiler {
   // Append a cached class block onto the program and rebase its self-relative
   // Split/Jmp targets onto the current base. Op::Byte advances by fall-through,
   // so only Split/Jmp carry targets to fix up.
-  void append_block(const ClassBlock &blk) {
+  void append_block(const std::shared_ptr<const ClassBlock> &held) {
+    const ClassBlock &blk = *held;
     const std::vector<Inst> &block = blk.insts;
     room(block.size());
     int base = here();
@@ -4114,7 +4157,7 @@ struct Compiler {
     if (std::find(listed_.begin(), listed_.end(), &blk) == listed_.end()) {
       listed_.push_back(&blk);
       if (blk.classes.n)
-        prog.byte_blocks.push_back(&blk);
+        prog.byte_blocks.push_back(held);
       else
         prog.byte_ranges.insert(prog.byte_ranges.end(), blk.ranges.begin(),
                                 blk.ranges.end());
@@ -4132,37 +4175,31 @@ struct Compiler {
 
   // Emit a code-point set (ranges) as a UTF-8 byte automaton: an alternation of
   // byte-range sequences (order is irrelevant — a class is a union). The block
-  // is built once per (set, direction) and cached (class_block_cached).
+  // is built once per (set, direction) and cached (ClassBlockCache).
   void emit_utf8_ranges(const CpRanges &rs) {
-    append_block(class_block_cached(rs, reverse_));
+    ClassBlockCache::Key key{2, reverse_};
+    for (const auto &r : rs) {
+      key.push_back(r.first);
+      key.push_back(r.second);
+    }
+    append_block(ClassBlockCache::instance().get(std::move(key), [&] {
+      return build_class_block(utf8_seqs(rs), reverse_);
+    }));
   }
 
   // Emit a parsed CharClass as a byte automaton, memoized on the class itself
   // (its source predicates/ranges, plus icase and direction) rather than on the
   // expanded code-point set. The class -> ranges expansion (class_cp_ranges,
   // which normalizes hundreds of ranges for \w/\p{L}) and the 700-element range
-  // key are then paid only on the first occurrence per process; every later
-  // emission is a cheap small-key lookup + append_block. The expensive rs path
+  // key are then paid only when the cache does not hold the block; every
+  // other emission is a cheap small-key lookup + append_block. The expensive rs path
   // (emit_utf8_ranges) stays for `.` and the icase single-char literal, whose
   // ranges do not come from a CharClass.
   void emit_class(const CharClass &cc) {
-    static std::map<std::vector<char32_t>, ClassBlock> cache;
-    static std::mutex mu;
-    std::vector<char32_t> key = class_key(cc, icase_, reverse_);
-    const ClassBlock *block;
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      auto it = cache.find(key);
-      if (it == cache.end())
-        it =
-            cache
-                .emplace(std::move(key),
-                         build_class_block(
-                             utf8_ranges_cached(class_cp_ranges(cc)), reverse_))
-                .first;
-      block = &it->second; // map nodes are stable; ref outlives the lock
-    }
-    append_block(*block);
+    append_block(ClassBlockCache::instance().get(
+        class_key(cc, icase_, reverse_), [&] {
+          return build_class_block(utf8_seqs(class_cp_ranges(cc)), reverse_);
+        }));
   }
 
   // UnicodeScalar `.`: any code point, minus surrogates, minus line breaks
@@ -9729,7 +9766,7 @@ private:
       }
       ByteClasses bc = tests.classes();
       if (listed)
-        for (const detail::ClassBlock *blk : prog.byte_blocks)
+        for (const auto &blk : prog.byte_blocks)
           detail::refine_byte_classes(bc, blk->classes);
       return bc;
     }
@@ -18061,9 +18098,14 @@ regex_search(const std::string &s, smatch &m, const basic_regex &re,
   return regex_search(s.begin(), s.end(), m, re, flags);
 }
 
-inline bool regex_search(const std::string &&, smatch &, const basic_regex &,
-                         match_flag_type = regex_constants::match_default) =
-    delete; // no dangling
+// A match_results points into its subject, so one over a string that dies at
+// the end of the call would dangle. std deletes the smatch form; a temporary
+// string also converts to the string_view an svmatch (cmatch) takes, so the
+// deleted form here is every match_results.
+template <class BiIter>
+bool regex_search(const std::string &&, match_results<BiIter> &,
+                  const basic_regex &,
+                  match_flag_type = regex_constants::match_default) = delete;
 
 inline bool
 regex_search(const char *s, cmatch &m, const basic_regex &re,
@@ -18120,9 +18162,11 @@ regex_match(const std::string &s, smatch &m, const basic_regex &re,
   return regex_match(s.begin(), s.end(), m, re, flags);
 }
 
-inline bool
-regex_match(const std::string &&, smatch &, const basic_regex &,
-            match_flag_type = regex_constants::match_default) = delete;
+// No match_results over a temporary string (see regex_search).
+template <class BiIter>
+bool regex_match(const std::string &&, match_results<BiIter> &,
+                 const basic_regex &,
+                 match_flag_type = regex_constants::match_default) = delete;
 
 inline bool
 regex_match(const char *s, cmatch &m, const basic_regex &re,

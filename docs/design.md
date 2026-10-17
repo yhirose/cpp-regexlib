@@ -765,18 +765,27 @@ relocatability the 16-byte `Inst` buys.
 
 A Unicode class expands to the same hundreds of ranges every time it appears, and
 a `Regex` emits each class more than once (forward + reverse programs, and per
-occurrence). Three `static`, mutex-guarded memo layers, keyed by the *source*
-class (so the lookup is proportional to the predicate, not the expansion):
+occurrence). Two process-wide, mutex-guarded caches:
 
 1. **`enum_cp_ranges`** — `\p{…}`/predicate → code-point ranges, by scanning
-   `0..0x10FFFF` once (surrogates excluded), cached by predicate.
-2. **`utf8_ranges_cached`** — a code-point set → its UTF-8 byte-range sequences,
-   memoized by the normalized set, direction-independent.
-3. **`class_block_cached`** — the whole emitted `Inst` block, memoized by
-   `(set, direction)`; each later emission is a `memcpy`-append + target rebase.
+   `0..0x10FFFF` once (surrogates excluded), cached by predicate. Its keys are
+   the predicates and Unicode properties, so it is bounded as it stands.
+2. **`ClassBlockCache`** — the whole emitted `Inst` block of a class, keyed by
+   the *source* class and direction (`class_key`, so the lookup is
+   proportional to the predicate, not the expansion) or by a code-point set and
+   direction; each later emission is a `memcpy`-append + target rebase.
 
 Together these took Unicode-class compile from the dominant cost to a block
 `memcpy` (~12–14× on the compile benchmark: `\w+` 0.44 → 0.037 ms).
+
+The block cache is bounded in bytes (`limits::kClassBlockCacheBytes`, 8 MiB)
+and drops the least recently used block. A program holds the blocks it lists
+by `shared_ptr` (`Program::byte_blocks`), so a block the cache drops lives on
+in the programs that use it, and a class compiled again is built anew. It was
+three unbounded maps — sets to byte sequences, sets to blocks, classes to
+blocks — holding every distinct class a process had ever compiled: 20000
+patterns with distinct Unicode classes grew a process by 3.8 GB, where it now
+levels off near 90 MB.
 
 ### The two-program split
 

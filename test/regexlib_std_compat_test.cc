@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <regex>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "regexlib.h" // std::regex-compatible API lives here now
 
@@ -337,6 +339,46 @@ void test_flags() {
 }
 
 // --- const char* / string_view subject overloads ---
+// Can regex_search / regex_match fill a match_results M from a subject S?
+template <class S, class M, class = void>
+struct can_search : std::false_type {};
+template <class S, class M>
+struct can_search<
+    S, M,
+    std::void_t<decltype(re::regex_search(std::declval<S>(), std::declval<M &>(),
+                                          std::declval<const re::regex &>()))>>
+    : std::true_type {};
+template <class S, class M, class = void>
+struct can_match : std::false_type {};
+template <class S, class M>
+struct can_match<
+    S, M,
+    std::void_t<decltype(re::regex_match(std::declval<S>(), std::declval<M &>(),
+                                         std::declval<const re::regex &>()))>>
+    : std::true_type {};
+
+// A match_results points into its subject: one over a temporary string would
+// dangle, so it does not compile — for an smatch as in std, and for a cmatch /
+// svmatch too, which a temporary string used to reach by converting to the
+// string_view an svmatch takes (ASan: heap-use-after-free).
+static_assert(!can_search<std::string, re::smatch>::value, "");
+static_assert(!can_search<std::string, re::cmatch>::value, "");
+static_assert(!can_search<const std::string, re::cmatch>::value, "");
+static_assert(!can_match<std::string, re::smatch>::value, "");
+static_assert(!can_match<std::string, re::cmatch>::value, "");
+// ... and every subject that outlives the call still does.
+static_assert(can_search<std::string &, re::smatch>::value, "");
+static_assert(can_search<const std::string &, re::cmatch>::value, "");
+static_assert(can_search<std::string_view, re::svmatch>::value, "");
+static_assert(can_search<const char *, re::cmatch>::value, "");
+static_assert(can_match<std::string &, re::cmatch>::value, "");
+static_assert(can_match<std::string_view, re::svmatch>::value, "");
+// A match-less search keeps nothing, so a temporary is fine there.
+static_assert(std::is_same<decltype(re::regex_search(
+                               std::string(), std::declval<const re::regex &>())),
+                           bool>::value,
+              "");
+
 void test_subject_overloads() {
   re::regex rxre(R"(\d+)");
   re::cmatch cm;
@@ -349,6 +391,12 @@ void test_subject_overloads() {
   CHECK(re::regex_search(sv, vm, kv));
   CHECK(vm[1].str() == "v");
   CHECK(vm[2].str() == "42");
+
+  // A std::string lvalue reaches the svmatch form and stays valid.
+  const std::string owned = "id=7";
+  re::cmatch om;
+  CHECK(re::regex_search(owned, om, kv) && om[2].str() == "7");
+  CHECK(re::regex_match(owned, om, kv) && om[1].str() == "id");
 }
 
 // --- regex_token_iterator: split (submatch -1) and group extraction ---
