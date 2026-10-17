@@ -5078,6 +5078,32 @@ void test_operand_pools() {
   }
 }
 
+// The class byte sub-automata are cached across every Regex of the process,
+// bounded in bytes, and a program owns the blocks it uses: the cache can drop
+// a block a live Regex still runs. Every distinct class a process compiled
+// used to stay — 20000 patterns like these grew a process by 3.8 GB.
+void test_class_block_cache() {
+  auto &cache = reg::detail::ClassBlockCache::instance();
+  const Regex early = make_us("[\\x{4E00}-\\x{4E10}\\w]+x");
+  const Regex early_i = make_us("(?i)[\\x{100}-\\x{17F}]+", 0);
+  for (int i = 0; i < 300; i++) {
+    char p[64];
+    std::snprintf(p, sizeof p, "[\\x{%X}-\\x{%X}\\w]x", 0x100 + i,
+                  0x200 + 3 * i);
+    make_us(p);
+    CHECK(cache.bytes() <= reg::limits::kClassBlockCacheBytes);
+  }
+  // The early patterns' blocks are long gone from the cache; they still run.
+  auto m = early.search("..\xE4\xB8\x85" "ab_x..");
+  CHECK(m && m.begin() == 2 && m.end() == 9);
+  CHECK(early.test("\xE4\xB8\x80x"));
+  CHECK(!early.test("\xE3\x80\x82x")); // U+3002: neither in range nor \w
+  CHECK(early_i.search("x\xC4\x80\xC4\x81").end() == 5);
+  // A class compiled again after its block was dropped is built anew, alike.
+  CHECK(make_us("[\\x{4E00}-\\x{4E10}\\w]+x").search("..\xE4\xB8\x85" "ab_x..").end() ==
+        9);
+}
+
 void test_out_of_range_utf8() {
   // A four-byte form past U+10FFFF (an F4 90.. or F5..F7 lead) is not UTF-8:
   // each of its bytes is a lone byte, never a code point indexing past the end
@@ -5463,6 +5489,7 @@ int main() {
   test_resource_limits();
   test_lookaround_programs();
   test_operand_pools();
+  test_class_block_cache();
   test_out_of_range_utf8();
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();
