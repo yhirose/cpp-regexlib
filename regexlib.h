@@ -9891,8 +9891,8 @@ private:
     // an assertion asks of an ASCII byte is told apart too (LazyDfa::side:
     // a word byte, a line break), so that a
     // transition can be cached by the byte's class there as well — and no
-    // ASCII byte shares a class with a byte of a longer code point, whose
-    // step is never cached.
+    // ASCII byte shares a class with a byte of a longer code point, which a
+    // step crosses by way of the states inside it (LazyDfa::look_next).
     ByteClasses byte_classes(const detail::Program &prog, bool look) const {
       using Op = detail::Inst::Op;
       static thread_local detail::ByteTests tests;
@@ -12476,8 +12476,8 @@ private:
   // therefore speak for the boundary BEFORE the code point that led to it: a
   // look scan sees a match one step late, and steps once more over the
   // text's edge, which has a column of its own (`edge`). What a non-ASCII
-  // code point is cannot be read off its bytes, so the step over one is
-  // taken whole and never cached (the ASCII bulk of a subject is).
+  // code point is cannot be read off its first byte, so the step over one
+  // is a path through states inside it, cached link by link (look_next).
   struct LazyDfa {
     // Pointers (not references) so LazyDfa is a regular movable value type: it
     // lives inside std::optional in a FindCache and, in future, inside a pooled
@@ -12517,6 +12517,9 @@ private:
     static constexpr uint32_t kStart = 8;  // the start state: where a forward
                                            // scan may skip ahead (see
                                            // dfa_start_skip)
+    static constexpr uint32_t kInside = 16; // look: a state inside a code
+                                            // point (see look_next), which no
+                                            // scan stands on
     // Look: what a code point — or the text's edge — is to the boundary
     // beside it. A state's context, and the input of a step.
     // (Not "half of a CR-LF", though in a Grapheme plan the pair is one
@@ -12526,14 +12529,18 @@ private:
     static constexpr uint8_t kEdge = 1, kWord = 2, kBreak = 4;
     static constexpr int kContexts = 8;
     // A look state's key ends in one byte: its context, and above it the
-    // kAccept / kFront of the boundary behind it.
+    // kAccept / kFront of the boundary behind it (and kInside).
     static constexpr int kTagFlags = 3;
+    static constexpr uint8_t kInsideTag = kInside << kTagFlags;
+    // The kinds a code point can be (no line break is a word character).
+    static constexpr int kKinds = 3;
 
     // The columns (see columns()): nothing of the table is read before a
     // scan has asked for its start state, which is where they are made.
     uint8_t cls[256];    // byte -> column of its class
     uint32_t stride = 0; // entries per state: the flags + one per class
-                         // (+ the edge's, with look); 0 = not made yet
+                         // (+ with look, the edge's and one per kind of
+                         // code point); 0 = not made yet
     uint32_t edge = 0;   // look: the column of the text's edge
     // Rows back to back: [flags][column 0][column 1]... A state id is the
     // index of its column 0, so tr[s - 1] is its flags and tr[s + cls[b]] its
@@ -12587,12 +12594,12 @@ private:
     // The table's columns: the byte classes of the program (see
     // Plan::byte_classes — it has some: the plan builds a lazy DFA over no
     // program with a lookaround or a guarded loop), and with look one more
-    // for the text's edge.
+    // for the text's edge and one per kind of code point (kind_column).
     void columns() {
       const Plan::ByteClasses bc = re->plan_->byte_classes(*prog, look);
       std::memcpy(cls, bc.cls.data(), sizeof cls);
       edge = bc.n;
-      stride = edge + 1 + look;
+      stride = edge + 1 + (look ? 1 + kKinds : 0);
     }
 
     // The state's canonical key: a sorted set, or — leftmost-first — the
@@ -12822,6 +12829,20 @@ private:
       return add(out_, tag, h);
     }
 
+    // The transition of state `s` in column `col`: the table's, or made —
+    // `make` leaves the pcs of the state it leads to in out_ and returns its
+    // tag — settled and noted. kQuit when the DFA has given up.
+    template <class Make> uint32_t step(uint32_t s, uint32_t col, Make make) {
+      uint32_t nxt = tr[s + col];
+      if (nxt != kUnknown) return nxt;
+      if (quit) return kQuit;
+      const uint8_t tag = make();
+      bool kept;
+      nxt = settle(tag, kept);
+      if (kept && nxt != kQuit) tr[s + col] = nxt;
+      return nxt;
+    }
+
     // NOTE: a state's flags (accept / front / dead) are deliberately NOT
     // packed into the transition value. They are per-STATE, and the scan loops load them OFF the step's
     // dependency chain (in parallel with the next step's load, from the same
@@ -12835,15 +12856,13 @@ private:
     // or kQuit when the DFA has given up (see settle for what a clear does).
     REGEXLIB_NOINLINE uint32_t next(uint32_t s, unsigned char b, int stepped) {
       scanned += static_cast<uint64_t>(stepped);
-      if (quit) return kQuit;
-      unpack_state(s, out_);
-      advance(out_, b, seeds_);
-      if (reseed) seeds_.push_back(0); // unanchored start at lowest priority
-      close(seeds_, out_, /*flags=*/0);
-      bool kept;
-      const uint32_t nxt = settle(/*tag=*/0, kept);
-      if (kept && nxt != kQuit) tr[s + cls[b]] = nxt;
-      return nxt;
+      return step(s, cls[b], [&] {
+        unpack_state(s, out_);
+        advance(out_, b, seeds_);
+        if (reseed) seeds_.push_back(0); // unanchored start at lowest priority
+        close(seeds_, out_, /*flags=*/0);
+        return uint8_t{0};
+      });
     }
 
     // --- Look ---
@@ -12885,52 +12904,91 @@ private:
       int len;
     };
 
-    // The cache-miss path of a look step from state `s` at boundary `at`:
-    // over the code point ahead, or over the text's edge (no bytes).
-    // `stepped` as next().
-    REGEXLIB_NOINLINE Stepped look_next(uint32_t s, std::string_view text,
-                                        int at, int stepped) {
-      scanned += static_cast<uint64_t>(stepped);
-      if (quit) return {kQuit, 0};
-      const unsigned char *p =
-          reinterpret_cast<const unsigned char *>(text.data());
-      // What the step consumes: the code point that starts at `at` — in
-      // reverse, the one that ends there — or nothing, at the text's edge.
-      const bool at_edge = column(text, at) == edge;
-      const Decoded ahead = at_edge   ? Decoded{0, 0}
-                            : reverse ? cp_before(text, at)
-                                      : cp_at(text, at);
-      const char32_t cp = ahead.cp;
-      const int len = ahead.len;
-      const uint8_t in = at_edge ? kEdge : side(cp);
+    // The column a state steps on into a code point of kind `in` — or, from
+    // inside one, out of it (see look_next).
+    uint32_t kind_column(uint8_t in) const { return edge + 1 + (in >> 1); }
+
+    // The pcs of look state `s` closed into out_ at the boundary it stands
+    // at, with `in` on the far side. Returns the tag of what the boundary is
+    // (kAccept / kFront).
+    uint8_t cross(uint32_t s, uint8_t in) {
       const uint8_t ctx = unpack_state(s, seeds_) & (kContexts - 1);
-      // Close at this boundary: the context on one side, the input on the
-      // other.
       const uint8_t l = reverse ? in : ctx, r = reverse ? ctx : in;
       close(seeds_, out_,
             re->bflags(l & kEdge, l & kWord, l & kBreak, /*l_cr=*/false,
                        r & kEdge, r & kWord, r & kBreak, /*r_lf=*/false));
-      uint8_t tag = static_cast<uint8_t>(match_flags(out_) << kTagFlags);
-      // ... and consume the code point, its bytes in the order the scan
-      // meets them. No assertion holds between two of them: inside a code
-      // point is no boundary.
-      for (int k = 0; k < len; k++) {
-        if (k) close(seeds_, out_, /*flags=*/0);
-        advance(out_, p[reverse ? at - 1 - k : at + k], seeds_);
-      }
-      if (at_edge) {
-        seeds_.clear();
-      } else {
-        if (reseed) seeds_.push_back(0); // unanchored start, lowest priority
-        tag |= side(cp);
-      }
+      return static_cast<uint8_t>(match_flags(out_) << kTagFlags);
+    }
+
+    // out_ stepped over byte `b`.
+    void consume(unsigned char b) {
+      advance(out_, b, seeds_);
       out_.swap(seeds_);
-      bool kept;
-      const uint32_t nxt = settle(tag, kept);
-      // Cached when the byte says all there is to know about the input.
-      if (kept && nxt != kQuit && (at_edge || (len == 1 && cp < 0x80)))
-        tr[s + column(text, at)] = nxt;
-      return {nxt, len};
+    }
+
+    // The cache-miss path of a look step from state `s` at boundary `at`:
+    // over the code point ahead — in reverse, the one behind — or over the
+    // text's edge (no bytes). `stepped` as next().
+    //
+    // A step crosses the boundary (closes the state under what stands on its
+    // two sides), consumes the code point's bytes, between which is no
+    // boundary, and leaves the code point's kind as the next one's context.
+    // Over the edge or an ASCII byte, the column says all of that: the step
+    // is one transition. Not over another code point, whose first byte does
+    // not say its kind: that step is a path through states inside the code
+    // point (kInside) — `s` on the kind to the state just inside, one
+    // transition per byte, by its column as any, and the last state on the
+    // kind to the one after it — every link of which, once made, is a load.
+    REGEXLIB_NOINLINE Stepped look_next(uint32_t s, std::string_view text,
+                                        int at, int stepped) {
+      scanned += static_cast<uint64_t>(stepped);
+      const uint32_t col = column(text, at);
+      if (col == edge)
+        return {step(s, col,
+                     [&] {
+                       const uint8_t tag = cross(s, kEdge);
+                       out_.clear(); // nothing is past the edge
+                       return tag;
+                     }),
+                0};
+      const unsigned char *p =
+          reinterpret_cast<const unsigned char *>(text.data()) +
+          (reverse ? at - 1 : at);
+      if (*p < 0x80) {
+        const uint8_t in = side(*p);
+        return {step(s, col,
+                     [&] {
+                       const uint8_t tag = cross(s, in);
+                       consume(*p);
+                       if (reseed) out_.push_back(0); // lowest priority
+                       return static_cast<uint8_t>(tag | in);
+                     }),
+                1};
+      }
+      const Decoded ahead = reverse ? cp_before(text, at) : cp_at(text, at);
+      const uint8_t in = side(ahead.cp);
+      uint32_t i = step(s, kind_column(in), [&] {
+        return static_cast<uint8_t>(cross(s, in) | kInsideTag);
+      });
+      for (int k = 0; k < ahead.len && i != kQuit; k++) {
+        const uint32_t from = i;
+        const unsigned char b = reverse ? p[-k] : p[k];
+        i = step(from, cls[b], [&] {
+          const uint8_t tag = unpack_state(from, seeds_);
+          close(seeds_, out_, /*flags=*/0);
+          consume(b);
+          return tag;
+        });
+      }
+      if (i != kQuit) {
+        const uint32_t from = i;
+        i = step(from, kind_column(in), [&] {
+          const uint8_t tag = unpack_state(from, out_);
+          if (reseed) out_.push_back(0);
+          return static_cast<uint8_t>((tag ^ kInsideTag) | in);
+        });
+      }
+      return {i, ahead.len};
     }
   };
 
