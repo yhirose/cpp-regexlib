@@ -3006,8 +3006,8 @@ struct Parser {
 
   // One member of a class: a code point, returned, or a set of them, added to
   // `cls` — \d, \p{L} and the like, a [:name:], or a cluster of several code
-  // points (each one added). A cluster is no range's endpoint, which `endpoint`
-  // says this member is.
+  // points (each one added). `endpoint`: it follows a range's '-'. A cluster
+  // there, or before one, is BadCharRange.
   std::optional<char32_t> class_member(CharClass &cls, bool endpoint = false) {
     // POSIX bracket sub-class [:name:]; only consumed when it is a valid
     // class, otherwise '[' falls through and is treated as a literal member.
@@ -3034,12 +3034,12 @@ struct Parser {
     return is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']');
   }
 
-  // Only ASCII letters and digits name escapes: after a '\', one that names
-  // none is an error (they are kept for new syntax), any other code point is
-  // itself.
-  static bool names_escape(char32_t c) {
-    return (c >= U'0' && c <= U'9') || (c >= U'A' && c <= U'Z') ||
-           (c >= U'a' && c <= U'z');
+  static bool ascii_letter(char32_t c) {
+    c |= 0x20;
+    return c >= U'a' && c <= U'z';
+  }
+  static bool ascii_alnum(char32_t c) {
+    return (c >= U'0' && c <= U'9') || ascii_letter(c);
   }
 
   // Consumes a '\' and, when it escapes a set — \d, \p{L} and the like — the
@@ -3051,7 +3051,7 @@ struct Parser {
     if (!single_cp(e)) {
       // A cluster, which is itself — unless it is a letter or digit with
       // marks: no escape's name takes them.
-      if (names_escape(peek()[0]))
+      if (ascii_alnum(peek()[0]))
         error(RegexError::Code::BadEscape, "invalid escape");
       return false;
     }
@@ -3157,10 +3157,11 @@ struct Parser {
   }
 
   // The code point an escaped `e`, the current token, stands for; consumes it.
+  // Only ASCII letters and digits name escapes: one that names none is an
+  // error (they are kept for new syntax), any other code point is itself.
   char32_t escaped_literal(char32_t e) {
     pos++;
     char32_t next;
-    const bool one = single_cp(next);
     switch (e) {
     case U'n': return U'\n';
     case U'r': return U'\r';
@@ -3171,11 +3172,11 @@ struct Parser {
     case U'e': return U'\x1b';
     case U'b': return U'\x08'; // in a class: outside one, a word boundary
     case U'0':
-      if (one && next >= U'0' && next <= U'9')
+      if (single_cp(next) && next >= U'0' && next <= U'9')
         error(RegexError::Code::BadEscape, "octal escapes are not supported");
       return U'\0';
     case U'c': // \cA … \cZ, either case: a control character
-      if (!one || (next | 0x20) < U'a' || (next | 0x20) > U'z')
+      if (!single_cp(next) || !ascii_letter(next))
         error(RegexError::Code::BadEscape, "\\c takes a letter");
       pos++;
       return next % 32;
@@ -3184,7 +3185,7 @@ struct Parser {
     default:
       if (e >= U'1' && e <= U'9')
         error(RegexError::Code::BadEscape, "backreferences are not supported");
-      if (names_escape(e)) error(RegexError::Code::BadEscape, "invalid escape");
+      if (ascii_alnum(e)) error(RegexError::Code::BadEscape, "invalid escape");
       return e; // an escaped metacharacter, or any other: itself
     }
   }

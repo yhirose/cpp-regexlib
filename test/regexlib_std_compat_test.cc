@@ -262,9 +262,7 @@ void test_redos_safe() {
   };
   CHECK(throws(R"((?>a))")); // atomic group
   CHECK(throws(R"(a++)"));   // possessive quantifier
-  // A backreference too: matching one is NP-hard. (Documented divergence
-  // from ECMAScript.)
-  CHECK(throws(R"((\w)\1)"));
+  // A backreference too (matching one is NP-hard): see test_error_codes.
 }
 
 // --- regex_error::code(): structured error classification (std taxonomy) ---

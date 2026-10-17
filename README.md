@@ -205,10 +205,10 @@ backtracking-only features can't be supported as-is):
   `reg::set_default_match_unit(reg::MatchUnit::CodePoint)`. Either way it is
   identical to `std::regex` on ASCII and more correct on UTF-8, where
   `std::regex`'s `.` splits a multi-byte character.
-- **Atomic groups `(?>…)` and possessive quantifiers `a++` throw** at
-  construction; a back-reference `\1` is read as the literal digit (so `(\w)\1`
-  matches `"a1"`, not `"aa"`). (POSIX classes like `[[:alpha:]]` *are* supported,
-  unlike ECMAScript `std::regex`.)
+- **Atomic groups `(?>…)`, possessive quantifiers `a++` and back-references
+  `\1` throw** at construction, and so does a letter escape that names nothing,
+  such as `\q`. (POSIX classes like `[[:alpha:]]` *are* supported, unlike
+  ECMAScript `std::regex`.)
 - `reg::regex_error` derives from `RegexError`, and `code()` returns the standard
   `regex_constants::error_type` taxonomy.
 

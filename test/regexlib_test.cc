@@ -5020,8 +5020,8 @@ void test_invalid_patterns() {
   for (const auto &[pat, code] : errors)
     CHECK(code_of(pat) == code);
   // The escapes there are: control characters, \0 alone, and [\b].
-  CHECK(Regex("^\\a\\e\\cA\\cz\\0$").test(std::string("\x07\x1b\x01\x1a", 4) +
-                                          std::string(1, '\0')));
+  CHECK(Regex("^\\a\\e\\cA\\cz\\0$")
+            .test(std::string("\x07\x1b\x01\x1a\0", 5)));
   CHECK(Regex("^[\\b]$").test("\x08") && !Regex("[\\b]").test("b"));
   CHECK(Regex("^[\\cA-\\cZ]+$").test("\x01\x1a"));
   CHECK(Regex("^\\0x$").test(std::string("\0x", 2)));
