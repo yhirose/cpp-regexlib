@@ -142,8 +142,9 @@ fusion pass (`fuse_literal_graphemes`) that re-segments each maximal run of
 adjacent, unquantified literals on grapheme boundaries, so `\r\n` compiles to
 the single `U"\r\n"` cluster literal — exactly the node the equivalent typed
 text produces. (A quantified escape, e.g. the `\n?` in `\r\n?`, is its own atom
-and does not fuse.) In CodePoint mode the pass is a no-op: a multi-code-point
-literal emits the same per-code-point match sequence as the separate literals.
+and does not fuse.) In CodePoint mode the pass changes nothing a match sees: a
+multi-code-point literal emits the same per-code-point match sequence as the
+separate literals.
 That mode's tokenizer hands the parser code points, not clusters — the pattern
 is read in the unit the subject is — so NFD `é+` repeats the mark and `[a-é]` is
 `a`–`e` and the mark, as in every code-point engine. In grapheme mode a cluster
