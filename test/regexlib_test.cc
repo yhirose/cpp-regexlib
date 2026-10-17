@@ -5111,6 +5111,88 @@ void test_escape() {
     }
 }
 
+// Inline flags are scoped: (?flags) sets them to the end of the enclosing
+// group, (?flags:…) within its own, and a '-' turns flags off — as in Perl,
+// PCRE, RE2 and Rust. (The expected spans are Rust regex's.) So a pattern
+// spliced into another as (?:…) keeps its flags to itself.
+void test_scoped_flags() {
+  struct Case {
+    const char *pat, *subj;
+    int b, e; // the leftmost match, or b < 0 for none
+  };
+  const Case cases[] = {
+      {"a(?i)b", "aB", 0, 2},          {"a(?i)b", "AB", -1, -1},
+      {"(?i:a)b", "Ab", 0, 2},         {"(?i:a)b", "AB", -1, -1},
+      {"(a(?i)b|c)", "C", 0, 1},       {"(?i)a(?-i)b", "Ab", 0, 2},
+      {"(?i)a(?-i)b", "AB", -1, -1},   {"(?i)a(?-i:b)c", "AbC", 0, 3},
+      {"(?i)a(?-i:b)c", "ABC", -1, -1}, {"(?s).(?-s).", "a\nb", 1, 3},
+      {"(?s).(?-s).", "\nb", 0, 2},    {"(?m:^b)|^a", "\nb", 1, 2},
+      {"(?m:^b)|^a", "b\na", 0, 1},    {"x(?m)$", "x\n", 0, 1},
+      {"(?m)a$(?-m)", "a\nb", 0, 1},   {"(?i:[a-c])d", "aBCd", 2, 4},
+      {"(?i:\\p{Lu})x", "abcx", 2, 4}, {"ABC(?:(?i)x)", "ABCX", 0, 4},
+      {"ABC(?:(?i)x)", "abcx", -1, -1}, {"(?i:k)K", "Kk", -1, -1},
+      {"(?i:[^k])", "\xE2\x84\xAA", -1, -1}, // not the Kelvin sign either
+      {"(?i:\\w)B", "aB", 0, 2},       {"(?i:\\w)B", "ab", -1, -1},
+      {"(?i)(?=B)b", "ab", 1, 2},      {"(?i:(?=B))b", "ab", 1, 2},
+      {"(?i:(?=B))b", "aB", -1, -1},
+  };
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const Case &c : cases) {
+      const auto m = make_unit(unit, c.pat).search(c.subj);
+      CHECK(c.b < 0 ? !m.matched()
+                    : m.matched() && m.begin() == size_t(c.b) &&
+                          m.end() == size_t(c.e));
+    }
+  // A cluster under a (?i) that does not span the pattern is its case
+  // variants, the clusters whose code points fold as its do.
+  const std::string nfd_e = "e\xCC\x81", nfd_E = "E\xCC\x81";
+  CHECK(Regex("^(?i:" + nfd_e + ")x$").test(nfd_E + "x"));
+  CHECK(!Regex("^(?i:" + nfd_e + ")x$").test(nfd_E + "X"));
+  CHECK(!Regex("^(?i:" + nfd_e + ")x$").test("Ex"));
+  std::string marks; // U+0345 has four case variants
+  for (int i = 0; i < 7; i++)
+    marks += "\xCD\x85";
+  CHECK(code_of("(?i:a" + marks + ")b") == RegexError::Code::ProgramTooLarge);
+  CHECK(!code_of("(?i)a" + marks + "b"));                  // not lowered
+  CHECK(!code_of("(?i:a" + marks + ")b", reg::MatchUnit::CodePoint));
+  // The flag letters: i, m, s, and after one '-' those to turn off.
+  for (const char *bad : {"(?-)", "(?i-)", "(?--i)", "(?i-:a)", "(?x)"})
+    CHECK(code_of(bad) == RegexError::Code::BadInlineFlags ||
+          code_of(bad) == RegexError::Code::BadGroup);
+  CHECK(Regex("(?-i)a").test("a") && Regex("(?-i:a)").test("a"));
+  // Flags given to the constructor are the pattern's outermost ones.
+  CHECK(Regex("a(?-i)b", IgnoreCase).test("Ab"));
+  CHECK(!Regex("a(?-i)b", IgnoreCase).test("AB"));
+}
+
+// Under icase a class holds a code point when any case variant of it is a
+// member — any member, \p{…} too, as RE2 and Rust have it — in every engine.
+void test_icase_class_members() {
+  const struct {
+    const char *pat, *subj;
+    bool hit;
+  } cases[] = {
+      {"(?i)\\p{Lu}", "a", true},       {"(?i)^\\p{Lu}$", "a", true},
+      {"(?i)(\\p{Lu})", "a", true},     {"(?i)(?=\\p{Lu})a", "a", true},
+      {"(?i)\\P{Ll}", "a", true},       {"(?i)[^\\p{Lu}]", "a", false},
+      {"(?i)\\p{Ll}+$", "AB", true},    {"(?i)[^a]", "A", false},
+      {"(?i)^[\\p{Lu}\\d]+$", "a1", true},
+  };
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const auto &c : cases) {
+      const Regex re = make_unit(unit, c.pat);
+      CHECK(re.test(c.subj) == c.hit && re.search(c.subj).matched() == c.hit);
+    }
+  // The predicates are case-closed, which case_closed relies on: a case
+  // variant of a \w, \d or \s code point is one too.
+  for (const auto &grp : reg::detail::case_fold_groups())
+    for (char32_t m : grp) {
+      CHECK(reg::detail::is_word_cp(m) == reg::detail::is_word_cp(grp[0]));
+      CHECK(reg::detail::is_digit_cp(m) == reg::detail::is_digit_cp(grp[0]));
+      CHECK(reg::detail::is_space_cp(m) == reg::detail::is_space_cp(grp[0]));
+    }
+}
+
 void test_resource_limits() {
   // Adversarial patterns must be rejected with RegexError, not crash or OOM.
   CHECK(rejects("a{1000000}")); // repetition blow-up -> program too big
@@ -5729,6 +5811,8 @@ int main() {
   test_invalid_patterns();
   test_syntax_by_code_point();
   test_escape();
+  test_scoped_flags();
+  test_icase_class_members();
   test_resource_limits();
   test_lookaround_programs();
   test_operand_pools();

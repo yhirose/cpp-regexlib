@@ -109,7 +109,7 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 | Escapes | `\n \r \t \f \v \a \e`, `\0` (not before a digit), `\cA`…`\cZ` (control characters), `[\b]` (backspace, in a class), `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` or `\u{…}` (one to six), each a scalar value (up to U+10FFFF, no surrogate). Any other ASCII letter or digit after `\` is an error — kept for new syntax, as in RE2 and Rust; so is a backreference `\1`. Any other escaped character is itself |
 | Lookahead | `(?=…)`, `(?!…)` — variable length |
 | Lookbehind | `(?<=…)`, `(?<!…)` — variable length |
-| Flags (inline) | `(?i)`, `(?m)`, `(?s)` |
+| Flags (inline) | `(?i)`, `(?m)`, `(?s)` to the end of the enclosing group; `(?i:…)` within its own; `(?-i)`, `(?i-s:…)` turn flags off |
 
 `.` excludes the line-break graphemes `\n`, `\r`, `\v`, `\f`, NEL (U+0085),
 LS (U+2028) and PS (U+2029). `DotAll` makes `.` match those too.
@@ -144,7 +144,13 @@ Flags are an OR-combinable mask:
 | `reg::Multiline` | `(?m)` | `^`/`$` match at line breaks |
 | `reg::DotAll` | `(?s)` | `.` matches a line break |
 
-Constructor flags and inline flags compose (either turns the flag on).
+Constructor flags are the pattern's outermost flags, which inline flags change
+within their group: `Regex("a(?-i)b", reg::IgnoreCase)` matches `"Ab"`, not
+`"AB"`. As in Perl, PCRE, RE2 and Rust, `(?i)` lasts to the end of the group it
+is in, `(?i:…)` covers its own group, and a `-` turns the flags after it off —
+so a pattern spliced into another as `(?:…)` keeps its flags to itself. Under
+`IgnoreCase` a class holds a character when any case variant of it is a member,
+`\p{…}` included: `(?i)\p{Lu}` matches `a`.
 
 ### Pinning the match unit per-Regex
 
@@ -519,8 +525,6 @@ translated from the engine's structured `RegexError::Code`.
   linear-time guarantee; RE2 documents the same class of divergence.
 - **Captures inside a lookaround are not exported.** Groups inside `(?=…)` /
   `(?<=…)` are treated as non-capturing.
-- **Inline flags apply globally.** `(?i)`, `(?m)`, `(?s)` set the flag for the
-  whole pattern regardless of position; scoped flags `(?i:…)` are not scoped.
 - **`\b` at the end of the subject matches**, as in Perl and Python.
 
 ## Resource limits

@@ -162,6 +162,30 @@ point, typed or escaped: `]◌́+` and `\]◌́+` both repeat the mark. In graph
 literal text in a class adds each of its code points but is no range endpoint
 (`BadCharRange`), as in Swift and Raku; an escape is always one code point.
 
+### Inline flags: scoped in the syntax, one value in the plan
+
+`(?i)` lasts to the end of its group and `(?i:…)` covers its own, as in Perl,
+PCRE, RE2 and Rust; but the compiler and every engine read one value per flag,
+pattern-wide (the plan's `icase_`, `multiline_`, `dotall_` — the case-folded
+byte automata, the icase prefilters, the line-anchor tables). The parser
+stamps each node with the flags in force where it stands, and `resolve_flags`
+settles them. A flag that has one value on every node it bears on — icase on a
+literal or class it can change, dotall on `.`, multiline on `^` and `$` — is
+that value, and the nodes stay as they are: a pattern whose flags are uniform,
+which is every pattern from before flags were scoped, plans exactly as it did.
+A flag whose nodes disagree is *lowered*: the nodes the plan's value does not
+fit become flag-free equivalents, so no engine has to learn per-node flags.
+Multiline is on, and a `^` / `$` without it becomes `\A` / `\z` (the planner
+already treats the two alike); dotall is off, and a `.` with it becomes the
+class of everything; icase is off, and a class with it becomes its case
+closure (the members' case-fold orbits joined to it — the byte compiler's
+icase rule, written out), a literal with it the alternation of its case
+variants (at most `kMaxCaseVariants` for one cluster). Under icase a class
+holds a character when any case variant of it is a member — any member,
+`\p{…}` included, as RE2 and Rust have it; the Pike's `matches_cp` once folded
+the explicit ranges only, so `(?i)\p{Lu}` matched `a` on the byte tiers and
+not on the Pike.
+
 ---
 
 ## 2. The leftmost-first lazy DFA
