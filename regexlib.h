@@ -3414,13 +3414,13 @@ struct Program {
   // instructions, which a repeated Unicode class copies by the hundred
   // thousand. `byte_ranges` holds the [lo, hi] of the instructions emitted
   // one at a time and of the small class blocks, as lo | hi << 8, each once
-  // or more; `byte_blocks` the large class blocks (a Unicode `\w` is ~470
-  // distinct ranges), each once, which bring their classes ready-made
-  // (ClassBlock::classes). Every Op::Byte of the program is on one of the two.
+  // or more; `byte_blocks` the byte classes of the large class blocks (a
+  // Unicode `\w` is ~470 distinct ranges), each block once, which bring them
+  // ready-made (ClassBlock::classes) — copied, so a program holds nothing of
+  // the class-block cache, which can drop a block once compiles are done with
+  // it. Every Op::Byte of the program is on one of the two.
   std::vector<uint16_t> byte_ranges;
-  // Shared with the class-block cache, which may drop a block a program
-  // still holds (ClassBlockCache).
-  std::vector<std::shared_ptr<const ClassBlock>> byte_blocks;
+  std::vector<ByteClasses> byte_blocks;
 };
 
 //------------------------------------------------------------------------------
@@ -3580,14 +3580,6 @@ enum_cp_ranges(int key, const std::function<bool(char32_t)> &pred) {
   return cache[key] = std::move(rs);
 }
 
-// utf8_ranges over a whole code-point set.
-inline std::vector<ByteSeq> utf8_seqs(const CpRanges &rs) {
-  std::vector<ByteSeq> seqs;
-  for (auto &r : rs)
-    utf8_ranges(r.first, r.second, seqs);
-  return seqs;
-}
-
 // Build the byte sub-automaton for one code-point set as a standalone block of
 // instructions whose Split/Jmp targets are relative to the block's own start
 // (pc 0). `reverse` flips the byte order within each sequence (for the reverse
@@ -3612,8 +3604,10 @@ struct ClassBlock {
   static constexpr size_t kManyRanges = 32;
 };
 
-inline ClassBlock build_class_block(const std::vector<ByteSeq> &seqs,
-                                    bool reverse) {
+inline ClassBlock build_class_block(const CpRanges &rs, bool reverse) {
+  std::vector<ByteSeq> seqs;
+  for (const auto &r : rs)
+    utf8_ranges(r.first, r.second, seqs);
   ClassBlock blk;
   std::vector<Inst> &b = blk.insts;
   if (seqs.empty()) { // matches nothing: a byte range that can never match
@@ -3682,20 +3676,15 @@ inline ClassBlock build_class_block(const std::vector<ByteSeq> &seqs,
 // The emitted class blocks, cached across every Regex of the process. A
 // Unicode class (\w, \p{L}) expands to the same thousands of instructions every
 // time it is emitted — once per direction per Regex, plus once more for every
-// occurrence in the pattern — so after the first, an emission is a
-// memcpy-append and a target rebase (Compiler::append_block), however large
-// the class. A program holds the blocks it lists by shared_ptr
-// (Program::byte_blocks), so the cache can let a block go while programs still
-// use it: it is bounded in bytes (limits::kClassBlockCacheBytes) and drops the
-// least recently used. (It was three unbounded maps — sets to byte sequences,
-// sets to blocks, classes to blocks — holding every distinct class a process
-// had compiled for its lifetime: a server compiling its users' patterns grew
-// without bound.) Mutex-guarded; a block is built under the lock.
+// occurrence in the pattern — so an emission the cache holds the block for is
+// a memcpy-append and a target rebase (Compiler::append_block), however large
+// the class. The cache is bounded in bytes (limits::kClassBlockCacheBytes)
+// and drops the least recently used block; a compile holds the blocks it uses
+// until it is done (Compiler::listed_), and a program keeps none of them (see
+// Program::byte_blocks). Blocks are built outside the lock.
 class ClassBlockCache {
 public:
-  // A block's key: class_key for a parsed class — its first element is the
-  // class's negate, 0 or 1 — or {2, reverse, lo, hi, ...} for a code-point set.
-  using Key = std::vector<char32_t>;
+  using Key = std::vector<char32_t>; // class_key
 
   static ClassBlockCache &instance() {
     static ClassBlockCache cache;
@@ -3705,23 +3694,31 @@ public:
   // The block for `key`, built by `build()` if the cache does not hold it.
   template <class Build>
   std::shared_ptr<const ClassBlock> get(Key key, Build build) {
-    std::lock_guard<std::mutex> lk(mu_);
-    const auto it = at_.find(key);
-    if (it != at_.end()) {
-      lru_.splice(lru_.begin(), lru_, it->second); // most recent first
-      return it->second->block;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      const auto it = at_.find(key);
+      if (it != at_.end()) {
+        lru_.splice(lru_.begin(), lru_, it->second.pos); // most recent first
+        return it->second.block;
+      }
     }
     auto block = std::make_shared<const ClassBlock>(build());
-    const size_t held = 2 * key.size() * sizeof(char32_t) + sizeof(ClassBlock) +
+    const size_t held = key.size() * sizeof(char32_t) + sizeof(ClassBlock) +
                         block->insts.size() * sizeof(Inst) +
                         block->ranges.size() * sizeof(uint16_t);
-    lru_.push_front({key, block, held});
-    at_.emplace(std::move(key), lru_.begin());
+    std::vector<std::shared_ptr<const ClassBlock>> dropped; // freed unlocked
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto ins = at_.emplace(std::move(key), Slot{block, held, {}});
+    if (!ins.second) return ins.first->second.block; // another thread's build
+    lru_.push_front(&ins.first->first);
+    ins.first->second.pos = lru_.begin();
     bytes_ += held;
     while (bytes_ > limits::kClassBlockCacheBytes && lru_.size() > 1) {
-      bytes_ -= lru_.back().bytes;
-      at_.erase(lru_.back().key);
+      const auto last = at_.find(*lru_.back());
+      bytes_ -= last->second.bytes;
+      dropped.push_back(std::move(last->second.block));
       lru_.pop_back();
+      at_.erase(last);
     }
     return block;
   }
@@ -3733,13 +3730,13 @@ public:
   }
 
 private:
-  struct Entry {
-    Key key;
+  struct Slot {
     std::shared_ptr<const ClassBlock> block;
     size_t bytes;
+    std::list<const Key *>::iterator pos; // in lru_
   };
-  std::list<Entry> lru_; // most recently used first
-  std::map<Key, std::list<Entry>::iterator> at_;
+  std::map<Key, Slot> at_;
+  std::list<const Key *> lru_; // at_'s keys, most recently used first
   size_t bytes_ = 0;
   mutable std::mutex mu_;
 };
@@ -3752,6 +3749,7 @@ private:
 inline std::vector<char32_t> class_key(const CharClass &cc, bool icase,
                                        bool reverse) {
   std::vector<char32_t> k;
+  k.reserve(6 + 2 * cc.ranges.size() + cc.preds.size() + 2 * cc.uprops.size());
   k.push_back(cc.negate);
   k.push_back(icase);
   k.push_back(reverse);
@@ -3881,8 +3879,10 @@ struct Compiler {
 
   int here() const { return static_cast<int>(prog.insts.size()); }
 
-  // The class blocks already on prog's lists (see append_block).
-  std::vector<const ClassBlock *> listed_;
+  // The class blocks already on prog's lists (see append_block), held until
+  // the compile is done: a block's address is its identity only while it
+  // lives, and the cache may drop it meanwhile.
+  std::vector<std::shared_ptr<const ClassBlock>> listed_;
 
   // A lookaround is a program of its own (Inst::Op::Look runs it), one per
   // lookaround of the pattern: its AST node is its identity, so the copies
@@ -4031,8 +4031,11 @@ struct Compiler {
     if (icase_) {
       std::u32string seq = cps;
       if (reverse_) std::reverse(seq.begin(), seq.end());
-      for (char32_t c : seq)
-        emit_utf8_ranges(normalize_ranges(case_expand({{c, c}})));
+      for (char32_t c : seq) {
+        CharClass one; // the code point's case-fold orbit (class_cp_ranges)
+        one.add_range(c, c);
+        emit_class(one);
+      }
       return;
     }
     std::string bytes = unicode::utf8::encode(cps);
@@ -4145,22 +4148,21 @@ struct Compiler {
   // Append a cached class block onto the program and rebase its self-relative
   // Split/Jmp targets onto the current base. Op::Byte advances by fall-through,
   // so only Split/Jmp carry targets to fix up.
-  void append_block(const std::shared_ptr<const ClassBlock> &held) {
+  void append_block(std::shared_ptr<const ClassBlock> held) {
     const ClassBlock &blk = *held;
     const std::vector<Inst> &block = blk.insts;
     room(block.size());
     int base = here();
     prog.insts.insert(prog.insts.end(), block.begin(), block.end());
     // What it tests goes on the program's lists the first time the block
-    // does (a cached block's address is its identity): the block itself if
-    // it has its classes, else its ranges.
-    if (std::find(listed_.begin(), listed_.end(), &blk) == listed_.end()) {
-      listed_.push_back(&blk);
+    // does: its classes if it has them, else its ranges.
+    if (std::find(listed_.begin(), listed_.end(), held) == listed_.end()) {
       if (blk.classes.n)
-        prog.byte_blocks.push_back(held);
+        prog.byte_blocks.push_back(blk.classes);
       else
         prog.byte_ranges.insert(prog.byte_ranges.end(), blk.ranges.begin(),
                                 blk.ranges.end());
+      listed_.push_back(std::move(held));
     }
     for (size_t i = base; i < prog.insts.size(); i++) {
       Inst &in = prog.insts[i];
@@ -4173,44 +4175,30 @@ struct Compiler {
     }
   }
 
-  // Emit a code-point set (ranges) as a UTF-8 byte automaton: an alternation of
-  // byte-range sequences (order is irrelevant — a class is a union). The block
-  // is built once per (set, direction) and cached (ClassBlockCache).
-  void emit_utf8_ranges(const CpRanges &rs) {
-    ClassBlockCache::Key key{2, reverse_};
-    for (const auto &r : rs) {
-      key.push_back(r.first);
-      key.push_back(r.second);
-    }
-    append_block(ClassBlockCache::instance().get(std::move(key), [&] {
-      return build_class_block(utf8_seqs(rs), reverse_);
-    }));
-  }
-
-  // Emit a parsed CharClass as a byte automaton, memoized on the class itself
-  // (its source predicates/ranges, plus icase and direction) rather than on the
-  // expanded code-point set. The class -> ranges expansion (class_cp_ranges,
-  // which normalizes hundreds of ranges for \w/\p{L}) and the 700-element range
-  // key are then paid only when the cache does not hold the block; every
-  // other emission is a cheap small-key lookup + append_block. The expensive rs path
-  // (emit_utf8_ranges) stays for `.` and the icase single-char literal, whose
-  // ranges do not come from a CharClass.
+  // Emit a class as a UTF-8 byte automaton: an alternation of byte-range
+  // sequences (order is irrelevant — a class is a union). The block is cached
+  // on the class itself (its source predicates/ranges, plus icase and
+  // direction: class_key), not on the code-point set it expands to, so the
+  // expansion — hundreds of ranges for \w/\p{L} — is paid only when the cache
+  // does not hold the block.
   void emit_class(const CharClass &cc) {
     append_block(ClassBlockCache::instance().get(
         class_key(cc, icase_, reverse_), [&] {
-          return build_class_block(utf8_seqs(class_cp_ranges(cc)), reverse_);
+          return build_class_block(class_cp_ranges(cc), reverse_);
         }));
   }
 
-  // UnicodeScalar `.`: any code point, minus surrogates, minus line breaks
-  // unless DotAll. Line breaks: \n \v \f \r (0x0A-0x0D), NEL, U+2028/U+2029.
+  // UnicodeScalar `.`: any code point but the line breaks — \n \v \f \r
+  // (0x0A-0x0D), NEL, U+2028/U+2029 — unless DotAll.
   void emit_utf8_any() {
-    if (dotall_) {
-      emit_utf8_ranges({{0, 0x10FFFF}});
-      return;
+    CharClass any;
+    any.negate = true;
+    if (!dotall_) {
+      any.add_range(0x0A, 0x0D);
+      any.add_range(0x85, 0x85);
+      any.add_range(0x2028, 0x2029);
     }
-    auto lb = normalize_ranges({{0x0A, 0x0D}, {0x85, 0x85}, {0x2028, 0x2029}});
-    emit_utf8_ranges(complement_ranges(lb));
+    emit_class(any);
   }
 
   void emit(const Node &n) {
@@ -5261,6 +5249,21 @@ namespace detail {
 // at what estimated cost — Plan::AnchorChoice), so a choice can be pinned
 // without becoming public surface.
 struct PlanProbe;
+
+// A subject a returned view would outlive: a temporary of a class type that
+// converts to std::string_view and is not one — a std::string, const or not,
+// a pmr::string, any owning string — whose characters die at the end of the
+// full expression. Every entry point that hands back views into its subject
+// (the borrowing find_all, find_iter, split, the std-compatible
+// regex_search / regex_match into a match_results) refuses one at compile
+// time, through a deleted overload constrained on this.
+template <class S>
+inline constexpr bool owning_temporary =
+    !std::is_reference<S>::value && std::is_class<std::remove_cv_t<S>>::value &&
+    !std::is_same<std::remove_cv_t<S>, std::string_view>::value &&
+    std::is_convertible<S, std::string_view>::value;
+template <class S>
+using if_owning_temporary = std::enable_if_t<owning_temporary<S>, int>;
 } // namespace detail
 
 class Regex {
@@ -5698,6 +5701,12 @@ public:
   class MatchList;
   MatchList find_all(std::string_view text) const;      // borrow (zero-copy)
   MatchList find_all(std::string &&text) const;         // move-own
+  // Any other owning temporary — a const std::string, another string type —
+  // would be borrowed and dangle (detail::owning_temporary).
+  template <class S, detail::if_owning_temporary<S> = 0>
+  MatchList find_all(S &&) const = delete;
+  template <class S, detail::if_owning_temporary<S> = 0>
+  MatchList find_all(S &&, FindCache &) const = delete;
   MatchList find_all_copy(std::string_view text) const; // copy-own
   MatchList find_all(std::string_view text, FindCache &cache) const;
   MatchList find_all(std::string &&text, FindCache &cache) const;
@@ -5714,12 +5723,15 @@ public:
   // composition. Yields MatchList::Match views that borrow the subject and are
   // valid only until the next ++ (call .to_owned() to keep one). The no-cache
   // form uses this thread's persistent DFAs; pass a FindCache to keep them warm
-  // across many scans. A temporary std::string subject is rejected (its views
-  // would dangle); bind it to a variable first.
+  // across many scans. An owning temporary subject (a std::string, any
+  // string) is rejected, as its views would dangle; bind it to a variable.
   class MatchIter;
   MatchIter find_iter(std::string_view text) const;
   MatchIter find_iter(std::string_view text, FindCache &cache) const;
-  MatchIter find_iter(std::string &&text) const = delete;
+  template <class S, detail::if_owning_temporary<S> = 0>
+  MatchIter find_iter(S &&) const = delete;
+  template <class S, detail::if_owning_temporary<S> = 0>
+  MatchIter find_iter(S &&, FindCache &) const = delete;
 
   // Stateless positional scan step: the leftmost match at or after byte offset
   // `pos`, plus the position the scan resumes from — exactly one step of
@@ -5756,12 +5768,15 @@ private:
 public:
 
   // Lazy split: a range over the substrings between matches (see SplitIter).
-  // Like find_iter, a temporary std::string subject is rejected (the pieces
-  // are views); bind it to a variable first.
+  // Like find_iter, an owning temporary subject is rejected (the pieces are
+  // views); bind it to a variable first.
   class SplitIter;
   SplitIter split(std::string_view text) const;
   SplitIter split(std::string_view text, FindCache &cache) const;
-  SplitIter split(std::string &&text) const = delete;
+  template <class S, detail::if_owning_temporary<S> = 0>
+  SplitIter split(S &&) const = delete;
+  template <class S, detail::if_owning_temporary<S> = 0>
+  SplitIter split(S &&, FindCache &) const = delete;
 
   // Replace matches. The replacement `repl` expands `$&` (whole match),
   // `` $` ``/`$'` (text before/after), `$1`..`$99` and `$<name>` (captures),
@@ -9766,8 +9781,8 @@ private:
       }
       ByteClasses bc = tests.classes();
       if (listed)
-        for (const auto &blk : prog.byte_blocks)
-          detail::refine_byte_classes(bc, blk->classes);
+        for (const detail::ByteClasses &blk : prog.byte_blocks)
+          detail::refine_byte_classes(bc, blk);
       return bc;
     }
 
@@ -14982,6 +14997,8 @@ public:
   public:
     MatchIter(const Regex &re, std::string_view text, FindCache &cache)
         : MatchIter(re, text, &cache) {}
+    template <class S, detail::if_owning_temporary<S> = 0>
+    MatchIter(const Regex &, S &&, FindCache &) = delete;
     MatchIter(MatchIter &&) = default;
     MatchIter(const MatchIter &) = delete;
     MatchIter &operator=(const MatchIter &) = delete;
@@ -15053,6 +15070,8 @@ public:
   public:
     SplitIter(const Regex &re, std::string_view text, FindCache &cache)
         : SplitIter(re, text, &cache) {}
+    template <class S, detail::if_owning_temporary<S> = 0>
+    SplitIter(const Regex &, S &&, FindCache &) = delete;
     SplitIter(SplitIter &&) = default;
     SplitIter(const SplitIter &) = delete;
     SplitIter &operator=(const SplitIter &) = delete;
@@ -18099,12 +18118,11 @@ regex_search(const std::string &s, smatch &m, const basic_regex &re,
 }
 
 // A match_results points into its subject, so one over a string that dies at
-// the end of the call would dangle. std deletes the smatch form; a temporary
-// string also converts to the string_view an svmatch (cmatch) takes, so the
-// deleted form here is every match_results.
-template <class BiIter>
-bool regex_search(const std::string &&, match_results<BiIter> &,
-                  const basic_regex &,
+// the end of the call would dangle: std deletes the smatch form, and an owning
+// temporary also converts to the string_view an svmatch (cmatch) takes, so
+// here it is refused for every match_results (detail::owning_temporary).
+template <class S, class BiIter, detail::if_owning_temporary<S> = 0>
+bool regex_search(S &&, match_results<BiIter> &, const basic_regex &,
                   match_flag_type = regex_constants::match_default) = delete;
 
 inline bool
@@ -18162,10 +18180,9 @@ regex_match(const std::string &s, smatch &m, const basic_regex &re,
   return regex_match(s.begin(), s.end(), m, re, flags);
 }
 
-// No match_results over a temporary string (see regex_search).
-template <class BiIter>
-bool regex_match(const std::string &&, match_results<BiIter> &,
-                 const basic_regex &,
+// No match_results over an owning temporary (see regex_search).
+template <class S, class BiIter, detail::if_owning_temporary<S> = 0>
+bool regex_match(S &&, match_results<BiIter> &, const basic_regex &,
                  match_flag_type = regex_constants::match_default) = delete;
 
 inline bool

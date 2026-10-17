@@ -779,9 +779,12 @@ Together these took Unicode-class compile from the dominant cost to a block
 `memcpy` (~12–14× on the compile benchmark: `\w+` 0.44 → 0.037 ms).
 
 The block cache is bounded in bytes (`limits::kClassBlockCacheBytes`, 8 MiB)
-and drops the least recently used block. A program holds the blocks it lists
-by `shared_ptr` (`Program::byte_blocks`), so a block the cache drops lives on
-in the programs that use it, and a class compiled again is built anew. It was
+and drops the least recently used block. A compile holds the blocks it uses
+until it is done (`Compiler::listed_`), and a program keeps nothing of them —
+it copies the byte classes it needs (`Program::byte_blocks`) — so the bound is
+what the blocks take, and a class compiled again is built anew. `.` and an
+IgnoreCase literal's code point are classes too, so every block has one key
+(`class_key`). It was
 three unbounded maps — sets to byte sequences, sets to blocks, classes to
 blocks — holding every distinct class a process had ever compiled: 20000
 patterns with distinct Unicode classes grew a process by 3.8 GB, where it now

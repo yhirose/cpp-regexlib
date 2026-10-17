@@ -15,8 +15,10 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -5079,9 +5081,49 @@ void test_operand_pools() {
 }
 
 // The class byte sub-automata are cached across every Regex of the process,
-// bounded in bytes, and a program owns the blocks it uses: the cache can drop
-// a block a live Regex still runs. Every distinct class a process compiled
-// used to stay — 20000 patterns like these grew a process by 3.8 GB.
+// bounded in bytes, and a program keeps nothing of them: the cache can drop a
+// block a live Regex was compiled from, and one compiled again is built anew.
+// The entry points that hand back views into their subject refuse an owning
+// temporary at compile time (detail::owning_temporary): a std::string, const
+// or not, or any other string type that converts to std::string_view. The
+// borrowing find_all still takes a std::string to own by moving it in.
+template <class S, class = void> struct can_find_iter : std::false_type {};
+template <class S>
+struct can_find_iter<S, std::void_t<decltype(std::declval<const Regex &>()
+                                                 .find_iter(std::declval<S>()))>>
+    : std::true_type {};
+template <class S, class = void> struct can_split : std::false_type {};
+template <class S>
+struct can_split<S, std::void_t<decltype(std::declval<const Regex &>().split(
+                        std::declval<S>()))>> : std::true_type {};
+template <class S, class = void> struct can_find_all : std::false_type {};
+template <class S>
+struct can_find_all<S, std::void_t<decltype(std::declval<const Regex &>()
+                                                .find_all(std::declval<S>()))>>
+    : std::true_type {};
+template <class S, class = void> struct can_find_iter_cached : std::false_type {};
+template <class S>
+struct can_find_iter_cached<
+    S, std::void_t<decltype(std::declval<const Regex &>().find_iter(
+           std::declval<S>(), std::declval<Regex::FindCache &>()))>>
+    : std::true_type {};
+static_assert(!can_find_iter<std::string>::value, "");
+static_assert(!can_find_iter<const std::string>::value, "");
+static_assert(!can_find_iter<std::pmr::string>::value, "");
+static_assert(!can_find_iter_cached<std::string>::value, "");
+static_assert(!can_split<std::string>::value, "");
+static_assert(!can_split<const std::string>::value, "");
+static_assert(!can_find_all<const std::string>::value, "");
+static_assert(!can_find_all<std::pmr::string>::value, "");
+static_assert(can_find_all<std::string>::value, ""); // moved in, owned
+static_assert(can_find_iter<std::string &>::value, "");
+static_assert(can_find_iter<const std::string &>::value, "");
+static_assert(can_find_iter<std::string_view>::value, "");
+static_assert(can_find_iter<const char *>::value, "");
+static_assert(can_find_iter_cached<std::string &>::value, "");
+static_assert(can_split<std::string_view>::value, "");
+static_assert(can_find_all<std::string_view>::value, "");
+
 void test_class_block_cache() {
   auto &cache = reg::detail::ClassBlockCache::instance();
   const Regex early = make_us("[\\x{4E00}-\\x{4E10}\\w]+x");
