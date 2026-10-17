@@ -3845,8 +3845,9 @@ void test_dfa_cache() {
   // ... and over text that is not ASCII, where a step over a code point is
   // a path through the states inside it (LazyDfa::look_next): a cache with
   // no room for them all clears part-way along one, and goes on from where
-  // it is. Word characters of two and three bytes, and line breaks of two
-  // and three (NEL, U+2028), which (?m) asks about.
+  // it is (`\w+$`, whose DFAs step bytewise, refills between bytes). Word
+  // characters of two and three bytes, and line breaks of two and three
+  // (NEL, U+2028), which (?m) asks about.
   {
     const char *pieces[] = {"\xC3\xA9", "\xCE\xB1", "\xE6\xBC\xA2",
                             "\xE5\xAD\x97", "x", " ", "\n", "\xC2\x85",
@@ -3874,10 +3875,10 @@ void test_dfa_cache() {
       }
   }
   // A look DFA whose program's assertions see only the text's edges steps
-  // a byte at a time instead, as one without look (LazyDfa::bytewise) —
-  // unless it re-seeds, and a start re-seeded inside a code point could
-  // match there with no byte (`\Aa|b*`: the boolean's DFA). Every find
-  // agrees with the Pike, the empty matches of `\w*$` and `\Aa|b*` too.
+  // a byte at a time instead (LazyDfa::columns), but for a re-seeding one
+  // that could match empty inside a code point (`\Aa|b*`'s boolean DFA).
+  // Every find agrees with the Pike, the empty matches of `\w*$` and
+  // `\Aa|b*` too.
   {
     const char *pieces[] = {"\xC3\xA9", "\xE6\xBC\xA2", "\xF0\x9F\x98\x80",
                             "a", "b", " ", "\n", "\xE2\x80\xA8"};
@@ -3887,7 +3888,7 @@ void test_dfa_cache() {
     struct Case {
       const char *pat;
       bool edges;        // the assertions see only the text's edges
-      bool empty_inside; // ... and the pattern matches empty between them
+      bool empty_inside; // ... and it matches empty through none of them
     };
     for (const Case &c : {Case{"\\w+$", true, false},
                           Case{"(?:\\A|a)\\w+", true, false},
@@ -3903,11 +3904,12 @@ void test_dfa_cache() {
         CHECK(finds_agree(re, flat_spans(pike, s, false), s));
         const auto steps = PlanProbe::look_steps(re);
         CHECK(!steps.empty());
-        for (const auto &[bytewise, reseed] : steps)
+        bool reseeds = false;
+        for (const auto &[bytewise, reseed] : steps) {
           CHECK(bytewise == (c.edges && !(reseed && c.empty_inside)));
-        if (c.empty_inside && !us) // (the boolean's DFA is among them)
-          CHECK(std::any_of(steps.begin(), steps.end(),
-                            [](const auto &st) { return st.second; }));
+          reseeds |= reseed;
+        }
+        if (c.empty_inside && !us) CHECK(reseeds); // the boolean's DFA
       }
   }
 

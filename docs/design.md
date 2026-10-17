@@ -326,9 +326,9 @@ differ by: the two loops (`dfa_forward_lf_scan`, `dfa_reverse_scan`) take
 they were.
 
 - **Byte classes tell apart what an assertion asks.** The classes of a look
-  program are refined by the word bytes and the line breaks, so that a
-  transition is cached by the class of an ASCII byte there
-  too — a row of `\b[a-z]+\d\b` is 10 entries, 40 bytes, where it was
+  program are refined by what its assertions ask of a byte — the word
+  bytes, if it has a `\b` or a `\B`, and the line breaks, under (?m) — so
+  that a transition is cached by the class of an ASCII byte there too — a row of `\b[a-z]+\d\b` is 10 entries, 40 bytes, where it was
   2,056 — and no ASCII byte shares a class with a byte of a longer code
   point.
 - **A non-ASCII code point is a path through states inside it.** What it
@@ -341,7 +341,7 @@ they were.
   any (with a closure between that follows no assertion: inside a code
   point is no boundary); and from the last, on its kind again, to the state
   after it, whose context that kind is. The kinds are three more columns of
-  every look row, and the states inside (`kInside`) are interned, cached,
+  every look row (but a bytewise one, below), and the states inside (`kInside`) are interned, cached,
   budgeted and cleared with the rest; no scan stands on one. So every link
   is a table load once made, and a step over a code point seen before —
   or one that only shares the path, by its kind and the classes of its
