@@ -1619,6 +1619,9 @@ struct RegexError : public std::runtime_error {
     PatternTooLong,     // source pattern exceeds the byte cap
     StepBudgetExceeded, // match-time step budget exhausted
     Internal,           // unclassified / should-not-happen
+    // (Appended: the values above are part of the ABI.)
+    BadRepeat,    // a counted repeat whose minimum exceeds its maximum
+    BadCharRange, // a class range whose start exceeds its end, e.g. [z-a]
   };
 
   RegexError(Code code, const std::string &msg)
@@ -2783,6 +2786,8 @@ struct Parser {
       return false;
     }
     pos++; // consume '}'
+    if (hi >= 0 && hi < lo)
+      error(RegexError::Code::BadRepeat, "repeat count out of order");
     rep.kind = Node::Kind::Repeat;
     rep.rmin = lo;
     rep.rmax = hi;
@@ -2943,8 +2948,8 @@ struct Parser {
       if (!is(U'}'))
         error(RegexError::Code::BadUnicodeProperty, "unterminated \\p{...}");
       pos++; // consume '}'
-    } else if (!eof() && toks[pos].size() == 1) {
-      name = std::string(1, static_cast<char>(toks[pos][0]));
+    } else if (!eof()) {
+      name = unicode::utf8::encode(peek()); // a one-letter name, as in \pL
       pos++;
     } else {
       error(RegexError::Code::BadUnicodeProperty, "malformed \\p");
@@ -2967,35 +2972,21 @@ struct Parser {
     bool first = true;
     while (!eof() && !(is(U']') && !first)) {
       first = false;
-      // POSIX bracket sub-class [:name:]; only consumed when it is a valid
-      // class, otherwise '[' falls through and is treated as a literal member.
-      if (is(U'[') && try_posix_class(n.cls)) continue;
-      // Predefined class escape inside [...]
-      if (is(U'\\')) {
+      char32_t lo, hi;
+      if (!class_member(n.cls, lo)) continue;
+      // A range joins two code points. A '-' before the ']', or next to a set
+      // (`[\w-.]`, `[a-\d]`), is itself.
+      if (is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']')) {
         pos++;
-        if (eof())
-          error(RegexError::Code::BadCharClass, "trailing backslash in class");
-        char32_t e;
-        if (single_cp(e) && try_prop_escape(e, n.cls)) continue;
-        if (single_cp(e) && add_class_escape(n.cls, e)) {
-          pos++;
+        if (class_member(n.cls, hi)) {
+          if (hi < lo)
+            error(RegexError::Code::BadCharRange, "class range out of order");
+          n.cls.add_range(lo, hi);
           continue;
         }
-        // escaped literal
-        char32_t lit = escaped_literal();
-        maybe_range(n.cls, lit);
-        continue;
+        n.cls.add_range(U'-', U'-');
       }
-      char32_t lo;
-      if (!single_cp(lo)) {
-        // Multi-code-point grapheme literal in a class: add each code point.
-        for (char32_t cp : peek())
-          n.cls.add_range(cp, cp);
-        pos++;
-        continue;
-      }
-      pos++;
-      maybe_range(n.cls, lo);
+      n.cls.add_range(lo, lo);
     }
     if (!is(U']'))
       error(RegexError::Code::BadCharClass, "unterminated character class");
@@ -3003,24 +2994,34 @@ struct Parser {
     return n;
   }
 
-  // After reading a class member `lo`, check for a `lo-hi` range.
-  void maybe_range(CharClass &cls, char32_t lo) {
-    if (is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']')) {
-      pos++; // consume '-'
-      char32_t hi;
-      if (is(U'\\')) {
+  // One member of a class: a code point, returned in `cp` (true), or a set of
+  // them, added to `cls` (false) — \d, \p{L} and the like, a [:name:], or a
+  // cluster of several code points (each one added).
+  bool class_member(CharClass &cls, char32_t &cp) {
+    // POSIX bracket sub-class [:name:]; only consumed when it is a valid
+    // class, otherwise '[' falls through and is treated as a literal member.
+    if (is(U'[') && try_posix_class(cls)) return false;
+    if (is(U'\\')) {
+      pos++;
+      if (eof())
+        error(RegexError::Code::BadCharClass, "trailing backslash in class");
+      char32_t e;
+      if (single_cp(e) && try_prop_escape(e, cls)) return false;
+      if (single_cp(e) && add_class_escape(cls, e)) {
         pos++;
-        hi = escaped_literal();
-      } else if (single_cp(hi)) {
-        pos++;
-      } else {
-        hi = lo;
+        return false;
       }
-      if (hi < lo) std::swap(lo, hi);
-      cls.add_range(lo, hi);
-    } else {
-      cls.add_range(lo, lo);
+      cp = escaped_literal();
+      return true;
     }
+    if (single_cp(cp)) {
+      pos++;
+      return true;
+    }
+    for (char32_t c : peek())
+      cls.add_range(c, c);
+    pos++;
+    return false;
   }
 
   // Returns true and records a predefined predicate; false if `e` is not one.
@@ -3137,39 +3138,37 @@ struct Parser {
     case U'f': return U'\f';
     case U'v': return U'\x0b';
     case U'0': return U'\0';
-    case U'x': return parse_hex();
-    case U'u': return parse_hex();
+    case U'x': return parse_hex(2);
+    case U'u': return parse_hex(4);
     default: return e; // escaped metacharacter → itself
     }
   }
 
-  // \xHH or \x{HHHH} / \uHHHH
-  char32_t parse_hex() {
+  // \xHH, \uHHHH, or \x{H…} / \u{H…} (one to six digits, a code point): the
+  // digits the form takes, exactly, or a BadEscape error.
+  char32_t parse_hex(int digits) {
     auto hexval = [](char32_t c) -> int {
       if (c >= U'0' && c <= U'9') return c - U'0';
       if (c >= U'a' && c <= U'f') return c - U'a' + 10;
       if (c >= U'A' && c <= U'F') return c - U'A' + 10;
       return -1;
     };
+    const bool braced = is(U'{');
+    if (braced) pos++;
     char32_t v = 0;
-    if (is(U'{')) {
+    int n = 0;
+    while (n < (braced ? 7 : digits)) {
+      char32_t c;
+      const int h = single_cp(c) ? hexval(c) : -1;
+      if (h < 0) break;
+      v = v * 16 + static_cast<char32_t>(h);
+      n++;
       pos++;
-      while (!eof() && !is(U'}')) {
-        int h = (toks[pos].size() == 1) ? hexval(toks[pos][0]) : -1;
-        if (h < 0) error(RegexError::Code::BadEscape, "invalid hex escape");
-        v = v * 16 + h;
-        pos++;
-      }
-      if (is(U'}')) pos++;
-    } else {
-      for (int i = 0; i < 4 && !eof(); i++) {
-        if (toks[pos].size() != 1) break;
-        int h = hexval(toks[pos][0]);
-        if (h < 0) break;
-        v = v * 16 + h;
-        pos++;
-      }
     }
+    const bool ok = braced ? n >= 1 && n <= 6 && v <= 0x10FFFF && is(U'}')
+                           : n == digits;
+    if (!ok) error(RegexError::Code::BadEscape, "invalid hex escape");
+    if (braced) pos++;
     return v;
   }
 
@@ -5013,7 +5012,10 @@ public:
   size_t group_count() const { return static_cast<size_t>(ngroups_); }
 
   // Materialize into a self-contained, owning MatchResult (copies the matched
-  // text). Use to keep a match past the next ++ / the subject's lifetime.
+  // text). Use to keep a match past the next ++ / the subject's lifetime. A
+  // result holds the text of its own span and the groups that lie in it, so
+  // that of a group keeps the groups nested in that group, and reads every
+  // other as unmatched.
   MatchResult to_owned() const;
 
 private:
@@ -5060,11 +5062,14 @@ public:
   }
   ~OwnedText() { release(); }
 
+  // The new storage is taken before the old is let go, so a bad_alloc
+  // leaves this text as it was.
   void assign(const char *p, size_t n) {
+    char *heap = n > kInline ? new char[n] : nullptr;
     release();
-    if (n > kInline) {
-      heap_ = new char[n];
-      std::memcpy(heap_, p, n);
+    if (heap) {
+      std::memcpy(heap, p, n);
+      heap_ = heap;
     } else if (n) {
       std::memcpy(inl_, p, n);
     }
@@ -5197,7 +5202,8 @@ inline MatchResult Match::to_owned() const {
   r._init(begin(), end(), sv.data(), sv.size(), ngroups_);
   for (int g = 1; g <= ngroups_; g++) {
     Match gg = group(g);
-    if (gg.matched()) r._set_group(g, gg.begin(), gg.end());
+    if (gg.matched() && gg.begin() >= begin() && gg.end() <= end())
+      r._set_group(g, gg.begin(), gg.end());
   }
   if (names_) r._set_names(*names_);
   return r;
@@ -15157,10 +15163,10 @@ private:
     return plan_->multiline_ && detail::is_line_break(seg.graphemes[sp]);
   }
 
+  // Is the cluster at `sp` a word character? As `\w` answers it: by its
+  // base code point (CharClass::matches), so `e` + U+0301 is one.
   static bool word_at(const detail::Segmented &seg, int sp, int n) {
-    if (sp < 0 || sp >= n) return false;
-    const auto &g = seg.graphemes[sp];
-    return g.size() == 1 && detail::is_word_cp(g[0]);
+    return sp >= 0 && sp < n && detail::is_word_cp(seg.graphemes[sp][0]);
   }
 
   bool wb(const detail::Segmented &seg, int sp, int n) const {
@@ -17610,8 +17616,8 @@ enum error_type {
   error_brack,      // unbalanced '[' ']'
   error_paren,      // unbalanced '(' ')' / bad group construct
   error_brace,      // unbalanced '{' '}' (never produced)
-  error_badbrace,   // invalid '{m,n}' contents (never produced)
-  error_range,      // invalid '[a-b]' range (never produced)
+  error_badbrace,   // invalid '{m,n}' contents: m > n
+  error_range,      // invalid '[a-b]' range: a > b
   error_space,      // out of memory (never produced)
   error_badrepeat,  // a repeat with no preceding expression
   error_complexity, // match/compile exceeded a resource limit
@@ -17654,6 +17660,8 @@ private:
       return regex_constants::error_paren;
     case C::NestingTooDeep: return regex_constants::error_stack;
     case C::NothingToRepeat: return regex_constants::error_badrepeat;
+    case C::BadRepeat: return regex_constants::error_badbrace;
+    case C::BadCharRange: return regex_constants::error_range;
     case C::ProgramTooLarge:
     case C::PatternTooLong:
     case C::StepBudgetExceeded: return regex_constants::error_complexity;

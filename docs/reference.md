@@ -96,16 +96,16 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 | Literal | any character; a base + combining marks form one literal grapheme |
 | Any | `.` (excludes line breaks unless DotAll — see below) |
 | Anchors | `^`, `$` (line-relative under Multiline) |
-| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside |
+| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself |
 | Predefined class | `\d \w \s` and `\D \W \S` (Unicode-property aware) |
 | POSIX class | `[[:alpha:]]`, `[[:digit:]]`, … inside a bracket (see below) |
 | Unicode property | `\p{Name}`, `\P{Name}`, single-letter `\pL` |
-| Quantifiers | `* + ?`, `{n}`, `{n,m}`, `{n,}`; lazy variants `*? +? ?? {n,m}?` |
+| Quantifiers | `* + ?`, `{n}`, `{n,m}` (`n` ≤ `m`), `{n,}`; lazy variants `*? +? ?? {n,m}?` |
 | Alternation | `\|` |
 | Group | `(…)` capturing, `(?:…)` non-capturing |
 | Named group | `(?<name>…)`, `(?'name'…)` |
 | Word boundary | `\b`, `\B` |
-| Escapes | `\n \r \t \f \v \0`, `\xHH`, `\x{…}`, `\uHHHH`, escaped metacharacters |
+| Escapes | `\n \r \t \f \v \0`, `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` (one to six, up to U+10FFFF), escaped metacharacters |
 | Lookahead | `(?=…)`, `(?!…)` — variable length |
 | Lookbehind | `(?<=…)`, `(?<!…)` — variable length |
 | Flags (inline) | `(?i)`, `(?m)`, `(?s)` |
@@ -215,7 +215,7 @@ group alike, with a single accessor surface:
 | `m.str()` | the matched text (a `std::string_view`) |
 | `m.group(i)` / `m.group("name")` | a sub-group, as a `Match` (group 0 = the whole match) |
 | `m.group_count()` | number of capture groups |
-| `m.to_owned()` | copy into an owning `MatchResult` (views only) |
+| `m.to_owned()` | copy into an owning `MatchResult` (views only): its span, and the groups within it |
 
 `group()` returns a `Match` recursively, so `m.group(1).str()`,
 `m.group(1).begin()`, and `m.group("name").matched()` all read the same way. An
@@ -233,9 +233,11 @@ differs. For **all** matches there are two bulk APIs, split by role:
 match per `++`**, so breaking out of the loop stops scanning the rest of the
 subject — the tool for early-exit, streaming, and range composition. Each
 iteration yields a `Match` view that borrows the subject and is **valid only
-until the next `++`** — copy out (or `to_owned()`) anything you need to keep. A
-temporary `std::string` subject is rejected (`find_iter(std::string&&)` is
-deleted), since the views would dangle; bind it to a variable first.
+until the next `++`** — copy out (or `to_owned()`) anything you need to keep. An
+owning temporary subject — a `std::string`, const or not, or any string type
+that converts to `std::string_view` — does not compile, since the views would
+dangle; bind it to a variable first. (The same holds for `split` and the
+borrowing `find_all`, which takes a `std::string&&` to own instead.)
 
 ```cpp
 for (auto m : re.find_iter(text)) {
@@ -387,7 +389,8 @@ a caret line. `RegexError::code()` additionally returns a structured
 `RegexError::Code` (RE2-style: `TrailingBackslash`, `BadEscape`, `BadCharClass`,
 `UnbalancedParen`, `BadGroup`, `BadInlineFlags`, `BadUnicodeProperty`,
 `NestingTooDeep`, `NothingToRepeat`, `ProgramTooLarge`, `PatternTooLong`,
-`StepBudgetExceeded`, `Internal`) for branching without parsing the message.
+`StepBudgetExceeded`, `Internal`, `BadRepeat` — `{n,m}` with `n` > `m` —,
+`BadCharRange` — `[z-a]`) for branching without parsing the message.
 
 ## std::regex-compatible API
 

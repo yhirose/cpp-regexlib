@@ -123,9 +123,10 @@ So `\w`/`\p{L}` match `é` whether NFC (`U+00E9`) or NFD (`e` + `◌́`), and `\
 matches a CR-LF cluster. A single-code-point cluster *is* its own base, so this
 is identical to `matches_cp` there — which is why the byte/code-point engines,
 which call `matches_cp` directly, agree with the grapheme engine on
-single-code-point input. (This base-code-point rule is a deliberate semantic
-choice; an earlier "a class matches only single-code-point clusters" rule was
-wrong.)
+single-code-point input. `\b`/`\B` ask the same question of the clusters on
+either side (`word_at`), so `\w+\b` ends after an NFD `é` too. (This
+base-code-point rule is a deliberate semantic choice; an earlier "a class
+matches only single-code-point clusters" rule was wrong.)
 
 ### Pattern literals are grapheme-segmented too
 

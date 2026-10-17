@@ -290,6 +290,8 @@ void test_error_codes() {
       {"a\\", rc::error_escape},             // trailing backslash
       {R"(\x{ZZ})", rc::error_escape},       // invalid hex escape
       {R"(\p{Nonesuch})", rc::error_escape}, // unknown unicode property
+      {"a{3,1}", rc::error_badbrace},        // repeat count out of order
+      {"[z-a]", rc::error_range},            // class range out of order
   };
   for (const Case &c : cases) {
     bool threw = false;
