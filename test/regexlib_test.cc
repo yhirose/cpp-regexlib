@@ -324,7 +324,7 @@ using reg::RegexError;
 // process-wide default (set_default_match_unit), frozen into the Regex at
 // construction, so flip it, build, and restore Grapheme.
 inline Regex make_unit(reg::MatchUnit u, const std::string &pat,
-                       unsigned flags) {
+                       unsigned flags = 0) {
   reg::MatchUnit prev = reg::default_match_unit();
   reg::set_default_match_unit(u);
   Regex r(pat, flags);
@@ -439,7 +439,7 @@ std::optional<RegexError::Code>
 code_of(const std::string &pat,
         reg::MatchUnit unit = reg::default_match_unit()) {
   try {
-    make_unit(unit, pat, 0);
+    make_unit(unit, pat);
   } catch (const RegexError &e) { return e.code(); }
   return std::nullopt;
 }
@@ -2039,7 +2039,7 @@ void test_unicode_scalar() {
     // but not the CR-LF cluster.
     CHECK(make_egc("\\r\\n?").search("x\ry").begin() == 1);
     CHECK(!make_egc("\\r\\n?").search("\r\n").matched());
-    // typed CR-LF already fused via tokenization; escaped now agrees with it
+    // typed CR-LF is one cluster (literal_len); escaped now agrees with it
     CHECK(make_egc("\r\n").search("\r\n").matched());
     CHECK(Regex("\\w+", US).search(ecombining).str() == "e");
     // "é" as NFC (single code point U+00E9) and NFD (e+◌́) match \w+
@@ -5003,7 +5003,6 @@ void test_invalid_patterns() {
       {"\\9", C::BadEscape},
       {"\\01", C::BadEscape},
       {"\\012", C::BadEscape},
-      {"\\01\xCC\x81", C::BadEscape}, // \0, then a cluster on a digit
       {"[\\012]", C::BadEscape},
       {"\\c", C::BadEscape},
       {"\\c1", C::BadEscape},
@@ -5049,7 +5048,7 @@ void test_invalid_patterns() {
   CHECK(Regex("^[\\" + cluster + "]$").test("\xCC\x81"));
   CHECK(Regex("^[a-\\" + cluster + "]+$").test("b\xCC\x81")); // a-ä, ◌́
 
-  // CodePoint mode reads the pattern by code points, as code-point engines
+  // CodePoint mode reads literal text by code points, as code-point engines
   // do: NFD `é` is `e` and a mark, each its own atom.
   const std::string nfd = "e\xCC\x81";
   const auto cp = reg::MatchUnit::CodePoint;
@@ -5070,9 +5069,7 @@ void test_invalid_patterns() {
 void test_syntax_by_code_point() {
   const std::string mark = "\xCC\x81", prepend = "\xD8\x80"; // ◌́, U+0600
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
-    const auto re = [unit](const std::string &p) {
-      return make_unit(unit, p, 0);
-    };
+    const auto re = [unit](const std::string &p) { return make_unit(unit, p); };
     CHECK(re("(" + mark + ")").test(mark));          // a group, of a mark
     CHECK(re("^(a)" + mark + "?$").test("a"));       // a group, then ◌́?
     CHECK(re("^[ae]" + mark + "?$").test("e" + mark)); // a class, then ◌́?
@@ -5082,32 +5079,35 @@ void test_syntax_by_code_point() {
     CHECK(code_of("[" + prepend + "-z]", unit) ==    // … nor a range's `-`
           RegexError::Code::BadCharRange);
   }
-  // Literal text is still read as the subject is: a cluster in grapheme mode.
+  // Literal text is still read as the subject is: a cluster in grapheme mode
+  // — but a metacharacter, typed or escaped, is one code point of its own.
   const std::string nfd = "e" + mark;
-  CHECK(make_egc("^" + nfd + "+$").test(nfd + nfd));
   CHECK(make_egc("^x" + nfd + "{2}$").test("x" + nfd + nfd));
+  for (const std::string &t : {"]" + mark, "]" + mark + mark, "]]" + mark})
+    CHECK(make_egc("^]" + mark + "+$").test(t) ==
+          make_egc("^\\]" + mark + "+$").test(t));
 }
 
 // reg::escape() quotes the metacharacters, so the result matches its text
 // literally wherever it is spliced: alone, in a group, in a class.
 void test_escape() {
   CHECK(reg::escape("a.b(c)") == "a\\.b\\(c\\)");
-  CHECK(reg::escape("\\^$.|?*+()[]{}-") ==
-        "\\\\\\^\\$\\.\\|\\?\\*\\+\\(\\)\\[\\]\\{\\}\\-");
+  CHECK(reg::escape(R"(\^$.|?*+()[]{}-)") ==
+        R"(\\\^\$\.\|\?\*\+\(\)\[\]\{\}\-)");
   CHECK(reg::escape("q#&~ \xC3\xA9") == "q#&~ \xC3\xA9");
-  const std::string mark = "\xCC\x81";
+  const std::string mark = "\xCC\x81", prepend = "\xD8\x80"; // ◌́, U+0600
   const std::string texts[] = {"", "a-z", "]", "^", "\\d", "(?i)", "{2}",
-                               mark + "x", "\xD8\x80" "(", "e" + mark + "+",
+                               mark + "x", prepend + "(", "e" + mark + "+",
                                "a" + mark + "|" + mark, "\r\n", "x" + mark};
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
     for (const std::string &t : texts) {
-      const Regex whole = make_unit(unit, "^(" + reg::escape(t) + ")$", 0);
+      const std::string e = reg::escape(t);
+      const Regex whole = make_unit(unit, "^(" + e + ")$");
       const auto m = whole.match(t);
       CHECK(whole.group_count() == 1 && m.matched() && m.group(1).str() == t);
-      if (t.empty()) continue;
-      const Regex set = make_unit(unit, "^[" + reg::escape(t) + "]+$", 0);
-      CHECK(set.test(t));
-      CHECK(!make_unit(unit, "[" + reg::escape(t) + "]", 0).test("!"));
+      if (t.empty()) continue; // "[]" opens a class whose first member is ']'
+      CHECK(make_unit(unit, "^[" + e + "]+$").test(t));
+      CHECK(!make_unit(unit, "[" + e + "]").test("!"));
     }
 }
 

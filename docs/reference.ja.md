@@ -375,13 +375,15 @@ for (const auto &doc : docs)
 そのままにします。構文は1コードポイントずつ読まれ、英数字以外をエスケープした
 文字は常にその文字自体なので、結果はどちらのマッチ単位でも、どこに埋め込んでも
 同じ意味になります——`s` が何であっても `"(" + reg::escape(s) + ")"` は1つの
-グループ、`"[" + reg::escape(s) + "]"` は `s` の文字の集合です。
+グループ、`"[" + reg::escape(s) + "]"` は `s` の文字の集合です。繰り返すときはグループにします（`"(?:" + reg::escape(s) + ")+"`）。
+クラスに入れるときは `s` が空であってはいけません（`[]` は最初の要素が `]` の
+クラスを開きます）。置換テンプレートには使いません（そちらのエスケープは `$$`）。
 
 ### エラー
 
 パースできないパターン（または資源上限を超えたパターン）は
-`reg::RegexError` を投げます。`what()` メッセージには該当位置とキャレット行が
-含まれます。加えて `RegexError::code()` が構造化された `RegexError::Code`（RE2 流：
+`reg::RegexError` を投げます。`what()` メッセージには該当位置（パターン中の書記素
+クラスタの番号）とキャレット行が含まれます。加えて `RegexError::code()` が構造化された `RegexError::Code`（RE2 流：
 `TrailingBackslash`, `BadEscape`, `BadCharClass`, `UnbalancedParen`, `BadGroup`,
 `BadInlineFlags`, `BadUnicodeProperty`, `NestingTooDeep`, `NothingToRepeat`,
 `ProgramTooLarge`, `PatternTooLong`, `StepBudgetExceeded`, `Internal`,
