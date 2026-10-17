@@ -433,6 +433,15 @@ std::string error_of(const std::string &pat) {
   return "";
 }
 
+// Returns the RegexError code for an invalid pattern (none if it compiled).
+std::optional<RegexError::Code> code_of(const std::string &pat) {
+  try {
+    Regex r(pat);
+    (void)r;
+  } catch (const RegexError &e) { return e.code(); }
+  return std::nullopt;
+}
+
 // True if `haystack` contains `needle`.
 bool has(const std::string &haystack, const std::string &needle) {
   return haystack.find(needle) != std::string::npos;
@@ -4945,38 +4954,60 @@ void test_invalid_patterns() {
   CHECK(!rejects("a{2,3}"));
   CHECK(!rejects("(?<name>x)"));
 
-  // A hex escape takes the digits its form takes, exactly: \xHH two, \uHHHH
-  // four, \x{…} one to six up to U+10FFFF and a closing brace.
-  const auto code_of = [](const char *pat) {
-    try {
-      Regex r(pat);
-    } catch (const RegexError &e) {
-      return static_cast<int>(e.code());
-    }
-    return -1;
+  using C = RegexError::Code;
+  const std::pair<const char *, C> errors[] = {
+      // A hex escape takes the digits its form takes, exactly — \xHH two,
+      // \uHHHH four, \x{…} one to six and a closing brace — and names a
+      // scalar value: up to U+10FFFF, not a surrogate.
+      {"\\xZ", C::BadEscape},
+      {"\\x4", C::BadEscape},
+      {"\\x{}", C::BadEscape},
+      {"\\x{41", C::BadEscape},
+      {"\\x{110000}", C::BadEscape},
+      {"\\x{100000041}", C::BadEscape},
+      {"\\x{1234567}", C::BadEscape},
+      {"\\u004", C::BadEscape},
+      {"\\uZZZZ", C::BadEscape},
+      {"\\x{D800}", C::BadEscape},
+      {"\\uDFFF", C::BadEscape},
+      {"[\\uD800-\\uDBFF]", C::BadEscape},
+      // A pattern ending in '\' — in a class too.
+      {"a\\", C::TrailingBackslash},
+      {"[\\", C::TrailingBackslash},
+      {"[a-\\", C::TrailingBackslash},
+      // A one-letter \p name is the letter, whatever it is.
+      {"\\p\xC5\x8C", C::BadUnicodeProperty},
+      // A range joins two code points, in order.
+      {"[z-a]", C::BadCharRange},
+      {"[\\x{20}-\\n]", C::BadCharRange},
+      // A counted repeat's minimum is at most its maximum, and neither is
+      // past the cap — compared as written, not as capped.
+      {"a{3,1}", C::BadRepeat},
+      {"(?:){1000001}", C::BadRepeat},
+      {"(?:){0,1000001}", C::BadRepeat},
+      {"(?:){1000001,1000000}", C::BadRepeat},
+      {"(?:){99999999999999999999,}", C::BadRepeat},
   };
-  const int bad_escape = static_cast<int>(RegexError::Code::BadEscape);
-  for (const char *pat : {"\\xZ", "\\x4", "\\x{}", "\\x{41", "\\x{110000}",
-                          "\\x{100000041}", "\\x{1234567}", "\\u004", "\\uZZZZ"})
-    CHECK(code_of(pat) == bad_escape);
+  for (const auto &[pat, code] : errors)
+    CHECK(code_of(pat) == code);
   CHECK(Regex("^\\x41B$").test("AB")); // two digits, then a literal B
   CHECK(!Regex("\\x41B").test("\xD0\x9B")); // not U+041B
   CHECK(Regex("^\\x{41}\\u0042\\x{10FFFF}$").test("AB\xF4\x8F\xBF\xBF"));
-  // A one-letter \p name is the letter, whatever it is.
-  CHECK(code_of("\\p\xC5\x8C") ==
-        static_cast<int>(RegexError::Code::BadUnicodeProperty));
-  // A range joins two code points, in order; a '-' next to a set is itself.
-  CHECK(code_of("[z-a]") == static_cast<int>(RegexError::Code::BadCharRange));
-  CHECK(code_of("[\\x{20}-\\n]") ==
-        static_cast<int>(RegexError::Code::BadCharRange));
+  // A '-' next to a set is itself.
   CHECK(Regex("^[a-\\d]+$").test("a-5"));
   CHECK(!Regex("[a-\\d]").test("b"));
   CHECK(Regex("^[\\w-.]+$").test("a-b.c"));
   CHECK(Regex("^[\\d-z]+$").test("1-z"));
   CHECK(!Regex("[\\d-z]").test("y"));
-  // A counted repeat's minimum is at most its maximum.
-  CHECK(code_of("a{3,1}") == static_cast<int>(RegexError::Code::BadRepeat));
   CHECK(Regex("^a{3,3}$").test("aaa"));
+  CHECK(Regex("(?:){1000000}").test(""));
+  CHECK(Regex("^x{99999999999$").test("x{99999999999")); // not a repeat
+  // An escaped cluster is the cluster: `\é` (NFD) is `é`, in a class each of
+  // its code points, as when written bare.
+  const std::string nfd = "e\xCC\x81";
+  CHECK(Regex("^\\" + nfd + "$").test(nfd));
+  CHECK(!Regex("\\" + nfd).test("e"));
+  CHECK(Regex("^[\\" + nfd + "]$").test("\xCC\x81"));
 }
 
 void test_resource_limits() {
@@ -5162,26 +5193,38 @@ static_assert(can_find_iter_cached<std::string &>::value, "");
 static_assert(can_split<std::string_view>::value, "");
 static_assert(can_find_all<std::string_view>::value, "");
 
-// A result of to_owned() holds the text of its own span and the groups that
-// lie in it: that of a group view keeps the groups nested in it and reads the
-// others as unmatched. A group view's result used to keep every group, with
-// spans outside its text, and its group(k).str() threw.
+// A result of to_owned() answers every accessor as the view it was taken
+// from does — that of a group view too.
 void test_owned_group_views() {
-  const Regex re("((\\w)\\w*)-(\\w+)");
+  const Regex re("((\\w)\\w*)-(\\w+)()");
   const std::string subj = "xx foo-barbaz yy";
+  const auto same = [](const auto &a, const auto &b) {
+    bool ok = a.matched() == b.matched() && a.begin() == b.begin() &&
+              a.end() == b.end() && a.str() == b.str() &&
+              a.group_count() == b.group_count();
+    for (size_t k = 0; k <= a.group_count() + 1; k++)
+      ok = ok && a.group(k).matched() == b.group(k).matched() &&
+           a.group(k).begin() == b.group(k).begin() &&
+           a.group(k).end() == b.group(k).end() &&
+           a.group(k).str() == b.group(k).str();
+    return ok;
+  };
+  int n = 0;
   for (auto m : re.find_iter(subj)) {
-    const auto all = m.to_owned(); // the whole match: every group
-    CHECK(all.str() == "foo-barbaz" && all.group(3).str() == "barbaz" &&
-          all.group(2).str() == "f");
-    const auto g1 = m.group(1).to_owned(); // `foo`, with `f` inside it
+    for (size_t g = 0; g <= m.group_count() + 1; g++) {
+      CHECK(same(m.group(g).to_owned(), m.group(g)));
+      CHECK(same(m.group(g).to_owned().group(g).to_owned(), m.group(g)));
+    }
+    const auto g1 = m.group(1).to_owned();
     CHECK(g1.str() == "foo" && g1.begin() == 3 && g1.end() == 6);
-    CHECK(g1.group(2).str() == "f" && g1.group(2).begin() == 3);
-    CHECK(!g1.group(3).matched() && g1.group(3).str().empty());
-    const auto g3 = m.group(3).to_owned();
-    CHECK(g3.str() == "barbaz" && !g3.group(1).matched() &&
-          !g3.group(2).matched());
-    CHECK(!m.group(9).to_owned().matched());
+    CHECK(g1.group(0).str() == "foo-barbaz" && g1.group(3).str() == "barbaz");
+    n++;
   }
+  CHECK(n == 1);
+  // An unmatched group, and a group of a search() result, the same.
+  const auto r = Regex("(a)|(b)").search("xb");
+  CHECK(same(r.group(1).to_owned(), r.group(1)));
+  CHECK(same(r.group(2).to_owned(), r.group(2)));
 }
 
 void test_class_block_cache() {

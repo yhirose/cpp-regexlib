@@ -100,12 +100,12 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 | Predefined class | `\d \w \s` and `\D \W \S` (Unicode-property aware) |
 | POSIX class | `[[:alpha:]]`, `[[:digit:]]`, … inside a bracket (see below) |
 | Unicode property | `\p{Name}`, `\P{Name}`, single-letter `\pL` |
-| Quantifiers | `* + ?`, `{n}`, `{n,m}` (`n` ≤ `m`), `{n,}`; lazy variants `*? +? ?? {n,m}?` |
+| Quantifiers | `* + ?`, `{n}`, `{n,m}` (`n` ≤ `m` ≤ 1000000), `{n,}`; lazy variants `*? +? ?? {n,m}?` |
 | Alternation | `\|` |
 | Group | `(…)` capturing, `(?:…)` non-capturing |
 | Named group | `(?<name>…)`, `(?'name'…)` |
 | Word boundary | `\b`, `\B` |
-| Escapes | `\n \r \t \f \v \0`, `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` (one to six, up to U+10FFFF), escaped metacharacters |
+| Escapes | `\n \r \t \f \v \0`, `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` or `\u{…}` (one to six), each a scalar value (up to U+10FFFF, no surrogate); escaped metacharacters |
 | Lookahead | `(?=…)`, `(?!…)` — variable length |
 | Lookbehind | `(?<=…)`, `(?<!…)` — variable length |
 | Flags (inline) | `(?i)`, `(?m)`, `(?s)` |
@@ -215,7 +215,7 @@ group alike, with a single accessor surface:
 | `m.str()` | the matched text (a `std::string_view`) |
 | `m.group(i)` / `m.group("name")` | a sub-group, as a `Match` (group 0 = the whole match) |
 | `m.group_count()` | number of capture groups |
-| `m.to_owned()` | copy into an owning `MatchResult` (views only): its span, and the groups within it |
+| `m.to_owned()` | copy into an owning `MatchResult` (views only) that answers as the view does — a group's too |
 
 `group()` returns a `Match` recursively, so `m.group(1).str()`,
 `m.group(1).begin()`, and `m.group("name").matched()` all read the same way. An
@@ -389,7 +389,7 @@ a caret line. `RegexError::code()` additionally returns a structured
 `RegexError::Code` (RE2-style: `TrailingBackslash`, `BadEscape`, `BadCharClass`,
 `UnbalancedParen`, `BadGroup`, `BadInlineFlags`, `BadUnicodeProperty`,
 `NestingTooDeep`, `NothingToRepeat`, `ProgramTooLarge`, `PatternTooLong`,
-`StepBudgetExceeded`, `Internal`, `BadRepeat` — `{n,m}` with `n` > `m` —,
+`StepBudgetExceeded`, `Internal`, `BadRepeat` — `{n,m}` with `n` > `m`, or a count past 1000000 —,
 `BadCharRange` — `[z-a]`) for branching without parsing the message.
 
 ## std::regex-compatible API
@@ -517,6 +517,7 @@ pattern that exceeds any of these raises `RegexError` at construction:
 | Pattern source length | 32 KiB |
 | Compiled program size | 262144 instructions, the lookaround programs it runs included |
 | Nesting depth | 200 |
+| Repeat count (`n`, `m` of `{n,m}`) | 1000000 |
 
 These bound compile cost (e.g. `a{1000000}`, nested `(x{50}){50}…`) and parser
 recursion (e.g. `((((…))))`). A lookaround is one program however many times a
