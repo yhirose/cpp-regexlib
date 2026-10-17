@@ -134,7 +134,7 @@ A literal in the pattern matches a cluster only by **full equality** of its code
 points (`lit_match`), not by base code point — so an exact literal is stricter
 than a class. For that to behave predictably the pattern's literal text must be
 segmented into clusters exactly as the subject is. Typed literals already are
-(the tokenizer hands the parser whole clusters), but **escapes — `\r`, `\n`,
+(`literal_len` reads them as clusters), but **escapes — `\r`, `\n`,
 `\uXXXX` — each parse to their own single-code-point literal**, so an escaped
 run like `\r\n` would stay two literals and could never match the indivisible
 CR-LF cluster (UAX #29 GB3) a subject presents. `parse_concat` therefore runs a
@@ -145,11 +145,19 @@ text produces. (A quantified escape, e.g. the `\n?` in `\r\n?`, is its own atom
 and does not fuse.) In CodePoint mode the pass changes nothing a match sees: a
 multi-code-point literal emits the same per-code-point match sequence as the
 separate literals.
-That mode's tokenizer hands the parser code points, not clusters — the pattern
-is read in the unit the subject is — so NFD `é+` repeats the mark and `[a-é]` is
-`a`–`e` and the mark, as in every code-point engine. In grapheme mode a cluster
-of several code points in a class adds each of them but is no range endpoint
-(`BadCharRange`), as in Swift and Raku.
+The parser reads the pattern a code point at a time in both modes, so syntax
+never depends on its neighbours: a combining mark after `(`, `]`, `+` or `\` is
+literal text after it, not part of it (segmenting the whole pattern into
+clusters, as an earlier tokenizer did, glued it to the metacharacter, so
+`(a)◌́` lost its `)`), and a pattern built by splicing `reg::escape(s)` into a
+template parses as the template does. Only literal text forms clusters: in
+grapheme mode `literal_len` reads the cluster a literal starts, up to the next
+metacharacter (a Prepend takes no `(`), so a quantifier repeats the whole
+cluster, as Swift coalesces literal scalars into characters. In CodePoint mode
+a literal is one code point, so NFD `é+` repeats the mark and `[a-é]` is `a`–`e`
+and the mark, as in every code-point engine. In grapheme mode a cluster of
+literal text in a class adds each of its code points but is no range endpoint
+(`BadCharRange`), as in Swift and Raku; an escape is always one code point.
 
 ---
 

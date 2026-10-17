@@ -2560,13 +2560,18 @@ inline bool node_nullable(const Node &n) {
 }
 
 //------------------------------------------------------------------------------
-// Parser  (recursive descent over the pattern's units: its grapheme clusters,
-// or in CodePoint mode its code points, as the subject is read)
+// Parser  (recursive descent over the pattern's code points)
+//
+// Syntax is read a code point at a time in either match unit, so a pattern's
+// syntax never depends on its neighbours: a combining mark after `(` is not
+// part of the paren. In grapheme mode typed literal text is read as clusters
+// (literal_len), as the subject is.
 //------------------------------------------------------------------------------
 
 struct Parser {
-  std::vector<std::u32string> toks; // the pattern, one unit per token
+  std::u32string cps; // the pattern's code points
   size_t pos = 0;
+  bool clusters;      // grapheme mode: typed literal text is read as clusters
   int ncap = 0;  // capture group counter (group 0 is the whole match)
   int depth = 0; // current group/lookaround nesting depth
   bool in_look =
@@ -2578,39 +2583,54 @@ struct Parser {
 
   Parser(std::string_view pattern, bool code_points, NameMap &named_,
          bool &icase_, bool &multiline_, bool &dotall_)
-      : named(named_), icase(icase_), multiline(multiline_), dotall(dotall_) {
-    toks = (code_points ? segment_cp(pattern) : segment(pattern)).graphemes;
+      : clusters(!code_points), named(named_), icase(icase_),
+        multiline(multiline_), dotall(dotall_) {
+    for (size_t off = 0; off < pattern.size();) {
+      char32_t cp;
+      off += unicode::utf8::decode_or_byte(pattern.data() + off,
+                                           pattern.size() - off, cp);
+      cps += cp;
+    }
   }
 
-  bool eof() const { return pos >= toks.size(); }
+  bool eof() const { return pos >= cps.size(); }
 
-  const std::u32string &peek() const { return toks[pos]; }
+  char32_t peek() const { return cps[pos]; } // not at eof()
 
-  // True when token `i` exists and is exactly the single code point `c`.
-  bool is_at(size_t i, char32_t c) const {
-    return i < toks.size() && toks[i].size() == 1 && toks[i][0] == c;
-  }
+  bool is_at(size_t i, char32_t c) const { return i < cps.size() && cps[i] == c; }
 
   bool is(char32_t c) const { return is_at(pos, c); }
 
-  // Scan the i/m/s letters of an inline flag group starting at token `p`,
-  // OR-ing each one it finds into the matching flag. Returns the index just
-  // past the run — equal to `p` when there is no flag letter there.
-  size_t scan_ims(size_t p, bool &ti, bool &tm, bool &ts) const {
-    while (p < toks.size() && toks[p].size() == 1 &&
-           (toks[p][0] == U'i' || toks[p][0] == U'm' || toks[p][0] == U's')) {
-      if (toks[p][0] == U'i') ti = true;
-      if (toks[p][0] == U'm') tm = true;
-      if (toks[p][0] == U's') ts = true;
-      p++;
-    }
-    return p;
+  // The characters that are syntax somewhere in a pattern. reg::escape()
+  // escapes exactly these, and no cluster of literal text takes one in.
+  static bool is_meta(char32_t c) {
+    return c < 0x80 && std::u32string_view(U"\\^$.|?*+()[]{}-").find(c) !=
+                           std::u32string_view::npos;
   }
 
-  bool single_cp(char32_t &out) const {
-    if (eof() || toks[pos].size() != 1) return false;
-    out = toks[pos][0];
-    return true;
+  // How many code points the literal at `pos` takes: in grapheme mode the
+  // cluster its text forms, up to the next metacharacter; else one.
+  size_t literal_len() const {
+    if (!clusters) return 1;
+    const char32_t *s = cps.data() + pos;
+    const size_t l = cps.size() - pos;
+    size_t n = 1;
+    while (n < l && !is_meta(s[n]) && !unicode::is_grapheme_boundary(s, l, n))
+      n++;
+    return n;
+  }
+
+  // Scan the i/m/s letters of an inline flag group starting at `p`, OR-ing
+  // each one it finds into the matching flag. Returns the index just past the
+  // run — equal to `p` when there is no flag letter there.
+  size_t scan_ims(size_t p, bool &ti, bool &tm, bool &ts) const {
+    for (; p < cps.size(); p++) {
+      if (cps[p] == U'i') ti = true;
+      else if (cps[p] == U'm') tm = true;
+      else if (cps[p] == U's') ts = true;
+      else break;
+    }
+    return p;
   }
 
   // A node of kind `k` with a default payload — the assertions, `.` and Empty
@@ -2636,17 +2656,17 @@ struct Parser {
   //   regex parse error at position 3: nothing to repeat
   //     ab**
   //       ^
-  // The caret column counts one space per preceding token, so it aligns for
+  // The caret column counts one space per preceding cluster, so it aligns for
   // ASCII patterns (and stays close for wider ones).
   [[noreturn]] void error(RegexError::Code code, const std::string &msg) {
-    std::string pat, indent;
-    for (size_t i = 0; i < toks.size(); i++) {
-      if (i < pos) indent += ' ';
-      pat += unicode::utf8::encode(toks[i]);
-    }
+    std::string indent;
+    for (size_t i = 0; i < pos && i < cps.size(); i++)
+      if (unicode::is_grapheme_boundary(cps.data(), cps.size(), i))
+        indent += ' ';
     throw RegexError(code, "regex parse error at position " +
-                               std::to_string(pos) + ": " + msg + "\n  " + pat +
-                               "\n  " + indent + "^");
+                               std::to_string(pos) + ": " + msg + "\n  " +
+                               unicode::utf8::encode(cps) + "\n  " + indent +
+                               "^");
   }
 
   Node parse() {
@@ -2654,7 +2674,7 @@ struct Parser {
     Node n = parse_alt();
     if (!eof())
       error(RegexError::Code::UnbalancedParen,
-            "unexpected '" + unicode::utf8::encode(peek()) + "'");
+            "unexpected '" + unicode::utf8::encode_codepoint(peek()) + "'");
     return n;
   }
 
@@ -2700,7 +2720,7 @@ struct Parser {
 
   // Re-segment runs of adjacent (unquantified) literal nodes on grapheme
   // boundaries. The raw-literal path already grapheme-segments typed text
-  // (peek() returns whole clusters), but escapes — `\r`, `\n`, `\uXXXX` — each
+  // (literal_len), but escapes — `\r`, `\n`, `\uXXXX` — each
   // parse to their own single-code-point Lit, so an escaped run like `\r\n`
   // never fuses into the one CR-LF cluster (UAX #29 GB3). In Grapheme mode the
   // subject presents CR-LF as a single indivisible cluster, so the unfused
@@ -2741,8 +2761,7 @@ struct Parser {
   Node parse_repeat() {
     Node atom = parse_atom();
     if (eof()) return atom;
-    char32_t c;
-    if (!single_cp(c)) return atom;
+    const char32_t c = peek();
     if (c == U'*' || c == U'+' || c == U'?') {
       pos++;
       Node rep;
@@ -2809,9 +2828,8 @@ struct Parser {
   bool read_int(int &out) {
     size_t start = pos;
     long v = 0;
-    while (!eof() && toks[pos].size() == 1 && toks[pos][0] >= U'0' &&
-           toks[pos][0] <= U'9') {
-      v = v * 10 + (toks[pos][0] - U'0');
+    while (!eof() && peek() >= U'0' && peek() <= U'9') {
+      v = v * 10 + (peek() - U'0');
       if (v > limits::kMaxRepeatCount) // for try_parse_counted to reject
         v = limits::kMaxRepeatCount + 1;
       pos++;
@@ -2822,26 +2840,23 @@ struct Parser {
   }
 
   Node parse_atom() {
-    char32_t c;
-    if (single_cp(c)) {
-      switch (c) {
-      case U'(': return parse_group();
-      case U'[': return parse_class();
-      case U'.': pos++; return make_node(Node::Kind::AnyChar);
-      case U'^': pos++; return make_node(Node::Kind::BOL);
-      case U'$': pos++; return make_node(Node::Kind::EOL);
-      case U'\\': return parse_escape();
-      case U'*':
-      case U'+':
-      case U'?': error(RegexError::Code::NothingToRepeat, "nothing to repeat");
-      case U')': error(RegexError::Code::UnbalancedParen, "unmatched ')'");
-      default: break;
-      }
+    switch (peek()) {
+    case U'(': return parse_group();
+    case U'[': return parse_class();
+    case U'.': pos++; return make_node(Node::Kind::AnyChar);
+    case U'^': pos++; return make_node(Node::Kind::BOL);
+    case U'$': pos++; return make_node(Node::Kind::EOL);
+    case U'\\': return parse_escape();
+    case U'*':
+    case U'+':
+    case U'?': error(RegexError::Code::NothingToRepeat, "nothing to repeat");
+    case U')': error(RegexError::Code::UnbalancedParen, "unmatched ')'");
+    default: break;
     }
-    // Ordinary literal grapheme cluster.
+    // Ordinary literal text: a code point, or in grapheme mode its cluster.
     Node n = make_node(Node::Kind::Lit);
-    n.lit = peek();
-    pos++;
+    n.lit = cps.substr(pos, literal_len());
+    pos += n.lit.size();
     return n;
   }
 
@@ -2867,8 +2882,8 @@ struct Parser {
     g.cap_index = -1;
     if (is(U'?')) {
       pos++;
-      char32_t c;
-      if (!single_cp(c)) error(RegexError::Code::BadGroup, "malformed group");
+      if (eof()) error(RegexError::Code::BadGroup, "malformed group");
+      const char32_t c = peek();
       if (c == U'=' || c == U'!') {
         pos++; // (?=...) / (?!...)
         return parse_lookaround(/*behind=*/false, /*negate=*/c == U'!');
@@ -2886,10 +2901,8 @@ struct Parser {
         char32_t close = (c == U'<') ? U'>' : U'\'';
         pos++;
         std::u32string name;
-        while (!eof() && !(toks[pos].size() == 1 && toks[pos][0] == close)) {
-          name += peek();
-          pos++;
-        }
+        while (!eof() && !is(close))
+          name += cps[pos++];
         if (eof()) error(RegexError::Code::BadGroup, "unterminated group name");
         pos++; // consume closing delimiter
         g.cap_index = assign_capture();
@@ -2912,9 +2925,9 @@ struct Parser {
           error(RegexError::Code::BadInlineFlags, "malformed inline flags");
         }
       } else {
-        error(RegexError::Code::BadGroup, "unsupported group construct '(?" +
-                                              unicode::utf8::encode(peek()) +
-                                              "'");
+        error(RegexError::Code::BadGroup,
+              "unsupported group construct '(?" +
+                  unicode::utf8::encode_codepoint(c) + "'");
       }
     } else {
       g.cap_index = assign_capture();
@@ -2951,16 +2964,14 @@ struct Parser {
     std::string name;
     if (is(U'{')) {
       pos++;
-      while (!eof() && !is(U'}')) {
-        name += unicode::utf8::encode(peek());
-        pos++;
-      }
+      while (!eof() && !is(U'}'))
+        name += unicode::utf8::encode_codepoint(cps[pos++]);
       if (!is(U'}'))
         error(RegexError::Code::BadUnicodeProperty, "unterminated \\p{...}");
       pos++; // consume '}'
     } else if (!eof()) {
-      name = unicode::utf8::encode(peek()); // a one-letter name, as in \pL
-      pos++;
+      // A one-letter name, as in \pL.
+      name = unicode::utf8::encode_codepoint(cps[pos++]);
     } else {
       error(RegexError::Code::BadUnicodeProperty, "malformed \\p");
     }
@@ -3005,33 +3016,31 @@ struct Parser {
   }
 
   // One member of a class: a code point, returned, or a set of them, added to
-  // `cls` — \d, \p{L} and the like, a [:name:], or a cluster of several code
-  // points (each one added). `endpoint`: it follows a range's '-'. A cluster
-  // there, or before one, is BadCharRange.
+  // `cls` — \d, \p{L} and the like, a [:name:], or (grapheme mode) a cluster
+  // of several code points of literal text (each one added). `endpoint`: it
+  // follows a range's '-'. A cluster there, or before one, is BadCharRange.
   std::optional<char32_t> class_member(CharClass &cls, bool endpoint = false) {
     // POSIX bracket sub-class [:name:]; only consumed when it is a valid
     // class, otherwise '[' falls through and is treated as a literal member.
     if (is(U'[') && try_posix_class(cls)) return std::nullopt;
-    char32_t cp;
     if (is(U'\\')) {
       if (escaped_set(cls)) return std::nullopt;
-      if (single_cp(cp)) return escaped_literal(cp);
-    } else if (single_cp(cp)) {
-      pos++;
-      return cp;
+      return escaped_literal();
     }
-    const std::u32string &cluster = toks[pos++]; // escaped or not
+    const size_t n = literal_len();
+    if (n == 1) return cps[pos++];
+    for (size_t i = 0; i < n; i++)
+      cls.add_range(cps[pos + i], cps[pos + i]);
+    pos += n;
     if (endpoint || range_dash())
       error(RegexError::Code::BadCharRange,
             "a class range joins code points, not clusters");
-    for (char32_t c : cluster)
-      cls.add_range(c, c);
     return std::nullopt;
   }
 
   // At a '-' that makes a range: a member follows it, not the ']'.
   bool range_dash() const {
-    return is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']');
+    return is(U'-') && pos + 1 < cps.size() && !is_at(pos + 1, U']');
   }
 
   static bool ascii_letter(char32_t c) {
@@ -3043,18 +3052,11 @@ struct Parser {
   }
 
   // Consumes a '\' and, when it escapes a set — \d, \p{L} and the like — the
-  // set too, added to `cls` (true). Otherwise the escaped token is next.
+  // set too, added to `cls` (true). Otherwise the escaped code point is next.
   bool escaped_set(CharClass &cls) {
     pos++;
     if (eof()) error(RegexError::Code::TrailingBackslash, "trailing backslash");
-    char32_t e;
-    if (!single_cp(e)) {
-      // A cluster, which is itself — unless it is a letter or digit with
-      // marks: no escape's name takes them.
-      if (ascii_alnum(peek()[0]))
-        error(RegexError::Code::BadEscape, "invalid escape");
-      return false;
-    }
+    const char32_t e = peek();
     if (try_prop_escape(e, cls)) return true;
     if (!add_class_escape(cls, e)) return false;
     pos++;
@@ -3135,15 +3137,9 @@ struct Parser {
       k++;
     }
     std::string name;
-    while (k < toks.size() && toks[k].size() == 1 && toks[k][0] >= U'a' &&
-           toks[k][0] <= U'z') {
-      name.push_back(static_cast<char>(toks[k][0]));
-      k++;
-    }
-    if (name.empty() || k + 1 >= toks.size()) return false;
-    if (!(toks[k].size() == 1 && toks[k][0] == U':' &&
-          toks[k + 1].size() == 1 && toks[k + 1][0] == U']'))
-      return false;
+    for (; k < cps.size() && cps[k] >= U'a' && cps[k] <= U'z'; k++)
+      name.push_back(static_cast<char>(cps[k]));
+    if (name.empty() || !is_at(k, U':') || !is_at(k + 1, U']')) return false;
     if (neg) {
       CharClass probe;
       if (!add_posix_class(probe, name)) return false; // unknown name: literal
@@ -3156,12 +3152,11 @@ struct Parser {
     return true;
   }
 
-  // The code point an escaped `e`, the current token, stands for; consumes it.
-  // Only ASCII letters and digits name escapes: one that names none is an
-  // error (they are kept for new syntax), any other code point is itself.
-  char32_t escaped_literal(char32_t e) {
-    pos++;
-    char32_t next;
+  // The code point that the escaped one at `pos` stands for; consumes the
+  // escape. Only ASCII letters and digits name escapes: one that names none is
+  // an error (they are kept for new syntax), any other code point is itself.
+  char32_t escaped_literal() {
+    const char32_t e = cps[pos++];
     switch (e) {
     case U'n': return U'\n';
     case U'r': return U'\r';
@@ -3171,15 +3166,14 @@ struct Parser {
     case U'a': return U'\x07';
     case U'e': return U'\x1b';
     case U'b': return U'\x08'; // in a class: outside one, a word boundary
-    case U'0': // not before a digit, a cluster on one included
-      if (!eof() && peek()[0] >= U'0' && peek()[0] <= U'9')
+    case U'0': // not before a digit
+      if (!eof() && peek() >= U'0' && peek() <= U'9')
         error(RegexError::Code::BadEscape, "octal escapes are not supported");
       return U'\0';
     case U'c': // \cA … \cZ, either case: a control character
-      if (!single_cp(next) || !ascii_letter(next))
+      if (eof() || !ascii_letter(peek()))
         error(RegexError::Code::BadEscape, "\\c takes a letter");
-      pos++;
-      return next % 32;
+      return cps[pos++] % 32;
     case U'x': return parse_hex(2);
     case U'u': return parse_hex(4);
     default:
@@ -3204,8 +3198,7 @@ struct Parser {
     char32_t v = 0;
     int n = 0;
     while (n < (braced ? 6 : digits)) {
-      char32_t c;
-      const int h = single_cp(c) ? hexval(c) : -1;
+      const int h = eof() ? -1 : hexval(peek());
       if (h < 0) break;
       v = v * 16 + static_cast<char32_t>(h);
       n++;
@@ -3222,13 +3215,11 @@ struct Parser {
     // A set (\d, \p{L} and the like) as a standalone atom.
     Node set = make_node(Node::Kind::Class);
     if (escaped_set(set.cls)) return set;
-    char32_t e;
-    if (!single_cp(e)) return parse_atom(); // an escaped cluster is the cluster
     // Word boundaries, and the absolute text anchors (unaffected by Multiline,
     // unlike ^/$): \A start of text, \z end of text, \Z end of text or just
     // before a trailing newline.
     Node::Kind anchor;
-    switch (e) {
+    switch (peek()) {
     case U'b': anchor = Node::Kind::WordBoundary; break;
     case U'B': anchor = Node::Kind::NonWordBoundary; break;
     case U'A': anchor = Node::Kind::BeginText; break;
@@ -3236,7 +3227,7 @@ struct Parser {
     case U'Z': anchor = Node::Kind::EndTextNL; break;
     default: {
       Node lit = make_node(Node::Kind::Lit);
-      lit.lit = std::u32string(1, escaped_literal(e));
+      lit.lit = std::u32string(1, escaped_literal());
       return lit;
     }
     }
@@ -5280,6 +5271,21 @@ inline void set_default_match_unit(MatchUnit u) {
 }
 inline MatchUnit default_match_unit() {
   return default_match_unit_storage().load(std::memory_order_relaxed);
+}
+
+// A pattern that matches `text` literally: its metacharacters,
+// \ ^ $ . | ? * + ( ) [ ] { } -, each escaped. Every other character is
+// itself, and syntax is read a code point at a time, so the result means the
+// same in either match unit and wherever it is spliced — in a class too:
+// Regex("(" + escape(s) + ")") has one group whatever `s` holds.
+inline std::string escape(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    if (detail::Parser::is_meta(static_cast<unsigned char>(c))) out += '\\';
+    out += c;
+  }
+  return out;
 }
 
 namespace detail {

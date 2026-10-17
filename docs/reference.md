@@ -64,12 +64,12 @@ What changes versus the default grapheme unit:
 | `\d \w \s [..] \p{…}` | classify a cluster by its base code point | match one code point |
 | match offsets | byte offsets on grapheme boundaries | byte offsets on code-point boundaries |
 | a lone/invalid UTF-8 byte | one fallback element | one code point (the byte value) |
-| the pattern itself | read by clusters: NFD `é+` repeats the `é` | read by code points: NFD `é+` repeats the mark |
+| literal text in the pattern | read by clusters: NFD `é+` repeats the `é` | read by code points: NFD `é+` repeats the mark |
 
 Everything else is identical — literals, alternation, quantifiers, groups,
 anchors, lookaround, named groups, the flags below (including `IgnoreCase`), and
 all method APIs behave the same; only the unit — of `.`/classes, of the
-pattern's own text — and the boundary of offsets differ.
+pattern's literal text — and the boundary of offsets differ.
 
 What counts as UTF-8 is exactly RFC 3629: a lead byte with its continuation
 bytes, and no overlong form, surrogate, or value past U+10FFFF. Any other byte —
@@ -94,10 +94,10 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 
 | Category | Syntax |
 | --- | --- |
-| Literal | any character; in grapheme mode a base + combining marks form one literal grapheme |
+| Literal | any character; in grapheme mode a base + combining marks form one literal grapheme. Syntax is read a code point at a time in either mode, so a mark after `(`, `]` or `+` is literal text after it, and an escape is one code point |
 | Any | `.` (excludes line breaks unless DotAll — see below) |
 | Anchors | `^`, `$` (line-relative under Multiline) |
-| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself. In grapheme mode a cluster of several code points in a class adds each of them, and is no range's endpoint (`[a-é]` with NFD `é` is an error) |
+| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself. In grapheme mode a cluster of several code points of literal text in a class adds each of them, and is no range's endpoint (`[a-é]` with NFD `é` is an error) |
 | Predefined class | `\d \w \s` and `\D \W \S` (Unicode-property aware) |
 | POSIX class | `[[:alpha:]]`, `[[:digit:]]`, … inside a bracket (see below) |
 | Unicode property | `\p{Name}`, `\P{Name}`, single-letter `\pL` |
@@ -383,6 +383,18 @@ for (const auto &doc : docs)
 An unrecognized escape, or a group ref past the last group, leaves the `$`
 literal. (This is the same grammar the std::regex-compat `regex_replace`
 expands, except that facade does not interpret `$<name>` — see below.)
+
+### Escaping literal text
+
+`reg::escape(text)` returns a pattern that matches `text` literally: it
+backslashes the metacharacters `\ ^ $ . | ? * + ( ) [ ] { } -` and leaves every
+other character as it is. Because syntax is read a code point at a time and an
+escaped non-alphanumeric is always itself, the result means the same in either
+match unit and wherever it is spliced — `"(" + reg::escape(s) + ")"` is one
+group, and `"[" + reg::escape(s) + "]"` one set of `s`'s characters, whatever
+`s` holds.
+
+### Errors
 
 A pattern that cannot be parsed (or that exceeds a resource limit) throws
 `reg::RegexError`, whose `what()` message carries the offending position and
