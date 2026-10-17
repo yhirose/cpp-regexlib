@@ -433,11 +433,13 @@ std::string error_of(const std::string &pat) {
   return "";
 }
 
-// Returns the RegexError code for an invalid pattern (none if it compiled).
-std::optional<RegexError::Code> code_of(const std::string &pat) {
+// Returns the RegexError code for an invalid pattern (none if it compiled),
+// built in `unit`.
+std::optional<RegexError::Code>
+code_of(const std::string &pat,
+        reg::MatchUnit unit = reg::default_match_unit()) {
   try {
-    Regex r(pat);
-    (void)r;
+    make_unit(unit, pat, 0);
   } catch (const RegexError &e) { return e.code(); }
   return std::nullopt;
 }
@@ -5050,19 +5052,14 @@ void test_invalid_patterns() {
   // CodePoint mode reads the pattern by code points, as code-point engines
   // do: NFD `é` is `e` and a mark, each its own atom.
   const std::string nfd = "e\xCC\x81";
-  const auto cp_code_of = [](const std::string &pat) -> std::optional<C> {
-    try {
-      make_us(pat);
-    } catch (const RegexError &e) { return e.code(); }
-    return std::nullopt;
-  };
+  const auto cp = reg::MatchUnit::CodePoint;
   CHECK(make_us("^[a-" + nfd + "]+$").test("b\xCC\x81"));     // a-e, and ◌́
-  CHECK(cp_code_of("[" + nfd + "-a]") == C::BadCharRange);    // ◌́ > a
+  CHECK(code_of("[" + nfd + "-a]", cp) == C::BadCharRange);    // ◌́ > a
   CHECK(make_us("^" + nfd + "+$").test(nfd + "\xCC\x81"));   // e, ◌́+
   CHECK(!make_us("^" + nfd + "+$").test(nfd + nfd));
   CHECK(make_egc("^" + nfd + "+$").test(nfd + nfd));         // (e◌́)+
   CHECK(make_us("^\\e\xCC\x81$").test("\x1b\xCC\x81"));     // \e, then ◌́
-  CHECK(!cp_code_of("[a-" + nfd + "]"));
+  CHECK(!code_of("[a-" + nfd + "]", cp));
 }
 
 void test_resource_limits() {
@@ -5130,12 +5127,7 @@ void test_resource_limits() {
 void test_lookaround_programs() {
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
     const auto rejected = [unit](const std::string &pat) {
-      try {
-        make_unit(unit, pat, 0);
-      } catch (const RegexError &e) {
-        return e.code() == RegexError::Code::ProgramTooLarge;
-      }
-      return false;
+      return code_of(pat, unit) == RegexError::Code::ProgramTooLarge;
     };
     // One program per lookaround, whatever the repeats around it.
     CHECK(PlanProbe::look_programs(make_unit(unit, "(?:(?=a)b){50}", 0)) == 1);

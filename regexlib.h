@@ -2579,14 +2579,7 @@ struct Parser {
   Parser(std::string_view pattern, bool code_points, NameMap &named_,
          bool &icase_, bool &multiline_, bool &dotall_)
       : named(named_), icase(icase_), multiline(multiline_), dotall(dotall_) {
-    for (std::u32string &g : segment(pattern).graphemes) {
-      if (!code_points) {
-        toks.push_back(std::move(g));
-        continue;
-      }
-      for (char32_t c : g)
-        toks.emplace_back(1, c);
-    }
+    toks = (code_points ? segment_cp(pattern) : segment(pattern)).graphemes;
   }
 
   bool eof() const { return pos >= toks.size(); }
