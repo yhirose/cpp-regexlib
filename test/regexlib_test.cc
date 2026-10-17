@@ -3842,11 +3842,7 @@ void test_dfa_cache() {
                             "\xE5\xAD\x97", "x", " ", "\n", "\xC2\x85",
                             "\xE2\x80\xA8", "."};
     std::string s;
-    unsigned x = 5;
-    for (int i = 0; i < 3000; i++) {
-      x = x * 1664525u + 1013904223u;
-      s += pieces[(x >> 16) % std::size(pieces)];
-    }
+    for (char c : noise(3000, "0123456789", 5)) s += pieces[c - '0'];
     s += pieces[2]; // a word at the end, for `\w+$`
     for (const char *pat : {"\\b\\w+\\b", "\\w+$", "(?m)^\\w+$", "\\B\\w\\b"})
       for (bool us : {false, true}) {
@@ -4040,12 +4036,11 @@ void test_linear_time() {
   std::printf("  [info] ReDoS bomb n=50000 completed in %.1f ms\n", dt);
 }
 
-// An assertion costs a scan over text that is not ASCII what it costs over
-// ASCII: a step over a code point is transitions of the DFA's table, as any
-// (LazyDfa::look_next), where it used to close the state's pcs afresh at
-// every code point — `\w+$` took 60 ms over 100 KB of Latin text that `\w+`
-// takes under one, and seconds over CJK. Timed against `\w+` over the same
-// text, which has no look: the bound is loose, the agreement exact.
+// An assertion costs a scan over text that is not ASCII about what it costs
+// over ASCII: a step over a code point is transitions of the DFA's table
+// (LazyDfa::look_next; docs/design.md, "Look", for what it used to cost).
+// Timed against `\w+` over the same text, which has no look: the bound is
+// loose, the agreement exact.
 void test_look_non_ascii() {
   std::string latin, cjk;
   for (int i = 0; i < 2000; i++)

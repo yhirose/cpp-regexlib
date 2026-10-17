@@ -352,11 +352,11 @@ they were.
   text with any outside ASCII a hundred times the cost of the same scan
   without one — `\w+$` took 60 ms over 100 KB of Latin text that `\w+`
   takes under one, and seconds over CJK, where every code point is one.
-  Now the one is at most about three times the other
-  (`test_look_non_ascii`). (A cache keyed by the code point would have
-  been a hash map beside the table, and of little help to text whose code
-  points rarely repeat; the path is the same table, and its links are shared by
-  every code point of a kind.)
+  Now the one measures at most about three times the other, and
+  `test_look_non_ascii` holds it under ten. (A cache keyed by the code
+  point would have been a hash map beside the table, and of little help to
+  text whose code points rarely repeat; the path is the same table, and its
+  links are shared by every code point of a kind.)
 - **Direction is which side the context is on.** A reverse program's DFA
   carries what stands to the *right*, and its input is the code point to
   the left; the boundary's flags are the same function of the two sides
@@ -1071,9 +1071,10 @@ A byte DFA cannot fold per byte, so icase is baked into the byte program at
 compile time. `case_fold_groups` scans `0..0x10FFFF` once (cached), grouping code
 points by `simple_case_folding` into orbits of size ≥ 2 (`{a,A}`, `{k,K,U+212A}`);
 `case_extras` lists, for every orbit intersecting a literal/class, the members
-it lacks, and they are added (`case_closed`) — so `prog_` accepts every case variant directly, matching the same
-fold-equivalence the Pike applies at match time on `cp_prog_`. (`ß`→`ss` full
-folding is out of scope, as in the grapheme engine.)
+it lacks, and they are added (`case_closed`) — so `prog_` accepts every case
+variant directly, matching the same fold-equivalence the Pike applies at match
+time on `cp_prog_`. (`ß`→`ss` full folding is out of scope, as in the grapheme
+engine.)
 
 DFA-based engines (byte DFA, one-pass) apply to US (any subject) and ASCII
 grapheme mode, but not to non-ASCII *grapheme* matching, where breaking is
