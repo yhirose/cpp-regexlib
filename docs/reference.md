@@ -150,7 +150,7 @@ within their group: `Regex("a(?-i)b", reg::IgnoreCase)` matches `"Ab"`, not
 is in, `(?i:…)` covers its own group, and a `-` turns the flags after it off —
 so a pattern spliced into another as `(?:…)` keeps its flags to itself. Under
 `IgnoreCase` a class holds a character when any case variant of it is a member,
-`\p{…}` included: `(?i)\p{Lu}` matches `a`.
+`\p{…}` and `\w` included: `(?i)\p{Lu}` matches `a`.
 
 ### Pinning the match unit per-Regex
 
@@ -542,7 +542,9 @@ pattern that exceeds any of these raises `RegexError` at construction:
 These bound compile cost (e.g. `a{1000000}`, nested `(x{50}){50}…`) and parser
 recursion (e.g. `((((…))))`). A lookaround is one program however many times a
 counted repeat copies it — `(?:(?=x)a){1000}` holds one — and each distinct
-lookaround counts toward the size of the program that runs it. The nesting limit is kept conservative so the
+lookaround counts toward the size of the program that runs it. So do the case
+variants a literal under an `(?i)` that does not span the pattern is written
+as (a grapheme cluster has one per combination of its code points' cases). The nesting limit is kept conservative so the
 recursive-descent parser stays within the smallest common thread stack
 (Windows' 1 MiB main-thread stack); hand-written patterns nest far below it.
 

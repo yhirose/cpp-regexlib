@@ -1658,9 +1658,6 @@ namespace limits {
 constexpr size_t kMaxPatternBytes = 1u << 15; // 32 KiB
 constexpr int kMaxProgramInsts = 1 << 18;     // 262144 compiled instructions
 constexpr int kMaxRepeatCount = 1000000;      // n and m of `{n,m}`
-// A literal under a (?i) that does not span the pattern is lowered to its case
-// variants (resolve_flags): at most this many for one cluster.
-constexpr size_t kMaxCaseVariants = 4096;
 // Group / lookaround nesting. The recursive-descent parser uses ~one native
 // call chain per nesting level, so this bound must keep the deepest pattern
 // inside the SMALLEST common stack — Windows' default 1 MiB main-thread stack
@@ -2032,8 +2029,7 @@ struct CharClass {
   // between the folds of a range's ends": fold is not monotonic.)
   bool matches_cp(char32_t cp, bool icase) const {
     bool in = has_member(cp);
-    // (The predicates are case-closed: only ranges and properties can gain.)
-    if (!in && icase && (!ranges.empty() || !uprops.empty()))
+    if (!in && icase)
       if (const std::vector<char32_t> *orbit = detail::case_fold_orbit(cp))
         for (char32_t m : *orbit)
           if (m != cp && has_member(m)) {
@@ -2645,19 +2641,38 @@ struct Parser {
   // a flag on, and after a '-' off. Returns the index past them — `p` when
   // there are none; a '-' with no letter after it is not read.
   size_t scan_flags(size_t p, InlineFlags &f) const {
-    for (bool on = true; p < cps.size(); p++) {
-      switch (cps[p]) {
-      case U'i': f.icase = on; break;
-      case U'm': f.multiline = on; break;
-      case U's': f.dotall = on; break;
-      case U'-':
-        if (!on || p + 1 >= cps.size() || !flag_letter(cps[p + 1])) return p;
-        on = false;
-        break;
-      default: return p;
-      }
+    bool on = true;
+    for (; p < cps.size(); p++) {
+      const char32_t c = cps[p];
+      if (c == U'-' && on) on = false;
+      else if (c == U'i') f.icase = on;
+      else if (c == U'm') f.multiline = on;
+      else if (c == U's') f.dotall = on;
+      else break;
     }
+    if (!on && cps[p - 1] == U'-') p--;
     return p;
+  }
+
+  // At a `(?flags)`, set them — to the end of the enclosing group — and take
+  // it: no node is left for it.
+  bool take_flags() {
+    if (!is(U'(') || !is_at(pos + 1, U'?')) return false;
+    InlineFlags f = flags;
+    const size_t p = scan_flags(pos + 2, f);
+    if (p == pos + 2 || !is_at(p, U')')) return false;
+    flags = f;
+    pos = p + 1;
+    return true;
+  }
+
+  // A group's body, read with `inner` flags; the flags in force after it are
+  // those before it.
+  Node parse_scoped(InlineFlags inner) {
+    const InlineFlags outer = std::exchange(flags, inner);
+    Node body = parse_alt();
+    flags = outer;
+    return body;
   }
 
   // A node of kind `k`, carrying the flags in force, with a default payload —
@@ -2701,27 +2716,11 @@ struct Parser {
   }
 
   Node parse() {
-    consume_leading_flags();
     Node n = parse_alt();
     if (!eof())
       error(RegexError::Code::UnbalancedParen,
             "unexpected '" + unicode::utf8::encode(peek()) + "'");
     return n;
-  }
-
-  // Recognise a leading run of inline flag groups like `(?i)` / `(?im)`.
-  // Consumed here rather than routed through parse_group so the AST keeps no
-  // Empty node for them: most of the downstream literal/anchor analyzers have
-  // no K::Empty case and would conservatively bail out of their fast paths.
-  void consume_leading_flags() {
-    while (is(U'(') && is_at(pos + 1, U'?')) {
-      // Past no flag letters, or not at a ')', parse_group reads the group.
-      InlineFlags f = flags;
-      const size_t p = scan_flags(pos + 2, f);
-      if (p == pos + 2 || !is_at(p, U')')) break;
-      flags = f;
-      pos = p + 1;
-    }
   }
 
   Node parse_alt() {
@@ -2740,9 +2739,8 @@ struct Parser {
   Node parse_concat() {
     Node cat;
     cat.kind = Node::Kind::Concat;
-    while (!eof() && !is(U'|') && !is(U')')) {
-      cat.kids.push_back(parse_repeat());
-    }
+    while (!eof() && !is(U'|') && !is(U')'))
+      if (!take_flags()) cat.kids.push_back(parse_repeat());
     if (!code_points) fuse_literal_graphemes(cat.kids);
     if (cat.kids.size() == 1) return std::move(cat.kids[0]);
     return cat;
@@ -2754,7 +2752,8 @@ struct Parser {
   // cluster at a metacharacter and at an escape, which is one code point; this
   // sets how the run is matched. So an escaped `\r\n` is the one CR-LF cluster
   // (UAX #29 GB3) the subject presents, and a Prepend before a literal `{` is
-  // one cluster with it, exactly the nodes the subject's text would give.
+  // one cluster with it, exactly the nodes the subject's text would give. A
+  // run is the literals under one icase: a change of it ends one.
   static void fuse_literal_graphemes(std::vector<Node> &kids) {
     std::vector<Node> out;
     out.reserve(kids.size());
@@ -2767,13 +2766,15 @@ struct Parser {
       }
       std::u32string run;
       size_t j = i;
-      for (; j < kids.size() && kids[j].kind == Node::Kind::Lit; j++)
+      for (; j < kids.size() && kids[j].kind == Node::Kind::Lit &&
+             kids[j].flags.icase == kids[i].flags.icase;
+           j++)
         run += kids[j].lit;
       for (size_t k = 0; k < run.size();) {
         const size_t len =
             unicode::grapheme_length(run.data() + k, run.size() - k);
-        Node lit = node_sans_kids(kids[i]); // a run shares its flags: a
-        lit.lit = run.substr(k, len);       // change of them is a group
+        Node lit = node_sans_kids(kids[i]); // the run's flags
+        lit.lit = run.substr(k, len);
         out.push_back(std::move(lit));
         k += len;
       }
@@ -2868,8 +2869,12 @@ struct Parser {
     case U'(': return parse_group();
     case U'[': return parse_class();
     case U'.': pos++; return make_node(Node::Kind::AnyChar);
-    case U'^': pos++; return make_node(Node::Kind::BOL);
-    case U'$': pos++; return make_node(Node::Kind::EOL);
+    case U'^': // a line anchor under (?m); else the text's
+      pos++;
+      return make_node(flags.multiline ? Node::Kind::BOL : Node::Kind::BeginText);
+    case U'$':
+      pos++;
+      return make_node(flags.multiline ? Node::Kind::EOL : Node::Kind::EndText);
     case U'\\': return parse_escape();
     case U'*':
     case U'+':
@@ -2903,7 +2908,7 @@ struct Parser {
     pos++; // consume '('
     Node g = make_node(Node::Kind::Group);
     g.cap_index = -1;
-    const InlineFlags outer = flags; // what a flag set in the group ends at
+    InlineFlags inner = flags;
     if (is(U'?')) {
       pos++;
       if (eof()) error(RegexError::Code::BadGroup, "malformed group");
@@ -2932,13 +2937,9 @@ struct Parser {
         g.cap_index = assign_capture();
         if (g.cap_index >= 0) named[unicode::utf8::encode(name)] = g.cap_index;
       } else if (flag_letter(c) || c == U'-') {
-        // (?flags) sets them to the end of the enclosing group; (?flags:…)
-        // within this one.
-        pos = scan_flags(pos, flags);
-        if (is(U')')) {
-          pos++;
-          return make_node(Node::Kind::Empty);
-        }
+        // (?flags:…), the flags within this group (take_flags took a
+        // well-formed (?flags)).
+        pos = scan_flags(pos, inner);
         if (!is(U':'))
           error(RegexError::Code::BadInlineFlags, "malformed inline flags");
         pos++;
@@ -2950,8 +2951,7 @@ struct Parser {
     } else {
       g.cap_index = assign_capture();
     }
-    g.kids.push_back(parse_alt());
-    flags = outer;
+    g.kids.push_back(parse_scoped(inner));
     if (!is(U')')) error(RegexError::Code::UnbalancedParen, "missing ')'");
     pos++; // consume ')'
     return g;
@@ -2963,12 +2963,9 @@ struct Parser {
   int assign_capture() { return in_look ? -1 : ++ncap; }
 
   Node parse_lookaround(bool behind, bool negate) {
-    const bool save = in_look;
-    const InlineFlags outer = flags;
-    in_look = true;
-    Node body = parse_alt();
+    const bool save = std::exchange(in_look, true);
+    Node body = parse_scoped(flags);
     in_look = save;
-    flags = outer;
     if (!is(U')'))
       error(RegexError::Code::UnbalancedParen, "missing ')' in lookaround");
     pos++; // consume ')'
@@ -3836,6 +3833,8 @@ inline const std::vector<std::vector<char32_t>> &case_fold_groups() {
 }
 
 inline const std::vector<char32_t> *case_fold_orbit(char32_t cp) {
+  if (cp < 0x80 && ((cp | 0x20) < U'a' || (cp | 0x20) > U'z'))
+    return nullptr; // an ASCII non-letter folds alone
   static const std::unordered_map<char32_t, const std::vector<char32_t> *>
       by_fold = [] {
         std::unordered_map<char32_t, const std::vector<char32_t> *> m;
@@ -4025,12 +4024,12 @@ struct Compiler {
     push(std::move(i));
   }
 
-  // Expand code-point ranges with case-fold orbits (UnicodeScalar icase): for
-  // each fold group that intersects `rs`, add all its members, so the byte
-  // automaton accepts every case variant. Returns the union (un-normalized; the
-  // caller normalizes). Cheap: ~1.5K groups, membership tested against `rs`.
-  static CpRanges case_expand(CpRanges rs) {
-    CpRanges norm = normalize_ranges(rs);
+  // The case variants `rs` lacks: every member of a case-fold group that
+  // touches `rs` and is not in it — what icase adds to a set (matches_cp's
+  // rule). Single-code-point ranges, un-normalized. Cheap: ~1.5K groups, each
+  // tested against `rs`.
+  static CpRanges case_extras(const CpRanges &rs) {
+    const CpRanges norm = normalize_ranges(rs);
     auto contains = [&](char32_t cp) {
       int lo = 0, hi = static_cast<int>(norm.size()) - 1;
       while (lo <= hi) {
@@ -4044,18 +4043,21 @@ struct Compiler {
       }
       return false;
     };
-    for (const auto &grp : detail::case_fold_groups()) {
-      bool hit = false;
-      for (char32_t m : grp)
-        if (contains(m)) {
-          hit = true;
-          break;
-        }
-      if (hit)
+    CpRanges extras;
+    for (const auto &grp : detail::case_fold_groups())
+      if (std::any_of(grp.begin(), grp.end(), contains))
         for (char32_t m : grp)
-          rs.push_back({m, m});
-    }
-    return rs;
+          if (!contains(m)) extras.push_back({m, m});
+    return extras;
+  }
+
+  // `cc` under icase, as a class without it: the same class with the case
+  // variants its members lack joined to it.
+  static CharClass case_closed(const CharClass &cc) {
+    CharClass r = cc;
+    for (const auto &[lo, hi] : normalize_ranges(case_extras(member_ranges(cc))))
+      r.add_range(lo, hi);
+    return r;
   }
 
   // UnicodeScalar mode: emit a literal's code points as a chain of exact-byte
@@ -4156,9 +4158,12 @@ struct Compiler {
   // whole set complemented for a negated class.
   CpRanges class_cp_ranges(const CharClass &cc) {
     CpRanges pos = member_ranges(cc);
-    // icase: expand the positive set with case-fold orbits before negating, so
-    // e.g. [a-z]/i also matches A-Z and [^a]/i excludes both a and A.
-    if (icase_) pos = case_expand(std::move(pos));
+    // icase: join the positive set's case variants before negating, so e.g.
+    // [a-z]/i also matches A-Z and [^a]/i excludes both a and A.
+    if (icase_) {
+      const CpRanges extras = case_extras(pos);
+      pos.insert(pos.end(), extras.begin(), extras.end());
+    }
     auto rs = normalize_ranges(std::move(pos));
     if (cc.negate) rs = complement_ranges(rs);
     return rs;
@@ -4186,22 +4191,6 @@ struct Compiler {
         add(base);
     }
     return pos;
-  }
-
-  // `cc` under icase, as a class without it: the same class with its members'
-  // case-fold orbits joined to it — matches_cp's icase rule, written out. The
-  // predicates (\d \w \s) are case-closed and stay as they are; the ranges and
-  // properties become their closure's ranges.
-  static CharClass case_closed(const CharClass &cc) {
-    CharClass rest = cc, r;
-    rest.negate = false;
-    rest.preds.clear();
-    r.negate = cc.negate;
-    r.preds = cc.preds;
-    for (const auto &[lo, hi] :
-         normalize_ranges(case_expand(member_ranges(rest))))
-      r.add_range(lo, hi);
-    return r;
   }
 
   // Append a cached class block onto the program and rebase its self-relative
@@ -4441,30 +4430,24 @@ struct Compiler {
 };
 
 //------------------------------------------------------------------------------
-// Inline flags, settled: the parser stamps each node with the flags in force
+// Inline flags, settled. The parser stamps each node with the flags in force
 // where it stands — (?i) to the end of its group, (?i:…) within its own — and
-// the plan, its compiler and every engine read one value per flag. A flag
-// that has one value on every node it bears on (icase on a literal or class
-// it can change, dotall on `.`, multiline on `^` and `$`) is that value, the
-// nodes as they are: a pattern whose flags are uniform plans as it always
-// has. A flag whose nodes disagree is lowered — the nodes the plan's value
-// does not fit become flag-free equivalents:
-//   multiline  on;  a `^` / `$` without it is \A / \z,
-//   dotall     off; a `.` with it is the class of everything,
-//   icase      off; a class with it is case_closed, and a literal with it
-//                   the alternation of its case variants.
+// reads (?m) itself, writing a `^` / `$` without it as \A / \z. The compiler
+// and every engine read one value per flag: a flag with one value on every
+// node it bears on (icase on a literal or class it can change, dotall on `.`)
+// is that value, the nodes as they are; a mixed one is off, and the nodes
+// that have it are lowered to flag-free equivalents — a (?s) `.` to the class
+// of everything, an icase class to its case closure, an icase literal to its
+// case variants.
 //------------------------------------------------------------------------------
 
-// Can icase change what `n` matches? (The predicates are case-closed.)
+// Can icase change what the literal or class `n` matches?
 inline bool case_matters(const Node &n) {
-  switch (n.kind) {
-  case Node::Kind::Lit:
-    for (char32_t c : n.lit)
-      if (case_fold_orbit(c)) return true;
-    return false;
-  case Node::Kind::Class: return !n.cls.ranges.empty() || !n.cls.uprops.empty();
-  default: return false;
-  }
+  if (n.kind == Node::Kind::Class)
+    return !Compiler::case_extras(Compiler::member_ranges(n.cls)).empty();
+  for (char32_t c : n.lit)
+    if (case_fold_orbit(c)) return true;
+  return false;
 }
 
 // The values one flag takes on the nodes it bears on.
@@ -4474,87 +4457,94 @@ struct FlagUse {
   bool mixed() const { return on && off; }
 };
 
-inline void see_flags(const Node &n, FlagUse &icase, FlagUse &multiline,
-                      FlagUse &dotall) {
-  using K = Node::Kind;
-  switch (n.kind) {
-  case K::Lit:
-  case K::Class:
-    if (case_matters(n)) icase.see(n.flags.icase);
-    break;
-  case K::AnyChar: dotall.see(n.flags.dotall); break;
-  case K::BOL:
-  case K::EOL: multiline.see(n.flags.multiline); break;
-  default: break;
-  }
-  for (const Node &k : n.kids)
-    see_flags(k, icase, multiline, dotall);
+// Call `f` on `n` and every node under it, a node `f` rewrites included.
+template <class F> void for_each_node(Node &n, F &&f) {
+  f(n);
+  for (Node &kid : n.kids)
+    for_each_node(kid, f);
 }
 
-// An icase literal as literals without it: every string whose code points
-// fold as its do (lit_match's icase rule), alternated.
-inline Node case_variants(const Node &lit) {
+// The strings whose code points fold as `lit`'s do (lit_match's icase rule),
+// each charged its length to `budget`.
+inline std::vector<std::u32string> case_variant_strings(const std::u32string &lit,
+                                                        size_t &budget) {
   std::vector<std::u32string> vs{U""};
-  for (char32_t c : lit.lit) {
+  for (char32_t c : lit) {
     const std::vector<char32_t> *orbit = case_fold_orbit(c);
-    std::vector<std::u32string> next;
-    for (const std::u32string &v : vs)
-      for (char32_t m : orbit ? *orbit : std::vector<char32_t>{c})
-        next.push_back(v + m);
-    if (next.size() > limits::kMaxCaseVariants)
+    if (!orbit) {
+      for (std::u32string &v : vs)
+        v += c;
+      continue;
+    }
+    if (vs.size() * orbit->size() * lit.size() > budget)
       throw RegexError(RegexError::Code::ProgramTooLarge,
                        "too many case variants of a literal under (?i)");
+    std::vector<std::u32string> next;
+    next.reserve(vs.size() * orbit->size());
+    for (const std::u32string &v : vs)
+      for (char32_t m : *orbit)
+        next.push_back(v + m);
     vs.swap(next);
   }
-  Node alt = node_sans_kids(lit);
-  alt.kind = Node::Kind::Alt;
-  alt.lit.clear();
-  for (std::u32string &v : vs) {
-    Node one = node_sans_kids(lit);
-    one.lit = std::move(v);
-    alt.kids.push_back(std::move(one));
-  }
-  return alt;
+  budget -= vs.size() * lit.size();
+  return vs;
 }
 
-inline void lower_flags(Node &n, bool icase, bool multiline, bool dotall) {
-  using K = Node::Kind;
-  switch (n.kind) {
-  case K::BOL:
-    if (multiline && !n.flags.multiline) n.kind = K::BeginText;
-    return;
-  case K::EOL:
-    if (multiline && !n.flags.multiline) n.kind = K::EndText;
-    return;
-  case K::AnyChar:
-    if (dotall && n.flags.dotall) {
-      n.kind = K::Class;
-      n.cls = CharClass();
-      n.cls.negate = true;
-    }
-    return;
-  case K::Class:
-    if (icase && n.flags.icase) n.cls = Compiler::case_closed(n.cls);
-    return;
-  case K::Lit:
-    if (icase && n.flags.icase && case_matters(n)) n = case_variants(n);
-    return;
-  default:
-    for (Node &k : n.kids)
-      lower_flags(k, icase, multiline, dotall);
+// `lit`, an icase literal, without icase: in CodePoint mode the class of its
+// code point's case variants; in grapheme mode, where a class matches a
+// cluster by its base, the alternation of its case variants.
+inline Node case_variants(const Node &lit, bool code_points, size_t &budget) {
+  Node r;
+  if (code_points) {
+    r.kind = Node::Kind::Class;
+    r.cls.add_range(lit.lit[0], lit.lit[0]);
+    r.cls = Compiler::case_closed(r.cls);
+    return r;
   }
+  r.kind = Node::Kind::Alt;
+  for (std::u32string &v : case_variant_strings(lit.lit, budget)) {
+    Node one;
+    one.kind = Node::Kind::Lit;
+    one.lit = std::move(v);
+    r.kids.push_back(std::move(one));
+  }
+  return r;
 }
 
 // The plan's value of each flag for `root`, lowering the nodes of a mixed one.
-inline void resolve_flags(Node &root, bool &icase, bool &multiline,
-                          bool &dotall) {
-  FlagUse i, m, s;
-  see_flags(root, i, m, s);
+inline void resolve_flags(Node &root, bool code_points, bool &icase,
+                          bool &multiline, bool &dotall) {
+  using K = Node::Kind;
+  const auto cased = [](const Node &n) {
+    return n.kind == K::Lit || n.kind == K::Class;
+  };
+  FlagUse i, s;
+  bool any_icase = false;
+  multiline = false;
+  for_each_node(root, [&](Node &n) {
+    any_icase |= cased(n) && n.flags.icase;
+    if (n.kind == K::AnyChar) s.see(n.flags.dotall);
+    multiline |= n.kind == K::BOL || n.kind == K::EOL; // (?m)'s, the parser's
+  });
+  if (any_icase) // case_matters is the costly test: only an icase pattern asks
+    for_each_node(root, [&](Node &n) {
+      if (cased(n) && case_matters(n)) i.see(n.flags.icase);
+    });
   icase = i.on && !i.off;
-  multiline = m.on;
   dotall = s.on && !s.off;
-  if (i.mixed() || m.mixed() || s.mixed())
-    lower_flags(root, i.mixed(), m.mixed(), s.mixed());
+  size_t budget = limits::kMaxProgramInsts; // a code point is an instruction
+  if (i.mixed() || s.mixed())
+    for_each_node(root, [&](Node &n) {
+      if (s.mixed() && n.kind == K::AnyChar && n.flags.dotall) {
+        n.kind = K::Class; // the class of everything
+        n.cls.negate = true;
+      } else if (i.mixed() && n.kind == K::Class && n.flags.icase) {
+        n.cls = Compiler::case_closed(n.cls);
+      } else if (i.mixed() && n.kind == K::Lit && n.flags.icase &&
+                 case_matters(n)) {
+        n = case_variants(n, code_points, budget);
+      }
+    });
 }
 
 //------------------------------------------------------------------------------
@@ -6819,7 +6809,7 @@ private:
       // (parse() first, as its own statement: parser.ncap is only known
       // after it, and argument evaluation order is unspecified.)
       detail::Node parsed = parser.parse();
-      detail::resolve_flags(parsed, icase_, multiline_, dotall_);
+      detail::resolve_flags(parsed, us_, icase_, multiline_, dotall_);
       detail::Node root = detail::peel_root_groups(std::move(parsed),
                                                    parser.ncap, alias_groups_);
       ncap_ = alias_groups_ ? 0 : parser.ncap;
@@ -9131,20 +9121,15 @@ private:
       if (cased == 0) return;
       detail::Node alt;
       alt.kind = K::Alt;
-      for (unsigned mask = 0; mask < (1u << cased); mask++) {
+      size_t budget = limits::kMaxProgramInsts;
+      for (const std::u32string &v : detail::case_variant_strings(
+               std::u32string(lit.begin(), lit.end()), budget)) {
         detail::Node br;
         br.kind = K::Concat;
-        int bit = 0;
-        for (char c : lit) {
+        for (char32_t c : v) {
           detail::Node ln;
           ln.kind = K::Lit;
-          char ch = c;
-          if (is_alpha(static_cast<unsigned char>(c))) {
-            bool upper = (mask >> bit++) & 1u;
-            ch = upper ? static_cast<char>(c & ~0x20)
-                       : static_cast<char>(c | 0x20);
-          }
-          ln.lit.assign(1, static_cast<char32_t>(static_cast<unsigned char>(ch)));
+          ln.lit.assign(1, c);
           br.kids.push_back(std::move(ln));
         }
         alt.kids.push_back(std::move(br));
