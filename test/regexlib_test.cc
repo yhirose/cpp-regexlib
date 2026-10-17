@@ -5012,11 +5012,9 @@ void test_invalid_patterns() {
       {"[\\A]", C::BadEscape},
       {"[\\z]", C::BadEscape},
       {"[\\q]", C::BadEscape},
-      {"\\e\xCC\x81", C::BadEscape}, // a letter with a mark names nothing
       // A class range joins code points: a cluster of several is no endpoint.
       {"[a-e\xCC\x81]", C::BadCharRange},
       {"[e\xCC\x81-z]", C::BadCharRange},
-      {"[a-\\\xC3\xA4\xCC\x81]", C::BadCharRange},
   };
   for (const auto &[pat, code] : errors)
     CHECK(code_of(pat) == code);
@@ -5043,12 +5041,13 @@ void test_invalid_patterns() {
   CHECK(Regex("^a{3,3}$").test("aaa"));
   CHECK(Regex("(?:){1000000}").test(""));
   CHECK(Regex("^x{99999999999$").test("x{99999999999")); // not a repeat
-  // An escaped cluster is the cluster: `\ä́` is `ä́`, in a class each of its
-  // code points, as when written bare.
+  // An escape is one code point; the text after it is literal text again,
+  // and the literal run they make is one cluster, as the subject has it.
   const std::string cluster = "\xC3\xA4\xCC\x81"; // ä + combining acute
   CHECK(Regex("^\\" + cluster + "$").test(cluster));
   CHECK(!Regex("\\" + cluster).test("\xC3\xA4"));
   CHECK(Regex("^[\\" + cluster + "]$").test("\xCC\x81"));
+  CHECK(Regex("^[a-\\" + cluster + "]+$").test("b\xCC\x81")); // a-ä, ◌́
 
   // CodePoint mode reads the pattern by code points, as code-point engines
   // do: NFD `é` is `e` and a mark, each its own atom.
@@ -5060,7 +5059,56 @@ void test_invalid_patterns() {
   CHECK(!make_us("^" + nfd + "+$").test(nfd + nfd));
   CHECK(make_egc("^" + nfd + "+$").test(nfd + nfd));         // (e◌́)+
   CHECK(make_us("^\\e\xCC\x81$").test("\x1b\xCC\x81"));     // \e, then ◌́
+  CHECK(make_egc("^\\e\xCC\x81$").test("\x1b\xCC\x81"));    // so in either
   CHECK(!code_of("[a-" + nfd + "]", cp));
+}
+
+// Syntax is read a code point at a time in either unit: a combining mark
+// after a metacharacter is literal text after it, never part of it, and in
+// grapheme mode literal text alone forms clusters. So a pattern's syntax
+// does not depend on what is spliced next to it.
+void test_syntax_by_code_point() {
+  const std::string mark = "\xCC\x81", prepend = "\xD8\x80"; // ◌́, U+0600
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const auto re = [unit](const std::string &p) {
+      return make_unit(unit, p, 0);
+    };
+    CHECK(re("(" + mark + ")").test(mark));          // a group, of a mark
+    CHECK(re("^(a)" + mark + "?$").test("a"));       // a group, then ◌́?
+    CHECK(re("^[ae]" + mark + "?$").test("e" + mark)); // a class, then ◌́?
+    CHECK(re("^a+" + mark + "?$").test("aaa"));      // `+` repeats `a`
+    CHECK(re("^(?:a|" + mark + "b)$").test("a"));    // `|` alternates
+    CHECK(re(prepend + "(a)").group_count() == 1);   // Prepend takes no `(`
+    CHECK(code_of("[" + prepend + "-z]", unit) ==    // … nor a range's `-`
+          RegexError::Code::BadCharRange);
+  }
+  // Literal text is still read as the subject is: a cluster in grapheme mode.
+  const std::string nfd = "e" + mark;
+  CHECK(make_egc("^" + nfd + "+$").test(nfd + nfd));
+  CHECK(make_egc("^x" + nfd + "{2}$").test("x" + nfd + nfd));
+}
+
+// reg::escape() quotes the metacharacters, so the result matches its text
+// literally wherever it is spliced: alone, in a group, in a class.
+void test_escape() {
+  CHECK(reg::escape("a.b(c)") == "a\\.b\\(c\\)");
+  CHECK(reg::escape("\\^$.|?*+()[]{}-") ==
+        "\\\\\\^\\$\\.\\|\\?\\*\\+\\(\\)\\[\\]\\{\\}\\-");
+  CHECK(reg::escape("q#&~ \xC3\xA9") == "q#&~ \xC3\xA9");
+  const std::string mark = "\xCC\x81";
+  const std::string texts[] = {"", "a-z", "]", "^", "\\d", "(?i)", "{2}",
+                               mark + "x", "\xD8\x80" "(", "e" + mark + "+",
+                               "a" + mark + "|" + mark, "\r\n", "x" + mark};
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const std::string &t : texts) {
+      const Regex whole = make_unit(unit, "^(" + reg::escape(t) + ")$", 0);
+      const auto m = whole.match(t);
+      CHECK(whole.group_count() == 1 && m.matched() && m.group(1).str() == t);
+      if (t.empty()) continue;
+      const Regex set = make_unit(unit, "^[" + reg::escape(t) + "]+$", 0);
+      CHECK(set.test(t));
+      CHECK(!make_unit(unit, "[" + reg::escape(t) + "]", 0).test("!"));
+    }
 }
 
 void test_resource_limits() {
@@ -5679,6 +5727,8 @@ int main() {
   test_findcache_shared_rebind();
   test_iterator_survives_cache_eviction();
   test_invalid_patterns();
+  test_syntax_by_code_point();
+  test_escape();
   test_resource_limits();
   test_lookaround_programs();
   test_operand_pools();
