@@ -392,13 +392,15 @@ other character as it is. Because syntax is read a code point at a time and an
 escaped non-alphanumeric is always itself, the result means the same in either
 match unit and wherever it is spliced — `"(" + reg::escape(s) + ")"` is one
 group, and `"[" + reg::escape(s) + "]"` one set of `s`'s characters, whatever
-`s` holds.
+`s` holds. To repeat it, group it: `"(?:" + reg::escape(s) + ")+"`; in a class,
+`s` must be non-empty (`[]` opens a class whose first member is `]`). It is
+not for a replacement template, whose own escape is `$$`.
 
 ### Errors
 
 A pattern that cannot be parsed (or that exceeds a resource limit) throws
-`reg::RegexError`, whose `what()` message carries the offending position and
-a caret line. `RegexError::code()` additionally returns a structured
+`reg::RegexError`, whose `what()` message carries the offending position (the
+index of the pattern's grapheme cluster it is in) and a caret line. `RegexError::code()` additionally returns a structured
 `RegexError::Code` (RE2-style: `TrailingBackslash`, `BadEscape`, `BadCharClass`,
 `UnbalancedParen`, `BadGroup`, `BadInlineFlags`, `BadUnicodeProperty`,
 `NestingTooDeep`, `NothingToRepeat`, `ProgramTooLarge`, `PatternTooLong`,

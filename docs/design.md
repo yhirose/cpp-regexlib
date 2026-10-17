@@ -133,8 +133,8 @@ matches only single-code-point clusters" rule was wrong.)
 A literal in the pattern matches a cluster only by **full equality** of its code
 points (`lit_match`), not by base code point — so an exact literal is stricter
 than a class. For that to behave predictably the pattern's literal text must be
-segmented into clusters exactly as the subject is. Typed literals already are
-(`literal_len` reads them as clusters), but **escapes — `\r`, `\n`,
+segmented into clusters exactly as the subject is. Typed literals mostly are
+(`literal_len` reads a typed cluster, stopping at a metacharacter), but **escapes — `\r`, `\n`,
 `\uXXXX` — each parse to their own single-code-point literal**, so an escaped
 run like `\r\n` would stay two literals and could never match the indivisible
 CR-LF cluster (UAX #29 GB3) a subject presents. `parse_concat` therefore runs a
@@ -142,9 +142,11 @@ fusion pass (`fuse_literal_graphemes`) that re-segments each maximal run of
 adjacent, unquantified literals on grapheme boundaries, so `\r\n` compiles to
 the single `U"\r\n"` cluster literal — exactly the node the equivalent typed
 text produces. (A quantified escape, e.g. the `\n?` in `\r\n?`, is its own atom
-and does not fuse.) In CodePoint mode the pass changes nothing a match sees: a
-multi-code-point literal emits the same per-code-point match sequence as the
-separate literals.
+and does not fuse.) `literal_len` sets how far an atom reaches — what a
+quantifier repeats — and the pass sets how a run is matched, so it also
+rejoins a metacharacter that is literal there to a cluster the subject has
+(a Prepend before a literal `{`). It runs in grapheme mode only: in CodePoint
+mode a literal is one code point.
 The parser reads the pattern a code point at a time in both modes, so syntax
 never depends on its neighbours: a combining mark after `(`, `]`, `+` or `\` is
 literal text after it, not part of it (segmenting the whole pattern into
@@ -155,7 +157,8 @@ grapheme mode `literal_len` reads the cluster a literal starts, up to the next
 metacharacter (a Prepend takes no `(`), so a quantifier repeats the whole
 cluster, as Swift coalesces literal scalars into characters. In CodePoint mode
 a literal is one code point, so NFD `é+` repeats the mark and `[a-é]` is `a`–`e`
-and the mark, as in every code-point engine. In grapheme mode a cluster of
+and the mark, as in every code-point engine. A metacharacter is always one code
+point, typed or escaped: `]◌́+` and `\]◌́+` both repeat the mark. In grapheme mode a cluster of
 literal text in a class adds each of its code points but is no range endpoint
 (`BadCharRange`), as in Swift and Raku; an escape is always one code point.
 
