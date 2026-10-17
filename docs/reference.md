@@ -64,11 +64,12 @@ What changes versus the default grapheme unit:
 | `\d \w \s [..] \p{…}` | classify a cluster by its base code point | match one code point |
 | match offsets | byte offsets on grapheme boundaries | byte offsets on code-point boundaries |
 | a lone/invalid UTF-8 byte | one fallback element | one code point (the byte value) |
+| the pattern itself | read by clusters: NFD `é+` repeats the `é` | read by code points: NFD `é+` repeats the mark |
 
 Everything else is identical — literals, alternation, quantifiers, groups,
 anchors, lookaround, named groups, the flags below (including `IgnoreCase`), and
-all method APIs behave the same; only the unit of `.`/classes and the boundary
-of offsets differ.
+all method APIs behave the same; only the unit — of `.`/classes, of the
+pattern's own text — and the boundary of offsets differ.
 
 What counts as UTF-8 is exactly RFC 3629: a lead byte with its continuation
 bytes, and no overlong form, surrogate, or value past U+10FFFF. Any other byte —
@@ -93,10 +94,10 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 
 | Category | Syntax |
 | --- | --- |
-| Literal | any character; a base + combining marks form one literal grapheme |
+| Literal | any character; in grapheme mode a base + combining marks form one literal grapheme |
 | Any | `.` (excludes line breaks unless DotAll — see below) |
 | Anchors | `^`, `$` (line-relative under Multiline) |
-| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself |
+| Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself. In grapheme mode a cluster of several code points in a class adds each of them, and is no range's endpoint (`[a-é]` with NFD `é` is an error) |
 | Predefined class | `\d \w \s` and `\D \W \S` (Unicode-property aware) |
 | POSIX class | `[[:alpha:]]`, `[[:digit:]]`, … inside a bracket (see below) |
 | Unicode property | `\p{Name}`, `\P{Name}`, single-letter `\pL` |
@@ -105,7 +106,7 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 | Group | `(…)` capturing, `(?:…)` non-capturing |
 | Named group | `(?<name>…)`, `(?'name'…)` |
 | Word boundary | `\b`, `\B` |
-| Escapes | `\n \r \t \f \v \0`, `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` or `\u{…}` (one to six), each a scalar value (up to U+10FFFF, no surrogate); escaped metacharacters |
+| Escapes | `\n \r \t \f \v \a \e`, `\0` (not before a digit), `\cA`…`\cZ` (control characters), `[\b]` (backspace, in a class), `\xHH` (two hex digits), `\uHHHH` (four), `\x{…}` or `\u{…}` (one to six), each a scalar value (up to U+10FFFF, no surrogate). Any other ASCII letter or digit after `\` is an error — kept for new syntax, as in RE2 and Rust; so is a backreference `\1`. Any other escaped character is itself |
 | Lookahead | `(?=…)`, `(?!…)` — variable length |
 | Lookbehind | `(?<=…)`, `(?<!…)` — variable length |
 | Flags (inline) | `(?i)`, `(?m)`, `(?s)` |
@@ -466,10 +467,11 @@ Read these before porting; they do **not** all fail the same way:
   Atomic groups `(?>…)` and possessive quantifiers (`a++`, `a*+`) throw
   `regex_error` at construction; a pathological pattern such as `(a+)+$` runs in
   linear time instead of detonating.
-- **A backreference becomes a literal, silently.** `\1` is parsed as the escaped
-  digit `1`, not a back-reference (it does **not** throw), so `(\w)\1` matches
-  `"a1"`, not `"aa"`. (POSIX classes such as `[[:alpha:]]`, on the other hand,
-  *are* supported — unlike ECMAScript `std::regex` — see Supported syntax.)
+- **Backreferences, and escapes that name nothing, are rejected.** `\1` and an
+  unknown letter escape such as `\q` throw `regex_error` (`error_escape`) at
+  construction, where `std::regex` would accept them. (POSIX classes such as
+  `[[:alpha:]]`, on the other hand, *are* supported — unlike ECMAScript
+  `std::regex` — see Supported syntax.)
 
 `reg::regex_error` derives from `reg::RegexError`, so `catch (re::regex_error&)`,
 `catch (reg::RegexError&)`, and `catch (std::runtime_error&)` all keep working

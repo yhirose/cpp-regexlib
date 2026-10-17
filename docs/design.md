@@ -144,6 +144,11 @@ the single `U"\r\n"` cluster literal — exactly the node the equivalent typed
 text produces. (A quantified escape, e.g. the `\n?` in `\r\n?`, is its own atom
 and does not fuse.) In CodePoint mode the pass is a no-op: a multi-code-point
 literal emits the same per-code-point match sequence as the separate literals.
+That mode's tokenizer hands the parser code points, not clusters — the pattern
+is read in the unit the subject is — so NFD `é+` repeats the mark and `[a-é]` is
+`a`–`e` and the mark, as in every code-point engine. In grapheme mode a cluster
+of several code points in a class adds each of them but is no range endpoint
+(`BadCharRange`), as in Swift and Raku.
 
 ---
 
