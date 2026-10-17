@@ -368,7 +368,8 @@ they were.
   re-seeds, if a start re-seeded inside a code point could match there
   with no byte, as `\Aa|b*`'s can: that one keeps the path, so that no
   state it stands on claims a match inside a code point.) `\w+$` over CJK
-  takes half the time the path took, less than `\w+`.
+  takes half the time the path took, and scans as fast as `\w+` does
+  without look.
 - **Direction is which side the context is on.** A reverse program's DFA
   carries what stands to the *right*, and its input is the code point to
   the left; the boundary's flags are the same function of the two sides

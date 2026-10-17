@@ -12610,16 +12610,15 @@ private:
     // with no byte (`\Aa|b*`): only steps over whole code points keep such a
     // match where it can be.
     void columns() {
-      const auto &plan = *re->plan_;
-      const Plan::ByteClasses bc = plan.byte_classes(*prog, look);
+      const Plan::ByteClasses bc = re->plan_->byte_classes(*prog, look);
       std::memcpy(cls, bc.cls.data(), sizeof cls);
       edge = bc.n;
       seen.assign(prog->insts.size(), 0);
-      bytewise = look && !plan.word_bounds_ && !plan.multiline_;
+      bytewise = look && !asks_kind();
       if (bytewise && reseed) {
-        std::vector<int> start{0}, inside;
-        close(start, inside, /*flags=*/0); // no assertion holds inside
-        bytewise = !(match_flags(inside) & kAccept);
+        seeds_.assign(1, 0);
+        close(seeds_, out_, /*flags=*/0); // no assertion holds inside
+        bytewise = !(match_flags(out_) & kAccept);
       }
       stride = edge + 1 + (look ? 1 + (bytewise ? 0 : kKinds) : 0);
     }
@@ -12906,10 +12905,17 @@ private:
              (plan.multiline_ && detail::is_line_break_cp(cp) ? kBreak : 0);
     }
 
+    // Whether the program's assertions ask what a code point is (side), not
+    // only where the text's edges are.
+    bool asks_kind() const {
+      return re->plan_->word_bounds_ || re->plan_->multiline_;
+    }
+
     // The context of a scan that starts at boundary `at`: what stands behind
     // it.
     uint8_t context(std::string_view text, int at) const {
       if (at == (reverse ? static_cast<int>(text.size()) : 0)) return kEdge;
+      if (!asks_kind()) return 0;
       return side((reverse ? cp_at(text, at) : cp_before(text, at)).cp);
     }
 
