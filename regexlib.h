@@ -1295,6 +1295,11 @@ inline size_t grapheme_length(const char32_t *s32, size_t l) {
 
 namespace utf8 {
 
+// A Unicode scalar value: a code point, not a surrogate. UTF-8 encodes these.
+constexpr bool is_scalar(char32_t cp) {
+  return cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+}
+
 inline size_t encode_codepoint(char32_t cp, char *buff) {
   if (cp < 0x0080) {
     buff[0] = static_cast<uint8_t>(cp & 0x7F);
@@ -1619,7 +1624,7 @@ struct RegexError : public std::runtime_error {
     PatternTooLong,     // source pattern exceeds the byte cap
     StepBudgetExceeded, // match-time step budget exhausted
     Internal,           // unclassified / should-not-happen
-    // (Appended: the values above are part of the ABI.)
+    // Values are ABI: a new code goes last.
     BadRepeat,    // a counted repeat whose minimum exceeds its maximum
     BadCharRange, // a class range whose start exceeds its end, e.g. [z-a]
   };
@@ -1652,6 +1657,7 @@ namespace limits {
 
 constexpr size_t kMaxPatternBytes = 1u << 15; // 32 KiB
 constexpr int kMaxProgramInsts = 1 << 18;     // 262144 compiled instructions
+constexpr int kMaxRepeatCount = 1000000;      // n and m of `{n,m}`
 // Group / lookaround nesting. The recursive-descent parser uses ~one native
 // call chain per nesting level, so this bound must keep the deepest pattern
 // inside the SMALLEST common stack — Windows' default 1 MiB main-thread stack
@@ -2786,6 +2792,8 @@ struct Parser {
       return false;
     }
     pos++; // consume '}'
+    if (std::max(lo, hi) > limits::kMaxRepeatCount)
+      error(RegexError::Code::BadRepeat, "repeat count too large");
     if (hi >= 0 && hi < lo)
       error(RegexError::Code::BadRepeat, "repeat count out of order");
     rep.kind = Node::Kind::Repeat;
@@ -2803,7 +2811,8 @@ struct Parser {
     while (!eof() && toks[pos].size() == 1 && toks[pos][0] >= U'0' &&
            toks[pos][0] <= U'9') {
       v = v * 10 + (toks[pos][0] - U'0');
-      if (v > 1000000) v = 1000000; // clamp pathological counts
+      if (v > limits::kMaxRepeatCount) // for try_parse_counted to reject
+        v = limits::kMaxRepeatCount + 1;
       pos++;
     }
     if (pos == start) return false;
@@ -2972,21 +2981,21 @@ struct Parser {
     bool first = true;
     while (!eof() && !(is(U']') && !first)) {
       first = false;
-      char32_t lo, hi;
-      if (!class_member(n.cls, lo)) continue;
+      const auto lo = class_member(n.cls);
+      if (!lo) continue;
       // A range joins two code points. A '-' before the ']', or next to a set
       // (`[\w-.]`, `[a-\d]`), is itself.
+      char32_t hi = *lo;
       if (is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']')) {
         pos++;
-        if (class_member(n.cls, hi)) {
-          if (hi < lo)
-            error(RegexError::Code::BadCharRange, "class range out of order");
-          n.cls.add_range(lo, hi);
-          continue;
-        }
-        n.cls.add_range(U'-', U'-');
+        if (const auto h = class_member(n.cls))
+          hi = *h;
+        else
+          n.cls.add_range(U'-', U'-');
       }
-      n.cls.add_range(lo, lo);
+      if (hi < *lo)
+        error(RegexError::Code::BadCharRange, "class range out of order");
+      n.cls.add_range(*lo, hi);
     }
     if (!is(U']'))
       error(RegexError::Code::BadCharClass, "unterminated character class");
@@ -2994,34 +3003,38 @@ struct Parser {
     return n;
   }
 
-  // One member of a class: a code point, returned in `cp` (true), or a set of
-  // them, added to `cls` (false) — \d, \p{L} and the like, a [:name:], or a
-  // cluster of several code points (each one added).
-  bool class_member(CharClass &cls, char32_t &cp) {
+  // One member of a class: a code point, returned, or a set of them, added to
+  // `cls` — \d, \p{L} and the like, a [:name:], or a cluster of several code
+  // points (each one added).
+  std::optional<char32_t> class_member(CharClass &cls) {
     // POSIX bracket sub-class [:name:]; only consumed when it is a valid
     // class, otherwise '[' falls through and is treated as a literal member.
-    if (is(U'[') && try_posix_class(cls)) return false;
+    if (is(U'[') && try_posix_class(cls)) return std::nullopt;
+    char32_t cp;
     if (is(U'\\')) {
+      if (escaped_set(cls)) return std::nullopt;
+      if (single_cp(cp)) return escaped_literal(cp);
+    } else if (single_cp(cp)) {
       pos++;
-      if (eof())
-        error(RegexError::Code::BadCharClass, "trailing backslash in class");
-      char32_t e;
-      if (single_cp(e) && try_prop_escape(e, cls)) return false;
-      if (single_cp(e) && add_class_escape(cls, e)) {
-        pos++;
-        return false;
-      }
-      cp = escaped_literal();
-      return true;
+      return cp;
     }
-    if (single_cp(cp)) {
-      pos++;
-      return true;
-    }
-    for (char32_t c : peek())
+    for (char32_t c : peek()) // a cluster, escaped or not: its code points
       cls.add_range(c, c);
     pos++;
-    return false;
+    return std::nullopt;
+  }
+
+  // Consumes a '\' and, when it escapes a set — \d, \p{L} and the like — the
+  // set too, added to `cls` (true). Otherwise the escaped token is next.
+  bool escaped_set(CharClass &cls) {
+    pos++;
+    if (eof()) error(RegexError::Code::TrailingBackslash, "trailing backslash");
+    char32_t e;
+    if (!single_cp(e)) return false;
+    if (try_prop_escape(e, cls)) return true;
+    if (!add_class_escape(cls, e)) return false;
+    pos++;
+    return true;
   }
 
   // Returns true and records a predefined predicate; false if `e` is not one.
@@ -3119,17 +3132,8 @@ struct Parser {
     return true;
   }
 
-  // Translate an escape sequence to a literal code point (caller has already
-  // consumed the backslash; current token is the escaped char).
-  char32_t escaped_literal() {
-    if (eof()) // e.g. a class range ending in `\`
-      error(RegexError::Code::TrailingBackslash, "trailing backslash");
-    char32_t e;
-    if (!single_cp(e)) {
-      char32_t cp = peek()[0];
-      pos++;
-      return cp;
-    }
+  // The code point an escaped `e`, the current token, stands for; consumes it.
+  char32_t escaped_literal(char32_t e) {
     pos++;
     switch (e) {
     case U'n': return U'\n';
@@ -3144,8 +3148,8 @@ struct Parser {
     }
   }
 
-  // \xHH, \uHHHH, or \x{H…} / \u{H…} (one to six digits, a code point): the
-  // digits the form takes, exactly, or a BadEscape error.
+  // \xHH, \uHHHH, or \x{H…} / \u{H…} (one to six digits): the digits the form
+  // takes, exactly, naming a scalar value, or a BadEscape error.
   char32_t parse_hex(int digits) {
     auto hexval = [](char32_t c) -> int {
       if (c >= U'0' && c <= U'9') return c - U'0';
@@ -3157,7 +3161,7 @@ struct Parser {
     if (braced) pos++;
     char32_t v = 0;
     int n = 0;
-    while (n < (braced ? 7 : digits)) {
+    while (n < (braced ? 6 : digits)) {
       char32_t c;
       const int h = single_cp(c) ? hexval(c) : -1;
       if (h < 0) break;
@@ -3165,52 +3169,37 @@ struct Parser {
       n++;
       pos++;
     }
-    const bool ok = braced ? n >= 1 && n <= 6 && v <= 0x10FFFF && is(U'}')
-                           : n == digits;
+    const bool ok = (braced ? n >= 1 && is(U'}') : n == digits) &&
+                    unicode::utf8::is_scalar(v);
     if (!ok) error(RegexError::Code::BadEscape, "invalid hex escape");
     if (braced) pos++;
     return v;
   }
 
   Node parse_escape() {
-    pos++; // consume '\'
-    if (eof()) error(RegexError::Code::TrailingBackslash, "trailing backslash");
+    // A set (\d, \p{L} and the like) as a standalone atom.
+    Node set = make_node(Node::Kind::Class);
+    if (escaped_set(set.cls)) return set;
     char32_t e;
-    if (single_cp(e)) {
-      // Unicode property class \p{...} / \P{...}.
-      Node prop = make_node(Node::Kind::Class);
-      if (try_prop_escape(e, prop.cls)) return prop;
-      // Predefined classes as standalone atoms.
-      CharClass cls;
-      if (Parser::add_class_escape(cls, e)) {
-        pos++;
-        Node n = make_node(Node::Kind::Class);
-        n.cls = cls;
-        return n;
-      }
-      if (e == U'b') {
-        pos++;
-        return make_node(Node::Kind::WordBoundary);
-      }
-      if (e == U'B') {
-        pos++;
-        return make_node(Node::Kind::NonWordBoundary);
-      }
-      // Absolute text anchors (unaffected by Multiline, unlike ^/$): \A start
-      // of text, \z end of text, \Z end of text or just before a trailing
-      // newline.
-      if (e == U'A' || e == U'z' || e == U'Z') {
-        pos++;
-        return make_node(e == U'A'   ? Node::Kind::BeginText
-                         : e == U'z' ? Node::Kind::EndText
-                                     : Node::Kind::EndTextNL);
-      }
+    if (!single_cp(e)) return parse_atom(); // an escaped cluster is the cluster
+    // Word boundaries, and the absolute text anchors (unaffected by Multiline,
+    // unlike ^/$): \A start of text, \z end of text, \Z end of text or just
+    // before a trailing newline.
+    Node::Kind anchor;
+    switch (e) {
+    case U'b': anchor = Node::Kind::WordBoundary; break;
+    case U'B': anchor = Node::Kind::NonWordBoundary; break;
+    case U'A': anchor = Node::Kind::BeginText; break;
+    case U'z': anchor = Node::Kind::EndText; break;
+    case U'Z': anchor = Node::Kind::EndTextNL; break;
+    default: {
+      Node lit = make_node(Node::Kind::Lit);
+      lit.lit = std::u32string(1, escaped_literal(e));
+      return lit;
     }
-    // Escaped literal.
-    char32_t lit = escaped_literal();
-    Node n = make_node(Node::Kind::Lit);
-    n.lit = std::u32string(1, lit);
-    return n;
+    }
+    pos++;
+    return make_node(anchor);
   }
 };
 
@@ -3565,8 +3554,7 @@ enum_cp_ranges(int key, const std::function<bool(char32_t)> &pred) {
   char32_t start = 0;
   bool inrun = false;
   for (char32_t cp = 0; cp <= 0x10FFFF; cp++) {
-    bool valid = !(cp >= 0xD800 && cp <= 0xDFFF); // surrogates aren't scalars
-    bool m = valid && pred(cp);
+    bool m = unicode::utf8::is_scalar(cp) && pred(cp);
     if (m && !inrun) {
       start = cp;
       inrun = true;
@@ -5011,11 +4999,10 @@ public:
   }
   size_t group_count() const { return static_cast<size_t>(ngroups_); }
 
-  // Materialize into a self-contained, owning MatchResult (copies the matched
-  // text). Use to keep a match past the next ++ / the subject's lifetime. A
-  // result holds the text of its own span and the groups that lie in it, so
-  // that of a group keeps the groups nested in that group, and reads every
-  // other as unmatched.
+  // Materialize into a self-contained, owning MatchResult (copies the whole
+  // match's text). Use to keep a match past the next ++ / the subject's
+  // lifetime. The result answers every accessor as this view does — that of a
+  // group too: its str() is the group, its group(k) the match's group k.
   MatchResult to_owned() const;
 
 private:
@@ -5115,10 +5102,11 @@ struct MatchResult {
   bool matched() const { return matched_; }
   explicit operator bool() const { return matched_; }
 
-  size_t begin() const { return mbegin_; } // byte offset of whole match start
-  size_t end() const { return mend_; }     // byte offset of whole match end
+  size_t begin() const { return mbegin_; } // byte offset of its span's start
+  size_t end() const { return mend_; }     // byte offset of its span's end
   std::string_view str() const {
-    return matched_ ? buf_.view() : std::string_view{};
+    return matched_ ? buf_.view().substr(mbegin_ - spans_[0], mend_ - mbegin_)
+                    : std::string_view{};
   }
 
   Match group(size_t i) const { return view().group(i); }
@@ -5174,13 +5162,15 @@ private:
 
   Match view() const {
     const uint32_t *sp = spans_.size() ? spans_.begin() : nullptr;
-    return Match(buf_.view(), mbegin_, sp, ngroups_, &names_, 0);
+    return Match(buf_.view(), sp ? sp[0] : 0, sp, ngroups_, &names_, 0);
   }
 
+  // Its own span, and whether it matched: the whole match's, but for
+  // to_owned() of a group view.
   bool matched_ = false;
   size_t mbegin_ = 0, mend_ = 0;
   int ngroups_ = 0;                 // capture groups (group 0 = whole match)
-  detail::OwnedText buf_;           // the whole-match text (subject[begin:end])
+  detail::OwnedText buf_;           // the whole match's text (group 0's span)
   // Absolute group offsets (2 per group, kSpanNone = unmatched). Inline for up
   // to 7 capture groups (group 0 + 7 => 16 slots) — so an owning result for a
   // captured match needs no heap allocation up through the wide
@@ -5197,14 +5187,15 @@ private:
 
 inline MatchResult Match::to_owned() const {
   MatchResult r;
-  if (!matched()) return r;
-  std::string_view sv = str();
-  r._init(begin(), end(), sv.data(), sv.size(), ngroups_);
-  for (int g = 1; g <= ngroups_; g++) {
-    Match gg = group(g);
-    if (gg.matched() && gg.begin() >= begin() && gg.end() <= end())
-      r._set_group(g, gg.begin(), gg.end());
-  }
+  const Match whole = group(0); // its text holds every group's
+  if (!whole) return r;
+  const std::string_view sv = whole.str();
+  r._init(whole.begin(), whole.end(), sv.data(), sv.size(), ngroups_);
+  for (int g = 1; g <= ngroups_; g++)
+    if (const Match gg = group(g)) r._set_group(g, gg.begin(), gg.end());
+  r.matched_ = matched(); // an unmatched group still reads the match's others
+  r.mbegin_ = begin();
+  r.mend_ = end();
   if (names_) r._set_names(*names_);
   return r;
 }

@@ -94,12 +94,12 @@ ZWJ・結合列の正しさ）場合は既定の `Grapheme` を選んでくだ�
 | 定義済みクラス | `\d \w \s` と `\D \W \S`（Unicode プロパティ準拠） |
 | POSIX クラス | `[[:alpha:]]`, `[[:digit:]]`, … （ブラケット内・下記参照） |
 | Unicode プロパティ | `\p{Name}`, `\P{Name}`, 1 文字形 `\pL` |
-| 量化子 | `* + ?`, `{n}`, `{n,m}`（`n` ≤ `m`）, `{n,}`。lazy 形 `*? +? ?? {n,m}?` |
+| 量化子 | `* + ?`, `{n}`, `{n,m}`（`n` ≤ `m` ≤ 1000000）, `{n,}`。lazy 形 `*? +? ?? {n,m}?` |
 | 選択 | `\|` |
 | グループ | `(…)` キャプチャ, `(?:…)` 非キャプチャ |
 | 名前付きグループ | `(?<name>…)`, `(?'name'…)` |
 | 単語境界 | `\b`, `\B` |
-| エスケープ | `\n \r \t \f \v \0`, `\xHH`（16進2桁）, `\uHHHH`（4桁）, `\x{…}`（1〜6桁、U+10FFFF まで）, エスケープしたメタ文字 |
+| エスケープ | `\n \r \t \f \v \0`, `\xHH`（16進2桁）, `\uHHHH`（4桁）, `\x{…}` または `\u{…}`（1〜6桁）。いずれもスカラー値（U+10FFFF まで、サロゲート不可）。エスケープしたメタ文字 |
 | 先読み | `(?=…)`, `(?!…)` — 可変長 |
 | 後読み | `(?<=…)`, `(?<!…)` — 可変長 |
 | フラグ（インライン） | `(?i)`, `(?m)`, `(?s)` |
@@ -208,7 +208,7 @@ Java (20+) の `Pattern.namedGroups()` にもあります。
 | `m.str()` | マッチ文字列（`std::string_view`） |
 | `m.group(i)` / `m.group("name")` | サブグループ（`Match`。グループ 0 = 全体マッチ） |
 | `m.group_count()` | キャプチャグループ数 |
-| `m.to_owned()` | 所有 `MatchResult` へコピー（view のみ）：自身の範囲と、その中のグループ |
+| `m.to_owned()` | 所有 `MatchResult` へコピー（view のみ）。グループの view でも、元の view と同じ答えを返す |
 
 `group()` は再帰的に `Match` を返すので、`m.group(1).str()`・`m.group(1).begin()`・
 `m.group("name").matched()` が同じ書き味になります。未マッチ／範囲外のグループは
@@ -373,7 +373,7 @@ for (const auto &doc : docs)
 `TrailingBackslash`, `BadEscape`, `BadCharClass`, `UnbalancedParen`, `BadGroup`,
 `BadInlineFlags`, `BadUnicodeProperty`, `NestingTooDeep`, `NothingToRepeat`,
 `ProgramTooLarge`, `PatternTooLong`, `StepBudgetExceeded`, `Internal`,
-`BadRepeat`（`n` > `m` の `{n,m}`）, `BadCharRange`（`[z-a]`））を返し、
+`BadRepeat`（`n` > `m` の `{n,m}`、または 1000000 を超える回数）, `BadCharRange`（`[z-a]`））を返し、
 メッセージを解析せず分岐できます。
 
 ## std::regex 互換 API
@@ -499,6 +499,7 @@ regexlib に対応のあるものは反映、それ以外は無視されます�
 | パターン長 | 32 KiB |
 | コンパイル後のプログラムサイズ | 262144 命令（実行する lookaround のプログラムを含む） |
 | ネスト深さ | 200 |
+| 回数指定（`{n,m}` の `n`, `m`） | 1000000 |
 
 これらはコンパイルコスト（例 `a{1000000}`、入れ子 `(x{50}){50}…`）とパーサの
 再帰（例 `((((…))))`）を抑えます。lookaround は回数指定がいくつコピーを作っても
