@@ -1707,7 +1707,7 @@ void test_find_ladder() {
   // (it used to at search() only): a literal prefix in either case, the
   // literals of an alternation, the bytes a match can begin with.
   for (const char *pat : {"abc(?=d)", "(?i)abc(?=d)", "(?:foo|bar)(?=\\d)",
-                          "[xy]\\w(?!z)", "(a)(?=b)\\w", "(\\w)\\1"})
+                          "[xy]\\w(?!z)", "(a)(?=b)\\w", "(\\w)1"})
     for (const char *subj :
          {"", "abcd abce ABCD", "foo1 bar barz bar2", "xa ybz yc", "ab ac ab",
           "aa bb ab", "abcd\xC3\xA9 ABCD abcd", "x\r\nabcd"})
@@ -4987,9 +4987,47 @@ void test_invalid_patterns() {
       {"(?:){0,1000001}", C::BadRepeat},
       {"(?:){1000001,1000000}", C::BadRepeat},
       {"(?:){99999999999999999999,}", C::BadRepeat},
+      // An ASCII letter or digit after '\' names an escape, or is an error:
+      // they are kept for new syntax. So is a backreference, and \0 before a
+      // digit (octal, elsewhere).
+      {"\\q", C::BadEscape},
+      {"\\k<n>", C::BadEscape},
+      {"\\N", C::BadEscape},
+      {"\\Q.\\E", C::BadEscape},
+      {"\\o{12}", C::BadEscape},
+      {"\\U0001F600", C::BadEscape},
+      {"\\1", C::BadEscape},
+      {"(a)\\1", C::BadEscape},
+      {"\\9", C::BadEscape},
+      {"\\01", C::BadEscape},
+      {"\\012", C::BadEscape},
+      {"[\\012]", C::BadEscape},
+      {"\\c", C::BadEscape},
+      {"\\c1", C::BadEscape},
+      {"\\c\xC3\xA9", C::BadEscape},
+      {"[\\B]", C::BadEscape},
+      {"[\\A]", C::BadEscape},
+      {"[\\z]", C::BadEscape},
+      {"[\\q]", C::BadEscape},
+      {"\\e\xCC\x81", C::BadEscape}, // a letter with a mark names nothing
+      // A class range joins code points: a cluster of several is no endpoint.
+      {"[a-e\xCC\x81]", C::BadCharRange},
+      {"[e\xCC\x81-z]", C::BadCharRange},
+      {"[a-\\\xC3\xA4\xCC\x81]", C::BadCharRange},
   };
   for (const auto &[pat, code] : errors)
     CHECK(code_of(pat) == code);
+  // The escapes there are: control characters, \0 alone, and [\b].
+  CHECK(Regex("^\\a\\e\\cA\\cz\\0$").test(std::string("\x07\x1b\x01\x1a", 4) +
+                                          std::string(1, '\0')));
+  CHECK(Regex("^[\\b]$").test("\x08") && !Regex("[\\b]").test("b"));
+  CHECK(Regex("^[\\cA-\\cZ]+$").test("\x01\x1a"));
+  CHECK(Regex("^\\0x$").test(std::string("\0x", 2)));
+  // Any other escaped character is itself.
+  CHECK(Regex("^\\-\\<\\_\\ \\\xC3\xA9$").test("-<_ \xC3\xA9"));
+  // A cluster of several code points is a class member, but no endpoint.
+  CHECK(Regex("^[e\xCC\x81-]+$").test("-e\xCC\x81"));
+  CHECK(Regex("^[\\w-e\xCC\x81]+$").test("a-"));
   CHECK(Regex("^\\x41B$").test("AB")); // two digits, then a literal B
   CHECK(!Regex("\\x41B").test("\xD0\x9B")); // not U+041B
   CHECK(Regex("^\\x{41}\\u0042\\x{10FFFF}$").test("AB\xF4\x8F\xBF\xBF"));
@@ -5002,12 +5040,29 @@ void test_invalid_patterns() {
   CHECK(Regex("^a{3,3}$").test("aaa"));
   CHECK(Regex("(?:){1000000}").test(""));
   CHECK(Regex("^x{99999999999$").test("x{99999999999")); // not a repeat
-  // An escaped cluster is the cluster: `\é` (NFD) is `é`, in a class each of
-  // its code points, as when written bare.
+  // An escaped cluster is the cluster: `\ä́` is `ä́`, in a class each of its
+  // code points, as when written bare.
+  const std::string cluster = "\xC3\xA4\xCC\x81"; // ä + combining acute
+  CHECK(Regex("^\\" + cluster + "$").test(cluster));
+  CHECK(!Regex("\\" + cluster).test("\xC3\xA4"));
+  CHECK(Regex("^[\\" + cluster + "]$").test("\xCC\x81"));
+
+  // CodePoint mode reads the pattern by code points, as code-point engines
+  // do: NFD `é` is `e` and a mark, each its own atom.
   const std::string nfd = "e\xCC\x81";
-  CHECK(Regex("^\\" + nfd + "$").test(nfd));
-  CHECK(!Regex("\\" + nfd).test("e"));
-  CHECK(Regex("^[\\" + nfd + "]$").test("\xCC\x81"));
+  const auto cp_code_of = [](const std::string &pat) -> std::optional<C> {
+    try {
+      make_us(pat);
+    } catch (const RegexError &e) { return e.code(); }
+    return std::nullopt;
+  };
+  CHECK(make_us("^[a-" + nfd + "]+$").test("b\xCC\x81"));     // a-e, and ◌́
+  CHECK(cp_code_of("[" + nfd + "-a]") == C::BadCharRange);    // ◌́ > a
+  CHECK(make_us("^" + nfd + "+$").test(nfd + "\xCC\x81"));   // e, ◌́+
+  CHECK(!make_us("^" + nfd + "+$").test(nfd + nfd));
+  CHECK(make_egc("^" + nfd + "+$").test(nfd + nfd));         // (e◌́)+
+  CHECK(make_us("^\\e\xCC\x81$").test("\x1b\xCC\x81"));     // \e, then ◌́
+  CHECK(!cp_code_of("[a-" + nfd + "]"));
 }
 
 void test_resource_limits() {

@@ -262,14 +262,9 @@ void test_redos_safe() {
   };
   CHECK(throws(R"((?>a))")); // atomic group
   CHECK(throws(R"(a++)"));   // possessive quantifier
-
-  // A backreference is NOT a backreference here: `\1` is the literal digit `1`,
-  // so `(\w)\1` matches "a1", never "aa". (Documented divergence from
-  // ECMAScript; a true backreference is NP-hard and incompatible with
-  // linear-time matching.)
-  re::regex pseudo_backref(R"((\w)\1)");
-  CHECK(re::regex_search(std::string("a1"), pseudo_backref));
-  CHECK(!re::regex_search(std::string("aa"), pseudo_backref));
+  // A backreference too: matching one is NP-hard. (Documented divergence
+  // from ECMAScript.)
+  CHECK(throws(R"((\w)\1)"));
 }
 
 // --- regex_error::code(): structured error classification (std taxonomy) ---
@@ -288,6 +283,8 @@ void test_error_codes() {
       {"[abc", rc::error_brack},             // unterminated character class
       {"*", rc::error_badrepeat},            // nothing to repeat
       {"a\\", rc::error_escape},             // trailing backslash
+      {"\\q", rc::error_escape},             // an escape that names nothing
+      {"(a)\\1", rc::error_escape},          // a backreference
       {R"(\x{ZZ})", rc::error_escape},       // invalid hex escape
       {R"(\p{Nonesuch})", rc::error_escape}, // unknown unicode property
       {"a{3,1}", rc::error_badbrace},        // repeat count out of order

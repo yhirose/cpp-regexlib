@@ -2560,11 +2560,12 @@ inline bool node_nullable(const Node &n) {
 }
 
 //------------------------------------------------------------------------------
-// Parser  (recursive descent over a stream of pattern grapheme clusters)
+// Parser  (recursive descent over the pattern's units: its grapheme clusters,
+// or in CodePoint mode its code points, as the subject is read)
 //------------------------------------------------------------------------------
 
 struct Parser {
-  std::vector<std::u32string> toks; // pattern segmented into graphemes
+  std::vector<std::u32string> toks; // the pattern, one unit per token
   size_t pos = 0;
   int ncap = 0;  // capture group counter (group 0 is the whole match)
   int depth = 0; // current group/lookaround nesting depth
@@ -2575,10 +2576,17 @@ struct Parser {
   bool &multiline;
   bool &dotall;
 
-  Parser(std::string_view pattern, NameMap &named_,
+  Parser(std::string_view pattern, bool code_points, NameMap &named_,
          bool &icase_, bool &multiline_, bool &dotall_)
       : named(named_), icase(icase_), multiline(multiline_), dotall(dotall_) {
-    toks = segment(pattern).graphemes;
+    for (std::u32string &g : segment(pattern).graphemes) {
+      if (!code_points) {
+        toks.push_back(std::move(g));
+        continue;
+      }
+      for (char32_t c : g)
+        toks.emplace_back(1, c);
+    }
   }
 
   bool eof() const { return pos >= toks.size(); }
@@ -2986,9 +2994,9 @@ struct Parser {
       // A range joins two code points. A '-' before the ']', or next to a set
       // (`[\w-.]`, `[a-\d]`), is itself.
       char32_t hi = *lo;
-      if (is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']')) {
+      if (range_dash()) {
         pos++;
-        if (const auto h = class_member(n.cls))
+        if (const auto h = class_member(n.cls, /*endpoint=*/true))
           hi = *h;
         else
           n.cls.add_range(U'-', U'-');
@@ -3005,8 +3013,9 @@ struct Parser {
 
   // One member of a class: a code point, returned, or a set of them, added to
   // `cls` — \d, \p{L} and the like, a [:name:], or a cluster of several code
-  // points (each one added).
-  std::optional<char32_t> class_member(CharClass &cls) {
+  // points (each one added). A cluster is no range's endpoint, which `endpoint`
+  // says this member is.
+  std::optional<char32_t> class_member(CharClass &cls, bool endpoint = false) {
     // POSIX bracket sub-class [:name:]; only consumed when it is a valid
     // class, otherwise '[' falls through and is treated as a literal member.
     if (is(U'[') && try_posix_class(cls)) return std::nullopt;
@@ -3018,10 +3027,26 @@ struct Parser {
       pos++;
       return cp;
     }
-    for (char32_t c : peek()) // a cluster, escaped or not: its code points
+    const std::u32string &cluster = toks[pos++]; // escaped or not
+    if (endpoint || range_dash())
+      error(RegexError::Code::BadCharRange,
+            "a class range joins code points, not clusters");
+    for (char32_t c : cluster)
       cls.add_range(c, c);
-    pos++;
     return std::nullopt;
+  }
+
+  // At a '-' that makes a range: a member follows it, not the ']'.
+  bool range_dash() const {
+    return is(U'-') && pos + 1 < toks.size() && !is_at(pos + 1, U']');
+  }
+
+  // Only ASCII letters and digits name escapes: after a '\', one that names
+  // none is an error (they are kept for new syntax), any other code point is
+  // itself.
+  static bool names_escape(char32_t c) {
+    return (c >= U'0' && c <= U'9') || (c >= U'A' && c <= U'Z') ||
+           (c >= U'a' && c <= U'z');
   }
 
   // Consumes a '\' and, when it escapes a set — \d, \p{L} and the like — the
@@ -3030,7 +3055,13 @@ struct Parser {
     pos++;
     if (eof()) error(RegexError::Code::TrailingBackslash, "trailing backslash");
     char32_t e;
-    if (!single_cp(e)) return false;
+    if (!single_cp(e)) {
+      // A cluster, which is itself — unless it is a letter or digit with
+      // marks: no escape's name takes them.
+      if (names_escape(peek()[0]))
+        error(RegexError::Code::BadEscape, "invalid escape");
+      return false;
+    }
     if (try_prop_escape(e, cls)) return true;
     if (!add_class_escape(cls, e)) return false;
     pos++;
@@ -3135,16 +3166,33 @@ struct Parser {
   // The code point an escaped `e`, the current token, stands for; consumes it.
   char32_t escaped_literal(char32_t e) {
     pos++;
+    char32_t next;
+    const bool one = single_cp(next);
     switch (e) {
     case U'n': return U'\n';
     case U'r': return U'\r';
     case U't': return U'\t';
     case U'f': return U'\f';
     case U'v': return U'\x0b';
-    case U'0': return U'\0';
+    case U'a': return U'\x07';
+    case U'e': return U'\x1b';
+    case U'b': return U'\x08'; // in a class: outside one, a word boundary
+    case U'0':
+      if (one && next >= U'0' && next <= U'9')
+        error(RegexError::Code::BadEscape, "octal escapes are not supported");
+      return U'\0';
+    case U'c': // \cA … \cZ, either case: a control character
+      if (!one || (next | 0x20) < U'a' || (next | 0x20) > U'z')
+        error(RegexError::Code::BadEscape, "\\c takes a letter");
+      pos++;
+      return next % 32;
     case U'x': return parse_hex(2);
     case U'u': return parse_hex(4);
-    default: return e; // escaped metacharacter → itself
+    default:
+      if (e >= U'1' && e <= U'9')
+        error(RegexError::Code::BadEscape, "backreferences are not supported");
+      if (names_escape(e)) error(RegexError::Code::BadEscape, "invalid escape");
+      return e; // an escaped metacharacter, or any other: itself
     }
   }
 
@@ -6605,7 +6653,7 @@ private:
       multiline_ = (flags & Multiline) != 0;
       dotall_ = (flags & DotAll) != 0;
       us_ = (unit == MatchUnit::CodePoint);
-      detail::Parser parser(pattern, named_, icase_, multiline_, dotall_);
+      detail::Parser parser(pattern, us_, named_, icase_, multiline_, dotall_);
       // Groups wrapping the whole pattern come off here, before anything
       // reads the AST. When they were all the groups there are, ncap_ is 0
       // from here on — the plan IS the capture-free twin's — and
@@ -17540,9 +17588,10 @@ inline Regex::SplitIter Regex::split(std::string_view text,
 //
 //   * The engine is linear-time (RE2-class) and ReDoS-proof. Backtracking-only
 //     constructs are unsupported: atomic groups `(?>…)` and possessive `a++`
-//     throw at construction; a backreference `\1` is parsed as the literal
-//     digit. (POSIX classes like `[[:alpha:]]` are supported, unlike ECMAScript
-//     std::regex.) See docs/reference.md for the supported-syntax reference.
+//     throw at construction, and so do a backreference `\1` and a letter
+//     escape that names nothing, such as `\q` (error_escape). (POSIX classes
+//     like `[[:alpha:]]` are supported, unlike ECMAScript std::regex.) See
+//     docs/reference.md for the supported-syntax reference.
 //
 //   * regex_constants flags with no regexlib equivalent are accepted but
 //     ignored. Honored: syntax icase / multiline, and match match_continuous /
