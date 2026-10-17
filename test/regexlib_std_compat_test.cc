@@ -10,6 +10,7 @@
 //
 
 #include <cstdio>
+#include <memory_resource>
 #include <regex>
 #include <string>
 #include <type_traits>
@@ -357,13 +358,14 @@ struct can_match<
                                          std::declval<const re::regex &>()))>>
     : std::true_type {};
 
-// A match_results points into its subject: one over a temporary string would
+// A match_results points into its subject: one over an owning temporary would
 // dangle, so it does not compile — for an smatch as in std, and for a cmatch /
-// svmatch too, which a temporary string used to reach by converting to the
-// string_view an svmatch takes (ASan: heap-use-after-free).
+// svmatch too, which an owning temporary reaches by converting to the
+// string_view an svmatch takes.
 static_assert(!can_search<std::string, re::smatch>::value, "");
 static_assert(!can_search<std::string, re::cmatch>::value, "");
 static_assert(!can_search<const std::string, re::cmatch>::value, "");
+static_assert(!can_search<std::pmr::string, re::cmatch>::value, "");
 static_assert(!can_match<std::string, re::smatch>::value, "");
 static_assert(!can_match<std::string, re::cmatch>::value, "");
 // ... and every subject that outlives the call still does.
