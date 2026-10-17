@@ -331,13 +331,32 @@ they were.
   too — a row of `\b[a-z]+\d\b` is 10 entries, 40 bytes, where it was
   2,056 — and no ASCII byte shares a class with a byte of a longer code
   point.
-- **A non-ASCII code point is one step, never cached.** What it is to a
-  boundary cannot be read off its bytes, so the miss path decodes it,
-  closes at the boundary by its properties, and feeds its bytes through the
-  program with a closure between them that follows no assertion (inside a
-  code point is no boundary). The scan advances by its length. This is what
-  the byte assert tier did; it is now the miss path of the same loop, and
-  the ASCII bulk of a non-ASCII subject runs at the table's speed.
+- **A non-ASCII code point is a path through states inside it.** What it
+  is to a boundary — its *kind*: a word character, a line break, neither —
+  cannot be read off its first byte, so no column of the state the scan is
+  in can hold the step. `look_next` decodes it and takes the step as a
+  path instead: from the state, on its kind, to a state *inside* the code
+  point (the pcs closed at the boundary, with the boundary's flags carried
+  in its tag); from there one transition per byte, by the byte's class as
+  any (with a closure between that follows no assertion: inside a code
+  point is no boundary); and from the last, on its kind again, to the state
+  after it, whose context that kind is. The kinds are three more columns of
+  every look row, and the states inside (`kInside`) are interned, cached,
+  budgeted and cleared with the rest; no scan stands on one. So every link
+  is a table load once made, and a step over a code point seen before —
+  or one that only shares the path, by its kind and the classes of its
+  bytes — builds nothing. The scan advances by its length.
+
+  It used to be one step, never cached: the miss path closed the state's
+  pcs afresh at every non-ASCII code point. That made an assertion over
+  text with any outside ASCII a hundred times the cost of the same scan
+  without one — `\w+$` took 60 ms over 100 KB of Latin text that `\w+`
+  takes under one, and seconds over CJK, where every code point is one.
+  Now the one is at most about three times the other
+  (`test_look_non_ascii`). (A cache keyed by the code point would have
+  been a hash map beside the table, and of little help to text whose code
+  points rarely repeat; the path is the same table, and its links are shared by
+  every code point of a kind.)
 - **Direction is which side the context is on.** A reverse program's DFA
   carries what stands to the *right*, and its input is the code point to
   the left; the boundary's flags are the same function of the two sides
@@ -1051,8 +1070,8 @@ subjects feed it via `segment_cp` (plain UTF-8 decode).
 A byte DFA cannot fold per byte, so icase is baked into the byte program at
 compile time. `case_fold_groups` scans `0..0x10FFFF` once (cached), grouping code
 points by `simple_case_folding` into orbits of size ≥ 2 (`{a,A}`, `{k,K,U+212A}`);
-`case_expand` adds, for every orbit intersecting a literal/class, all its members
-— so `prog_` accepts every case variant directly, matching the same
+`case_extras` lists, for every orbit intersecting a literal/class, the members
+it lacks, and they are added (`case_closed`) — so `prog_` accepts every case variant directly, matching the same
 fold-equivalence the Pike applies at match time on `cp_prog_`. (`ß`→`ss` full
 folding is out of scope, as in the grapheme engine.)
 

@@ -3493,10 +3493,9 @@ void test_assert_dfa() {
 
   // Assert patterns on non-ASCII subjects take the byte assert tier (the
   // lazy DFAs over the byte programs, with look, forward and reverse — a
-  // non-ASCII code point is a step they take whole); they must agree with
-  // the forced Pike,
-  // including multiline ^/$ across CR-LF and accented letters. é=U+00E9,
-  // α=U+03B1.
+  // non-ASCII code point is a path through the states inside it); they must
+  // agree with the forced Pike, including multiline ^/$ across CR-LF and
+  // accented letters. é=U+00E9, α=U+03B1.
   const std::string E = "\xC3\xA9", A = "\xCE\xB1";
   const char *bpats[] = {"\\b\\w+n\\b", "\\b\\w+", "(?m)^\\w+", "(?m)\\w+$",
                          "\\w+",        "(?m)^.",  "\\bfoo\\b", "(?m)^[^c]"};
@@ -3833,6 +3832,41 @@ void test_dfa_cache() {
       CHECK(spans(re, s2, &fc) == want2);
     }
   }
+  // ... and over text that is not ASCII, where a step over a code point is
+  // a path through the states inside it (LazyDfa::look_next): a cache with
+  // no room for them all clears part-way along one, and goes on from where
+  // it is. Word characters of two and three bytes, and line breaks of two
+  // and three (NEL, U+2028), which (?m) asks about.
+  {
+    const char *pieces[] = {"\xC3\xA9", "\xCE\xB1", "\xE6\xBC\xA2",
+                            "\xE5\xAD\x97", "x", " ", "\n", "\xC2\x85",
+                            "\xE2\x80\xA8", "."};
+    std::string s;
+    unsigned x = 5;
+    for (int i = 0; i < 3000; i++) {
+      x = x * 1664525u + 1013904223u;
+      s += pieces[(x >> 16) % std::size(pieces)];
+    }
+    s += pieces[2]; // a word at the end, for `\w+$`
+    for (const char *pat : {"\\b\\w+\\b", "\\w+$", "(?m)^\\w+$", "\\B\\w\\b"})
+      for (bool us : {false, true}) {
+        const std::vector<size_t> want = spans(
+            us ? pike_twin(pat, 0, reg::MatchUnit::CodePoint) : pike_twin(pat),
+            s);
+        CHECK(!want.empty());
+        Regex re = us ? make_us(pat) : Regex(pat);
+        Regex::FindCache roomy;
+        CHECK(spans(re, s, &roomy) == want);
+        const Stats full = PlanProbe::dfa_stats(roomy);
+        CHECK(full.clears == 0 && !full.quit);
+        Regex::FindCache tight;
+        PlanProbe::dfa_cache(re, tight, 256 + full.bytes / 4, ~0u);
+        CHECK(spans(re, s, &tight) == want);
+        const Stats st = PlanProbe::dfa_stats(tight);
+        CHECK(st.clears > 0 && !st.quit);
+        CHECK(spans(re, s, &tight) == want);
+      }
+  }
 
   // Refilling that PAYS is not given up on, however often it happens. Each
   // letter's run is one state, entered once and stepped through for 60
@@ -4004,6 +4038,54 @@ void test_linear_time() {
                   .count();
   CHECK(!matched);
   std::printf("  [info] ReDoS bomb n=50000 completed in %.1f ms\n", dt);
+}
+
+// An assertion costs a scan over text that is not ASCII what it costs over
+// ASCII: a step over a code point is transitions of the DFA's table, as any
+// (LazyDfa::look_next), where it used to close the state's pcs afresh at
+// every code point — `\w+$` took 60 ms over 100 KB of Latin text that `\w+`
+// takes under one, and seconds over CJK. Timed against `\w+` over the same
+// text, which has no look: the bound is loose, the agreement exact.
+void test_look_non_ascii() {
+  std::string latin, cjk;
+  for (int i = 0; i < 2000; i++)
+    latin += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9\n";
+  unsigned x = 7;
+  for (int i = 0; i < 40000; i++) { // ideographs at random, spaced
+    x = x * 1664525u + 1013904223u;
+    cjk += (x >> 13) % 8 ? reg::unicode::utf8::encode_codepoint(
+                               0x4E00 + (x >> 16) % 20000)
+                         : " ";
+  }
+  latin += "end"; // a word at the end, for `\w+$`
+  cjk += "\xE5\xAD\x97";
+  auto best_ms = [](const Regex &re, const std::string &s) {
+    double best = 1e9;
+    for (int k = 0; k < 3; k++) {
+      const auto t0 = std::chrono::steady_clock::now();
+      CHECK(re.find_all(s).size() > 0);
+      best = std::min(best, std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
+    }
+    return best;
+  };
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const std::string *s : {&latin, &cjk}) {
+      const double plain = best_ms(make_unit(unit, "\\w+"), *s);
+      for (const char *pat : {"\\w+$", "\\b\\w+\\b", "(?m)\\w+$", "(?m)^\\w+"}) {
+        const Regex re = make_unit(unit, pat);
+        CHECK(finds_agree(re, flat_spans(pike_twin(pat, 0, unit), *s, false),
+                          *s));
+        const double t = best_ms(re, *s);
+        CHECK(t < 10 * plain + 2);
+        std::printf("  [info] %s over %zu KB of %s (%s): %.2f ms, \\w+ %.2f "
+                    "ms\n",
+                    pat, s->size() >> 10, s == &cjk ? "CJK" : "Latin",
+                    unit == reg::MatchUnit::Grapheme ? "Grapheme" : "CodePoint",
+                    t, plain);
+      }
+    }
 }
 
 void test_walk_budget_linearity() {
@@ -5823,6 +5905,7 @@ int main() {
   test_dfa_search();
   test_longest_safe_repeat();
   test_linear_time();
+  test_look_non_ascii();
   test_walk_budget_linearity();
   test_scalar_chain_soundness();
   test_onepass_leftmost_first();
