@@ -1428,7 +1428,7 @@ static void run_size_bench() {
   for (auto &p : pats) {
     reg::NameMap named;
     bool icase = false, ml = false, da = false;
-    d::Parser parser(p.pat, /*code_points=*/true, named, icase, ml, da);
+    d::Parser parser(p.pat, /*code_points=*/true, named, {icase, ml, da});
     d::Node root = parser.parse();
     d::Program prog =
         d::Compiler::compile(root, parser.ncap, /*us=*/true, /*reverse=*/false,
