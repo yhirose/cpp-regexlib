@@ -9758,6 +9758,7 @@ private:
         Op op = prog_.insts[i].op;
         // assertions need the context-aware scan
         if (prog_.insts[i].is_assert()) dfa_ok_ = false;
+        if (op == Op::AssertWB || op == Op::AssertNWB) word_bounds_ = true;
 
         // Lookaround / Loop break even the assertion-aware DFA -> Pike VM. \Z
         // (AssertEndTextNL) needs absolute position (sp == n-1 before a final
@@ -10625,6 +10626,9 @@ private:
     // Pike VM. Lookaround / Loop still force the Pike (dfa_assert_ok_ stays
     // false).
     bool dfa_assert_ok_ = false;
+    // The program has a `\b` or a `\B`: the one assertion a look DFA's
+    // context tells word characters apart for (LazyDfa::side).
+    bool word_bounds_ = false;
 
     // The main program's Match pc. Derived, not stored, for the same reason
     // Compiled::match_pc() is: compile() always emits Match last, so there is
@@ -12477,7 +12481,9 @@ private:
   // look scan sees a match one step late, and steps once more over the
   // text's edge, which has a column of its own (`edge`). What a non-ASCII
   // code point is cannot be read off its first byte, so the step over one
-  // is a path through states inside it, cached link by link (look_next).
+  // is a path through states inside it, cached link by link (look_next) —
+  // or, when the program's assertions see only the text's edges, the steps
+  // over its bytes (`bytewise`).
   struct LazyDfa {
     // Pointers (not references) so LazyDfa is a regular movable value type: it
     // lives inside std::optional in a FindCache and, in future, inside a pooled
@@ -12505,6 +12511,7 @@ private:
                           // stays on built transitions is still a DFA scan.
     bool reverse = false; // look: steps right to left (a reverse program),
                           // so the context is what stands to the RIGHT
+    bool bytewise = false; // look: every byte is a step (see columns())
 
     static constexpr uint32_t kUnknown = 0xFFFFFFFFu; // transition not built
     static constexpr uint32_t kQuit = 0xFFFFFFFEu;    // next(): gave up
@@ -12596,7 +12603,24 @@ private:
       const Plan::ByteClasses bc = re->plan_->byte_classes(*prog, look);
       std::memcpy(cls, bc.cls.data(), sizeof cls);
       edge = bc.n;
-      stride = edge + 1 + (look ? 1 + kKinds : 0);
+      seen.assign(prog->insts.size(), 0);
+      // Look over a program whose assertions see only the text's edges (no
+      // `\b`, `\B`, nor a `^` / `$` of (?m)): to them every code point is of
+      // one kind, and a boundary inside one is the same as one between two.
+      // So a step over a code point is the steps over its bytes, each one
+      // transition by its class, as without look — unless a start, re-seeded
+      // inside a code point, could match there with no byte (`\Aa|b*`),
+      // which only the steps over whole code points rule out (look_next).
+      const auto &plan = *re->plan_;
+      if (look && !plan.word_bounds_ && !plan.multiline_) {
+        std::vector<int> start{0}, inside;
+        close(start, inside,
+              re->bflags(false, false, false, false, false, false, false,
+                         false));
+        bytewise = !reseed || std::find(inside.begin(), inside.end(),
+                                        match_pc) == inside.end();
+      }
+      stride = edge + 1 + (look ? 1 + (bytewise ? 0 : kKinds) : 0);
     }
 
     // The state's canonical key: a sorted set, or — leftmost-first — the
@@ -12746,7 +12770,6 @@ private:
       if (!stride) columns();
       if (slots.empty()) slots.assign(64, 0);
       std::vector<int> sp, seeds{0};
-      seen.assign(prog->insts.size(), 0); // reused across calls
       if (look)
         sp = seeds;
       else
@@ -12866,17 +12889,20 @@ private:
 
     // --- Look ---
 
-    // What the code point `cp` is to a boundary beside it. (A line break
-    // only where a `^` or a `$` can ask: the context is part of which state
-    // a state is. And an ASCII one by the short way: every scan asks this
-    // of the code point it starts beside, and a verify is a few steps long.)
+    // What the code point `cp` is to a boundary beside it, as far as the
+    // program's assertions ask: a word character only where a `\b` or a
+    // `\B` can, a line break only where a `^` or a `$` of (?m) can (the
+    // context is part of which state a state is). And an ASCII one by the
+    // short way: every scan asks this of the code point it starts beside,
+    // and a verify is a few steps long.
     uint8_t side(char32_t cp) const {
+      const auto &plan = *re->plan_;
       const bool word =
-          cp < 0x80 ? detail::ascii_word_byte(static_cast<unsigned char>(cp))
-                    : detail::is_word_cp(cp);
+          plan.word_bounds_ &&
+          (cp < 0x80 ? detail::ascii_word_byte(static_cast<unsigned char>(cp))
+                     : detail::is_word_cp(cp));
       return (word ? kWord : 0) |
-             (re->plan_->multiline_ && detail::is_line_break_cp(cp) ? kBreak
-                                                                    : 0);
+             (plan.multiline_ && detail::is_line_break_cp(cp) ? kBreak : 0);
     }
 
     // The context of a scan that starts at boundary `at`: what stands behind
@@ -12930,10 +12956,11 @@ private:
     // A look step the scan's own load did not answer, from state `s` at
     // boundary `at`: over the code point ahead — in reverse, the one behind
     // — or over the text's edge (no bytes). `stepped` as next(). Over the
-    // edge or an ASCII byte the step is one transition. Over another code
-    // point, whose first byte does not say its kind, it is a path through
-    // states inside it (kInside): in on its kind, a transition per byte,
-    // and out on its kind (docs/design.md, "Look").
+    // edge or an ASCII byte the step is one transition, and over any byte
+    // when the DFA is `bytewise`. Over another code point, whose first byte
+    // does not say its kind, it is a path through states inside it
+    // (kInside): in on its kind, a transition per byte, and out on its kind
+    // (docs/design.md, "Look").
     REGEXLIB_NOINLINE Stepped look_next(uint32_t s, std::string_view text,
                                         int at, int stepped) {
       scanned += static_cast<uint64_t>(stepped);
@@ -12948,8 +12975,8 @@ private:
       const unsigned char *p =
           reinterpret_cast<const unsigned char *>(text.data()) +
           (reverse ? at - 1 : at);
-      if (*p < 0x80) {
-        const uint8_t in = side(*p);
+      if (*p < 0x80 || bytewise) {
+        const uint8_t in = side(*p); // (bytewise: 0, for any byte)
         return {step(s, cls[*p],
                      [&](uint32_t from) {
                        const uint8_t tag = cross(from, in);

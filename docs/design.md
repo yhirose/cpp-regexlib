@@ -357,6 +357,18 @@ they were.
   point would have been a hash map beside the table, and of little help to
   text whose code points rarely repeat; the path is the same table, and its
   links are shared by every code point of a kind.)
+- **A context holds only what the assertions ask; to edges alone, a byte
+  is a step.** `side` reports a word character only to a program with a
+  `\b` or a `\B`, and a line break only to one with a `^` or a `$` of
+  (?m). A program with neither sees only the text's edges: every code point
+  is of one kind to it, and a boundary inside one the same as a boundary
+  between two. So the step over a code point is the steps over its bytes,
+  each one transition by its class, as without look (`bytewise`): no
+  decode, no path, and the scan's own loop takes them. (Not in a DFA that
+  re-seeds, if a start re-seeded inside a code point could match there
+  with no byte, as `\Aa|b*`'s can: that one keeps the path, so that no
+  state it stands on claims a match inside a code point.) `\w+$` over CJK
+  takes half the time the path took, less than `\w+`.
 - **Direction is which side the context is on.** A reverse program's DFA
   carries what stands to the *right*, and its input is the code point to
   the left; the boundary's flags are the same function of the two sides
