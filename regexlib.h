@@ -2636,8 +2636,8 @@ struct Parser {
   //   regex parse error at position 3: nothing to repeat
   //     ab**
   //       ^
-  // The caret column counts one space per preceding grapheme, so it aligns for
-  // ASCII patterns (and stays close for wider clusters).
+  // The caret column counts one space per preceding token, so it aligns for
+  // ASCII patterns (and stays close for wider ones).
   [[noreturn]] void error(RegexError::Code code, const std::string &msg) {
     std::string pat, indent;
     for (size_t i = 0; i < toks.size(); i++) {
@@ -2708,8 +2708,8 @@ struct Parser {
   // match real CR-LF — the typed-vs-escaped asymmetry this removes. Concatenate
   // each maximal Lit run's code points and re-split on grapheme boundaries so
   // escaped text compiles to exactly the node the equivalent typed text would.
-  // (No-op in CodePoint mode: a multi-code-point Lit emits the same per-code-
-  // point match sequence as the separate Lits did.)
+  // (In CodePoint mode it changes nothing a match sees: a multi-code-point Lit
+  // emits the same per-code-point match sequence as the separate Lits did.)
   static void fuse_literal_graphemes(std::vector<Node> &kids) {
     std::vector<Node> out;
     out.reserve(kids.size());
@@ -3171,8 +3171,8 @@ struct Parser {
     case U'a': return U'\x07';
     case U'e': return U'\x1b';
     case U'b': return U'\x08'; // in a class: outside one, a word boundary
-    case U'0':
-      if (single_cp(next) && next >= U'0' && next <= U'9')
+    case U'0': // not before a digit, a cluster on one included
+      if (!eof() && peek()[0] >= U'0' && peek()[0] <= U'9')
         error(RegexError::Code::BadEscape, "octal escapes are not supported");
       return U'\0';
     case U'c': // \cA … \cZ, either case: a control character

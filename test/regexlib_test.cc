@@ -5003,6 +5003,7 @@ void test_invalid_patterns() {
       {"\\9", C::BadEscape},
       {"\\01", C::BadEscape},
       {"\\012", C::BadEscape},
+      {"\\01\xCC\x81", C::BadEscape}, // \0, then a cluster on a digit
       {"[\\012]", C::BadEscape},
       {"\\c", C::BadEscape},
       {"\\c1", C::BadEscape},
