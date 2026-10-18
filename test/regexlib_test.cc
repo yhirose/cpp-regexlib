@@ -379,13 +379,12 @@ template <class M> void add_spans(std::vector<size_t> &out, const M &m) {
 inline std::vector<size_t> flat_spans(const Regex &re, std::string_view subj,
                                       bool lazy) {
   std::vector<size_t> out;
-  auto add = [&](const reg::Match &m) { add_spans(out, m); };
   if (lazy)
     for (auto m : re.find_iter(subj))
-      add(m);
+      add_spans(out, m);
   else
     for (auto m : re.find_all(subj))
-      add(m);
+      add_spans(out, m);
   return out;
 }
 
@@ -1557,6 +1556,16 @@ std::vector<std::string> cluster_subjects() {
   return subjects;
 }
 
+// At least `bytes` of prose with an accent every few words: a Grapheme
+// subject the byte engines answer for, and whose first non-ASCII byte is
+// near its start.
+std::string accented_prose(size_t bytes) {
+  std::string s;
+  while (s.size() < bytes)
+    s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
+  return s;
+}
+
 // The find from the end (Rung::EndAnchor): every match of an end-anchored
 // pattern ends at the text's end, so the reverse DFA run from there finds
 // the leftmost-first one, reading what it spans and no more — the subject
@@ -1586,10 +1595,7 @@ void test_end_anchor() {
   // the match — after a stray byte, a combining mark or a CR-LF the scan
   // never reads, in either mode. A boolean reads less still: up to its first
   // accept, though the match is the whole text.
-  std::string body;
-  while (body.size() < (1u << 20))
-    body += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
-  body += "end";
+  const std::string body = accented_prose(1u << 20) + "end";
   for (const char *head : {"", "\xFF", "e\xCC\x81", "\r\n"}) {
     const std::string s = head + body;
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
@@ -1637,11 +1643,8 @@ void test_assert_byte_groups() {
 
   // ... and in Grapheme mode it is that engine that answers, where the
   // grapheme Pike used to segment the whole subject: a find and match()
-  // over 1 MB of non-ASCII prose build its DFAs.
-  std::string s;
-  while (s.size() < (1u << 20))
-    s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
-  s += "a@b";
+  // over non-ASCII prose build its DFAs.
+  const std::string s = accented_prose(4096) + "a@b";
   const Regex find("(\\w+)@(\\w+)\\b"), match("(\\w+) (\\w+)\\b");
   const reg::MatchResult f = find.search(s);
   CHECK(f.matched() && f.group(1).str() == "a" && f.group(2).str() == "b");
@@ -1712,6 +1715,12 @@ void test_find_ladder() {
   CHECK(test(make_us("e[a-z]{3,}q")) == 'S');
   CHECK(test(make_us("[a-z]+@[a-z]+")) == 'I');
   CHECK(test(make_us("(\\w+)=(\\w+)")) == 'B');
+  // So does an assert pattern's, on either engine and in either unit, with
+  // groups or without, where no literal bounds what follows a hit: where
+  // the find chains to the end of a long match, the boolean stops at the
+  // first accepting state.
+  for (const char *pat : {"\\w+@\\w+\\b", "(\\w+)@(\\w+)\\b", "(?s)(\\w)\\b(.*)"})
+    CHECK(rows(make_us(pat)) == 'c' && test(make_us(pat)) == 'B');
 
   // --- every entry point, against the bare VM ---
   // (The loops below run one pattern over many subjects: its reference and
@@ -5025,12 +5034,12 @@ void test_body_dollar() {
     }
   }
   { // Regression: the iterator's byte-assert rung served EGC capture patterns
-    // on a non-ASCII subject, a tier search() and find_all() reserve for
-    // capture-FREE patterns (assert_cap_ compiles for an ASCII subject only).
-    // A subject ending in a lone UTF-8 lead byte is where the two engines part:
-    // the grapheme engine gives the invalid byte its own cluster and matches,
-    // the byte automaton wants a continuation byte and does not — so find_iter
-    // reported no match where search() and find_all() reported one.
+    // on a non-ASCII subject while search() and find_all() kept them off it,
+    // and the subject check let a stray byte through. A subject ending in a
+    // lone UTF-8 lead byte is where the two engines part: the grapheme engine
+    // gives the invalid byte its own cluster and matches, the byte automaton
+    // wants a continuation byte and does not — so find_iter reported no match
+    // where search() and find_all() reported one.
     for (const char *pat : {R"(([^ ]+)$)", R"((\w+)$)", R"((.)$)"}) {
       Regex re = make_egc(pat);
       const std::string s = "ab\xc3"; // \xc3 with no continuation byte

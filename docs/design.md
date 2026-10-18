@@ -446,7 +446,7 @@ Three tiers, picked structurally from the pattern:
 | --- | --- | --- |
 | **1** | capture-free ∧ DFA-able | Forward ordered+cut DFA finds the leftmost-first end `e`; the reverse scan finds the start `s`; return `[s, e)`. **No Pike.** Covers the ASCII grapheme tier, the UTF-8 byte tier (§4/§5), and `^ $ \b \A \z` via an assertion-aware DFA. Targets `\w+`, `[a-z]+`, literals, general alternation (`a\|ab`, `(?m)^…\|…$`). |
 | **2** | captures ∧ DFA-able | The lf DFA locates `[s, e)`, then a capture engine resolves groups *bounded by `e`* (§6). A pattern whose every group wraps the whole match (`(\w+)`) never reaches this tier: it is planned as its capture-free twin (§3, *Root groups*). |
-| **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the lazy DFA over the grapheme programs (ASCII subject) or over the **byte** programs (a non-ASCII EGC subject, or **US mode on any subject** — see below), stepped with look. |
+| **2a** | captures ∧ assertion-DFA-able (`^ $ \b \A \z` + groups, e.g. `(\w+)$`, `\.([a-z]+)$`) | The **assertion-aware** DFA locates `[s, e)` (capture-stripped); the bounded backtracker (`bitstate_bytes`, which evaluates the assert ops via `empty_flags_cp`) resolves groups on it — replacing the Pike, which dominated these patterns (`(\w+)$`: 5300→700 ns). The locate runs on the lazy DFA over the grapheme programs (ASCII subject) or over the **byte** programs (a non-ASCII EGC subject, or **US mode on any UTF-8 subject** — see below), stepped with look. |
 | **3** | DFA-ineligible (lookaround / nested empty-loop), or a DFA that gave up on its cache | Pike VM over the whole subject, with the §7 prefilters. The fallback. |
 
 `dfa_ok_` = "regular" program (no lookaround, no `Op::Loop`); `dfa_assert_ok_`
@@ -462,9 +462,10 @@ by the code points on its two sides — which is exactly what an EGC non-ASCII
 subject (byte == grapheme) *and* US matching (code points, no graphemes) both
 need. So US does not get a copied assert engine: a US `^ $ \b`-anchored pattern
 (capture or not) reuses `assert_find_span` / `assert_prefix_find` on **any**
-subject, with the same prefilters and the same
+UTF-8 subject, with the same prefilters and the same
 `cp_prog_` bitstate capture resolution. `assert_byte_path_ok` is the only
-mode-aware gate (US: any subject; EGC: non-ASCII, no multi-code-point cluster).
+mode-aware gate (US: any subject the unit's own UTF-8 check, `us_stray`, has
+let through; EGC: non-ASCII, no multi-code-point cluster).
 On an ASCII subject an EGC plan steps its grapheme programs instead. Captures
 whose span overflows the bitstate still fall back to the code-point Pike over
 that span.
@@ -474,13 +475,12 @@ that span.
 an EGC plan every cluster is one code point — or a CR-LF pair that a
 `crlf_byte_safe_` pattern cannot split, with a group boundary or otherwise
 (`crlf_run_ends`) — so the groups it finds in the located span are the grapheme
-engine's: the argument `Dfa/EgcByte+cap` rests on. EGC groups were held off
+engine's: the argument the `Dfa/EgcByte` tier's groups rest on. EGC groups were held off
 this tier while the subject check let a stray byte through: a subject ending in
 a lone UTF-8 lead byte gave `([^ ]+)$` two answers (the grapheme engine gives
 the invalid byte its own cluster and matches; the byte automaton wants a
 continuation byte and does not). `simple_from` and the cluster walk refuse a
-stray byte now, so the subject alone decides. `match()` tries this tier ahead
-of the unit's own: no other tier serves the same (plan, subject). On 4 MB of
+stray byte now, so the subject alone decides. On 4 MB of
 non-ASCII prose (Grapheme), `(\w+)$`'s `match()` went from 207 to 2.1 ms,
 `(\w+)@(\w+)\b`'s `search()` from 512 to 11 ms and `\b(\w+)\b`'s `find_all`
 from 628 to 59 ms — the grapheme Pike they ran on segments the whole subject.
@@ -490,8 +490,10 @@ from 628 to 59 ms — the grapheme Pike they ran on segments the whole subject.
 The numbered tiers above say *what engine runs*. Which of them serves a call
 is decided in two places: the find entry points (`test` / `search` /
 `find_all` / `find_iter` / `find_at`) climb one shared ladder (next section),
-and `match` — anchored at 0, where no prefilter applies and every rung is a
-different primitive — keeps a ladder of its own over the same gates. Every
+and `match` — anchored at 0, where no prefilter applies — takes one rung per
+family of that ladder, behind the gates `ladder_gated` gives the family and in
+its order: the family's DFA anchored at 0 locates the end, and
+`match_located` resolves any groups within it. Every
 branch carries a `[Tier: …]` label in the source, with one canonical name per
 (pattern-class × subject-class) combination:
 
@@ -507,7 +509,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap`: assert-aware bitstate, in either unit (see above) |
+| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any UTF-8 subject; EGC: non-ASCII simple) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap`: assert-aware bitstate, in either unit (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
 Both ladders try their eligible tiers top-down and fall through when a DFA
@@ -596,7 +598,10 @@ accepting state it reaches instead of going on to the end a find reports
 (`dfa_forward_first`; the suffix scan simply does not walk forward) — the
 rest of a match can be as long as the subject (`[^?]+\?.*`: the answer is at
 the `?`, and the leftmost-first end is the end of the line) — and where a
-find would walk or chain, it scans (`Rung::Bool`). Two limits keep a boolean
+find would walk or chain, it scans (`Rung::Bool`): the assert chain too, on
+either engine, in either unit, with groups or without (a CodePoint plan and a
+capture plan used to chain — `(?s)(\w)\b(.*)` over 4 MB of prose, 19 ms to
+1.9). Two limits keep a boolean
 from paying for a skip it has no use for (`limits::kBoolSkipBytes`,
 `kBoolFloorBytes`): under 64 bytes of subject it leaves the interior-literal
 rung out and scans (`[^?]+\?.*` over a 23-byte path: 48 ns through the rung,
@@ -1141,7 +1146,7 @@ variant directly, matching the same fold-equivalence the Pike applies at match
 time on `cp_prog_`. (`ß`→`ss` full folding is out of scope, as in the grapheme
 engine.)
 
-DFA-based engines (byte DFA, one-pass) apply to US (any subject) and ASCII
+DFA-based engines (byte DFA, one-pass) apply to US (any UTF-8 subject) and ASCII
 grapheme mode, but to non-ASCII *grapheme* matching, where breaking is
 stateful, only on a subject of one code point to a cluster (§4). So US is the
 fast path for non-ASCII; grapheme captures on a subject with a
