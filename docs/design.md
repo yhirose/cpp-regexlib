@@ -270,13 +270,15 @@ the code point before, whose kind the boundary there asks:
   went to the grapheme Pike over the whole subject.
 
 Bytes that fail, or a DFA that gives up, hand the scan to `Classify` from the
-cursor. Over 4 MB of prose ending in a word, `\w+$` went from 6.6 ms to under
-a microsecond; `(\w+)$` in a Grapheme plan over text with an `é` in it from
-464 ms; a match that is the whole text, `(?s).*\z`, does one reverse pass
-where it did a forward and a reverse one (14 ms → 7). Of other engines only
-RE2 and Rust do this; .NET, V8, Perl and Oniguruma jump the start to near the
-end when the match length is bounded (`\d{3}$`), and PCRE2, Go, Python and
-Java scan from the start (`test_end_anchor`).
+cursor (`test_end_anchor` runs such tails against the Pike). A boolean stops
+at the first accept. Over 4 MB of prose ending in a word, `\w+$` went from
+6.6 ms to under a microsecond; `(\w+)$` in a Grapheme plan over text with an
+`é` in it from 464 ms; a match that is the whole text, `(?s).*\z`, does one
+reverse pass where it did a forward and a reverse one (14 ms → 7), and its
+`test()` reads one code point. Of other engines only RE2 and Rust do this;
+.NET, V8, Perl and Oniguruma jump the start to near the end when the match
+length is bounded (`\d{3}$`), and PCRE2, Go, Python and Java scan from the
+start.
 
 ### The table: byte classes, row offsets, a byte budget
 
@@ -474,7 +476,9 @@ lead byte shows it (the grapheme engine gives the invalid byte its own cluster
 and matches `([^ ]+)$`; the byte automaton wants a continuation byte and does
 not). `assert_byte_path_ok` itself carries the `ncap_ == 0` gate for that
 reason, so every ladder inherits it — it used to be spelled out at each call
-site, and the one site that forgot is what this paragraph is about.
+site, and the one site that forgot is what this paragraph is about. (The find
+from the end resolves such groups, over the bytes it vets: one code point to
+a cluster, no stray byte — §2.)
 
 ### Canonical tier names (the `[Tier: …]` labels)
 

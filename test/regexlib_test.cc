@@ -1571,12 +1571,14 @@ void test_end_anchor() {
   // From the end, the find reads what it finds: over 1 MB that ends in the
   // match, the reverse DFA is the one stepped, and over little more than
   // the match — after a stray byte, a combining mark or a CR-LF the scan
-  // never reads, in either mode.
+  // never reads, in either mode. A boolean reads less still: up to its first
+  // accept, though the match is the whole text.
+  std::string body;
+  while (body.size() < (1u << 20))
+    body += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
+  body += "end";
   for (const char *head : {"", "\xFF", "e\xCC\x81", "\r\n"}) {
-    std::string s = head;
-    while (s.size() < (1u << 20))
-      s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
-    s += "end";
+    const std::string s = head + body;
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re("(\\w+)$", 0, unit);
       Regex::FindCache fc;
@@ -1585,6 +1587,9 @@ void test_end_anchor() {
             all[0].group(1).str() == "end");
       const PlanProbe::DfaStats st = PlanProbe::dfa_stats(fc);
       CHECK(st.built == 1 && st.fwd_entries == 0 && st.scanned < 16);
+      const Regex whole("(?s).*\\z", 0, unit);
+      CHECK(whole.test(s));
+      CHECK(PlanProbe::dfa_stats(whole).scanned < 16);
     }
   }
 }

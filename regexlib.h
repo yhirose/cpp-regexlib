@@ -1452,6 +1452,16 @@ inline bool valid_from(const char *s8, size_t n, size_t from = 0) {
   return true;
 }
 
+// Where the code point that holds byte `at` would start: back over at most
+// three continuation bytes, to the nearest lead (or as far as they go).
+inline size_t cp_start(const char *s8, size_t at) {
+  for (int k = 0;
+       k < 3 && at > 0 && (static_cast<unsigned char>(s8[at]) & 0xC0) == 0x80;
+       k++)
+    at--;
+  return at;
+}
+
 // The element that ENDS at byte `at` (> 0), read as decode_or_byte reads left to
 // right: the code point whose well-formed encoding ends exactly there, else the
 // single byte before `at` standing for itself. (A lead byte always begins an
@@ -1459,9 +1469,7 @@ inline bool valid_from(const char *s8, size_t n, size_t from = 0) {
 // at `at` would start; a longer or shorter sequence from it ends elsewhere.)
 // Returns its byte length.
 inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
-  size_t j = at - 1;
-  const size_t lo = at > 4 ? at - 4 : 0;
-  while (j > lo && (static_cast<unsigned char>(s8[j]) & 0xC0) == 0x80) j--;
+  const size_t j = cp_start(s8, at - 1);
   size_t bytes;
   if (decode_codepoint(s8 + j, at - j, bytes, cp) && j + bytes == at)
     return bytes;
@@ -6939,12 +6947,8 @@ private:
     // eligibility gate, so it tests assert_.anchor_gatefree directly).
     bool assert_anchor_egc() const { return !us_ && assert_.anchor_gatefree; }
     // [Tier: EndAnchor] the find from the text's end, over the byte assert
-    // programs; for a caller that reads groups, when the code-point program
-    // resolves them in the span it locates.
-    bool end_anchor_ok(bool groups) const {
-      return end_anchored_ && byte_assert_path_ &&
-             (!groups || ncap_ == 0 || (us_ ? byte_assert_cap_ : assert_cap_));
-    }
+    // programs (with them comes the program that resolves groups).
+    bool end_anchor_ok() const { return end_anchored_ && byte_assert_path_; }
     // [Tier: Dfa/EgcByte] optimistic fused literal-prefilter tier: a
     // capture-free, crlf-byte-safe, non-nullable, case-sensitive byte-path
     // pattern with a fixed ASCII prefix or suffix to scan for. The literal
@@ -12409,9 +12413,7 @@ private:
       // pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
-    if (plan_->crlf_byte_safe_ && !plan_->can_match_empty_)
-      return simple_from_crlf_ok(text, i);
-    return simple_from(text, i);
+    return egc_simple_from(text, i);
   }
 
   // Priority-ordered ε-closure with the leftmost-first match cut, for the
@@ -13216,6 +13218,16 @@ private:
   // non-ASCII byte, and only there decode and grapheme-break-check the
   // neighborhood: the ASCII left-neighbor (for an ASCII base + non-ASCII
   // combining mark, GB9) and any following code points that keep fusing.
+  // Is `s8` from `i` on free of every multi-code-point cluster but the
+  // CR-LF pairs a pattern that cannot split one may meet — what lets a byte
+  // program answer for a Grapheme subject? `i` starts a cluster, its left
+  // neighbor ASCII or absent (a subject's first non-ASCII byte, or a
+  // slice's start).
+  bool egc_simple_from(std::string_view s8, size_t i) const {
+    return plan_->crlf_byte_safe_ && !plan_->can_match_empty_
+               ? simple_from_crlf_ok(s8, i)
+               : simple_from(s8, i);
+  }
   static bool simple_from_crlf_ok(std::string_view s8, size_t start) {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(s8.data());
@@ -13445,6 +13457,15 @@ private:
 
   // Is this a CodePoint plan's subject with a stray byte in it? Its byte DFAs
   // cannot match one, so such a scan starts on the Pike (see utf8::valid_from).
+  // `l` for a scan over `text` — or the Pike, for a CodePoint subject with a
+  // stray byte, which no byte automaton reads, where `l` stands on a family's
+  // rung. (A rung ahead of Classify reads no subject class, or vets what it
+  // reads; Classify checks for itself.)
+  Ladder unstray(std::string_view text, Ladder l) const {
+    return l.rung > Rung::Classify && l.rung != Rung::Pike && us_stray(text)
+               ? pike_ladder(l.want)
+               : l;
+  }
   bool us_stray(std::string_view text) const {
     if (!plan_->us_) return false;
     const size_t i = first_nonascii(text);
@@ -13482,9 +13503,7 @@ private:
     // matches the grapheme engine when the pattern cannot touch a CR-LF
     // cluster. simple_from_crlf_ok permits exactly the simple_from subjects
     // plus CRLF-only ones, so it subsumes the strict check in a single pass.
-    if (plan_->crlf_byte_safe_ && !plan_->can_match_empty_)
-      return simple_from_crlf_ok(text, i);
-    return simple_from(text, i);
+    return egc_simple_from(text, i);
   }
 
   // True iff every CR is immediately followed by LF and every LF immediately
@@ -13646,8 +13665,9 @@ private:
   // `Look`: `d` is over a program with assertions (see LazyDfa). The scan is
   // the same one; a state then says whether the boundary it was stepped FROM
   // accepts, and the boundary at `floor` takes a step of its own, over what
-  // stands to its left.
-  template <bool Look = false>
+  // stands to its left. `First`: any start answers (a boolean) — the scan
+  // stops at the first accept.
+  template <bool Look = false, bool First = false>
   int dfa_reverse_scan(LazyDfa &d, std::string_view text, int e, int floor,
                        int *low_out = nullptr) const {
     size_t s = Look ? d.start(d.context(text, e)) : d.start();
@@ -13658,7 +13678,7 @@ private:
         reinterpret_cast<const unsigned char *>(text.data());
     int pos = e;
     int mark = e; // stepped bytes are reported to `d` from here down
-    if (!(f & LazyDfa::kDead)) {
+    if (!(f & LazyDfa::kDead) && !(First && leftmost >= 0)) {
       while (pos > floor) {
         // Consume the byte left of pos (as dfa_forward_lf_scan).
         uint32_t nx = detail::walk_column(tr, d.cls[p[pos - 1]])[s];
@@ -13681,10 +13701,10 @@ private:
         pos -= len;
         f = Look ? detail::walk_flags(tr, s) : tr[s - 1]; // (as forward)
         if (f & LazyDfa::kAccept) leftmost = Look ? at : pos;
-        if (f & LazyDfa::kDead) break;
+        if ((f & LazyDfa::kDead) || (First && leftmost >= 0)) break;
       }
       if constexpr (Look) {
-        if (!(f & LazyDfa::kDead)) {
+        if (!(f & LazyDfa::kDead) && !(First && leftmost >= 0)) {
           const uint32_t nx =
               d.look_next(static_cast<uint32_t>(s), text, pos, mark - pos)
                   .state;
@@ -14319,9 +14339,10 @@ private:
     return dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(d, text, from,
                                                                reach);
   }
+  template <bool First = false>
   REGEXLIB_NOINLINE int look_reverse(LazyDfa &d, std::string_view text, int e,
                                      int floor, int *low_out = nullptr) const {
-    return dfa_reverse_scan</*Look=*/true>(d, text, e, floor, low_out);
+    return dfa_reverse_scan</*Look=*/true, First>(d, text, e, floor, low_out);
   }
 
   // The verify of a candidate, for either caller: the leftmost-first end
@@ -15212,8 +15233,7 @@ public:
     Finder(const Regex &re, std::string_view text, FindCache *cache)
         : re_(&re), text_(text), cache_(cache), l_(re.plan_->start_[0]),
           budget_(text.size()) {
-      if (l_.rung != Rung::EndAnchor && re.us_stray(text))
-        l_ = pike_ladder(l_.want);
+      l_ = re.unstray(text, l_);
     }
 
     // The next match, handed to `out`; false when none remains. Over the
@@ -16701,64 +16721,52 @@ private:
       out.groups(*this, text, saves);
   }
 
-  // Rung::EndAnchor's step. Every match of the pattern ends at the text's
-  // end n, so of those at or after `from` the leftmost-first one is the one
-  // with the leftmost start: what the reverse DFA finds, run from n down to
-  // `from` (RE2's reverse-from-the-end find, and regex-automata's
-  // ReverseAnchored). It reads what the match spans and none of the subject
-  // before it, which nothing classifies either: end_region_ok vets the bytes
-  // it read. Hands the match to `out` and returns where the scan goes on,
-  // -1 when there is no match, or LazyDfa::kCap when those bytes cannot
-  // answer for the subject or the DFA gave up.
+  // Rung::EndAnchor's step (docs/design.md, "The find from the end"): the
+  // reverse DFA from the text's end down to `from` gives the leftmost start
+  // of a match there — for a boolean, any start — reading only what the
+  // match spans, and end_region_ok vets what it read. Hands the match to
+  // `out` and returns where the scan goes on, -1 when there is none, or
+  // LazyDfa::kCap when those bytes cannot answer for the subject or the DFA
+  // gave up.
   template <class Out>
   int end_anchor_step(FindCache &fc, std::string_view text, int from,
                       Scratch &sc, std::vector<int> &saves, Out &out) const {
     const int n = static_cast<int>(text.size());
     if (from > n) return -1;
     int low = n;
-    const int s = look_reverse(fc.brv(*this), text, n, from, &low);
-    if (s == LazyDfa::kCap || !end_region_ok(text, from, low))
-      return LazyDfa::kCap;
+    const int s =
+        look_reverse<!Out::kGroups>(fc.brv(*this), text, n, from, &low);
+    // What the scan read: from `low` (inside a code point, where a bytewise
+    // scan stopped), and the code point before when it reached its floor.
+    size_t q = static_cast<size_t>(low == from && low > 0 ? low - 1 : low);
+    if (q < text.size()) q = unicode::utf8::cp_start(text.data(), q);
+    if (s == LazyDfa::kCap || !end_region_ok(text, q)) return LazyDfa::kCap;
     if (s < 0 || !emit_located(text, s, n, sc, saves, out)) return -1;
-    return s < n ? n : n + 1;
+    // Past the end, unless an empty match can follow there.
+    return s < n && plan_->can_match_empty_ ? n : n + 1;
   }
 
-  // Whether the verdict of a reverse scan from the text's end stands for the
-  // subject without a look at the rest of it. What the scan read: [low, n)
-  // — from inside a code point, where a bytewise scan died — and, unless it
-  // died above its floor `from`, the code point before `low`, whose kind the
-  // boundary there asks. CodePoint: when those bytes are well-formed UTF-8
-  // (a byte DFA meets no stray byte; the Pike reads one as an element).
-  // Grapheme: when each of their clusters is one code point, or a CR-LF to
-  // a pattern that cannot split one, read from a boundary that nothing
-  // before it can join — then a byte program and the code-point program
-  // that resolves the groups see what the grapheme engine does.
-  bool end_region_ok(std::string_view text, int from, int low) const {
-    const size_t n = text.size();
-    int q = low > from || low == 0 ? low : low - cp_before(text, low).len;
-    for (int k = 0; k < 3 && q > 0 && static_cast<size_t>(q) < n &&
-                    (static_cast<unsigned char>(text[q]) & 0xC0) == 0x80;
-         k++)
-      q--;
+  // Whether the bytes [q, n) a reverse scan from the end read can answer for
+  // the subject without a look at the rest of it: well-formed UTF-8
+  // (CodePoint); clusters of one code point, or a CR-LF to a pattern that
+  // cannot split one, from a boundary nothing before `q` can join (Grapheme).
+  bool end_region_ok(std::string_view text, size_t q) const {
     if (plan_->us_)
-      return unicode::utf8::valid_from(text.data(), n, static_cast<size_t>(q));
-    // Back to a boundary that holds whatever stands before it: one the pair
-    // across never fuses at, whose left is no Extend or ZWJ (GB9c and GB11
-    // look further back from those). A stray byte is no code point.
+      return unicode::utf8::valid_from(text.data(), text.size(), q);
+    // Back past pairs that fuse, and past an Extend or ZWJ left side (GB9c
+    // and GB11 look further back from those). A stray byte is no code point.
     using GB = unicode::GraphemeBreak;
-    for (; q > 0;) {
-      const Decoded l = cp_before(text, q);
+    while (q > 0 && q < text.size()) {
+      const Decoded l = cp_before(text, static_cast<int>(q));
       if (l.len == 1 && l.cp >= 0x80) return false;
       const GB lp = unicode::_grapheme_break_properties::get_value(l.cp);
       if (lp != GB::Extend && lp != GB::ZWJ &&
           !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(
-                            cp_at(text, q).cp)))
+                            cp_at(text, static_cast<int>(q)).cp)))
         break;
-      q -= l.len;
+      q -= static_cast<size_t>(l.len);
     }
-    return egc_match_clean(text, static_cast<size_t>(q), n) &&
-           ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_) ||
-            !contains_crlf(text.substr(static_cast<size_t>(q))));
+    return egc_simple_from(text.substr(q), 0);
   }
 
   // One assert-tier chain match handed to `out` (the assert twin
@@ -17310,7 +17318,7 @@ inline void Regex::ladder_plan(Plan &p) {
       st.rung = st.below = Rung::Literal;
     } else if (p.literal_alt_ok()) {
       st.rung = st.below = Rung::LiteralAlt;
-    } else if (p.end_anchor_ok(w == 0)) {
+    } else if (p.end_anchor_ok()) {
       // Ahead of the literal anchor's memmem (`foo$`): from the end, the
       // find reads what the match spans.
       st.rung = st.below = Rung::EndAnchor;
@@ -17476,8 +17484,7 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
         l = plan_->start_[2];
     }
   }
-  if (l.rung != Rung::Pike && l.rung != Rung::EndAnchor && us_stray(text))
-    l = pike_ladder(l.want);
+  l = unstray(text, l);
   if (l.rung == Rung::Walk) {
     const Step st = ladder_walk<false>(text, scr, l, c, budget, chain_once, out);
     if (st != Step::Again) return st == Step::Yield;
