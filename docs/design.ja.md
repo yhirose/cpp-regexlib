@@ -246,7 +246,7 @@ Rust・Go と同じくテキストの末尾だけです。PCRE2・Python・Java 
   それを 1 要素として読む）。
 - **Grapheme**：その中の書記素がすべて 1 コードポイント——CR-LF は、それを分け得ない
   パターンなら可——であることを、前に何が来ても繋がらない境界から前向きに確かめる
-  （`egc_match_clean`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
+  （`egc_simple_from`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
   （さらに前を見る規則 GB9c と GB11）も越えて遡って求める。こうすればバイト
   プログラムも、範囲内でグループを解決するコードポイントのプログラムも、書記素
   エンジンと同じものを見ます。そのため、以前は主題全体の書記素 Pike に回っていた、
@@ -434,19 +434,24 @@ look なしの実体化は元のコードのままです。
 `assert_find_span` / `assert_prefix_find` を再利用し、同じ
 prefilter・同じ `cp_prog_` bitstate capture 解決を使う。モード依存は
 `assert_byte_path_ok` のゲートのみ（US: 任意 subject；EGC: 非ASCII かつ複数CP
-クラスタ無し）。ASCII の subject では、EGC のプランは書記素プログラムのほうを歩く。US で span が
-bitstate を溢れる場合はコードポイント Pike へフォールバック。
+クラスタ無し）。ASCII の subject では、EGC のプランは書記素プログラムのほうを歩く。span が
+bitstate を溢れる場合は、その span の上でコードポイント Pike へフォールバック。
 
-**この tier での capture は US 専用。** `assert_cap_` は ASCII subject 前提で
-`cp_prog_` を組む（`assert_find_ok` が `ascii_grapheme_ok` でゲートする）ので、
-EGC の capture パターンは非ASCII subject では書記素 Pike のまま。そこではバイト
-オートマトンの答えが書記素エンジンの答えではないからで、末尾が単独の UTF-8 先頭
-バイトの subject がそれを露呈する（書記素エンジンはその不正バイトに独自クラスタを
-与え `([^ ]+)$` にマッチするが、バイトオートマトンは継続バイトを要求してマッチ
-しない）。この理由から `assert_byte_path_ok` 自身が `ncap_ == 0` ゲートを持ち、
-どの階段もそれを継承する。以前は各呼び出し側に書き下されており、書き忘れた 1 箇所が
-まさにこの段落の元になった。（末尾からの find は、検査したバイトの上でそうした
-グループも解決する。1 書記素 1 コードポイントで、迷子のバイトがないこと——§2。）
+**この tier の capture は両モードで。** グループはコードポイントプログラムの
+`cp_prog_` の上で解決する。EGC のプランで `assert_byte_path_ok` が通す subject は、
+どのクラスタも 1 コードポイントか、`crlf_byte_safe_` なパターンが分割できない
+CR-LF の対（グループの境界でも分割できない——`crlf_run_ends`）なので、特定した
+span の中で見つかるグループは書記素エンジンのものと一致する。`Dfa/EgcByte+cap` が
+拠って立つのと同じ理屈。EGC のグループは、subject の検査が迷子のバイトを通して
+いた間はこの tier から外されていた：末尾が単独の UTF-8 先頭バイトの subject で
+`([^ ]+)$` が 2 通りの答えを返した（書記素エンジンはその不正バイトに独自クラスタを
+与えてマッチし、バイトオートマトンは継続バイトを要求してマッチしない）。今は
+`simple_from` もクラスタの歩行も迷子のバイトを拒否するので、subject だけで決まる。
+`match()` はこの tier をモードごとの tier より先に試す。同じ（プラン、subject）を
+受け持つ tier はほかにない。非 ASCII の文章 4 MB（Grapheme）で、`(\w+)$` の
+`match()` は 207 → 2.1 ms、`(\w+)@(\w+)\b` の `search()` は 512 → 11 ms、
+`\b(\w+)\b` の `find_all` は 628 → 59 ms になった。それまで走っていた書記素 Pike は
+subject 全体を分割する。
 
 ### tier の正式名（ソース中の `[Tier: …]` ラベル）
 
@@ -469,7 +474,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；one-pass 歩行と `+cap` は同上。ただし CRLF collapse プランは除く（`byte_walk_ok`：そのバイトプログラムは CR-LF の対を 1 要素と数え、歩行の表は 2 要素と数える） |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | 書記素プログラム上の LazyDfa を look つきで（前向きと、開始を求める逆向き）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)`（US: 任意 subject；EGC: 非ASCII simple **かつ capture なし**） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap` は US 専用（上記参照） |
+| `Assert/Byte` | `assert_byte_path_ok(text)`（US: 任意 subject；EGC: 非ASCII simple） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap`: assert 対応 bitstate、両モード（上記参照） |
 | `Pike` / `Pike/cp` | 常時（フォールバック） | `prog_` 上の書記素 Pike VM；US: `cp_prog_` 上のコードポイント Pike |
 
 どちらの階段も適格な tier を上から試し、DFA がキャッシュを断念したら次へフォールスルーする。
@@ -1052,8 +1057,10 @@ byte DFA に残って全速。唯一の食い違いは CR-LF 内部 LF 位置の
 エンジン同様 対象外。）
 
 DFA ベースのエンジン（バイト DFA、one-pass）は US（任意 subject）と ASCII 書記素
-モードに適用できますが、分割が状態依存の非ASCII *書記素*マッチには適用できません。
-よって US が非ASCII の高速パスで、非ASCII 書記素キャプチャは書記素 Pike に残ります。
+モードに適用できますが、分割が状態依存の非ASCII *書記素*マッチには、1 クラスタ
+1 コードポイントの subject（§4）でしか適用できません。よって US が非ASCII の
+高速パスで、複数コードポイントのクラスタを含む subject の書記素キャプチャは
+書記素 Pike に残ります。
 
 ---
 

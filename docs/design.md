@@ -261,7 +261,7 @@ the code point before, whose kind the boundary there asks:
 - **CodePoint**: they are well-formed UTF-8 (a byte DFA meets no stray byte;
   the Pike reads one as an element of its own).
 - **Grapheme**: every cluster among them is one code point — or a CR-LF, to a
-  pattern that cannot split one — checked forward (`egc_match_clean`) from a
+  pattern that cannot split one — checked forward (`egc_simple_from`) from a
   boundary that nothing before it can join: back past any pair that fuses,
   and past a left side that is `Extend` or `ZWJ`, the two rules (GB9c, GB11)
   that look further back. Then the byte program, and the code-point program
@@ -465,20 +465,25 @@ need. So US does not get a copied assert engine: a US `^ $ \b`-anchored pattern
 subject, with the same prefilters and the same
 `cp_prog_` bitstate capture resolution. `assert_byte_path_ok` is the only
 mode-aware gate (US: any subject; EGC: non-ASCII, no multi-code-point cluster).
-On an ASCII subject an EGC plan steps its grapheme programs instead. US captures
-whose span overflows the bitstate still fall back to the code-point Pike.
+On an ASCII subject an EGC plan steps its grapheme programs instead. Captures
+whose span overflows the bitstate still fall back to the code-point Pike over
+that span.
 
-**Captures on this tier are US-only.** `assert_cap_` compiles `cp_prog_` for an
-ASCII subject (`assert_find_ok` gates on `ascii_grapheme_ok`), so an EGC capture
-pattern on a non-ASCII subject keeps the grapheme Pike — the byte automaton's
-answer is not the grapheme engine's there, and a subject ending in a lone UTF-8
-lead byte shows it (the grapheme engine gives the invalid byte its own cluster
-and matches `([^ ]+)$`; the byte automaton wants a continuation byte and does
-not). `assert_byte_path_ok` itself carries the `ncap_ == 0` gate for that
-reason, so every ladder inherits it — it used to be spelled out at each call
-site, and the one site that forgot is what this paragraph is about. (The find
-from the end resolves such groups, over the bytes it vets: one code point to
-a cluster, no stray byte — §2.)
+**Captures on this tier, in either unit.** The groups are resolved over
+`cp_prog_`, a code-point program. On a subject `assert_byte_path_ok` admits for
+an EGC plan every cluster is one code point — or a CR-LF pair that a
+`crlf_byte_safe_` pattern cannot split, with a group boundary or otherwise
+(`crlf_run_ends`) — so the groups it finds in the located span are the grapheme
+engine's: the argument `Dfa/EgcByte+cap` rests on. EGC groups were held off
+this tier while the subject check let a stray byte through: a subject ending in
+a lone UTF-8 lead byte gave `([^ ]+)$` two answers (the grapheme engine gives
+the invalid byte its own cluster and matches; the byte automaton wants a
+continuation byte and does not). `simple_from` and the cluster walk refuse a
+stray byte now, so the subject alone decides. `match()` tries this tier ahead
+of the unit's own: no other tier serves the same (plan, subject). On 4 MB of
+non-ASCII prose (Grapheme), `(\w+)$`'s `match()` went from 207 to 2.1 ms,
+`(\w+)@(\w+)\b`'s `search()` from 512 to 11 ms and `\b(\w+)\b`'s `find_all`
+from 628 to 59 ms — the grapheme Pike they ran on segments the whole subject.
 
 ### Canonical tier names (the `[Tier: …]` labels)
 
@@ -502,7 +507,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple **and capture-free**) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap` is US-only (see above) |
+| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any subject; EGC: non-ASCII simple) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap`: assert-aware bitstate, in either unit (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
 Both ladders try their eligible tiers top-down and fall through when a DFA
@@ -1137,9 +1142,10 @@ time on `cp_prog_`. (`ß`→`ss` full folding is out of scope, as in the graphem
 engine.)
 
 DFA-based engines (byte DFA, one-pass) apply to US (any subject) and ASCII
-grapheme mode, but not to non-ASCII *grapheme* matching, where breaking is
-stateful. So US is the fast path for non-ASCII; non-ASCII grapheme captures stay
-on the grapheme Pike.
+grapheme mode, but to non-ASCII *grapheme* matching, where breaking is
+stateful, only on a subject of one code point to a cluster (§4). So US is the
+fast path for non-ASCII; grapheme captures on a subject with a
+multi-code-point cluster stay on the grapheme Pike.
 
 ---
 

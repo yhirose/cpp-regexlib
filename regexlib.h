@@ -5788,6 +5788,19 @@ public:
       if (e >= 0) return build_result_bytes(text, sc.saves);
       if (e == -1) return MatchResult{};
     }
+    // [Tier: Assert/Byte] anchored at 0, either unit: the anchored lf byte
+    // assert DFA gives the leftmost-first end, the assert-aware bitstate the
+    // groups. No other tier below serves the same (plan, subject) — an
+    // assert plan is not dfa_ok_, and a Grapheme plan's ASCII subjects are
+    // the ASCII assert tiers' (see assert_byte_path_ok) — so it can lead.
+    if (us_bytes && assert_byte_path_ok(text, fna)) {
+      int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
+      if (e == -1) return MatchResult{};
+      if (e != LazyDfa::kCap)
+        return plan_->byte_assert_cap_ ? run_captures_bytes(text, 0, e, sc)
+                                       : build_dfa_result(text, 0, e);
+      // kCap — fall through to the unit's Pike below.
+    }
     if (plan_->us_) {
       // [Tier: Dfa/US] anchored: the leftmost-first byte DFA gives the end.
       if (!us_bytes) {
@@ -5805,17 +5818,6 @@ public:
         if (e == -1) return MatchResult{};
         if (e != LazyDfa::kCap) return run_captures_bytes(text, 0, e, sc);
         // end == kCap — fall through to the code-point Pike VM.
-      }
-      // [Tier: Assert/Byte] anchored at 0: the anchored lf byte assert DFA
-      // gives the leftmost-first end; captures resolved by the assert-aware
-      // bitstate.
-      if (us_bytes && assert_byte_path_ok(text)) {
-        int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
-        if (e == -1) return MatchResult{};
-        if (e != LazyDfa::kCap)
-          return plan_->byte_assert_cap_ ? run_captures_bytes(text, 0, e, sc)
-                                         : build_dfa_result(text, 0, e);
-        // kCap — fall through to the code-point Pike VM.
       }
       // [Tier: Pike/cp] the US baseline: anchored code-point Pike VM.
       auto seg = detail::segment_cp(text);
@@ -5896,16 +5898,6 @@ public:
     // from 0 via the anchored lf DFA (lfa over the bare pattern, with look).
     if (plan_->ncap_ == 0 && assert_find_ok(text, fna)) {
       int e = look_forward_lf(dfa_fwda(cache, /*byte=*/false), text, 0);
-      if (e == -1) return MatchResult{};
-      if (e != LazyDfa::kCap) return build_dfa_result(text, 0, e);
-      // kCap — fall through to the Pike VM below.
-    }
-
-    // [Tier: Assert/Byte] capture-free, non-ASCII, anchored at 0:
-    // leftmost-first end via the anchored lf byte DFA (blfa over the bare
-    // byte_prog_, with look).
-    if (assert_byte_path_ok(text)) {
-      int e = look_forward_lf(dfa_fwda(cache, /*byte=*/true), text, 0);
       if (e == -1) return MatchResult{};
       if (e != LazyDfa::kCap) return build_dfa_result(text, 0, e);
       // kCap — fall through to the Pike VM below.
@@ -7243,9 +7235,9 @@ private:
         // program above); the code-point program — carrying the assert ops, now
         // evaluated by the assertion-aware bitstate — then resolves groups on that
         // bounded span, replacing the grapheme Pike VM (whose per-thread Saves
-        // churn dominated these `$`/`^`/`\b`-anchored capture patterns). ASCII
-        // subject only for now (assert_find_ok gates on ascii_grapheme_ok); a
-        // non-ASCII subject keeps the correct grapheme Pike.
+        // churn dominated these `$`/`^`/`\b`-anchored capture patterns) — on
+        // an ASCII subject, and on a non-ASCII one the byte assert tier
+        // serves (assert_byte_path_ok).
         if (ncap_ > 0) {
           cp_prog_ = detail::Compiler::compile(root, ncap_, /*us=*/false,
                                                /*reverse=*/false, dotall_,
@@ -12378,6 +12370,14 @@ private:
   // with no multi-code-point grapheme cluster (so code-point == grapheme). The
   // CRLF gate matches the regular byte path (a CR-LF interior carries no match
   // boundary when the pattern is CRLF-byte-safe and non-empty).
+  //
+  // Groups included, in both modes: on such a subject the code-point program
+  // the bitstate runs (cp_prog_) reads the same elements the grapheme engine
+  // does, so the groups it resolves inside the located span are the grapheme
+  // engine's — the argument Dfa/EgcByte+cap rests on. (A Grapheme capture
+  // plan was held off this tier while the subject check let a stray byte
+  // through: `([^ ]+)$` over a subject ending in a lone UTF-8 lead byte had
+  // two answers. egc_simple_from refuses a stray byte now.)
   bool assert_byte_path_ok(std::string_view text,
                            size_t fna = kUnclassified) const {
     if (!plan_->byte_assert_path_) return false;
@@ -12385,14 +12385,6 @@ private:
     // semantics, on ANY subject — no grapheme/CRLF concern (US never fuses
     // CR-LF), so no non-ASCII / simple_from gate.
     if (plan_->us_) return true;
-    // EGC mode: capture-free only. assert_cap_ compiles cp_prog_ for an ASCII
-    // subject (assert_find_ok gates on ascii_grapheme_ok), so an EGC capture
-    // pattern on a non-ASCII subject belongs to the grapheme Pike. This lives
-    // here rather than at the call sites because it drifted, back when each
-    // entry point had its own ladder: search / match / find_all each spelled
-    // it out and find_iter did not, and `([^ ]+)$` over a subject ending in
-    // a lone UTF-8 lead byte then had two answers.
-    if (plan_->ncap_ > 0) return false;
     // EGC mode: only a non-ASCII subject with no multi-code-point grapheme
     // cluster (so byte == grapheme); a pure-ASCII subject uses the grapheme
     // assert tier, and the CRLF gate matches the regular byte path.
@@ -17250,9 +17242,8 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     l.set(Ladder::kWalkByte);
     break;
   case kFamUsAssert:
-    // Shared byte assert engine: the assert chain resolves captures when
-    // ncap_ > 0. CodePoint only — Grapheme shares the engine but not the
-    // captures (assert_byte_path_ok gates it on ncap_ == 0).
+    // Shared byte assert engine (the assert chain resolves the groups), with
+    // the walk of a `body$` capture plan ahead of it.
     l.set(Ladder::kAssert);
     l.set(Ladder::kAssertByte);
     l.set(Ladder::kWalkOn, p.capture_scan_ok());
@@ -17266,11 +17257,7 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     l.set(Ladder::kWalkOn, l.has(Ladder::kFindOk) && p.capture_scan_ok());
     break;
   case kFamAssertByte:
-    // Grapheme: capture-free, by assert_byte_path_ok's own gate. This is
-    // where that gate went missing — a capture pattern read its groups off
-    // the byte assert engine and disagreed with search() and find_all() on
-    // the same subject (`([^ ]+)$` over one ending in a lone UTF-8 lead
-    // byte).
+    // Grapheme: the same engine on a subject assert_byte_path_ok admits.
     l.set(Ladder::kAssert);
     l.set(Ladder::kAssertByte);
     break;
@@ -17821,10 +17808,9 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       if (!All) return Step::Yield;
     }
     break;
-  // The ASCII grapheme assert engine and the US byte assert engine resolve
-  // captures here (EGC's byte assert engine is capture-free — see
-  // assert_byte_path_ok). The assert chain answers -1 for a cursor past the
-  // end; a DFA that gives up downgrades.
+  // The assert engines, ASCII and byte, locate each match here and resolve
+  // its groups. The assert chain answers -1 for a cursor past the end; a DFA
+  // that gives up downgrades.
   case Rung::AssertChain:
     for (;;) {
       int nx = assert_chain_step(*scr.cache, text, c.pos,

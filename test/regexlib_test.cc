@@ -365,18 +365,21 @@ inline std::vector<reg::MatchResult> find_all(const Regex &re,
   return v;
 }
 
+// Byte spans of every group of one match, appended to `out`. A group that
+// did not participate reads as a pair of size_t(-1).
+template <class M> void add_spans(std::vector<size_t> &out, const M &m) {
+  for (size_t g = 0; g <= m.group_count(); g++) {
+    out.push_back(m.group(g).matched() ? m.group(g).begin() : size_t(-1));
+    out.push_back(m.group(g).matched() ? m.group(g).end() : size_t(-1));
+  }
+}
+
 // Byte spans of every group of every match, flattened — from find_all, or
-// (`lazy`) from find_iter. A group that did not participate reads as a pair
-// of size_t(-1).
+// (`lazy`) from find_iter.
 inline std::vector<size_t> flat_spans(const Regex &re, std::string_view subj,
                                       bool lazy) {
   std::vector<size_t> out;
-  auto add = [&](const reg::Match &m) {
-    for (size_t g = 0; g <= m.group_count(); g++) {
-      out.push_back(m.group(g).matched() ? m.group(g).begin() : size_t(-1));
-      out.push_back(m.group(g).matched() ? m.group(g).end() : size_t(-1));
-    }
-  };
+  auto add = [&](const reg::Match &m) { add_spans(out, m); };
   if (lazy)
     for (auto m : re.find_iter(subj))
       add(m);
@@ -1521,17 +1524,14 @@ void test_whole_match_capture() {
   }
 }
 
-// The find from the end (Rung::EndAnchor): every match of an end-anchored
-// pattern ends at the text's end, so the reverse DFA run from there finds
-// the leftmost-first one, reading what it spans and no more — the subject
-// before it is never looked at, so the bytes it read must answer for it:
-// valid UTF-8 (CodePoint), clusters of one code point read from a boundary
-// nothing joins (Grapheme). Every surface agrees with the Pike over tails of
-// stray bytes, combining marks, ZWJ emoji, flags, Hangul jamo, an Indic
-// conjunct (GB9c), a Prepend, CR-LF and NEL, where the scan gives way.
-void test_end_anchor() {
+// Subjects where a byte engine and the grapheme engine can part: up to ten
+// pieces each — ASCII, CR-LF, a lone CR, NEL, stray bytes, combining marks,
+// ZWJ emoji, flags, Hangul jamo, an Indic conjunct (GB9c), a Prepend — and
+// among them the clean ones (one code point to a cluster) a byte engine
+// answers for.
+std::vector<std::string> cluster_subjects() {
   const char *pieces[] = {
-      "a", "b", "1", " ", "\n", "\r\n", "\r", "x", ".",
+      "a", "b", "1", " ", "\n", "\r\n", "\r", "x", ".", "@",
       "\xC3\xA9", "\xC3\x89",     // é É
       "e\xCC\x81",                // e + combining acute
       "\xCC\x81",                 // a lone combining acute
@@ -1544,12 +1544,6 @@ void test_end_anchor() {
       "\xD8\x80",                                     // U+0600, a Prepend
       "\xE6\xBC\xA2", "\xC2\x85",                     // 漢, NEL
       "\x80", "\xFF", "\xE6\xBC"};                    // stray bytes
-  const char *pats[] = {"\\w+$", "(\\w+)$", "(\\w)(\\w*)\\z", "[a-z]+$",
-                        "foo\\d*$", "(?:\\w+|\\d+)$", "\\w*$", "\\s\\w+$",
-                        ".{3}$", "(?s)(.)$", "$", "\\b\\w+$", "\\B\\w$",
-                        "\\W*$", "\\r?\\n?$", "\\r\\n$", "\\p{L}+$",
-                        "a$|b\\z|\\d+$", "(\\w+?)(\\d*)$", "(?i)[\xC3\xA0-\xC3\xBF]+$",
-                        "(?i)(\\w*\xC3\xA9)$", "\xCC\x81$"};
   std::vector<std::string> subjects;
   unsigned x = 11;
   for (int t = 0; t < 160; t++) {
@@ -1560,6 +1554,25 @@ void test_end_anchor() {
     }
     subjects.push_back(s);
   }
+  return subjects;
+}
+
+// The find from the end (Rung::EndAnchor): every match of an end-anchored
+// pattern ends at the text's end, so the reverse DFA run from there finds
+// the leftmost-first one, reading what it spans and no more — the subject
+// before it is never looked at, so the bytes it read must answer for it:
+// valid UTF-8 (CodePoint), clusters of one code point read from a boundary
+// nothing joins (Grapheme). Every surface agrees with the Pike over tails of
+// stray bytes, combining marks, ZWJ emoji, flags, Hangul jamo, an Indic
+// conjunct (GB9c), a Prepend, CR-LF and NEL, where the scan gives way.
+void test_end_anchor() {
+  const char *pats[] = {"\\w+$", "(\\w+)$", "(\\w)(\\w*)\\z", "[a-z]+$",
+                        "foo\\d*$", "(?:\\w+|\\d+)$", "\\w*$", "\\s\\w+$",
+                        ".{3}$", "(?s)(.)$", "$", "\\b\\w+$", "\\B\\w$",
+                        "\\W*$", "\\r?\\n?$", "\\r\\n$", "\\p{L}+$",
+                        "a$|b\\z|\\d+$", "(\\w+?)(\\d*)$", "(?i)[\xC3\xA0-\xC3\xBF]+$",
+                        "(?i)(\\w*\xC3\xA9)$", "\xCC\x81$"};
+  const std::vector<std::string> subjects = cluster_subjects();
   for (const char *pat : pats)
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
@@ -1592,6 +1605,51 @@ void test_end_anchor() {
       CHECK(PlanProbe::dfa_stats(whole).scanned < 16);
     }
   }
+}
+
+// The byte assert engine resolves groups in either unit ([Tier:
+// Assert/Byte]): on a Grapheme subject of one code point to a cluster, the
+// code-point program reads the elements the grapheme engine does, so the
+// groups it finds in the span the byte assert DFA located are the grapheme
+// engine's. match() and every find surface agree with the Pike — over
+// subjects ending in a lone UTF-8 lead byte among the rest, which held
+// Grapheme groups off this tier while its subject check let a stray byte
+// through (`([^ ]+)$` over "ab\xC3" had two answers).
+void test_assert_byte_groups() {
+  const char *pats[] = {
+      "([^ ]+)$", "(\\w+)$", "^(\\w+)-(\\w+)$", "(\\w+)@(\\w+)\\b",
+      "\\b(\\w)(\\w*)\\b", "(\\w+)\\b(\\W*)", "(?m)^(\\w+)", "(?m)(\\w+)$",
+      "(\\s+)$", "(?m)(\\s+)$", "(.)\\B(.)", "(\\r\\n|\\w)\\b",
+      "([^.]*)[^.]+\\b", "(\\w+?)(\\d*)\\b", "(?i)(\\w*\xC3\xA9)\\b"};
+  const std::vector<std::string> subjects = cluster_subjects();
+  for (const char *pat : pats)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      for (const std::string &s : subjects) {
+        CHECK(finds_agree(re, flat_spans(pike, s, false), s));
+        const reg::MatchResult got = re.match(s), want = pike.match(s);
+        std::vector<size_t> a, b;
+        if (got.matched()) add_spans(a, got);
+        if (want.matched()) add_spans(b, want);
+        CHECK(a == b);
+      }
+    }
+
+  // ... and in Grapheme mode it is that engine that answers, where the
+  // grapheme Pike used to segment the whole subject: a find and match()
+  // over 1 MB of non-ASCII prose build its DFAs.
+  std::string s;
+  while (s.size() < (1u << 20))
+    s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
+  s += "a@b";
+  const Regex find("(\\w+)@(\\w+)\\b"), match("(\\w+) (\\w+)\\b");
+  const reg::MatchResult f = find.search(s);
+  CHECK(f.matched() && f.group(1).str() == "a" && f.group(2).str() == "b");
+  CHECK(PlanProbe::dfa_stats(find).built > 0);
+  const reg::MatchResult m = match.match(s);
+  CHECK(m.matched() && m.group(1).str() == "The" &&
+        m.group(2).str() == "quick");
+  CHECK(PlanProbe::dfa_stats(match).built > 0);
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -6024,6 +6082,7 @@ int main() {
   test_onewalk_local_bail();
   test_find_ladder();
   test_end_anchor();
+  test_assert_byte_groups();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();
