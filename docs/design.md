@@ -807,6 +807,18 @@ the pattern matches:
   `find_all`'s rows, one widened row per step in `MatchIter`). With any other
   group in the pattern the wrappers' slots are real work, and they stay.
 
+A wrapper need not be the root's: one beside nothing but assertions —
+`\b(\w+)\b`, `^((\w+))$` — spans the whole match all the same, since an
+assertion consumes nothing (`wrapped_element`). Its groups come out of the
+sequence and what they held is spliced into it (`unwrap_groups`), so the twin
+is the pattern as written without them: `\b(\w+ing)\b` is planned as the
+four-element `\b\w+ing\b`, with its literal suffix. Over 4 MB of prose
+`\b(\w+)\b` went from 56 to 36 ms as a `find_all` (its twin's 33),
+`\b(\w+ing)\b` from 15 to 4.6. A lookaround is zero-width too but is not
+counted: a pattern with one runs on the Pike either way, and wrapping a
+pattern in lookarounds is how the test suites keep their Pike reference's
+groups real (`pike_twin`).
+
 It has to happen on the AST, ahead of every analysis, because the analyses
 read the root's *shape* — a `Concat` ending in a literal, a bare literal run —
 and a wrapper that survives to the plan hides it. Before this a wrapped pattern

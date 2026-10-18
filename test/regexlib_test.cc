@@ -72,6 +72,9 @@ struct PlanProbe {
     const auto &prog = p.us_ ? p.cp_prog_ : p.prog_;
     return {prog.lits.size(), prog.classes.size()};
   }
+  // How many groups the plan reports as the whole match, run as its
+  // capture-free twin (detail::peel_root_groups); 0 when its groups are real.
+  static int alias_groups(const Regex &re) { return re.plan_->alias_groups_; }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
@@ -1444,6 +1447,43 @@ void test_whole_match_capture() {
     // A wrapper that can match empty: the groups are empty spans too.
     CHECK(rows(mk(R"((x*))"), "ax", {{0, 0}, {1, 2}, {2, 2}}));
     CHECK(rows(mk(R"(())"), "ab", {{0, 0}, {1, 1}, {2, 2}}));
+    // A wrapper beside assertions only: they consume nothing, so the groups
+    // still span the whole match.
+    CHECK(rows(mk(R"(\b(\w+)\b)"), "on a train", {{0, 2}, {3, 4}, {5, 10}}));
+    CHECK(rows(mk(R"(\b(\w+ing)\b)"), "sing a ringing thingy",
+               {{0, 4}, {7, 14}}));
+    CHECK(rows(mk(R"(^((\w+))$)", Multiline), "ab\ncd e", {{0, 2}}));
+    CHECK(rows(mk(R"(\B(?:(\d+))\z)"), "a12 x345", {{5, 8}}));
+    CHECK(rows(mk(R"(^()$)", Multiline), "a\n\nb", {{2, 2}}));
+  }
+  // ... and is planned as its capture-free twin — flattened, so the twin is
+  // the pattern written without the groups — where the groups are all such
+  // wrappers. Not beside a lookaround (the Pike runs it either way, and it
+  // is what keeps the reference twins' groups real: see pike_twin), nor with
+  // a second group, nor a group under a quantifier.
+  const std::pair<const char *, const char *> twins[] = {
+      {R"(\b(\w+)\b)", R"(\b\w+\b)"},
+      {R"(\b(\w+ing)\b)", R"(\b\w+ing\b)"},
+      {R"(^((\w+))$)", R"(^\w+$)"},
+      {R"(\B(?:(\d+))\z)", R"(\B\d+\z)"},
+      {R"(\b(?<w>Holmes)\b)", R"(\bHolmes\b)"}};
+  for (const auto &[pat, bare] : twins)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), twin(bare, 0, unit);
+      CHECK(PlanProbe::alias_groups(re) == static_cast<int>(re.group_count()));
+      CHECK(PlanProbe::start(re, false) == PlanProbe::start(twin, false) &&
+            PlanProbe::start(re, true) == PlanProbe::start(twin, true) &&
+            PlanProbe::anchor(re) == PlanProbe::anchor(twin));
+    }
+  for (const char *pat :
+       {R"((?=\w)(\w+))", R"(\b(\w+)\b(x))", R"(\b(\w)+\b)", R"((a)|\bb)"})
+    CHECK(PlanProbe::alias_groups(Regex(pat)) == 0);
+  // Beside an element that consumes, after it or before, a group has a span
+  // of its own.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    CHECK(Regex(R"(\b(\w+)\d)", 0, unit).search(" ab1").group(1).str() == "ab");
+    CHECK(Regex(R"(\b[a-z](\d+)\b)", 0, unit).search(" a12 ").group(1).str() ==
+          "12");
   }
   // The group count and names are the pattern's, not the twin's.
   {

@@ -2529,15 +2529,42 @@ inline bool node_has_capture(const Node &n) {
   return false;
 }
 
-// If every capturing group wraps the WHOLE pattern — nested outermost with
-// nothing beside them, like (\w+), (?:(\w+)) or ((x)) — returns their count;
-// otherwise -1. For such a pattern every group's span equals the whole-match
-// span, so captures need no capture engine at all: the pattern is planned as
-// its capture-free twin (peel_root_groups, below). A group that is not in
-// wrapping position — a(\w+),
-// (\w+)=(\w+),
-// (\w+)? (a quantifier is not a group), (?=(\w+)) (inside a lookaround) — makes
-// the whole pattern ineligible (returns -1 once such a group is seen).
+// The one element of a sequence that consumes, when everything beside it is
+// an assertion, so that the sequence matches what it matches (the `\w+` of
+// `\b\w+\b`); nullptr for any other node. (Not a lookaround, zero-width as
+// it is: a pattern with one runs on the Pike either way, and it is how the
+// test suites keep their Pike reference's groups real — `(?=[\s\S]|$)(?:pat)`.)
+inline const Node *wrapped_element(const Node &n) {
+  using K = Node::Kind;
+  if (n.kind != K::Concat) return nullptr;
+  const Node *body = nullptr;
+  for (const Node &k : n.kids) {
+    switch (k.kind) {
+    case K::Empty:
+    case K::BOL:
+    case K::EOL:
+    case K::WordBoundary:
+    case K::NonWordBoundary:
+    case K::BeginText:
+    case K::EndText:
+    case K::EndTextNL: continue;
+    default: break;
+    }
+    if (body) return nullptr;
+    body = &k;
+  }
+  return body;
+}
+
+// If every capturing group wraps the WHOLE match — nested outermost, with
+// nothing beside them but assertions (see wrapped_element), like (\w+),
+// (?:(\w+)), ((x)) or \b(\w+)\b — returns their count; otherwise -1. For
+// such a pattern every group's span equals the whole-match span, so captures
+// need no capture engine at all: the pattern is planned as its capture-free
+// twin (peel_root_groups, below). A group that is not in wrapping position —
+// a(\w+), (\w+)=(\w+), (\w+)? (a quantifier is not a group), (?=(\w+))
+// (inside a lookaround) — makes the whole pattern ineligible (returns -1
+// once such a group is seen).
 inline int count_wrapping_capture_groups(const Node &n) {
   using K = Node::Kind;
   if (n.kind == K::Group) {
@@ -2545,23 +2572,50 @@ inline int count_wrapping_capture_groups(const Node &n) {
     if (inner < 0) return -1;
     return inner + (n.cap_index >= 1 ? 1 : 0);
   }
-  // Not a group: the groups counted above are all of them only if nothing else
-  // here captures.
+  if (const Node *body = wrapped_element(n))
+    return count_wrapping_capture_groups(*body);
+  // Not a wrapper: the groups counted above are all of them only if nothing
+  // else here captures.
   return node_has_capture(n) ? -1 : 0;
 }
 
-// Peel the groups that wrap the WHOLE pattern off its root, returning what
-// they wrap. A group at the root adds nothing to what the pattern matches:
+// `n` with the groups on its path to the wrapped element taken out (see
+// count_wrapping_capture_groups), as if they had not been written: a group
+// gives way to what it holds, and a sequence's element, once unwrapped, is
+// spliced into it — `\b(\w+ing)\b` becomes the four-element `\b\w+ing\b`.
+inline Node unwrap_groups(Node n) {
+  if (n.kind == Node::Kind::Group)
+    return n.kids.empty() ? Node{} : unwrap_groups(std::move(n.kids[0]));
+  const Node *body = wrapped_element(n);
+  if (!body) return n;
+  Node r = node_sans_kids(n);
+  for (Node &k : n.kids) {
+    if (&k != body) {
+      r.kids.push_back(std::move(k));
+      continue;
+    }
+    Node u = unwrap_groups(std::move(k));
+    if (u.kind == Node::Kind::Concat)
+      for (Node &e : u.kids) r.kids.push_back(std::move(e));
+    else
+      r.kids.push_back(std::move(u));
+  }
+  return r;
+}
+
+// Peel the groups that wrap the WHOLE match off the pattern, returning what
+// they wrap. Such a group adds nothing to what the pattern matches:
 //
-//  - a non-capturing one — (?:\w+ing) — is pure syntax, and is always peeled;
+//  - a non-capturing one at the root — (?:\w+ing) — is pure syntax, and is
+//    always peeled;
 //  - a capturing one records a span that is, by position, the match's own. It
 //    is peeled only when EVERY group of the pattern is such a wrapper
-//    (count_wrapping_capture_groups: (\w+), ((x)), (?:(\w+))), and their
-//    count is returned in `alias_groups`: the pattern is then planned and run
-//    as its capture-free twin — every tier, prefilter and walk the twin gets —
-//    and each group is reported as the whole match where a result is handed
-//    out (Regex::finish_result / alias_rows). With any other group in the
-//    pattern the slots are real work and the wrappers stay.
+//    (count_wrapping_capture_groups: (\w+), ((x)), (?:(\w+)), \b(\w+)\b), and
+//    their count is returned in `alias_groups`: the pattern is then planned
+//    and run as its capture-free twin — every tier, prefilter and walk the
+//    twin gets — and each group is reported as the whole match where a
+//    result is handed out (Regex::finish_result / alias_rows). With any other
+//    group in the pattern the slots are real work and the wrappers stay.
 //
 // The analyses read the root's shape (a Concat ending in a literal, a bare
 // literal run, ...), so a wrapper that survives to the plan hides it: before
@@ -2571,7 +2625,8 @@ inline int count_wrapping_capture_groups(const Node &n) {
 inline Node peel_root_groups(Node root, int ncap, int &alias_groups) {
   const bool whole = ncap > 0 && count_wrapping_capture_groups(root) == ncap;
   alias_groups = whole ? ncap : 0;
-  while (root.kind == Node::Kind::Group && (whole || root.cap_index < 1)) {
+  if (whole) return unwrap_groups(std::move(root));
+  while (root.kind == Node::Kind::Group && root.cap_index < 1) {
     Node inner = root.kids.empty() ? Node{} : std::move(root.kids[0]);
     root = std::move(inner);
   }
