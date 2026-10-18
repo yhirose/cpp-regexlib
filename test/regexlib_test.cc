@@ -1708,21 +1708,25 @@ void test_assert_byte_groups() {
   CHECK(PlanProbe::dfa_stats(match).built > 0);
 }
 
-// `\B` holds between the CR and the LF of a CR-LF in the byte engines (both
-// are non-word), where the grapheme engine has no position at all: the pair
-// is one cluster. A pattern that can consume a `\r` or `\n` could stop or
-// start a match there — `\s+\B` matched the CR of "\r\nE", `\B\W+\w` began
-// on the LF of "ing\r\n\n\xC3\x89". Like a multiline anchor, `\B` keeps the
-// byte tiers on a CR-LF subject only when nothing consumes either byte
-// (crlf_inert). Every surface and match() agree with the Pike in both units,
-// on ASCII and non-ASCII subjects.
-void test_crlf_nonword_boundary() {
-  const char *pats[] = {"\\s+\\B",   "\\B\\W+\\w",   "\\W\\B",    "\\B\\s",
-                        "(\\s+)\\B(\\w)", "\\B[^a]+x", "\\s+\\b",  "\\w+\\B\\w",
-                        "\\B\\w+",   "(?m)\\B\\s*$"};
+// `\B`, and a multiline `^`/`$`, hold between the CR and the LF of a CR-LF
+// in the byte engines, where the grapheme engine has no position at all: the
+// pair is one cluster. Next to a run that takes CR and LF they let a match
+// stop or start there — `\s+\B` matched the CR of "\r\nE", `\B\W+\w` began
+// on the LF of "ing\r\n\n\xC3\x89" — so crlf_run_ends counts them as runs,
+// which must not meet one. Every surface and match() agree with the Pike in
+// both units, on ASCII and non-ASCII subjects, for patterns on both sides of
+// that line.
+void test_crlf_interior_anchors() {
+  const char *pats[] = {
+      "\\s+\\B",         "\\B\\W+\\w",       "\\W\\B",           "\\B\\s",
+      "(\\s+)\\B(\\w)",  "\\B[^a]+x",       "\\s+\\b",          "\\w+\\B\\w",
+      "\\B\\w+",         "(?m)\\B\\s*$",     "\\Bing\\s+\\w",     "x\\B\\s+",
+      "\\w+\\Bly\\s+\\w+", "(?m)^\\w+,\\s+\\w+", "(?m)$\\s+\\w",      "(?m)(\\s+)$",
+      "(?m)^(\\w+)\\s+(\\w+)"};
   std::vector<std::string> subjects = cluster_subjects();
   for (const char *s : {"\r\nE", "a \r\nE", "\xC3\xA9\r\nE", "ing\r\n\n\xC3\x89",
-                        "x\r\n\r\ny", " \r\n", "ab\r\n"})
+                        "x\r\n\r\ny", " \r\n", "ab\r\n", "sing\r\nnow",
+                        "quickly\r\n go", "a,\r\nb\r\nc, d"})
     subjects.push_back(s);
   for (const char *pat : pats)
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
@@ -1730,10 +1734,13 @@ void test_crlf_nonword_boundary() {
       for (const std::string &s : subjects)
         CHECK(all_agree(re, pike, s));
     }
-  // A `\B` pattern that consumes neither byte keeps the byte tiers' CR-LF
-  // admission; one that can does not.
-  CHECK(PlanProbe::crlf_byte_safe(Regex("\\w+\\B\\w")));
-  CHECK(!PlanProbe::crlf_byte_safe(Regex("\\s+\\B")));
+  // Where such an anchor meets no run the byte tiers keep a CR-LF subject;
+  // where it does, it goes to the Pike.
+  for (const char *pat : {"\\w+\\B\\w", "\\Bing\\s+\\w", "(?m)^\\w+,\\s+\\w+",
+                          "(?m)^(\\w+)\\s+(\\w+)"})
+    CHECK(PlanProbe::crlf_byte_safe(Regex(pat)));
+  for (const char *pat : {"\\s+\\B", "\\B\\W+\\w", "(?m)$\\s+\\w", "(?m)(\\s+)$"})
+    CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -5162,8 +5169,9 @@ void test_body_dollar() {
     CHECK(rows(make_egc(R"((?m)(\s+)$)"), s).empty());
     // Before the fix: [2,3) and [5,6), both cluster interiors.
     CHECK(rows(make_egc(R"((?m)^([^ ]+))"), " \r\n \r\n").empty());
-    // A crlf_inert pattern keeps the fast tiers AND the right answer: `\w`
-    // refuses \r and \n, so no match can reach a cluster interior.
+    // A pattern whose anchors meet no run keeps the fast tiers AND the right
+    // answer: `\w` refuses \r and \n, so no match can reach a cluster
+    // interior.
     CHECK(rows(make_egc(R"((?m)^(\w+))"), "ab\r\ncd") ==
           (std::vector<std::string>{"0,2=ab", "4,6=cd"}));
   }
@@ -6176,7 +6184,7 @@ int main() {
   test_find_ladder();
   test_end_anchor();
   test_assert_byte_groups();
-  test_crlf_nonword_boundary();
+  test_crlf_interior_anchors();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

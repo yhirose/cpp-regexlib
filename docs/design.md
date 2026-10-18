@@ -994,28 +994,20 @@ a pattern is safe if no element observes the difference:
   cluster in one — same span, no boundary between). A class matching **exactly
   one** of `\r`/`\n` diverges and is unsafe;
 - `.` touches `\r`/`\n` only under dotall, and only transparently;
-- `^`/`$` under **Multiline** only when the pattern is `crlf_inert`. They consume
-  nothing, but a multiline anchor *binds at* the line terminator, and the ASCII
-  tier fires it on any line-break byte — so inside a CR-LF pair it also binds
-  **between** the two code points, a position the grapheme engine, seeing one
-  cluster, does not have. The byte anchor set is a superset of the grapheme one
-  and the extra element is exactly the cluster interior. That is harmless when no
-  element of the pattern can consume a lone `\r` or `\n` (`crlf_inert`): a match
-  cannot then start there (it would consume the `\n`; the empty match is already
-  excluded), end there, or cross it (either would have consumed the `\r`), so the
-  extra anchors seed threads that die before accepting. `(?m)^\w+` stays on the
-  fast tiers; `(?m)(\s+)$` does not, and over `"ab\r\n01 x\r\n"` it is one match
-  to the grapheme engine — the trailing cluster — and two to the byte engine,
-  which also stops `\s+` inside the first cluster. (Without Multiline they are
-  text anchors and touch no interior position at all.) A literal `\r\n` pair is
-  not inert even though the literal rule above admits it: this test is about
-  reaching the interior, and consuming the pair reaches it;
-- `\B` only when the pattern is `crlf_inert`, for the same reason: CR and LF are
-  both non-word, so `\B` holds at the interior. `\s+\B` over `"\r\nE"` stopped
-  the run on the `\r` and matched `[0,1)`, where the grapheme engine finds
-  nothing (the cluster is followed by a word character); `\B\W+\w` began a
-  match on the `\n`. `\b` never holds there (non-word on both sides) and keeps
-  its word-ness at every position the grapheme engine has, so it adds nothing;
+- a multiline `^`/`$` and `\B` only where they meet no CR-LF run (below). They
+  consume nothing, but each holds **between** the two code points of a CR-LF —
+  a multiline anchor binds at any line-break byte on the ASCII tier, and `\B`
+  holds between two non-word code points — a position the grapheme engine,
+  seeing one cluster, does not have. A thread can stand there only at a run's
+  end (the run took the `\r`) or at a match's start (the next element takes
+  the `\n`, which only a run can), so such an anchor is harmful exactly next
+  to a run: `\s+\B` over `"\r\nE"` ends on the `\r` at `[0,1)` where the
+  grapheme engine finds nothing, `(?m)(\s+)$` stops `\s+` inside a cluster,
+  `\B\W+\w` starts on the `\n`. `crlf_run_ends` therefore counts these anchors
+  as runs of nothing, which no run may meet. `\Bing\s+\w` and
+  `(?m)^Holmes\s+\w+` keep the fast tiers. (Without Multiline `^`/`$` are text
+  anchors and touch no interior position; `\b` never holds there.) `\Z` and
+  lookarounds also see the interior, but no DFA tier admits them;
 - transparency stops at group boundaries and at fixed-count / non-greedy structure.
 
 `can_match_empty_` (nullable) additionally forces a **non-empty** match for CRLF
