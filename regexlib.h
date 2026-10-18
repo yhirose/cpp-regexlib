@@ -2521,95 +2521,110 @@ inline Node wrap_unanchored(const Node &root) {
   return wrapped;
 }
 
-// True if any capturing group appears anywhere in the subtree.
-inline bool node_has_capture(const Node &n) {
-  if (n.kind == Node::Kind::Group && n.cap_index >= 1) return true;
-  for (const auto &k : n.kids)
-    if (node_has_capture(k)) return true;
+// The empty-width assertions, `^ $ \b \B \A \z \Z` — not a lookaround,
+// whose body is a pattern of its own. (Every kind is listed: a kind added
+// later is not an assertion until it says so.)
+inline bool is_assertion(Node::Kind k) {
+  using K = Node::Kind;
+  switch (k) {
+  case K::BOL:
+  case K::EOL:
+  case K::WordBoundary:
+  case K::NonWordBoundary:
+  case K::BeginText:
+  case K::EndText:
+  case K::EndTextNL: return true;
+  case K::Empty:
+  case K::Lit:
+  case K::AnyChar:
+  case K::Class:
+  case K::Concat:
+  case K::Alt:
+  case K::Repeat:
+  case K::Group:
+  case K::LookAround: return false;
+  }
   return false;
 }
 
 // The one element of a sequence that consumes, when everything beside it is
 // an assertion, so that the sequence matches what it matches (the `\w+` of
-// `\b\w+\b`); nullptr for any other node. (Not a lookaround, zero-width as
-// it is: a pattern with one runs on the Pike either way, and it is how the
-// test suites keep their Pike reference's groups real — `(?=[\s\S]|$)(?:pat)`.)
+// `\b\w+\b`); nullptr for any other node. (A lookaround is zero-width too,
+// but not taken: wrapping a pattern in lookarounds is how the test suites
+// build a Pike reference whose groups are real — pike_twin checks that — and
+// a pattern with one would only save its groups' Saves on the Pike.)
 inline const Node *wrapped_element(const Node &n) {
-  using K = Node::Kind;
-  if (n.kind != K::Concat) return nullptr;
+  if (n.kind != Node::Kind::Concat) return nullptr;
   const Node *body = nullptr;
   for (const Node &k : n.kids) {
-    switch (k.kind) {
-    case K::Empty:
-    case K::BOL:
-    case K::EOL:
-    case K::WordBoundary:
-    case K::NonWordBoundary:
-    case K::BeginText:
-    case K::EndText:
-    case K::EndTextNL: continue;
-    default: break;
-    }
+    if (k.kind == Node::Kind::Empty || is_assertion(k.kind)) continue;
     if (body) return nullptr;
     body = &k;
   }
   return body;
 }
 
-// If every capturing group wraps the WHOLE match — nested outermost, with
-// nothing beside them but assertions (see wrapped_element), like (\w+),
-// (?:(\w+)), ((x)) or \b(\w+)\b — returns their count; otherwise -1. For
-// such a pattern every group's span equals the whole-match span, so captures
-// need no capture engine at all: the pattern is planned as its capture-free
-// twin (peel_root_groups, below). A group that is not in wrapping position —
-// a(\w+), (\w+)=(\w+), (\w+)? (a quantifier is not a group), (?=(\w+))
-// (inside a lookaround) — makes the whole pattern ineligible (returns -1
-// once such a group is seen).
+// How many capturing groups wrap the whole match: nested outermost, with
+// nothing beside them but assertions (see wrapped_element) — like (\w+),
+// (?:(\w+)), ((x)) or \b(\w+)\b. When that is every group of the pattern,
+// each group's span is the match's, so captures need no capture engine at
+// all: the pattern is planned as its capture-free twin (peel_root_groups,
+// below). Any other group — a(\w+), (\w+)=(\w+), (\w+)? (a quantifier is
+// not a group), (?=x)(\w+) (a lookaround is not an assertion) — leaves the
+// count short of the pattern's.
 inline int count_wrapping_capture_groups(const Node &n) {
-  using K = Node::Kind;
-  if (n.kind == K::Group) {
-    int inner = n.kids.empty() ? 0 : count_wrapping_capture_groups(n.kids[0]);
-    if (inner < 0) return -1;
-    return inner + (n.cap_index >= 1 ? 1 : 0);
-  }
-  if (const Node *body = wrapped_element(n))
-    return count_wrapping_capture_groups(*body);
-  // Not a wrapper: the groups counted above are all of them only if nothing
-  // else here captures.
-  return node_has_capture(n) ? -1 : 0;
+  if (n.kind == Node::Kind::Group)
+    return (n.cap_index >= 1 ? 1 : 0) +
+           (n.kids.empty() ? 0 : count_wrapping_capture_groups(n.kids[0]));
+  const Node *body = wrapped_element(n);
+  return body ? count_wrapping_capture_groups(*body) : 0;
 }
 
-// `n` with the groups on its path to the wrapped element taken out (see
-// count_wrapping_capture_groups), as if they had not been written: a group
-// gives way to what it holds, and a sequence's element, once unwrapped, is
-// spliced into it — `\b(\w+ing)\b` becomes the four-element `\b\w+ing\b`.
-inline Node unwrap_groups(Node n) {
-  if (n.kind == Node::Kind::Group)
-    return n.kids.empty() ? Node{} : unwrap_groups(std::move(n.kids[0]));
+// `n` without the groups that wrap its match (count_wrapping_capture_groups'
+// path), as if they had not been written — the capturing ones too when
+// `caps`. A group gives way to what it holds, and what a sequence's wrapped
+// element unwraps to is spliced into the sequence: `\b(?:\w+ing)\b` is
+// planned as the flat `\b\w+ing\b`, its literal suffix in view. (No literal
+// meets another at the splice: the element's neighbours are assertions.)
+inline Node peel_groups(Node n, bool caps) {
+  while (n.kind == Node::Kind::Group && (caps || n.cap_index < 1)) {
+    Node inner = n.kids.empty() ? Node{} : std::move(n.kids[0]);
+    n = std::move(inner);
+  }
+  return n;
+}
+// The elements of the sequence `n` (wrapped or not), unwrapped, onto `out`
+// — top down, each node moved once, however deep the wrappers nest.
+inline void unwrap_into(Node n, bool caps, std::vector<Node> &out) {
   const Node *body = wrapped_element(n);
-  if (!body) return n;
-  Node r = node_sans_kids(n);
   for (Node &k : n.kids) {
     if (&k != body) {
-      r.kids.push_back(std::move(k));
+      out.push_back(std::move(k));
       continue;
     }
-    Node u = unwrap_groups(std::move(k));
+    Node u = peel_groups(std::move(k), caps);
     if (u.kind == Node::Kind::Concat)
-      for (Node &e : u.kids) r.kids.push_back(std::move(e));
+      unwrap_into(std::move(u), caps, out);
     else
-      r.kids.push_back(std::move(u));
+      out.push_back(std::move(u));
   }
+}
+inline Node unwrap_groups(Node n, bool caps) {
+  n = peel_groups(std::move(n), caps);
+  if (!wrapped_element(n)) return n;
+  Node r = node_sans_kids(n);
+  r.kids.reserve(n.kids.size() + 2);
+  unwrap_into(std::move(n), caps, r.kids);
   return r;
 }
 
-// Peel the groups that wrap the WHOLE match off the pattern, returning what
-// they wrap. Such a group adds nothing to what the pattern matches:
+// Peel the groups that wrap the WHOLE match off the pattern, returning it
+// without them. Such a group adds nothing to what the pattern matches:
 //
-//  - a non-capturing one at the root — (?:\w+ing) — is pure syntax, and is
-//    always peeled;
+//  - a non-capturing one — (?:\w+ing), \b(?:\w+ing)\b — is pure syntax, and
+//    always comes off;
 //  - a capturing one records a span that is, by position, the match's own. It
-//    is peeled only when EVERY group of the pattern is such a wrapper
+//    comes off only when EVERY group of the pattern is such a wrapper
 //    (count_wrapping_capture_groups: (\w+), ((x)), (?:(\w+)), \b(\w+)\b), and
 //    their count is returned in `alias_groups`: the pattern is then planned
 //    and run as its capture-free twin — every tier, prefilter and walk the
@@ -2625,12 +2640,7 @@ inline Node unwrap_groups(Node n) {
 inline Node peel_root_groups(Node root, int ncap, int &alias_groups) {
   const bool whole = ncap > 0 && count_wrapping_capture_groups(root) == ncap;
   alias_groups = whole ? ncap : 0;
-  if (whole) return unwrap_groups(std::move(root));
-  while (root.kind == Node::Kind::Group && root.cap_index < 1) {
-    Node inner = root.kids.empty() ? Node{} : std::move(root.kids[0]);
-    root = std::move(inner);
-  }
-  return root;
+  return unwrap_groups(std::move(root), whole);
 }
 
 // True if `n` can match the empty string. Used to decide whether an unbounded
@@ -6830,7 +6840,7 @@ private:
       detail::Parser parser(pattern, us_, named_,
                             {(flags & IgnoreCase) != 0,
                              (flags & Multiline) != 0, (flags & DotAll) != 0});
-      // Groups wrapping the whole pattern come off here, before anything
+      // Groups wrapping the whole match come off here, before anything
       // reads the AST. When they were all the groups there are, ncap_ is 0
       // from here on — the plan IS the capture-free twin's — and
       // alias_groups_ remembers how many groups a result reports.
@@ -7408,21 +7418,12 @@ private:
 
     // Any zero-width assertion / lookaround anywhere under `n`?
     static bool node_has_assert(const detail::Node &n) {
-      using K = detail::Node::Kind;
-      switch (n.kind) {
-      case K::BOL:
-      case K::EOL:
-      case K::WordBoundary:
-      case K::NonWordBoundary:
-      case K::BeginText:
-      case K::EndText:
-      case K::EndTextNL:
-      case K::LookAround: return true;
-      default:
-        for (const auto &k : n.kids)
-          if (node_has_assert(k)) return true;
-        return false;
-      }
+      if (detail::is_assertion(n.kind) ||
+          n.kind == detail::Node::Kind::LookAround)
+        return true;
+      for (const auto &k : n.kids)
+        if (node_has_assert(k)) return true;
+      return false;
     }
 
     // The compact one-pass walk table shared by the AnchoredOnePass and
@@ -8067,18 +8068,8 @@ private:
     // Used by analyze_assert_suffix to peel trailing assertions off the literal.
     static bool is_zero_width(const detail::Node &n) {
       using K = detail::Node::Kind;
-      switch (n.kind) {
-      case K::BOL:
-      case K::EOL:
-      case K::WordBoundary:
-      case K::NonWordBoundary:
-      case K::BeginText:
-      case K::EndText:
-      case K::EndTextNL:
-      case K::LookAround:
-      case K::Empty: return true;
-      default: return false;
-      }
+      return detail::is_assertion(n.kind) || n.kind == K::LookAround ||
+             n.kind == K::Empty;
     }
 
     // Required trailing literal for the assert tier: the last consuming atom is an

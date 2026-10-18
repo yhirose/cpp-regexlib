@@ -76,8 +76,9 @@ constexpr int kDefaultIters = kAsan ? 5000 : 25000;
 // befriends it): whether a Regex is served by the Pike VM and by nothing
 // else — no literal, DFA or assert tier, and none of the Pike rung's own
 // accelerators either (the start filters that skip to a candidate, the
-// bounded backtracker). Every reference below is built through
-// pike_reference(), which asks.
+// bounded backtracker) — with its groups resolved by the VM, not reported
+// as the whole match of a capture-free twin. Every reference below is built
+// through pike_reference(), which asks.
 namespace reg {
 namespace detail {
 struct PlanProbe {
@@ -88,7 +89,7 @@ struct PlanProbe {
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
-           !p.first_bytes_.ok && !p.cap_bitstate_;
+           !p.first_bytes_.ok && !p.cap_bitstate_ && !p.alias_groups_;
   }
   // Whether the byte classes are exact, for each program of the plan a lazy
   // DFA runs over: classes numbered in byte order, and no instruction that

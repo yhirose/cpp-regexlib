@@ -150,16 +150,16 @@ struct PlanProbe {
   using Teddy = Regex::Teddy;
   static const Teddy &teddy(const Regex &re) { return re.plan_->teddy_; }
   // Served by the Pike VM and by nothing else — no literal, DFA or assert
-  // tier planned, and none of the Pike rung's own accelerators either (the
-  // start filters, the bounded backtracker): what a reference Regex has to
-  // be.
+  // tier planned, none of the Pike rung's own accelerators either (the
+  // start filters, the bounded backtracker), and the groups the VM's, not
+  // a capture-free twin's whole match: what a reference Regex has to be.
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
-           !p.first_bytes_.ok && !p.cap_bitstate_;
+           !p.first_bytes_.ok && !p.cap_bitstate_ && !p.alias_groups_;
   }
   // The rung a scan starts on, for a caller that wants matches (`test`
   // false) or only whether there is one. One letter per rung:
@@ -1455,35 +1455,35 @@ void test_whole_match_capture() {
     CHECK(rows(mk(R"(^((\w+))$)", Multiline), "ab\ncd e", {{0, 2}}));
     CHECK(rows(mk(R"(\B(?:(\d+))\z)"), "a12 x345", {{5, 8}}));
     CHECK(rows(mk(R"(^()$)", Multiline), "a\n\nb", {{2, 2}}));
-  }
-  // ... and is planned as its capture-free twin — flattened, so the twin is
-  // the pattern written without the groups — where the groups are all such
-  // wrappers. Not beside a lookaround (the Pike runs it either way, and it
-  // is what keeps the reference twins' groups real: see pike_twin), nor with
-  // a second group, nor a group under a quantifier.
-  const std::pair<const char *, const char *> twins[] = {
-      {R"(\b(\w+)\b)", R"(\b\w+\b)"},
-      {R"(\b(\w+ing)\b)", R"(\b\w+ing\b)"},
-      {R"(^((\w+))$)", R"(^\w+$)"},
-      {R"(\B(?:(\d+))\z)", R"(\B\d+\z)"},
-      {R"(\b(?<w>Holmes)\b)", R"(\bHolmes\b)"}};
-  for (const auto &[pat, bare] : twins)
-    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
-      const Regex re(pat, 0, unit), twin(bare, 0, unit);
+    // ... and the pattern is planned as its capture-free twin, flattened:
+    // the pattern written without its groups. So is one whose wrappers do
+    // not capture.
+    const std::pair<const char *, const char *> twins[] = {
+        {R"(\b(\w+)\b)", R"(\b\w+\b)"},
+        {R"(\b(\w+ing)\b)", R"(\b\w+ing\b)"},
+        {R"(\b(?:\w+ing)\b)", R"(\b\w+ing\b)"},
+        {R"(^((\w+))$)", R"(^\w+$)"},
+        {R"(\B(?:(\d+))\z)", R"(\B\d+\z)"},
+        {R"(\b(?<w>Holmes)\b)", R"(\bHolmes\b)"},
+        {R"(\b(\b(x)\b)\b)", R"(\b\bx\b\b)"}};
+    for (const auto &[pat, bare] : twins) {
+      const Regex re = mk(pat), twin = mk(bare);
       CHECK(PlanProbe::alias_groups(re) == static_cast<int>(re.group_count()));
       CHECK(PlanProbe::start(re, false) == PlanProbe::start(twin, false) &&
             PlanProbe::start(re, true) == PlanProbe::start(twin, true) &&
             PlanProbe::anchor(re) == PlanProbe::anchor(twin));
     }
-  for (const char *pat :
-       {R"((?=\w)(\w+))", R"(\b(\w+)\b(x))", R"(\b(\w)+\b)", R"((a)|\bb)"})
-    CHECK(PlanProbe::alias_groups(Regex(pat)) == 0);
-  // Beside an element that consumes, after it or before, a group has a span
-  // of its own.
-  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
-    CHECK(Regex(R"(\b(\w+)\d)", 0, unit).search(" ab1").group(1).str() == "ab");
-    CHECK(Regex(R"(\b[a-z](\d+)\b)", 0, unit).search(" a12 ").group(1).str() ==
-          "12");
+    // Not beside a lookaround (see wrapped_element), nor with a second group
+    // or under a quantifier: those groups are real, and one beside an element
+    // that consumes, after it or before, has a span of its own.
+    const auto unit = us ? reg::MatchUnit::CodePoint : reg::MatchUnit::Grapheme;
+    for (const char *pat : {R"((?=\w)(\w+))", R"(\b(\w+)\b(x))", R"(\b(\w)+\b)",
+                            R"((a)|\bb)", R"(\b(\w+)\d)", R"(\b[a-z](\d+)\b)"}) {
+      const Regex re = mk(pat), pike = pike_twin(pat, 0, unit);
+      CHECK(PlanProbe::alias_groups(re) == 0);
+      for (const char *subj : {" ab1 a12 x", "a1b2 bb ab x", " \xC3\xA9" "1 b"})
+        CHECK(finds_agree(re, flat_spans(pike, subj, false), subj));
+    }
   }
   // The group count and names are the pattern's, not the twin's.
   {
@@ -1660,17 +1660,21 @@ void test_end_anchor() {
 // engine's. match() and every find surface agree with the Pike — over
 // subjects ending in a lone UTF-8 lead byte among the rest, which held
 // Grapheme groups off this tier while its subject check let a stray byte
-// through (`([^ ]+)$` over "ab\xC3" had two answers).
+// through (`([^ ]+)$` over "ab\xC3" had two answers). Every group here is
+// real: one that spans the whole match is no work for the capture engine
+// (see test_whole_match_capture).
 void test_assert_byte_groups() {
   const char *pats[] = {
-      "([^ ]+)$", "(\\w+)$", "^(\\w+)-(\\w+)$", "(\\w+)@(\\w+)\\b",
-      "\\b(\\w)(\\w*)\\b", "(\\w+)\\b(\\W*)", "(?m)^(\\w+)", "(?m)(\\w+)$",
-      "(\\s+)$", "(?m)(\\s+)$", "(.)\\B(.)", "(\\r\\n|\\w)\\b",
-      "([^.]*)[^.]+\\b", "(\\w+?)(\\d*)\\b", "(?i)(\\w*\xC3\xA9)\\b"};
+      "([^ ])([^ ]*)$", "(\\w)(\\w*)$", "^(\\w+)-(\\w+)$", "(\\w+)@(\\w+)\\b",
+      "\\b(\\w)(\\w*)\\b", "(\\w+)\\b(\\W*)", "(?m)^(\\w)(\\w*)",
+      "(?m)(\\w+)()$", "(\\s)(\\s*)$", "(?m)(\\s)(\\s*)$", "(.)\\B(.)",
+      "(\\r\\n|\\w)\\b(\\W?)", "([^.]*)[^.]+\\b", "(\\w+?)(\\d*)\\b",
+      "(?i)(\\w)(\\w*\xC3\xA9)\\b"};
   const std::vector<std::string> subjects = cluster_subjects();
   for (const char *pat : pats)
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      CHECK(PlanProbe::alias_groups(re) == 0);
       for (const std::string &s : subjects) {
         CHECK(finds_agree(re, flat_spans(pike, s, false), s));
         const reg::MatchResult got = re.match(s), want = pike.match(s);
@@ -5080,7 +5084,10 @@ void test_body_dollar() {
     // gives the invalid byte its own cluster and matches, the byte automaton
     // wants a continuation byte and does not — so find_iter reported no match
     // where search() and find_all() reported one.
-    for (const char *pat : {R"(([^ ]+)$)", R"((\w+)$)", R"((.)$)"}) {
+    // (The groups of the first three span their matches, so they run as
+    // capture-free twins; the second three keep real groups.)
+    for (const char *pat : {R"(([^ ]+)$)", R"((\w+)$)", R"((.)$)",
+                            R"(([^ ])([^ ]*)$)", R"((\w)(\w*)$)", R"((.)()$)"}) {
       Regex re = make_egc(pat);
       const std::string s = "ab\xc3"; // \xc3 with no continuation byte
       CHECK(rows(re, s).size() == 1);
