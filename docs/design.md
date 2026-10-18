@@ -491,9 +491,10 @@ The numbered tiers above say *what engine runs*. Which of them serves a call
 is decided in two places: the find entry points (`test` / `search` /
 `find_all` / `find_iter` / `find_at`) climb one shared ladder (next section),
 and `match` — anchored at 0, where no prefilter applies — takes one rung per
-family of that ladder, behind the gates `ladder_gated` gives the family and in
-its order: the family's DFA anchored at 0 locates the end, and
-`match_located` resolves any groups within it. Every
+family of that ladder (`match_end`): the family's DFA anchored at 0 locates
+the end, and `match_located` resolves any groups within it. Which family
+answers is not decided by the gates up front but by trying them in turn (see
+"`match()`: the families in turn" below). Every
 branch carries a `[Tier: …]` label in the source, with one canonical name per
 (pattern-class × subject-class) combination:
 
@@ -554,8 +555,8 @@ family's ladder for each kind of caller (`Plan::family_`; three kinds, see
 starts (`Plan::start_` — a CodePoint plan's family does not depend on the
 subject at all, so its scan starts on the family's first rung outright).
 `ladder_family` is the one place a family is defined, `ladder_classify` the
-one place a find reads the subject gates (`match()`, anchored, still reads
-them itself — see Tier dispatch), and `ladder_pick` the one place the
+one place a find reads the subject gates (`match()` asks them of what its
+guesses read — see below), and `ladder_pick` the one place the
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts
 there by `ladder_plan`, and the fused scans are where `ladder_classify`
@@ -648,6 +649,58 @@ Three things keep the shared ladder from costing them anything:
 
 A scan that outlives the call (`Finder`: `find_iter`, `find_all`, `find_at`)
 stores the same ladder and cursor and takes the same steps.
+
+### `match()`: the families in turn, each judged on what it read
+
+`match()` is anchored at 0, so its answer is settled by the head of the
+subject — a few bytes, for a validator or the token that starts a line. It
+used to look at all of the subject first anyway: the gates a family is chosen
+by (`first_nonascii`, then `simple_from` or `contains_crlf`; `valid_from` in
+CodePoint mode) are passes over the whole of it. `\w+` over 4 MB of prose
+paid 0.14–1.3 ms to answer from its first word, and a stray byte or a
+combining mark anywhere sent it to the Pike, which segmented all 4 MB
+(70–183 ms).
+
+It does not classify the subject now. The plan lists the families `match()`
+can run (`Plan::match_guesses_`, set by `ladder_plan`): a CodePoint plan's
+one; a Grapheme plan's ASCII family, then its byte family — the byte family
+first for a pattern with a CR-LF literal, which the ASCII family cannot match
+(`ascii_grapheme_ok`), so that on the subjects where it matters the first
+scan is not thrown away. Each runs anchored at 0 (`match_end`), and the first
+whose answer holds for the subject *as far as its scan read* answers
+(`guess_held`). When none holds, the Pike answers.
+
+- **How far a scan read** (`reach`): one past the furthest byte it examined —
+  at least the match's end. A DFA scan reports it (the anchored DFAs have no
+  start-state skip, and a scan consumes the byte that ends it); a one-pass
+  walk records it in its budget (`WalkBudget::read_to`) on every return.
+- **What must hold**: the family's own gate, over the prefix of the subject
+  that ends with the code point at `reach`. That code point is where the scan
+  stopped, and whether it joins the one before it is what the stop meant:
+  `\w` over `a` + U+0301 consumes the `a` and stops, and the cluster is
+  three bytes. The prefix is extended over an LF after a CR there, so no
+  pair is split. Nothing after it matters: the scan consumed none of it, and
+  a cluster that starts at `reach` is judged by its first code point. The
+  gates are split into the route and the soundness — `egc_byte_path` sends a
+  pure-ASCII subject to the ASCII family, which is faster there, and
+  `byte_sound` is whether the byte programs answer for it at all — and only
+  the soundness is asked.
+- **Why the Pike may answer when none holds**: it is the reference. And it
+  is no more often the Pike than before: a gate that holds for the whole
+  subject holds for each of its prefixes, so a subject no guess holds for is
+  one no family served before either.
+- **What a wrong guess costs**: its scan, to where it stopped. On a
+  non-ASCII subject the ASCII family's anchored DFA dies at the first
+  non-ASCII byte (`lazy_inst_matches` matches none), so it is the ASCII run
+  before that.
+
+Measured on `match()` over 4 MB of prose with a match at 0, in both units:
+`\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.14–1.3 ms to
+0.05–0.1 µs, and with a stray byte at 100 or at the end from 70–183 ms to the
+same. On ~60-byte subjects they run at 0.63–1.07× of before — save `.*fox`
+over one whose first non-ASCII byte follows 45 ASCII ones, 1.75× (+70 ns):
+the wrong guess's scan. A pattern whose scan reads to the end (`.*fox`, no
+line break) costs what it did.
 
 ### Linearity (the O(n²) trap)
 
@@ -978,7 +1031,9 @@ and the byte DFA's answer equals the grapheme engine's). It is one forward pass:
 check the ASCII prefix for a `CR×LF` fusion; from `start`, decode and reject the
 moment two adjacent code points fuse (`gb_fuses`); **SIMD-skip printable-ASCII
 runs** (a printable-ASCII run cannot hold a multi-code-point cluster). Any fusion
-→ fall back to the grapheme Pike.
+→ fall back to the grapheme Pike. (`match()` asks the same of the prefix its
+scan read, not of the whole subject: see §2, "`match()`: the families in
+turn".)
 
 ### CRLF — the cliff, and `crlf_byte_safe`
 

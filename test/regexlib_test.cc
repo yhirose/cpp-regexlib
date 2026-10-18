@@ -301,6 +301,24 @@ struct PlanProbe {
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
   }
+  // The families match() tries, in order, a letter each: U Dfa/US,
+  // u Assert/Byte (CodePoint), b Dfa/EgcByte, a Dfa/Ascii, A Assert/Ascii,
+  // B Assert/Byte (Grapheme).
+  static std::string match_guesses(const Regex &re) {
+    std::string s;
+    for (const auto f : re.plan_->match_guesses_)
+      if (f != Regex::kFamilyCount) s += "UubiaAB"[f];
+    return s;
+  }
+  // Whether the answer of `re`'s family `fam` (a letter as above), which
+  // read `s` up to `reach`, holds for `s` (Regex::guess_held).
+  static bool guess_held(const Regex &re, char fam, std::string_view s,
+                         int reach) {
+    size_t fna = Regex::kUnclassified;
+    const auto f = static_cast<Regex::Family>(
+        std::string_view("UubiaAB").find(fam));
+    return re.guess_held(f, s, reach, fna);
+  }
   // For each lazy DFA with look that the calling thread's cache of `re` has
   // built: whether it steps a byte at a time (LazyDfa::bytewise), and
   // whether it re-seeds.
@@ -1741,6 +1759,114 @@ void test_crlf_interior_anchors() {
     CHECK(PlanProbe::crlf_byte_safe(Regex(pat)));
   for (const char *pat : {"\\s+\\B", "\\B\\W+\\w", "(?m)$\\s+\\w", "(?m)(\\s+)$"})
     CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
+}
+
+// match()'s answer and its groups: the same from `re` as from its reference.
+bool match_agrees(const Regex &re, const Regex &pike, std::string_view s) {
+  std::vector<size_t> a, b;
+  const reg::MatchResult got = re.match(s), want = pike.match(s);
+  if (got.matched()) add_spans(a, got);
+  if (want.matched()) add_spans(b, want);
+  return a == b;
+}
+
+// match() does not classify its subject. It tries the plan's families in
+// turn, each anchored at 0 (Plan::match_guesses_), and the first whose
+// answer holds for the subject as far as its scan read answers
+// (guess_held). So what a family cannot read — a stray byte, a combining
+// mark, a ZWJ sequence, a flag, a Prepend, a CR-LF, a lone CR, a NEL — is
+// placed at every offset of the first 48 bytes and further on, over ASCII,
+// accented and CR-LF text: match() agrees with the Pike, groups and all, in
+// both units. And it reads what its answer needs: over 1 MB of prose that
+// ends in a stray byte, the families answer from the first few bytes,
+// where the subject's class sent match() to the Pike, which segmented the
+// whole of it.
+void test_match_guess() {
+  const char *pats[] = {
+      "\\w+", ".", "\\w", "[a-z]+ing", ".*fox", "[^ ]+ [^ ]+", "x\\w*z",
+      "\\W+", "(?i)the", "a|ab", "\\w*", "(?s).{3}", "[^x]{2}",
+      "\\s{1,3}\\w", "(\\w+) (\\w+)", "(\\w+)@(\\w+)", "(\\w)(\\w*)",
+      "(a|ab)(c|bcd)(d*)", "(\\w+)\\s+(\\d+)", "\\w+ \\w+$", "\\b\\w+\\b",
+      "(\\w+)\\b", "\\w+\\B", "(?m)^\\w+$", "\\w+$", "^(\\w+)-(\\w+)$",
+      "(?m)(\\w+)$", "\\b(\\w+) (\\w+)\\b", "\\w+\\r\\n", "(\\w+)\\r\\n(\\w*)",
+      "the\\s"};
+  const char *dirt[] = {
+      "\xFF", "\xC3", "\xCC\x81", "e\xCC\x81", "\xE2\x80\x8D",
+      "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80", "\r\n", "\r", "\xC2\x85",
+      "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB"};
+  const char *bodies[] = {"the quick brown fox jumps over the lazy dog ",
+                          "the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over ",
+                          "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
+                          "the quick brown fox\r\njumps over the dog\r\n"};
+  std::vector<size_t> offsets;
+  for (size_t at = 0; at <= 48; at++) offsets.push_back(at);
+  offsets.push_back(100);
+  for (const char *pat : pats)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      for (const char *body : bodies) {
+        std::string base;
+        while (base.size() < 160) base += body;
+        CHECK(match_agrees(re, pike, base));
+        for (const char *d : dirt)
+          for (size_t at : offsets) {
+            std::string s = base;
+            s.insert(at, d);
+            CHECK(match_agrees(re, pike, s));
+          }
+      }
+    }
+  // A scan can read past where its answer ends, and what it read there
+  // counts: the one-pass walk of `(a)(?:x[\r\n]b)?` takes `a` and goes on
+  // into the optional part, which in Grapheme mode the CR-LF ahead (one
+  // cluster to `[\r\n]`) completes.
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const char *s : {"ax\r\nb", "ax\r\nb\xFF", "ax\r\nc", "ax\rb"})
+      for (const char *pat : {"(a)(?:x[\\r\\n]b)?", "(\\w+)(?: x[\\r\\n]y)?"})
+        CHECK(match_agrees(Regex(pat, 0, unit), pike_twin(pat, 0, unit), s));
+
+  // What a guess's answer holds for: the code points that start at or
+  // before where its scan stopped — the one there is the last, even when it
+  // joins the one before (a combining mark after `a`), or reach is inside it
+  // — and the LF of a CR there, so that the pair is not split (a lone CR
+  // would refuse the collapsed byte programs of `[^x]{2}`).
+  const Regex word("\\w"), pair("[^x]{2}"), us_word = make_us("\\w");
+  CHECK(PlanProbe::guess_held(word, 'a', "ab", 1));
+  CHECK(!PlanProbe::guess_held(word, 'a', "a\xCC\x81", 1));
+  CHECK(PlanProbe::guess_held(word, 'b', "\xC3\xA9" "a", 1));
+  CHECK(!PlanProbe::guess_held(word, 'b', "a\xCC\x81", 1));
+  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 1));
+  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 2));
+  CHECK(PlanProbe::guess_held(pair, 'b', "\xC3\xA9\r\nab", 2));
+  CHECK(!PlanProbe::guess_held(pair, 'b', "\xC3\xA9\rab", 2));
+
+  // The order: a CodePoint plan's one family; a Grapheme plan's ASCII
+  // family, then its byte family — but the byte family first for a pattern
+  // with a CR-LF literal, which the ASCII family cannot match. A pattern no
+  // family runs has the Pike alone.
+  struct Order {
+    const char *pat, *egc, *us;
+  } orders[] = {{"\\w+", "ab", "U"},
+                {"\\b\\w+\\b", "AB", "u"},
+                {"\\w+\\r\\n", "ba", "U"},
+                {"(?=a)b", "", ""}};
+  for (const Order &o : orders) {
+    CHECK(PlanProbe::match_guesses(Regex(o.pat)) == o.egc);
+    CHECK(PlanProbe::match_guesses(make_us(o.pat)) == o.us);
+  }
+
+  const std::string prose = accented_prose(1u << 20) + "\xFF";
+  for (const char *head : {"", "\xC3\xA9t\xC3\xA9 "})
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+      for (const char *pat : {"\\w+", "\\b\\w+\\b"}) {
+        const std::string s = head + prose;
+        const Regex re(pat, 0, unit);
+        const reg::MatchResult m = re.match(s);
+        CHECK(m.matched() &&
+              m.group(0).str() == (*head ? "\xC3\xA9t\xC3\xA9" : "The"));
+        const PlanProbe::DfaStats st = PlanProbe::dfa_stats(re);
+        CHECK(st.built > 0 && st.scanned < 16);
+      }
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -6185,6 +6311,7 @@ int main() {
   test_end_anchor();
   test_assert_byte_groups();
   test_crlf_interior_anchors();
+  test_match_guess();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();
