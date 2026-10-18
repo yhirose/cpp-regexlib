@@ -224,6 +224,42 @@ DFA 状態は占有するプログラムカウンタの*集合*で、「どこ�
 は書記素 `Segmented` が必要で tier-1 の「分割なし」の利点を潰すため、バイト DFA に
 します。
 
+### 末尾からの find（`EndAnchor`）
+
+テキストの末尾でしか終われないパターン——どの選択肢も `\z` か、(?m) のものでない
+`$` で終わる（`forces_text_end`。`forces_text_begin` の鏡写し）——では、どの一致も
+`n` で終わります。そのうち leftmost-first の一致は開始が最も左のもので、それは
+`n` からカーソルまで逆 DFA を走らせれば求まります。前向きの走査はまったく要りません。
+RE2 の `RE2::Match` の特別扱い（「一致の終わる場所はもう分かっている」）、
+`regex-automata` の `ReverseAnchored` と同じです。両者と同じく、先頭にも固定された
+パターンには使いません（それは 0 からの歩行が受け持ちます）。ここでの `$` は RE2・
+Rust・Go と同じくテキストの末尾だけです。PCRE2・Python・Java の `$` は最後の改行の
+前でも成り立ち、それはこのライブラリの `\Z` にあたり、末尾固定ではありません。
+
+走査は一致の範囲だけを読み、段は主題の分類より前に走るので、残りを読むものは
+ほかにもありません。主題全体の検査をすれば find はまた O(n) に戻ります。代わりに
+段は自分が読んだバイトを検査します（`end_region_ok`）。バイトずつの走査が
+コードポイントの途中で止まったならそのコードポイント全体、下限より上で止まった
+のでなければその前のコードポイント（そこでの境界が尋ねる種類）も含めます：
+
+- **CodePoint**：UTF-8 として正しいこと（バイト DFA は迷子のバイトを扱えず、Pike は
+  それを 1 要素として読む）。
+- **Grapheme**：その中の書記素がすべて 1 コードポイント——CR-LF は、それを分け得ない
+  パターンなら可——であることを、前に何が来ても繋がらない境界から前向きに確かめる
+  （`egc_match_clean`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
+  （さらに前を見る規則 GB9c と GB11）も越えて遡って求める。こうすればバイト
+  プログラムも、範囲内でグループを解決するコードポイントのプログラムも、書記素
+  エンジンと同じものを見ます。そのため、以前は主題全体の書記素 Pike に回っていた、
+  グループ付きの Grapheme プランの非 ASCII テキストもこの段で扱えます。
+
+検査に通らないバイトや、諦めた DFA は、カーソルから `Classify` に走査を渡します。
+単語で終わる 4 MB の文章で、`\w+$` は 6.6 ms から 1 µs 未満に、`é` を含むテキストでの
+Grapheme の `(\w+)$` は 464 ms から同じく 1 µs 未満になりました。一致がテキスト全体の
+`(?s).*\z` は、前向きと逆向きの 2 回の走査が逆向きの 1 回になります（14 ms → 7）。
+ほかのエンジンでこれをするのは RE2 と Rust だけです。.NET・V8・Perl・Oniguruma は
+一致長に上限があるとき（`\d{3}$`）開始位置を末尾近くへ飛ばすだけで、PCRE2・Go・
+Python・Java は先頭から走査します（`test_end_anchor`）。
+
 ### 表の形：バイトクラス、行オフセット、バイト数の予算
 
 1 ステップのコストは、そのステップが読む表で決まります。だから表は小さく、1 回の
@@ -423,6 +459,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | `Literal` | `literal_only_` | memmem（+ Grapheme モードでは書記素境界チェック）；subject 分類なし |
 | `LiteralAlt` | `literal_alt_` 非空 | Teddy 複数リテラルスキャン、見つかった fingerprint で始まるリテラルの順序付き verify |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
+| `EndAnchor` | `end_anchor_ok`（`end_anchored_`、バイト assert プログラム、グループには capture プログラム） | `n` からカーソルまでの逆バイト DFA：最も左の開始。グループは `[s, n)` で解決。読んだバイトだけを検査（`end_region_ok`）、通らなければ `Classify` |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——状態は自分の行のオフセットで表す（LazyDfa と同じ前掛け。1 バイトごとのロードは前のロードだけを待つ）。1 行は 129 エントリで、状態の accept フラグのあとに ASCII の 1 バイトにつき 1 列が続く。フラグは依存チェーンの外で読む。幅を 2 のべきにしないのは、多くの行の同じ列が 1 つのキャッシュセットに集まらないようにするため（主題を変えながら 128 桁を検証する場合：128 エントリの行で 262 ns、129 エントリで 140 ns）。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。候補は短いスカラーの入口ランプのあと、ブロック単位で取る（`word_start_block`。スキャンの節を参照）。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る（§2「線形性」） |
@@ -453,6 +490,7 @@ EGC の capture パターンは非ASCII subject では書記素 Pike のまま�
 | --- | --- | --- |
 | `Literal` / `LiteralAlt` / `AssertAnchor` | プランそのものが位置特定になっているもの。下へ落ちない | カーソル |
 | `TextAnchor` | テキスト先頭に固定されたパターンは 0 でマッチするか、どこでもしない：`AnchoredOnePass` の 0 からの歩行が find の全部。群を読まない呼び出し側（capture-free のプラン、または `test()`）のための段 | カーソル |
+| `EndAnchor` | 末尾に固定されたパターンは末尾でマッチするか、どこでもしない：末尾からの逆 DFA が find の全部。読んだバイトは自分で検査する（§2「末尾からの find」） | キャッシュ |
 | `Classify` | 主題を見て、それを受け持つ系統の段に立つ。上の段がプランの全部でない限り、Grapheme のプランはここから始まる | 主題の分類 |
 | `FusedPrefix` / `FusedSuffix` | 融合 EGC リテラルスキャン（§4） | キャッシュ |
 | `IcasePrefix` / `Suffix` / `Inner` | 候補＋検証のプレフィルタ（§7） | キャッシュ、予算 |

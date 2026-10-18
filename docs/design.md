@@ -237,6 +237,47 @@ is recovered by a **reverse byte DFA** scanning a reversed program leftward from
 *Pike* would need the grapheme `Segmented`, defeating tier-1's no-segmentation
 win — hence a byte DFA.
 
+### The find from the end (`EndAnchor`)
+
+A pattern that can only end at the end of the text — every alternative ends
+in `\z`, or in a `$` that is not (?m)'s (`forces_text_end`, the mirror of
+`forces_text_begin`) — has every match end at `n`. Of those, the
+leftmost-first match is the one with the leftmost start, which is what the
+reverse DFA finds run from `n` down to the cursor: the forward scan is not
+needed at all. That is RE2's special case in `RE2::Match` ("we already know
+where the match must end") and `regex-automata`'s `ReverseAnchored`; like
+them it is not taken for a pattern anchored at the start as well (the walk
+from 0 has those). `$` here is the end of the text only, as in RE2, Rust and
+Go; in PCRE2, Python or Java it also matches before a final newline, which
+is this library's `\Z`, and not end-anchored.
+
+The scan reads what the match spans, and the rung runs before the subject
+is classified, so nothing else reads the rest either: a whole-subject check
+would make the find O(n) again. Instead the rung vets the bytes it read
+(`end_region_ok`) — and, a bytewise scan having stopped inside a code
+point, the code point it stopped in, and unless it died above its floor
+the code point before, whose kind the boundary there asks:
+
+- **CodePoint**: they are well-formed UTF-8 (a byte DFA meets no stray byte;
+  the Pike reads one as an element of its own).
+- **Grapheme**: every cluster among them is one code point — or a CR-LF, to a
+  pattern that cannot split one — checked forward (`egc_match_clean`) from a
+  boundary that nothing before it can join: back past any pair that fuses,
+  and past a left side that is `Extend` or `ZWJ`, the two rules (GB9c, GB11)
+  that look further back. Then the byte program, and the code-point program
+  that resolves groups in the span, see what the grapheme engine sees — so a
+  Grapheme plan with groups is served over non-ASCII text too, which before
+  went to the grapheme Pike over the whole subject.
+
+Bytes that fail, or a DFA that gives up, hand the scan to `Classify` from the
+cursor. Over 4 MB of prose ending in a word, `\w+$` went from 6.6 ms to under
+a microsecond; `(\w+)$` in a Grapheme plan over text with an `é` in it from
+464 ms; a match that is the whole text, `(?s).*\z`, does one reverse pass
+where it did a forward and a reverse one (14 ms → 7). Of other engines only
+RE2 and Rust do this; .NET, V8, Perl and Oniguruma jump the start to near the
+end when the match length is bounded (`\d{3}$`), and PCRE2, Go, Python and
+Java scan from the start (`test_end_anchor`).
+
 ### The table: byte classes, row offsets, a byte budget
 
 What a step costs is decided by the table it reads, so the table is built to
@@ -450,6 +491,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Literal` | `literal_only_` | memmem (+ grapheme-boundary check in Grapheme mode); no subject classification |
 | `LiteralAlt` | `literal_alt_` non-empty | Teddy multi-literal scan, ordered verify of the literals behind the fingerprint found |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
+| `EndAnchor` | `end_anchor_ok` (`end_anchored_`, the byte assert programs, and for groups the capture program) | the reverse byte DFA from `n` to the cursor: the leftmost start; groups in `[s, n)`; vets only the bytes it read (`end_region_ok`), else `Classify` |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — a state is the offset of its row (premultiplied, as the LazyDfa's), so each byte's one load waits on the load before it and nothing else; a row is 129 entries, the state's accept flag and then a column per ASCII byte — the flag is read off the dependency chain, and the odd width keeps one column of many rows out of one cache set (a 128-digit validator over varying subjects: 262 ns with 128-entry rows, 140 so); a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes, taken a block at a time (`word_start_block`, see the scan section) behind a short scalar entry ramp; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity). A subject with a stray byte (not RFC 3629 UTF-8; `us_stray`) starts on the code-point Pike instead — a byte automaton cannot match a byte that is no code point, and the Pike reads it as an element of its own |
@@ -482,6 +524,7 @@ a rung exists at all of them or at none.
 | --- | --- | --- |
 | `Literal` / `LiteralAlt` / `AssertAnchor` | a plan that is its own locate; never falls | the cursor |
 | `TextAnchor` | a text-anchored pattern matches at 0 or nowhere: the `AnchoredOnePass` walk from 0 is the whole find. For a caller that reads no groups — a capture-free plan, or `test()` | the cursor |
+| `EndAnchor` | an end-anchored pattern matches at the end or nowhere: the reverse DFA from the end is the whole find, over the bytes it vets itself (§2, "The find from the end") | cache |
 | `Classify` | looks at the subject and stands on the family that serves it; where a Grapheme plan starts unless a rung above is the whole plan | the subject's class |
 | `FusedPrefix` / `FusedSuffix` | the fused EGC literal scans (§4) | cache |
 | `IcasePrefix` / `Suffix` / `Inner` | the candidate + verify prefilters (§7) | cache, budget |

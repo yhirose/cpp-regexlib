@@ -161,7 +161,8 @@ struct PlanProbe {
   // The rung a scan starts on, for a caller that wants matches (`test`
   // false) or only whether there is one. One letter per rung:
   //   L literal   A literal alternation   a assert-literal anchor
-  //   ^ the walk from 0   ? the subject decides
+  //   ^ the walk from 0   $ the reverse scan from the end
+  //   ? the subject decides
   //   i (?i) prefix   S suffix   I interior literal   W the walk
   //   C the chain   c the assert chain   B the boolean scan   P the Pike
   //   F / f the fused prefix / suffix scans (never a start: the subject
@@ -173,6 +174,7 @@ struct PlanProbe {
     case R::LiteralAlt: return 'A';
     case R::AssertAnchor: return 'a';
     case R::TextAnchor: return '^';
+    case R::EndAnchor: return '$';
     case R::Classify: return '?';
     case R::FusedPrefix: return 'F';
     case R::FusedSuffix: return 'f';
@@ -273,6 +275,7 @@ struct PlanProbe {
     size_t bytes = 0, states = 0;
     // The largest table, in entries: of the forward DFAs, and of the reverse.
     size_t fwd_entries = 0, rev_entries = 0;
+    uint64_t scanned = 0; // subject bytes stepped since a clear (summed)
   };
   static DfaStats dfa_stats(const Regex::FindCache &c) {
     DfaStats s;
@@ -281,6 +284,7 @@ struct PlanProbe {
       s.clears += d.clears;
       s.quit = s.quit || d.quit;
       s.bytes = std::max(s.bytes, d.bytes());
+      s.scanned += d.scanned;
       s.states = std::max(s.states, d.states.size());
       size_t &entries = reverse ? s.rev_entries : s.fwd_entries;
       entries = std::max(entries, d.tr.size());
@@ -1517,6 +1521,74 @@ void test_whole_match_capture() {
   }
 }
 
+// The find from the end (Rung::EndAnchor): every match of an end-anchored
+// pattern ends at the text's end, so the reverse DFA run from there finds
+// the leftmost-first one, reading what it spans and no more — the subject
+// before it is never looked at, so the bytes it read must answer for it:
+// valid UTF-8 (CodePoint), clusters of one code point read from a boundary
+// nothing joins (Grapheme). Every surface agrees with the Pike over tails of
+// stray bytes, combining marks, ZWJ emoji, flags, Hangul jamo, an Indic
+// conjunct (GB9c), a Prepend, CR-LF and NEL, where the scan gives way.
+void test_end_anchor() {
+  const char *pieces[] = {
+      "a", "b", "1", " ", "\n", "\r\n", "\r", "x", ".",
+      "\xC3\xA9", "\xC3\x89",     // é É
+      "e\xCC\x81",                // e + combining acute
+      "\xCC\x81",                 // a lone combining acute
+      "\xE2\x80\x8D",             // ZWJ
+      "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB", // woman ZWJ laptop
+      "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5",             // a flag (two RIs)
+      "\xED\x95\x9C",                                 // 한
+      "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB",         // 한 as jamo L V T
+      "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7",         // क्ष (GB9c)
+      "\xD8\x80",                                     // U+0600, a Prepend
+      "\xE6\xBC\xA2", "\xC2\x85",                     // 漢, NEL
+      "\x80", "\xFF", "\xE6\xBC"};                    // stray bytes
+  const char *pats[] = {"\\w+$", "(\\w+)$", "(\\w)(\\w*)\\z", "[a-z]+$",
+                        "foo\\d*$", "(?:\\w+|\\d+)$", "\\w*$", "\\s\\w+$",
+                        ".{3}$", "(?s)(.)$", "$", "\\b\\w+$", "\\B\\w$",
+                        "\\W*$", "\\r?\\n?$", "\\r\\n$", "\\p{L}+$",
+                        "a$|b\\z|\\d+$", "(\\w+?)(\\d*)$", "(?i)[\xC3\xA0-\xC3\xBF]+$",
+                        "(?i)(\\w*\xC3\xA9)$", "\xCC\x81$"};
+  std::vector<std::string> subjects;
+  unsigned x = 11;
+  for (int t = 0; t < 160; t++) {
+    std::string s;
+    for (int i = 0; i < t % 11; i++) {
+      x = x * 1664525u + 1013904223u;
+      s += pieces[(x >> 16) % std::size(pieces)];
+    }
+    subjects.push_back(s);
+  }
+  for (const char *pat : pats)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      CHECK(PlanProbe::start(re, false) == '$');
+      for (const std::string &s : subjects)
+        CHECK(finds_agree(re, flat_spans(pike, s, false), s));
+    }
+
+  // From the end, the find reads what it finds: over 1 MB that ends in the
+  // match, the reverse DFA is the one stepped, and over little more than
+  // the match — after a stray byte, a combining mark or a CR-LF the scan
+  // never reads, in either mode.
+  for (const char *head : {"", "\xFF", "e\xCC\x81", "\r\n"}) {
+    std::string s = head;
+    while (s.size() < (1u << 20))
+      s += "The quick brown fox jumps over the lazy dog. \xC3\xA9t\xC3\xA9 ";
+    s += "end";
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re("(\\w+)$", 0, unit);
+      Regex::FindCache fc;
+      const auto all = re.find_all(s, fc);
+      CHECK(all.size() == 1 && all[0].begin() == s.size() - 3 &&
+            all[0].group(1).str() == "end");
+      const PlanProbe::DfaStats st = PlanProbe::dfa_stats(fc);
+      CHECK(st.built == 1 && st.fwd_entries == 0 && st.scanned < 16);
+    }
+  }
+}
+
 // The find ladder: search, test, find_all, find_iter and find_at climb the
 // same rungs in the same order. These pin where a scan STARTS (so a fast path
 // cannot quietly stop being taken) and what the rungs that only some callers
@@ -1549,6 +1621,19 @@ void test_find_ladder() {
   CHECK(test(make_us("^(\\d+)-(\\d+)$")) == '^');
   CHECK(rows(make_us("^(\\d+)-(\\d+)$")) == 'W');
   CHECK(rows(Regex("^(\\d+)-(\\d+)$")) == '?');
+  // An end-anchored pattern: one reverse scan from the end, before the
+  // subject is looked at — for every caller, in either mode, with groups or
+  // without (they resolve in the span it locates). Not one anchored at the
+  // start too (the walk from 0, or the families, have it), nor one with a
+  // branch that can end elsewhere, nor `\Z` or (?m)'s `$`.
+  for (const char *pat :
+       {"\\w+$", "(\\w+)$", "foo\\d*\\z", "(?:a|bc)\\z|\\d$", "\\w+\\z\\b"})
+    for (const Regex &re : {Regex(pat), make_us(pat)})
+      CHECK(rows(re) == '$' && test(re) == '$');
+  for (const char *pat :
+       {"^\\w+$", "\\w+$|x", "(?m)\\w+$", "\\w+\\Z", "(?=a)\\w+$", "\\w+(?:$)?"})
+    for (const Regex &re : {Regex(pat), make_us(pat)})
+      CHECK(rows(re) != '$' && test(re) != '$');
   // CodePoint: the family does not depend on the subject, so the scan
   // starts on its first rung outright.
   CHECK(rows(make_us("\\w+")) == 'W' && test(make_us("\\w+")) == 'B');
@@ -5933,6 +6018,7 @@ int main() {
   test_whole_match_capture();
   test_onewalk_local_bail();
   test_find_ladder();
+  test_end_anchor();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

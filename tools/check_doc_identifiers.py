@@ -40,7 +40,8 @@ ALLOW = {
     'Grapheme_Cluster_Break', 'Extended_Pictographic', 'Regional_Indicator',
     'SpacingMark', 'ZWJ', 'InCB',
     # other engines' / std internals cited for comparison
-    'ReverseSuffix', 'ReverseInner', 'regex_automata', 'pcre2_match_data',
+    'ReverseSuffix', 'ReverseInner', 'ReverseAnchored', 'regex_automata',
+    'pcre2_match_data',
     'match_data', 'wchar_t', 'NamedCapturingGroups',
     # illustrative placeholders in doc examples, not real code
     'lvalue_string', 'rvalue_string', 'read_file', 're_comma',

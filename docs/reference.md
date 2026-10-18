@@ -96,7 +96,7 @@ user-perceived character" (emoji/ZWJ/combining-sequence correctness).
 | --- | --- |
 | Literal | any character; in grapheme mode a base + combining marks form one literal grapheme. Syntax is read a code point at a time in either mode, so a mark after `(`, `]` or `+` is literal text after it, and an escape is one code point |
 | Any | `.` (excludes line breaks unless DotAll — see below) |
-| Anchors | `^`, `$` (line-relative under Multiline) |
+| Anchors | `^`, `$` (line-relative under Multiline, else the start / end of the text); `\A`, `\z` (always the start / end of the text); `\Z` (the end, or before a final `\n`) |
 | Character class | `[abc]`, `[a-z]`, `[^…]`; `\p{…}` and `[:posix:]` may appear inside. A range joins two code points in order (`[z-a]` is an error); a `-` next to a set, as in `[\w-.]`, is itself. In grapheme mode a cluster of several code points of literal text in a class adds each of them, and is no range's endpoint (`[a-é]` with NFD `é` is an error) |
 | Predefined class | `\d \w \s` and `\D \W \S` (Unicode-property aware) |
 | POSIX class | `[[:alpha:]]`, `[[:digit:]]`, … inside a bracket (see below) |
