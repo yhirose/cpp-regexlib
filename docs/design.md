@@ -1010,6 +1010,12 @@ a pattern is safe if no element observes the difference:
   text anchors and touch no interior position at all.) A literal `\r\n` pair is
   not inert even though the literal rule above admits it: this test is about
   reaching the interior, and consuming the pair reaches it;
+- `\B` only when the pattern is `crlf_inert`, for the same reason: CR and LF are
+  both non-word, so `\B` holds at the interior. `\s+\B` over `"\r\nE"` stopped
+  the run on the `\r` and matched `[0,1)`, where the grapheme engine finds
+  nothing (the cluster is followed by a word character); `\B\W+\w` began a
+  match on the `\n`. `\b` never holds there (non-word on both sides) and keeps
+  its word-ness at every position the grapheme engine has, so it adds nothing;
 - transparency stops at group boundaries and at fixed-count / non-greedy structure.
 
 `can_match_empty_` (nullable) additionally forces a **non-empty** match for CRLF

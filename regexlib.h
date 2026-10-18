@@ -9372,15 +9372,24 @@ private:
         // which also stops `\s+` inside the first cluster. Non-multiline `^`/`$`
         // are text anchors and touch no interior position at all.
         return !multiline_ || crlf_inert_;
-      case K::WordBoundary:
       case K::NonWordBoundary:
+        // The same superset for `\B`: CR and LF are both non-word, so `\B`
+        // holds at the interior, a position the grapheme engine does not
+        // have. `\s+\B` over "\r\nE" stopped the run on the `\r` and matched
+        // [0,1) there, where the cluster is followed by a word character and
+        // the grapheme engine finds nothing; `\B\W+\w` began a match on the
+        // `\n`. Safe, as above, only when nothing consumes a `\r` or `\n`.
+        return crlf_inert_;
+      case K::WordBoundary:
+        // `\b` does NOT hold at the interior (non-word on both sides), and a
+        // position the grapheme engine has keeps its word-ness on either
+        // side: the byte set adds no `\b` position.
       case K::BeginText:
       case K::EndText:
       case K::EndTextNL:
       case K::LookAround:
       case K::Empty:
-        return true; // zero-width, and \b/\B read only word-ness (CR and LF are
-                     // both non-word, so the cluster interior changes nothing)
+        return true; // zero-width
       }
       return true;
     }
@@ -9457,7 +9466,7 @@ private:
 
     // Can NO element of `n` consume a `\r` or a `\n`? Then no match can touch
     // the interior of a CR-LF cluster, which is what lets a multiline anchor
-    // keep CRLF byte safety above. A literal `\r\n` PAIR is deliberately not
+    // or `\B` keep CRLF byte safety above. A literal `\r\n` PAIR is deliberately not
     // inert here even though crlf_byte_safe admits it: this predicate is about
     // reaching the interior, and a pattern that consumes the pair reaches it.
     bool crlf_inert(const detail::Node &n) const {
@@ -9539,10 +9548,9 @@ private:
     // mode but not in the grapheme one) let the byte DFA reproduce the grapheme
     // engine on a CRLF subject.
     void analyze_crlf_byte_safe(const detail::Node &root) {
-      // crlf_byte_safe reads crlf_inert_ for the multiline anchors, so it is
-      // computed first. Only multiline patterns consult it, so only they pay
-      // for the extra walk.
-      crlf_inert_ = multiline_ && crlf_inert(root);
+      // crlf_byte_safe reads crlf_inert_ for the multiline anchors and `\B`,
+      // so it is computed first.
+      crlf_inert_ = crlf_inert(root);
       crlf_byte_safe_ = crlf_byte_safe(root, false, /*inside_repeat=*/false);
       if (crlf_byte_safe_) {
         bool split = false;
@@ -10700,10 +10708,9 @@ private:
     // together) that is the atom of an unbounded greedy repetition. See
     // analyze_crlf_byte_safe.
     bool crlf_byte_safe_ = false; // byte DFA == grapheme engine on a CRLF subject
-    // Multiline pattern whose every element refuses \r and \n (see crlf_inert):
-    // its extra anchor positions inside a CR-LF cluster are unreachable, so it
-    // keeps CRLF byte safety. false for every non-multiline pattern (nothing
-    // reads it there).
+    // Every element of the pattern refuses \r and \n (see crlf_inert): the
+    // positions a multiline anchor or `\B` has inside a CR-LF cluster are
+    // unreachable, so the pattern keeps CRLF byte safety.
     bool crlf_inert_ = false;
     // A Lit node holds a \r or \n (see has_crlf_literal). Under
     // crlf_byte_safe_ — the only place this is read — that is necessarily a

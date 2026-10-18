@@ -75,6 +75,10 @@ struct PlanProbe {
   // How many groups the plan reports as the whole match, run as its
   // capture-free twin (detail::peel_root_groups); 0 when its groups are real.
   static int alias_groups(const Regex &re) { return re.plan_->alias_groups_; }
+  // Whether the byte tiers may serve a CR-LF subject (see crlf_byte_safe).
+  static bool crlf_byte_safe(const Regex &re) {
+    return re.plan_->crlf_byte_safe_;
+  }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
@@ -424,6 +428,17 @@ inline bool finds_agree(const Regex &re, const std::vector<size_t> &want,
   if (re.test(subj) != !want.empty()) return false;
   // find_at stepped from 0: the scan find_iter just took.
   return same_as_iter(re, subj);
+}
+
+// ... and match() too, groups and all: `re` against its reference `pike`.
+inline bool all_agree(const Regex &re, const Regex &pike,
+                      std::string_view subj) {
+  if (!finds_agree(re, flat_spans(pike, subj, false), subj)) return false;
+  const reg::MatchResult got = re.match(subj), want = pike.match(subj);
+  std::vector<size_t> a, b;
+  if (got.matched()) add_spans(a, got);
+  if (want.matched()) add_spans(b, want);
+  return a == b;
 }
 
 // Two alternations with more literals than Teddy has buckets.
@@ -1675,14 +1690,8 @@ void test_assert_byte_groups() {
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
       CHECK(PlanProbe::alias_groups(re) == 0);
-      for (const std::string &s : subjects) {
-        CHECK(finds_agree(re, flat_spans(pike, s, false), s));
-        const reg::MatchResult got = re.match(s), want = pike.match(s);
-        std::vector<size_t> a, b;
-        if (got.matched()) add_spans(a, got);
-        if (want.matched()) add_spans(b, want);
-        CHECK(a == b);
-      }
+      for (const std::string &s : subjects)
+        CHECK(all_agree(re, pike, s));
     }
 
   // ... and in Grapheme mode it is that engine that answers, where the
@@ -1697,6 +1706,34 @@ void test_assert_byte_groups() {
   CHECK(m.matched() && m.group(1).str() == "The" &&
         m.group(2).str() == "quick");
   CHECK(PlanProbe::dfa_stats(match).built > 0);
+}
+
+// `\B` holds between the CR and the LF of a CR-LF in the byte engines (both
+// are non-word), where the grapheme engine has no position at all: the pair
+// is one cluster. A pattern that can consume a `\r` or `\n` could stop or
+// start a match there — `\s+\B` matched the CR of "\r\nE", `\B\W+\w` began
+// on the LF of "ing\r\n\n\xC3\x89". Like a multiline anchor, `\B` keeps the
+// byte tiers on a CR-LF subject only when nothing consumes either byte
+// (crlf_inert). Every surface and match() agree with the Pike in both units,
+// on ASCII and non-ASCII subjects.
+void test_crlf_nonword_boundary() {
+  const char *pats[] = {"\\s+\\B",   "\\B\\W+\\w",   "\\W\\B",    "\\B\\s",
+                        "(\\s+)\\B(\\w)", "\\B[^a]+x", "\\s+\\b",  "\\w+\\B\\w",
+                        "\\B\\w+",   "(?m)\\B\\s*$"};
+  std::vector<std::string> subjects = cluster_subjects();
+  for (const char *s : {"\r\nE", "a \r\nE", "\xC3\xA9\r\nE", "ing\r\n\n\xC3\x89",
+                        "x\r\n\r\ny", " \r\n", "ab\r\n"})
+    subjects.push_back(s);
+  for (const char *pat : pats)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      for (const std::string &s : subjects)
+        CHECK(all_agree(re, pike, s));
+    }
+  // A `\B` pattern that consumes neither byte keeps the byte tiers' CR-LF
+  // admission; one that can does not.
+  CHECK(PlanProbe::crlf_byte_safe(Regex("\\w+\\B\\w")));
+  CHECK(!PlanProbe::crlf_byte_safe(Regex("\\s+\\B")));
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -6139,6 +6176,7 @@ int main() {
   test_find_ladder();
   test_end_anchor();
   test_assert_byte_groups();
+  test_crlf_nonword_boundary();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();
