@@ -301,23 +301,23 @@ struct PlanProbe {
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
   }
-  // The families match() tries, in order, a letter each: U Dfa/US,
-  // u Assert/Byte (CodePoint), b Dfa/EgcByte, a Dfa/Ascii, A Assert/Ascii,
-  // B Assert/Byte (Grapheme).
+  // The engine families, a letter each, in Regex::Family order: U Dfa/US,
+  // u Assert/Byte (CodePoint), b Dfa/EgcByte, i the same with the (?i)
+  // probe, a Dfa/Ascii, A Assert/Ascii, B Assert/Byte (Grapheme).
+  static constexpr std::string_view kFamilies = "UubiaAB";
+  // The families match() tries, in order.
   static std::string match_guesses(const Regex &re) {
     std::string s;
     for (const auto f : re.plan_->match_guesses_)
-      if (f != Regex::kFamilyCount) s += "UubiaAB"[f];
+      if (f != Regex::kFamilyCount) s += kFamilies[f];
     return s;
   }
-  // Whether the answer of `re`'s family `fam` (a letter as above), which
-  // read `s` up to `reach`, holds for `s` (Regex::guess_held).
+  // Whether the answer of `re`'s family `fam`, which read `s` up to `reach`,
+  // holds for `s` (Regex::guess_held).
   static bool guess_held(const Regex &re, char fam, std::string_view s,
                          int reach) {
-    size_t fna = Regex::kUnclassified;
-    const auto f = static_cast<Regex::Family>(
-        std::string_view("UubiaAB").find(fam));
-    return re.guess_held(f, s, reach, fna);
+    return re.guess_held(static_cast<Regex::Family>(kFamilies.find(fam)), s,
+                         reach);
   }
   // For each lazy DFA with look that the calling thread's cache of `re` has
   // built: whether it steps a byte at a time (LazyDfa::bytewise), and
@@ -448,15 +448,21 @@ inline bool finds_agree(const Regex &re, const std::vector<size_t> &want,
   return same_as_iter(re, subj);
 }
 
-// ... and match() too, groups and all: `re` against its reference `pike`.
-inline bool all_agree(const Regex &re, const Regex &pike,
-                      std::string_view subj) {
-  if (!finds_agree(re, flat_spans(pike, subj, false), subj)) return false;
-  const reg::MatchResult got = re.match(subj), want = pike.match(subj);
+// match()'s answer and its groups: the same from `re` as from its reference.
+inline bool match_agrees(const Regex &re, const Regex &pike,
+                         std::string_view s) {
   std::vector<size_t> a, b;
+  const reg::MatchResult got = re.match(s), want = pike.match(s);
   if (got.matched()) add_spans(a, got);
   if (want.matched()) add_spans(b, want);
   return a == b;
+}
+
+// ... and every find surface too: `re` against its reference `pike`.
+inline bool all_agree(const Regex &re, const Regex &pike,
+                      std::string_view subj) {
+  return finds_agree(re, flat_spans(pike, subj, false), subj) &&
+         match_agrees(re, pike, subj);
 }
 
 // Two alternations with more literals than Teddy has buckets.
@@ -1761,26 +1767,18 @@ void test_crlf_interior_anchors() {
     CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
 }
 
-// match()'s answer and its groups: the same from `re` as from its reference.
-bool match_agrees(const Regex &re, const Regex &pike, std::string_view s) {
-  std::vector<size_t> a, b;
-  const reg::MatchResult got = re.match(s), want = pike.match(s);
-  if (got.matched()) add_spans(a, got);
-  if (want.matched()) add_spans(b, want);
-  return a == b;
-}
-
 // match() does not classify its subject. It tries the plan's families in
 // turn, each anchored at 0 (Plan::match_guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
 // (guess_held). So what a family cannot read — a stray byte, a combining
-// mark, a ZWJ sequence, a flag, a Prepend, a CR-LF, a lone CR, a NEL — is
+// mark, a ZWJ sequence, a flag, a Prepend, Hangul jamo, an Indic conjunct
+// (GB9c), a CR-LF, a lone CR or LF, a NEL — is
 // placed at every offset of the first 48 bytes and further on, over ASCII,
 // accented and CR-LF text: match() agrees with the Pike, groups and all, in
 // both units. And it reads what its answer needs: over 1 MB of prose that
-// ends in a stray byte, the families answer from the first few bytes,
-// where the subject's class sent match() to the Pike, which segmented the
-// whole of it.
+// ends in a stray byte, a family answers from the first few bytes, where
+// the subject's class sent match() to the Pike, which segmented the whole
+// of it.
 void test_match_guess() {
   const char *pats[] = {
       "\\w+", ".", "\\w", "[a-z]+ing", ".*fox", "[^ ]+ [^ ]+", "x\\w*z",
@@ -1791,8 +1789,10 @@ void test_match_guess() {
       "(?m)(\\w+)$", "\\b(\\w+) (\\w+)\\b", "\\w+\\r\\n", "(\\w+)\\r\\n(\\w*)",
       "the\\s"};
   const char *dirt[] = {
-      "\xFF", "\xC3", "\xCC\x81", "e\xCC\x81", "\xE2\x80\x8D",
-      "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80", "\r\n", "\r", "\xC2\x85",
+      "\xFF", "\x80", "\xC3", "\xE6\xBC", "\xCC\x81", "e\xCC\x81",
+      "\xE2\x80\x8D", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80",
+      "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7",
+      "\r\n", "\r", "\n", "\xC2\x85",
       "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB"};
   const char *bodies[] = {"the quick brown fox jumps over the lazy dog ",
                           "the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over ",
@@ -1866,8 +1866,11 @@ void test_match_guess() {
         const reg::MatchResult m = re.match(s);
         CHECK(m.matched() &&
               m.group(0).str() == (*head ? "\xC3\xA9t\xC3\xA9" : "The"));
+        // One family's DFA, stepped over a few bytes — on the text that
+        // starts with a non-ASCII byte, the byte family's alone: the ASCII
+        // family, which cannot hold there, is not tried.
         const PlanProbe::DfaStats st = PlanProbe::dfa_stats(re);
-        CHECK(st.built > 0 && st.scanned < 16);
+        CHECK(st.built == 1 && st.scanned < 16);
       }
 }
 

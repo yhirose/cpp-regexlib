@@ -432,9 +432,9 @@ look なしの実体化は元のコードのままです。
 （コードポイント、書記素なし）の両方が必要とするもの。よって US は assert エンジンの
 コピーを得ない：US の `^ $ \b` パターン（capture 有無問わず）は**任意**の UTF-8 subject で
 `assert_find_span` / `assert_prefix_find` を再利用し、同じ
-prefilter・同じ `cp_prog_` bitstate capture 解決を使う。モード依存は
-`assert_byte_path_ok` のゲートのみ（US: モード自身の UTF-8 検査 `us_stray` を通った任意の subject；EGC: 非ASCII かつ複数CP
-クラスタ無し）。ASCII の subject では、EGC のプランは書記素プログラムのほうを歩く。span が
+prefilter・同じ `cp_prog_` bitstate capture 解決を使う。単位によるのはゲートだけで、CodePoint のプランは
+単位自身の UTF-8 検査（`us_stray`）を通った任意の subject で、Grapheme のプランは非ASCII かつ複数CP
+クラスタ無しの subject で（`assert_byte_path_ok`）この tier を使う。ASCII の subject では、EGC のプランは書記素プログラムのほうを歩く。span が
 bitstate を溢れる場合は、その span の上でコードポイント Pike へフォールバック。
 
 **この tier の capture は両モードで。** グループはコードポイントプログラムの
@@ -460,7 +460,7 @@ subject 全体を分割する。
 位置 0 に固定されていてプレフィルタが使えないので、その階段の系統ごとに 1 段を持つ
 （`match_end`）。系統の DFA を位置 0 から走らせて終端を求め、グループがあれば
 `match_located` がその範囲で解決する。どの系統が答えるかは、前もってゲートで決めず、
-系統を順に試して決める（下の「`match()`：系統を順に試す」を参照）。ソースの各分岐には `[Tier: …]` ラベルを付け、
+系統を順に試して決める（下の「`match()`：系統を順に試し、読んだ範囲で判定する」を参照）。ソースの各分岐には `[Tier: …]` ラベルを付け、
 （パターン分類 × subject 分類）の組ごとに正式名を1つ定める：
 
 | ラベル | ゲート | 動作 |
@@ -475,7 +475,7 @@ subject 全体を分割する。
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；one-pass 歩行と `+cap` は同上。ただし CRLF collapse プランは除く（`byte_walk_ok`：そのバイトプログラムは CR-LF の対を 1 要素と数え、歩行の表は 2 要素と数える） |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | 書記素プログラム上の LazyDfa を look つきで（前向きと、開始を求める逆向き）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)`（US: 任意の UTF-8 subject；EGC: 非ASCII simple） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap`: assert 対応 bitstate、両モード（上記参照） |
+| `Assert/Byte` | US: 任意の UTF-8 subject（`us_stray`）；EGC: `assert_byte_path_ok(text)`（非ASCII simple） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap`: assert 対応 bitstate、両モード（上記参照） |
 | `Pike` / `Pike/cp` | 常時（フォールバック） | `prog_` 上の書記素 Pike VM；US: `cp_prog_` 上のコードポイント Pike |
 
 どちらの階段も適格な tier を上から試し、DFA がキャッシュを断念したら次へフォールスルーする。
@@ -610,9 +610,8 @@ chain も同じで、どちらのエンジンでも、どちらのモードで�
 `match()` は位置 0 に固定されているので、答えは主題の先頭で決まります。検証パターンや
 行頭のトークンなら数バイトです。それでも以前は、まず主題の全体を見ていました。系統を
 選ぶゲート（`first_nonascii`、続いて `simple_from` か `contains_crlf`。CodePoint では
-`valid_from`）は、どれも主題全体を読みます。4 MB の散文に `\w+` をかけると、最初の
-単語で答えが出るのに 0.14–1.3 ms かかり、どこかに迷子のバイトや結合文字が 1 つあれば
-Pike に回って 4 MB 全体を分割していました（70–183 ms）。
+`valid_from`）は、どれも主題全体を読みます。どこかに迷子のバイトや結合文字が 1 つあれば、
+Pike に回って主題全体を分割していました。
 
 今は主題を分類しません。プランが `match()` の走らせる系統の列を持ちます
 （`Plan::match_guesses_`。`ladder_plan` が決める）。
@@ -628,9 +627,9 @@ Pike に回って 4 MB 全体を分割していました（70–183 ms）。
 
 - **走査が読んだ範囲**（`reach`）：調べた最も遠いバイトの 1 つ先。少なくともマッチの
   終端以上です。
-  - DFA の走査はそれを報告します。アンカー付きの DFA は開始状態の読み飛ばしをせず、
-    走査は自分を止めたバイトを消費します。
-  - 一方向の歩行では、止まったバイトの 1 つ先です（`OnePassWalk::reach`）。`^body$` のドライバは、それを予算で渡します（`WalkBudget::read_to`）。
+  - 走査がそれぞれ自分の値を報告します。DFA の走査（アンカー付きの DFA は開始状態の
+    読み飛ばしをせず、走査は自分を止めたバイトを消費します）と、一方向の歩行
+    （`OnePassWalk::reach`）です。
 - **成り立つべきこと**：系統自身のゲートを、`reach` の位置のコードポイントで終わる
   主題の接頭辞に問います。
   - そのコードポイントは走査が止まった所で、それが前のコードポイントと結びつくかが、
@@ -648,7 +647,8 @@ Pike に回って 4 MB 全体を分割していました（70–183 ms）。
     主題です。
 - **推測が外れたときの費用**：止まるまでの走査です。非 ASCII の主題では、ASCII 系統の
   アンカー付き DFA は最初の非 ASCII バイトで死にます（`lazy_inst_matches` はどれにも
-  一致させない）。無駄になるのは、その前の ASCII の部分です。
+  一致させない）。無駄になるのは、その前の ASCII の部分です。先頭のバイトが非 ASCII なら
+  無駄はありません。読んだ範囲が必ずそのバイトを含むので、ASCII 系統はそもそも試しません。
 
 計測（4 MB の散文、位置 0 にマッチ、両方の単位）：
 
@@ -958,7 +958,7 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
 コードポイントが融合した瞬間に棄却（`gb_fuses`）；**印字可能 ASCII ラン を SIMD で
 スキップ**（印字可能 ASCII ランは多コードポイントクラスタを含めない）。融合があれば
 書記素 Pike へフォールバック。（`match()` は同じことを、主題全体ではなく走査が読んだ
-接頭辞に問います。§2「`match()`：系統を順に試す」を参照。）
+接頭辞に問います。§2「`match()`：系統を順に試し、読んだ範囲で判定する」を参照。）
 
 ### CRLF — 崖と `crlf_byte_safe`
 

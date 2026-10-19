@@ -463,9 +463,10 @@ subject (byte == grapheme) *and* US matching (code points, no graphemes) both
 need. So US does not get a copied assert engine: a US `^ $ \b`-anchored pattern
 (capture or not) reuses `assert_find_span` / `assert_prefix_find` on **any**
 UTF-8 subject, with the same prefilters and the same
-`cp_prog_` bitstate capture resolution. `assert_byte_path_ok` is the only
-mode-aware gate (US: any subject the unit's own UTF-8 check, `us_stray`, has
-let through; EGC: non-ASCII, no multi-code-point cluster).
+`cp_prog_` bitstate capture resolution. Only the gate is the unit's: a
+CodePoint plan takes the tier on any subject its own UTF-8 check (`us_stray`)
+lets through, a Grapheme plan on a non-ASCII one with no multi-code-point
+cluster (`assert_byte_path_ok`).
 On an ASCII subject an EGC plan steps its grapheme programs instead. Captures
 whose span overflows the bitstate still fall back to the code-point Pike over
 that span.
@@ -510,7 +511,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
-| `Assert/Byte` | `assert_byte_path_ok(text)` (US: any UTF-8 subject; EGC: non-ASCII simple) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap`: assert-aware bitstate, in either unit (see above) |
+| `Assert/Byte` | US: any UTF-8 subject (`us_stray`); EGC: `assert_byte_path_ok(text)` (non-ASCII simple) | the lazy DFAs over the byte programs, with look; same prefilters; `+cap`: assert-aware bitstate, in either unit (see above) |
 | `Pike` / `Pike/cp` | always (the fallback) | grapheme Pike VM over `prog_`; US: code-point Pike over `cp_prog_` |
 
 Both ladders try their eligible tiers top-down and fall through when a DFA
@@ -656,10 +657,8 @@ stores the same ladder and cursor and takes the same steps.
 subject — a few bytes, for a validator or the token that starts a line. It
 used to look at all of the subject first anyway: the gates a family is chosen
 by (`first_nonascii`, then `simple_from` or `contains_crlf`; `valid_from` in
-CodePoint mode) are passes over the whole of it. `\w+` over 4 MB of prose
-paid 0.14–1.3 ms to answer from its first word, and a stray byte or a
-combining mark anywhere sent it to the Pike, which segmented all 4 MB
-(70–183 ms).
+CodePoint mode) are passes over the whole of it, and a stray byte or a
+combining mark anywhere sent it to the Pike, which segmented all of it.
 
 It does not classify the subject now. The plan lists the families `match()`
 can run (`Plan::match_guesses_`, set by `ladder_plan`): a CodePoint plan's
@@ -671,10 +670,9 @@ whose answer holds for the subject *as far as its scan read* answers
 (`guess_held`). When none holds, the Pike answers.
 
 - **How far a scan read** (`reach`): one past the furthest byte it examined —
-  at least the match's end. A DFA scan reports it (the anchored DFAs have no
-  start-state skip, and a scan consumes the byte that ends it); a one-pass
-  walk's is one past the byte it ended on (`OnePassWalk::reach`), which the
-  `^body$` driver passes on in its budget (`WalkBudget::read_to`).
+  at least the match's end. Each scan reports its own: a DFA scan (the
+  anchored DFAs have no start-state skip, and a scan consumes the byte that
+  ends it), a one-pass walk (`OnePassWalk::reach`).
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:
@@ -693,7 +691,8 @@ whose answer holds for the subject *as far as its scan read* answers
 - **What a wrong guess costs**: its scan, to where it stopped. On a
   non-ASCII subject the ASCII family's anchored DFA dies at the first
   non-ASCII byte (`lazy_inst_matches` matches none), so it is the ASCII run
-  before that.
+  before that — and nothing when that is the first byte, where an ASCII
+  family is not tried at all (what it read would include it).
 
 Measured on `match()` over 4 MB of prose with a match at 0, in both units:
 `\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.14–1.3 ms to

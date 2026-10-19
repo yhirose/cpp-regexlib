@@ -5652,7 +5652,6 @@ class Regex {
     // candidates (see spend_at_candidate).
     int64_t cand_charge_ = 0;
     int64_t cand_chain_ = 0;
-    int reach_ = 0; // see read_to
 
     // The profitability yardstick: the distance the DRIVER covered — the
     // position reached less what the chain covered after local bails, which
@@ -5670,12 +5669,6 @@ class Regex {
     static constexpr int kCandChain = 3; // ... per candidate of the chain's
     explicit WalkBudget(size_t subject_len)
         : left_(static_cast<int>(subject_len)) {}
-    // How far the walks of the `^body$` driver read (OnePassWalk::reach),
-    // for match() to judge its answer by (see guess_held).
-    void read_to(int pos) {
-      if (pos > reach_) reach_ = pos;
-    }
-    int reach() const { return reach_; }
     bool spend(int walked) {
       left_ -= walked;
       return left_ >= 0;
@@ -5845,14 +5838,18 @@ public:
     // to segment the subject for the Pike, and nor is the length of a clean
     // one a reason to scan it. [Tier: Pike] / [Tier: Pike/cp] when no family
     // holds: a subject none of them serves.
-    size_t fna = kUnclassified;
     for (const Family f : plan_->match_guesses_) {
       if (f == kFamilyCount) break;
+      // An ASCII family holds for no subject whose first byte is not: what
+      // it read always includes that byte.
+      if ((f == kFamAscii || f == kFamAssertAscii) && !text.empty() &&
+          static_cast<unsigned char>(text[0]) >= 0x80)
+        continue;
       int reach = 0;
       bool walked = false;
       const int e = match_end(f, text, cache, sc, reach, walked);
       if (e == LazyDfa::kCap) continue; // a DFA gave up: the next family
-      if (!guess_held(f, text, std::max(e, reach), fna)) continue;
+      if (!guess_held(f, text, reach)) continue;
       if (e < 0) return MatchResult{};
       return walked ? build_result_bytes(text, sc.saves)
                     : match_located(text, e, sc);
@@ -12244,32 +12241,24 @@ private:
     return plan_->assert_ascii_tier() && ascii_grapheme_ok(text, fna);
   }
 
-  // Whether the non-ASCII assertion byte tier serves this (pattern, subject):
-  // an assert pattern's byte programs are built and the subject is non-ASCII
-  // with no multi-code-point grapheme cluster (so code-point == grapheme). The
-  // CRLF gate matches the regular byte path (a CR-LF interior carries no match
-  // boundary when the pattern is CRLF-byte-safe and non-empty).
+  // Whether the non-ASCII assertion byte tier serves this (Grapheme pattern,
+  // subject): an assert pattern's byte programs are built and the subject is
+  // non-ASCII with no multi-code-point grapheme cluster (so code-point ==
+  // grapheme); a pure-ASCII subject uses the grapheme assert tier. The CRLF
+  // gate matches the regular byte path (a CR-LF interior carries no match
+  // boundary when the pattern is CRLF-byte-safe and non-empty). `fna` is the
+  // subject's first non-ASCII byte. (A CodePoint plan's byte assert DFA
+  // reproduces code-point matching on any well-formed UTF-8, which is all the
+  // unit's own check asks: us_stray.)
   //
-  // Groups included, in both modes: on such a subject the code-point program
-  // the bitstate runs (cp_prog_) reads the elements the grapheme engine does,
-  // so the groups it finds in the located span are the grapheme engine's —
-  // as for the Dfa/EgcByte tier's. That rests on egc_simple_from refusing a
-  // stray byte (`([^ ]+)$` over "ab\xC3").
-  bool assert_byte_path_ok(std::string_view text,
-                           size_t fna = kUnclassified) const {
+  // Groups included: on such a subject the code-point program the bitstate
+  // runs (cp_prog_) reads the elements the grapheme engine does, so the
+  // groups it finds in the located span are the grapheme engine's — as for
+  // the Dfa/EgcByte tier's. That rests on egc_simple_from refusing a stray
+  // byte (`([^ ]+)$` over "ab\xC3").
+  bool assert_byte_path_ok(std::string_view text, size_t fna) const {
     if (!plan_->byte_assert_path_) return false;
-    // US mode: the byte assert DFA reproduces code-point matching, which IS US
-    // semantics, on any well-formed UTF-8 — what the unit's own check, where
-    // a scan or match() starts, has let through (us_stray). No grapheme/CRLF
-    // concern (US never fuses CR-LF), so no non-ASCII / simple_from gate.
-    if (plan_->us_) return true;
-    // EGC mode: only a non-ASCII subject with no multi-code-point grapheme
-    // cluster (so byte == grapheme); a pure-ASCII subject uses the grapheme
-    // assert tier, and the CRLF gate matches the regular byte path.
-    // (`fna`: the subject's first non-ASCII byte, if the caller has it.)
-    size_t n = text.size();
-    size_t i = fna != kUnclassified ? fna : first_nonascii(text);
-    if (i == n)
+    if (fna == text.size())
       // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT when that
       // tier has just refused a fused CR-LF literal on a CR-LF-bearing subject
       // (ascii_grapheme_ok's !crlf_fused_lit_), where the only rung left below
@@ -12283,7 +12272,7 @@ private:
       // pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
-    return egc_simple_from(text, i);
+    return egc_simple_from(text, fna);
   }
 
   // Priority-ordered ε-closure with the leftmost-first match cut, for the
@@ -13343,25 +13332,23 @@ private:
            !unicode::utf8::valid_from(text.data(), text.size(), i);
   }
 
-  // The non-ASCII EGC byte path applies when the byte programs are built and
-  // the subject is non-ASCII with no multi-code-point grapheme cluster. The
-  // first-non-ASCII index `i` is precomputed by the caller (shared with
-  // ascii_grapheme_ok at the dispatch site, so the subject is classified once).
-  //
-  // Pure ASCII: the plain ASCII tier is faster and handles it — EXCEPT a
-  // CR-LF-bearing subject, which the ASCII tier segments as two graphemes and
-  // so cannot match a fused `\r\n` literal against. A byte program that reads
-  // the pair as the grapheme engine does — collapsed, or a crlf_byte_safe,
-  // non-empty pattern's, which matches `\r\n`'s two bytes exactly — takes
-  // those instead of the ASCII tier. That is the route; whether the byte
-  // engine answers for the subject at all is byte_sound's.
+  // Whether the EGC byte family serves this subject (`i` its first non-ASCII
+  // byte, shared with ascii_grapheme_ok at the dispatch site so the subject
+  // is classified once): one the byte programs answer for (byte_sound), and
+  // not pure ASCII — the plain ASCII tier is faster there and handles it —
+  // EXCEPT a CR-LF-bearing one, which the ASCII tier segments as two
+  // graphemes and so cannot match a fused `\r\n` literal against. A byte
+  // program that reads the pair as the grapheme engine does takes those
+  // instead: collapsed, or a crlf_byte_safe, non-empty pattern's, which
+  // matches `\r\n`'s two bytes exactly (byte_sound on pure ASCII, spelled
+  // out).
   bool egc_byte_path(std::string_view text, size_t i) const {
     if (!plan_->byte_path_) return false;
-    if (i == text.size() &&
-        !((plan_->byte_crlf_collapse_ ||
-           (plan_->crlf_byte_safe_ && !plan_->can_match_empty_)) &&
-          contains_crlf(text)))
-      return false;
+    if (i == text.size())
+      return plan_->byte_crlf_collapse_
+                 ? contains_crlf(text) && no_lone_crlf(text)
+                 : plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
+                       contains_crlf(text);
     return byte_sound(text, i);
   }
   // Whether the byte programs' engine answers for `text` as the grapheme
@@ -13390,13 +13377,12 @@ private:
   // test over that prefix R is the family's gate less its route (see
   // egc_byte_path). A gate that holds for the whole subject holds for R, so
   // a subject no guess holds for is one no family served either, and the
-  // Pike answers it. `fna` is the subject's first non-ASCII byte once known:
-  // a test that finds one in R has found it.
+  // Pike answers it.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
-                                         int reach, size_t &fna) const {
+                                         int reach) const {
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
-    size_t end = static_cast<size_t>(reach < 0 ? 0 : reach);
+    size_t end = static_cast<size_t>(reach);
     if (end < n) {
       end++; // the code point at reach, or the one reach is inside
       while (end < n && (p[end] & 0xC0) == 0x80) end++;
@@ -13405,19 +13391,18 @@ private:
       end = n;
     }
     const std::string_view r = text.substr(0, end);
-    if (plan_->us_) return unicode::utf8::valid_from(r.data(), end);
-    if (fna == kUnclassified) {
-      const size_t i = first_nonascii(r);
-      if (i < end) fna = i;
-    }
-    const size_t i = fna < end ? fna : end;
     switch (f) {
+    case kFamUsDfa:
+    case kFamUsAssert: return !us_stray(r);
     case kFamAscii:
-    case kFamAssertAscii: return ascii_grapheme_ok(r, i);
-    case kFamEgcByte:
-    case kFamEgcByteIp: return byte_sound(r, i);
-    default: return egc_simple_from(r, i); // kFamAssertByte
+    case kFamAssertAscii: return ascii_grapheme_ok(r, first_nonascii(r));
+    case kFamEgcByte: return byte_sound(r, first_nonascii(r));
+    case kFamAssertByte: return egc_simple_from(r, first_nonascii(r));
+    case kFamEgcByteIp: // no guess list holds it: its (?i) probe's own test
+    case kFamilyCount:  // of the subject (icase_choose_probe) is not asked here
+      break;
     }
+    return false;
   }
 
   // True iff every CR is immediately followed by LF and every LF immediately
@@ -16436,6 +16421,17 @@ private:
     return -1;
   }
 
+  // The unbounded one-pass walk from 0 as the whole find — a text-anchored
+  // plan's one candidate (WalkDriver::AnchoredStart), or match()'s: the end
+  // (groups in `saves`), -1 when no match starts there, or kWalkLocal on a
+  // non-ASCII byte (the caller's DFA answers). `w` reports how far it read.
+  int onepass_from0(std::string_view t, std::vector<int> &saves,
+                    OnePassWalk &w) const {
+    const int e = cp_onepass_find(t, 0, saves, w);
+    if (e == kWalkLocal) return e;
+    return e >= 0 && onepass_end_ok(e, t) ? e : -1;
+  }
+
   // One front door for the unbounded one-pass capture find: route through
   // the best candidate source (literal prefix > non-absorbing ReverseInner >
   // position scan). Returns the match end (saves filled), -1 (definitive
@@ -16455,10 +16451,7 @@ private:
     case Plan::WalkDriver::AnchoredStart: {
       if (from > 0) return -1;
       OnePassWalk w;
-      int e = cp_onepass_find(t, 0, saves, w);
-      budget.read_to(w.reach(0, static_cast<int>(t.size())));
-      if (e == kWalkLocal) return kWalkLocal; // one candidate: nothing to count
-      return (e > 0 && onepass_end_ok(e, t)) ? e : -1;
+      return onepass_from0(t, saves, w); // one candidate: nothing to count
     }
     case Plan::WalkDriver::Prefix:
       return prefix_onepass_find(t, from, saves, budget,
@@ -16751,13 +16744,15 @@ private:
   }
 
   // match()'s locate on family `f`, anchored at 0 (its rung of match()):
-  // the end, -1 when no match starts there,
-  // or LazyDfa::kCap when a DFA gave up. `reach` is how far it read (see
+  // the end, -1 when no match starts there, or LazyDfa::kCap when a DFA
+  // gave up. `reach` is how far it read — at least the end (see
   // guess_held); `walked`, that a one-pass walk resolved the groups too, in
   // sc.saves. The family's DFA locates the end — with captures, the one-pass
-  // walk first where it can serve (a bail falls to the DFA): unbounded on
-  // Dfa/Ascii, `^body$` (onepass_anchored_start_) on the assert families,
-  // through the find ladder's own front door (capture_find_dispatch).
+  // walk from 0 first where it can serve (a bail falls to the DFA):
+  // unbounded on Dfa/Ascii (onepass_end_ok keeps the
+  // onepass_unbounded_ / onepass_require_end_ pair read together), `^body$`
+  // (onepass_anchored_start_) on the assert family the find ladder's walk
+  // takes it on.
   REGEXLIB_ALWAYS_INLINE int match_end(Family f, std::string_view text,
                                        FindCache &cache, Scratch &sc,
                                        int &reach, bool &walked) const {
@@ -16771,19 +16766,8 @@ private:
     // [Tier: Dfa/Ascii] the ordered+cut DFA over the grapheme program.
     case kFamAscii:
       if (p.ncap_ > 0 && p.onepass_unbounded_) {
-        OnePassWalk w;
-        const int e = cp_onepass_find(text, 0, sc.saves, w);
-        reach = w.reach(0, static_cast<int>(text.size()));
-        // onepass_end_ok keeps the (onepass_unbounded_,
-        // onepass_require_end_) pair-read local: today require_end implies
-        // an assert plan, which is !dfa_ok_ and so never reaches this rung,
-        // but the rung must not silently drop the trailing `$` if that
-        // gating ever widens.
-        if (e >= 0) {
-          walked = onepass_end_ok(e, text);
-          return walked ? e : -1;
-        }
-        if (e == -1) return -1;
+        const int e = match_walk(text, sc, reach, walked);
+        if (e != kWalkLocal) return e;
       }
       return dfa_forward_lf(cache.lfa(*this), text, 0, &reach);
     // [Tier: Assert/Ascii | Assert/Byte] the anchored lf assert DFA over the
@@ -16795,19 +16779,22 @@ private:
     default: {
       const bool byte = f != kFamAssertAscii;
       if (p.onepass_anchored_start_ && (p.us_ || !byte)) {
-        WalkBudget budget(text.size()); // the `^body$` driver: its reach
-        const int e =
-            capture_find_dispatch(&cache, text, 0, sc.saves, budget, p.us_);
-        reach = budget.reach();
-        if (e >= 0) {
-          walked = true;
-          return e;
-        }
-        if (e == -1) return -1;
+        const int e = match_walk(text, sc, reach, walked);
+        if (e != kWalkLocal) return e;
       }
       return look_forward_lf(dfa_fwda(cache, byte), text, 0, &reach);
     }
     }
+  }
+  // match_end's walk (onepass_from0): its end, or -1, with the groups in
+  // sc.saves (`walked`); kWalkLocal hands the find to the family's DFA.
+  int match_walk(std::string_view text, Scratch &sc, int &reach,
+                 bool &walked) const {
+    OnePassWalk w;
+    const int e = onepass_from0(text, sc.saves, w);
+    reach = w.reach(0, static_cast<int>(text.size()));
+    walked = e >= 0;
+    return e;
   }
 
   // match()'s result for the span [0, e) a DFA located, the groups resolved
