@@ -1665,7 +1665,7 @@ Hyperscan scratch / `regex-automata` `Cache` のイディオム）が DFA を呼
 ```cpp
 class Regex::FindCache {       // opaque。テキスト非依存の状態のみ保持：
   const Regex *owner_;         //   DFA 遷移表 ＋ Scratch 容量
-  std::optional<LazyDfa> dfas_[2][kRoles]; // （セグメント化はテキストごとで
+  std::optional<LazyDfa> dfas_[2][kDfaRoles]; // （セグメント化はテキストごとで
   std::optional<LazyDfa> inrev_;            //   キャッシュしない）
   Scratch sc_;
 };
@@ -1674,13 +1674,11 @@ MatchIter find_iter(std::string_view, FindCache&) const;
 ```
 
 DFA は 1 つの表です。添字はプログラム集合（UTF-8 バイトのプログラムか、
-書記素／コードポイントのプログラムか）と役割です。役割は `kBool`（再シードし、
-最初の受理で止まる：`test()`）、`kFwd`（非アンカーの leftmost-first。
-`(?s:.)*?` を前に付けたプログラム上）、`kFwda`（アンカー付きの leftmost-first：
-`match()` と候補の検証）、`kRev`（逆向きのプログラム。開始位置を求める）の 4 つです。
-`inrev_` は ReverseInner プリフィルタ専用です。どの段も DFA を 1 つの取り出し
-`FindCache::dfa` から得ます。まだ無ければ行外で作ります（`FindCache::make`：
-役割ごとのプログラムと開始状態の読み飛ばしを決める唯一の場所）。こうして取り出しを
+書記素／コードポイントのプログラムか）と役割（`DfaRole`：再シードする真偽値、
+非アンカーとアンカー付きの leftmost-first、逆向き）です。`inrev_` は
+ReverseInner プリフィルタ専用です。どの段も DFA を 1 つの取り出し
+`FindCache::dfa` から得ます。まだ無ければ行外の `FindCache::make` で作ります
+（役割ごとのプログラムと開始状態の読み飛ばしを決める唯一の場所）。こうして取り出しを
 短い呼び出しにインライン化できる大きさに保ちます。
 
 キャッシュなしの `find_iter(s)`/`find_all(s)` は、プロセス一意の `Regex` id で束ねた

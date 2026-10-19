@@ -95,8 +95,7 @@ struct PlanProbe {
   // gives up, and a boolean never does (its scan is the re-seeding one).
   static bool lf_dfa_built(const Regex &re) {
     const Regex::FindCache &c = re.thread_cache();
-    return c.dfas_[0][Regex::FindCache::kFwd] ||
-           c.dfas_[1][Regex::FindCache::kFwd];
+    return c.dfas_[0][Regex::kDfaFwd] || c.dfas_[1][Regex::kDfaFwd];
   }
   // What test() answers with that skip off (LazyDfa::look_pf) — every byte
   // stepped, as before there was one — on this thread's cache of `re`.
@@ -104,8 +103,7 @@ struct PlanProbe {
     (void)re.test(s); // builds the DFA the boolean steps for this subject
     Regex::FindCache &c = re.thread_cache();
     std::optional<Regex::LazyDfa> *const dfas[] = {
-        &c.dfas_[0][Regex::FindCache::kBool],
-        &c.dfas_[1][Regex::FindCache::kBool]};
+        &c.dfas_[0][Regex::kDfaBool], &c.dfas_[1][Regex::kDfaBool]};
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
       if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
@@ -241,8 +239,8 @@ struct PlanProbe {
   // `f(dfa, reverse)` for each lazy DFA a cache has built.
   template <class F> static void each_lazy(const Regex::FindCache &c, F f) {
     for (const auto &set : c.dfas_)
-      for (int r = 0; r < Regex::FindCache::kRoles; r++)
-        if (set[r]) f(*set[r], r == Regex::FindCache::kRev);
+      for (int r = 0; r < Regex::kDfaRoles; r++)
+        if (set[r]) f(*set[r], r == Regex::kDfaRev);
     if (c.inrev_) f(*c.inrev_, true);
   }
   // The lazy DFAs of a cache, built small: `bytes` of cache each, and
@@ -362,7 +360,7 @@ struct PlanProbe {
   // The calling thread's unanchored forward DFA of `re`, given up: the
   // boolean's (Rung::Bool) on the DFA family.
   static void quit_fu(const Regex &re) {
-    re.thread_cache().dfa(re, false, Regex::FindCache::kBool).quit = true;
+    re.thread_cache().dfa(re, false, Regex::kDfaBool).quit = true;
   }
   // Whether `f` — calls of `re` that draw on this thread's cache — ran the
   // Pike: it prepares the cache's scratch, which is emptied first.

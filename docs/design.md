@@ -1833,7 +1833,7 @@ scratch / `regex-automata` `Cache` idiom) persists the DFAs across calls:
 ```cpp
 class Regex::FindCache {       // opaque; holds only text-independent state:
   const Regex *owner_;         //   the DFA transition tables + Scratch capacity
-  std::optional<LazyDfa> dfas_[2][kRoles]; // (segmentation is per-text and
+  std::optional<LazyDfa> dfas_[2][kDfaRoles]; // (segmentation is per-text and
   std::optional<LazyDfa> inrev_;            //  not cached)
   Scratch sc_;
 };
@@ -1842,14 +1842,12 @@ MatchIter find_iter(std::string_view, FindCache&) const;
 ```
 
 The DFAs form one table, indexed by program set — the UTF-8 byte programs or
-the grapheme / code-point ones — and by role: `kBool` (re-seeding, stops at the
-first accept: `test()`), `kFwd` (unanchored leftmost-first, over the
-`(?s:.)*?`-led program), `kFwda` (anchored leftmost-first: `match()`, and the
-verifying of a candidate) and `kRev` (the reverse program's, which recovers a
-start); `inrev_` is the ReverseInner prefilter's own. Every rung fetches its
-DFAs through the one accessor `FindCache::dfa`, which builds a missing one out
-of line (`FindCache::make`: the one place a role's program and start-state
-skip are chosen), so the accessor stays small enough to inline into the short
+the grapheme / code-point ones — and by role (`DfaRole`: the re-seeding
+boolean, the unanchored and the anchored leftmost-first, the reverse);
+`inrev_` is the ReverseInner prefilter's own. Every rung fetches its DFAs
+through the one accessor `FindCache::dfa`, which builds a missing one out of
+line in `FindCache::make` — the one place a role's program and start-state
+skip are chosen — so the accessor stays small enough to inline into the short
 calls.
 
 The no-cache `find_iter(s)`/`find_all(s)` reuse a **`thread_local` cache** bound by a
