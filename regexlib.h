@@ -9318,7 +9318,8 @@ private:
         // does not have (the pair is one cluster): a multiline `^`/`$` binds
         // at any line-break byte (see empty_flags), and `\B` holds between two
         // non-word code points. crlf_run_ends judges them, as the place a run
-        // could stop or start.
+        // could stop or start. (A `^`/`$` without Multiline is parsed as a
+        // text anchor, BeginText / EndText, which holds at no interior.)
       case K::WordBoundary:
         // `\b` never holds at the interior (non-word on both sides), and
         // keeps its word-ness at every position the grapheme engine has.

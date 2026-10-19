@@ -1774,21 +1774,29 @@ void test_assert_byte_groups() {
 // in the byte engines, where the grapheme engine has no position at all: the
 // pair is one cluster. Next to a run that takes CR and LF they let a match
 // stop or start there — `\s+\B` matched the CR of "\r\nE", `\B\W+\w` began
-// on the LF of "ing\r\n\n\xC3\x89" — so crlf_run_ends counts them as runs,
-// which must not meet one. Every surface and match() agree with the Pike in
-// both units, on ASCII and non-ASCII subjects, for patterns on both sides of
-// that line.
+// on the LF of "ing\r\n\n\xC3\x89", `\B\D+` matched the LF alone of
+// "日\r\n" — so crlf_run_ends counts them as runs, which must not meet one.
+// A `^`/`$` without Multiline is a text anchor, which never holds there, and
+// may meet a run. Every surface and match() agree with the Pike in both
+// units, on ASCII and non-ASCII subjects, for patterns on both sides of that
+// line.
 void test_crlf_interior_anchors() {
   const char *pats[] = {
       "\\s+\\B",         "\\B\\W+\\w",       "\\W\\B",           "\\B\\s",
       "(\\s+)\\B(\\w)",  "\\B[^a]+x",       "\\s+\\b",          "\\w+\\B\\w",
       "\\B\\w+",         "(?m)\\B\\s*$",     "\\Bing\\s+\\w",     "x\\B\\s+",
       "\\w+\\Bly\\s+\\w+", "(?m)^\\w+,\\s+\\w+", "(?m)$\\s+\\w",      "(?m)(\\s+)$",
-      "(?m)^(\\w+)\\s+(\\w+)"};
+      "(?m)^(\\w+)\\s+(\\w+)",
+      // The reported ones, and text anchors next to a run.
+      "\\B\\D+", "[a-z]?[\\w\\s]+\\B", "\\s+$", "^\\s+\\w", "(\\w+)\\s+$"};
   std::vector<std::string> subjects = cluster_subjects();
-  for (const char *s : {"\r\nE", "a \r\nE", "\xC3\xA9\r\nE", "ing\r\n\n\xC3\x89",
-                        "x\r\n\r\ny", " \r\n", "ab\r\n", "sing\r\nnow",
-                        "quickly\r\n go", "a,\r\nb\r\nc, d"})
+  for (const char *s :
+       {"\r\nE", "a \r\nE", "\xC3\xA9\r\nE", "ing\r\n\n\xC3\x89", "x\r\n\r\ny",
+        " \r\n", "ab\r\n", "sing\r\nnow", "quickly\r\n go", "a,\r\nb\r\nc, d",
+        "\xE6\x97\xA5\r\n",    // 日 CR LF
+        "\xE6\x97\xA5 a\r\nq", // 日 ' ' a CR LF q
+        "z1\r\n\xC3\xA9",      // z 1 CR LF é
+        "\r\n\r\nab", "ab \r\n"})
     subjects.push_back(s);
   for (const char *pat : pats)
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
@@ -1796,12 +1804,22 @@ void test_crlf_interior_anchors() {
       for (const std::string &s : subjects)
         CHECK(all_agree(re, pike, s));
     }
+  // The reported Grapheme answers, pinned: each split the CR-LF cluster.
+  // `\B\D+` over 日 CR LF found the LF alone, [4,5); `[a-z]?[\w\s]+\B` ended
+  // between the CR and the LF, [0,6); `\B\D+` over "z1\r\né" began on the LF.
+  CHECK(!Regex("\\B\\D+").test("\xE6\x97\xA5\r\n"));
+  CHECK(!Regex("\\B\\D+").search("\xE6\x97\xA5\r\n").matched());
+  CHECK(!Regex("[a-z]?[\\w\\s]+\\B").test("\xE6\x97\xA5 a\r\nq"));
+  CHECK(!Regex("[a-z]?[\\w\\s]+\\B").match("\xE6\x97\xA5 a\r\nq").matched());
+  CHECK(!Regex("\\B\\D+").search("z1\r\n\xC3\xA9").matched());
   // Where such an anchor meets no run the byte tiers keep a CR-LF subject;
-  // where it does, it goes to the Pike.
+  // where it does, it goes to the Pike. A text anchor may meet a run.
   for (const char *pat : {"\\w+\\B\\w", "\\Bing\\s+\\w", "(?m)^\\w+,\\s+\\w+",
-                          "(?m)^(\\w+)\\s+(\\w+)"})
+                          "(?m)^(\\w+)\\s+(\\w+)", "\\s+$", "^\\s+\\w"})
     CHECK(PlanProbe::crlf_byte_safe(Regex(pat)));
-  for (const char *pat : {"\\s+\\B", "\\B\\W+\\w", "(?m)$\\s+\\w", "(?m)(\\s+)$"})
+  for (const char *pat :
+       {"\\s+\\B", "\\B\\W+\\w", "(?m)$\\s+\\w", "(?m)(\\s+)$", "\\B\\D+",
+        "[a-z]?[\\w\\s]+\\B", "(?m)\\s+$"})
     CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
 }
 
