@@ -163,6 +163,11 @@ struct PlanProbe {
       if (*dfas[k]) (*dfas[k])->look_pf = was[k];
     return r;
   }
+  // Whether test() over the ASCII assert tier takes the word scan, its
+  // start set sparse (Plan::word_scan_sparse).
+  static bool word_scan_sparse(const Regex &re) {
+    return re.plan_->word_scan_sparse();
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -2210,6 +2215,64 @@ void invariant_fuzz_assert_prefix_bool(int iters) {
   }
 }
 
+// test() on the word scan's shapes, where the plan holds the start set
+// sparse: the boolean takes the find (Plan::word_scan_sparse), and when the
+// walk gives up — its budget spent on walks that run into one another, or a
+// CR that a body reading `\s` meets (onepass_walk_bails_cr) — the boolean's
+// own scan answers, stopping at the first accept. Bodies that cross a
+// separator, so that a walk from one word runs over the next; subjects that
+// repeat a token such a walk crosses and fails on, long enough to spend the
+// budget, between random units that complete a match now and then. Every
+// subject's test() against search() and the Pike.
+void invariant_fuzz_word_bool(int iters) {
+  static const char *HEAD[] = {"[0-9]", "[x-z]", "\\d", "[xz]", "k", "[0-9]+"};
+  static const char *BODY[] = {"",
+                               "[a-c]*",
+                               "(?: [x-z0-9]+)*",
+                               "(?:\\s[0-9]+)*",
+                               "(?:\\.[0-9]{1,2})*",
+                               "(?:-[a-c]+)*"};
+  static const char *TAIL[] = {"\\b", " q\\b", "x\\b", "_", "\\.[0-9]\\b"};
+  static const char *TOKENS[] = {"xy ", "1 ", "1.", "1.2.", "1\r", "1\n",
+                                 "z-ab-", "7 a", "k1 ", "x\r\n"};
+  static const char *UNITS[] = {"x", "z", "1", "7", "k", "a", "q", " ",
+                                ".", "-", "_", "\r", "\n", "\r\n", "1.2 q"};
+  for (int it = 0; it < iters; it++) {
+    const std::string pat =
+        std::string("\\b") + HEAD[U(0, 5)] + BODY[U(0, 5)] + TAIL[U(0, 4)];
+    reg::Regex *re = nullptr;
+    try {
+      re = new reg::Regex(pat);
+    } catch (...) { continue; }
+    if (!reg::detail::PlanProbe::word_scan_sparse(*re)) {
+      delete re;
+      continue;
+    }
+    reg::Regex *pike = pike_reference(pat);
+    for (int s = 0; s < 4; s++) {
+      std::string subj;
+      for (int i = U(0, 6); i > 0; i--)
+        subj += UNITS[U(0, 14)];
+      const char *tok = TOKENS[U(0, 9)];
+      for (int i = U(0, 1) ? U(1, 8) : U(20, 400); i > 0; i--)
+        subj += tok;
+      for (int i = U(0, 12); i > 0; i--)
+        subj += UNITS[U(0, 14)];
+      try {
+        const bool t = re->test(subj);
+        if (t != re->search(subj).matched())
+          fail("word-bool: test() != search", pat, subj);
+        if (pike && t != pike->search(subj).matched())
+          fail("word-bool: test() != Pike", pat, subj);
+      } catch (...) {
+        fail("word-bool: threw", pat, subj);
+      }
+    }
+    delete re;
+    delete pike;
+  }
+}
+
 void invariant_fuzz_assert_unicode(int iters) {
   for (int it = 0; it < iters; it++) {
     std::string pat = gen_alt(3); // produces ^ $ \b \d \w \s . [...] groups alt
@@ -2472,6 +2535,9 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A tenth: eight subjects of up to a few hundred bytes per pattern, each
   // asked twice (with the skip and without).
   invariant_fuzz_assert_prefix_bool(share(inv / 10));
+  // A tenth: four subjects of up to a kilobyte or so per pattern, about a
+  // third of the patterns kept.
+  invariant_fuzz_word_bool(share(inv / 10));
 }
 
 int main(int argc, char **argv) {

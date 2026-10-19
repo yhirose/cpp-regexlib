@@ -86,6 +86,17 @@ struct PlanProbe {
   static bool assert_prefix_skips(const Regex &re) {
     return re.plan_->assert_prefix_skips();
   }
+  // ... and whether it takes the word scan, its start set sparse.
+  static bool word_scan_sparse(const Regex &re) {
+    return re.plan_->word_scan_sparse();
+  }
+  // Whether this thread's cache of `re` holds the leftmost-first forward
+  // DFA, of either program: what an assert find steps when every anchor
+  // gives up, and a boolean never does (its scan is the re-seeding one).
+  static bool lf_dfa_built(const Regex &re) {
+    const Regex::FindCache &c = re.thread_cache();
+    return c.lfu_ || c.blfu_;
+  }
   // What test() answers with that skip off (LazyDfa::look_pf) — every byte
   // stepped, as before there was one — on this thread's cache of `re`.
   static bool test_unskipped(const Regex &re, std::string_view s) {
@@ -193,8 +204,18 @@ struct PlanProbe {
   //   F / f the fused prefix / suffix scans (never a start: the subject
   //   has to be looked at first)
   static char start(const Regex &re, bool test) {
+    return rung(re.plan_->start_[test ? 1 : 0].rung);
+  }
+  // ... and the one a boolean stands on in the ASCII assert family, over a
+  // subject of limits::kBoolSkipBytes or more (`short_subject` false) or
+  // under.
+  static char assert_ascii_bool(const Regex &re, bool short_subject) {
+    return rung(
+        re.plan_->family_[Regex::kFamAssertAscii][short_subject ? 2 : 1].rung);
+  }
+  static char rung(Regex::Rung r) {
     using R = Regex::Rung;
-    switch (re.plan_->start_[test ? 1 : 0].rung) {
+    switch (r) {
     case R::Literal: return 'L';
     case R::LiteralAlt: return 'A';
     case R::AssertAnchor: return 'a';
@@ -2271,6 +2292,61 @@ void test_find_ladder() {
     Regex t("^.*foo\\b");
     CHECK(t.test("foo " + big));
     CHECK(PlanProbe::dfa_stats(t).scanned < 64);
+  }
+  // test() on the word scan's shapes, led by no literal priced below the
+  // scan: where its start set is sparse the boolean takes the find, which
+  // skips to a candidate a block at a time (Plan::word_scan_sparse), on a
+  // subject of any length; where it is dense, the boolean scan, which steps
+  // through every word faster than one walk a word. Candidates at the
+  // subject's edges, inside a word, across a block, failing a byte in;
+  // a lone CR (the walk gives up on it for a body that reads one) and a
+  // CR-LF pair.
+  {
+    for (const char *pat :
+         {"\\b\\d+\\b", "\\b[0-9]{3}\\b", "\\b[xz]\\w+\\b", "\\b\\d+[a-z]*",
+          "\\bk[a-z]*\\d\\b", "\\b\\d\\s\\d\\b", "\\b[xz][a-z]*e\\b"}) {
+      const Regex re(pat);
+      CHECK(PlanProbe::word_scan_sparse(re));
+      CHECK(PlanProbe::assert_ascii_bool(re, false) == 'c');
+      CHECK(PlanProbe::assert_ascii_bool(re, true) == 'c');
+    }
+    for (const char *pat : {"\\b[a-z]+\\d\\b", "\\b\\w+\\b", "\\bq[a-z]+e\\b"}) {
+      const Regex re(pat);
+      CHECK(!PlanProbe::word_scan_sparse(re));
+      CHECK(PlanProbe::assert_ascii_bool(re, false) == 'B');
+    }
+    const std::string pad(70, ' '), words = "the lazy dog jumps over; ";
+    for (const char *pat :
+         {"\\b\\d+\\b", "\\b[0-9]{3}\\b", "\\b[xz]\\w+\\b", "\\b\\d+[a-z]*",
+          "\\bk[a-z]*\\d\\b", "\\b\\d\\s\\d\\b", "\\b[xz][a-z]*e\\b",
+          "\\b[a-z]+\\d\\b"})
+      for (const std::string &subj :
+           {std::string(), std::string("7"), std::string("a7"),
+            std::string("7a"), std::string("a 7"), std::string("123"),
+            std::string("1234 12 x123"), std::string("k9 xe"),
+            std::string("ak9 kk9"), std::string("zone xe"),
+            std::string("1\r2"), std::string("1\r\n2"), std::string("1\n2 z"),
+            words + "7", words + "x7 k7_ 1_2 " + words, pad + "123",
+            pad + "1234 _12 " + pad, words + words + "z" + words + "zap",
+            pad + "1 2" + pad, pad + "1\r2" + pad, pad + "a1\r2 x"})
+        CHECK(agree(pat, subj));
+  }
+  // ... and what that costs: over a megabyte of prose with no candidate,
+  // the boolean steps no DFA at all (it used to step every byte); a dense
+  // start set is stepped through.
+  {
+    std::string big;
+    while (big.size() < (size_t{1} << 20))
+      big += "The quick brown fox jumps over the lazy dog. Holmes a@b skip ";
+    for (const char *pat : {"\\b\\d+\\b", "\\b[0-9]{3}\\b", "\\b[xz]\\w+\\b"}) {
+      Regex re(pat);
+      CHECK(!re.test(big));
+      CHECK(PlanProbe::dfa_stats(re).built == 0);
+      CHECK(re.test(big + " 123 zap"));
+    }
+    Regex dense("\\b[a-z]+\\d\\b");
+    CHECK(!dense.test(big));
+    CHECK(PlanProbe::dfa_stats(dense).scanned > big.size() / 2);
   }
   // The interior-literal rung as a boolean looks back 32 bytes for where a
   // match through the literal could start, and leaves the subject to the
@@ -4857,6 +4933,46 @@ void test_walk_budget_linearity() {
     cases.push_back({"word-scan", pat, s + "ab.", 0});
     cases.push_back({"word-scan-bail-match", pat, s + "ab. ab 7", 1});
   }
+  { // ... over a start set the plan holds sparse, which a boolean takes the
+    // find for (Plan::word_scan_sparse). When its walk bails, what answers is
+    // the boolean's own scan, which stops at the first accept — not the
+    // find's, which goes on to the leftmost-first end and back to its start.
+    const char *pat = R"(\b[x-z]+(?: [x-z]+)* [0-9]\b)";
+    CHECK(PlanProbe::word_scan_sparse(Regex(pat)));
+    std::string s = "-------- ";
+    for (int i = 0; i < 200000; i++)
+      s += "xy ";
+    for (const auto &[subj, want] :
+         {std::pair<std::string, bool>{s + "xy.", false},
+          {s + "xy. xy 7", true},
+          {s + "xy. xy 7 " + s + "xy.", true}}) {
+      Regex re(pat);
+      CHECK(re.test(subj) == want);
+      CHECK(PlanProbe::dfa_stats(re).scanned > 0); // the walk gave up
+      CHECK(!PlanProbe::lf_dfa_built(re));
+    }
+    cases.push_back({"word-scan-sparse", pat, s + "xy.", 0});
+    cases.push_back({"word-scan-sparse-match", pat, s + "xy. xy 7", 1});
+  }
+  { // The same for a boolean the trailing literal drives (the assert-suffix
+    // case above, with a match past where its budget runs out), over the
+    // ASCII assert tier and the byte one.
+    const char *pat = "(?m)^[a-z]+ing";
+    std::string s = "Z" + std::string(1000, 'a');
+    for (int i = 0; i < 30000; i++)
+      s += "ing";
+    for (const auto &[subj, want] :
+         {std::pair<std::string, bool>{s + "\nsing", true},
+          {"\xC3\xA9" + s + "\nsing", true},
+          {s, false},
+          {"\xC3\xA9" + s, false}}) {
+      Regex re(pat);
+      CHECK(re.test(subj) == want);
+      CHECK(!PlanProbe::lf_dfa_built(re));
+    }
+    cases.push_back({"assert-suffix-match", pat, s + "\nsing", 1});
+    cases.push_back({"assert-suffix-byte", pat, "\xC3\xA9" + s + "\nsing", 1});
+  }
   for (auto &c : cases) {
     Regex re(c.pat);
     auto t0 = std::chrono::steady_clock::now();
@@ -4865,6 +4981,7 @@ void test_walk_budget_linearity() {
       (void)m, n++;
     for (auto m : re.find_iter(c.subj))
       (void)m, n++;
+    CHECK(re.test(c.subj) == (c.want > 0));
     double dt = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0)
                     .count();

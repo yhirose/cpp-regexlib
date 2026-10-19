@@ -825,6 +825,19 @@ static void run_sherlock_bench(int iters) {
       // (the rows above it in the first section run on the byte one).
       {"test: leading literal, \\b", "\\bqzx\\w*\\b", true, {ascii}},
       {"test: leading rare letter, \\b", "\\bq[a-z]+j\\b", true, {ascii}},
+      // test() on the word scan's shapes, led by no literal, none of which
+      // matches anywhere: where the start set is sparse the boolean takes
+      // the find (Plan::word_scan_sparse), and used to step every byte, ~15x
+      // behind it. A digit begins some 250 words, an `x` or a `z` five; the
+      // first row's find twin follows it. A start set as common as `[a-z]`
+      // stays on the boolean scan, which steps through the words faster
+      // than the find walks each one: the last row, and its find twin.
+      {"test: word scan, digit start, \\b", "\\b\\d+[xz]\\b", true, {ascii}},
+      {"word scan, digit start, \\b", "\\b\\d+[xz]\\b", false, {ascii}},
+      {"test: word scan, rare start, \\b", "\\b[xz][a-z]*\\d\\b", true,
+       {ascii}},
+      {"test: word scan, dense start, \\b", "\\b[a-z]+\\d\\b", true, {ascii}},
+      {"word scan, dense start, \\b", "\\b[a-z]+\\d\\b", false, {ascii}},
   };
   for (auto &c : ascii_cases)
     run_case(c, iters);

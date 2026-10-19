@@ -661,6 +661,35 @@ occurrence it steps the rest of the subject, as it did before. The fuzzer
 asks every subject of its layer for it twice, with the skip and without,
 malformed bytes among them.
 
+**... and takes the word scan where its start set is sparse.** The
+`\b body \b` shapes the word scan serves (`Plan::wop_`) with no literal
+priced below the scan — `\b\d+\b`, `\b[0-9]{3}\b`, `\b[xz]\w+\b` — had the
+same gap, and nothing to skip to: the boolean stepped every byte, where the
+find reads sixteen positions at a time for a candidate (`word_start_block`)
+and walks the candidates alone. `\b\d+\b` tested over a megabyte of prose
+with no digit took ~1.8 ms, the find ~115 µs. A walk ends where its word
+does, so the word scan is a bounded anchor in the sense above, and
+`ladder_pick` gives a boolean on the ASCII assert family the find when the
+plan holds the scan sparse (`Plan::word_scan_sparse`): the scan leads (no
+literal anchor priced below it, `wop_after_anchor_`) and its estimate
+(`anchor_.scan_cost`) is under the bar the DFA tiers leave a dense prefix to
+their scan at (`AnchorChoice::kDenseNs`). The plan works the answer out with
+the ladders, for each assert family (`Plan::assert_bool_find_`, in
+`ladder_plan`), and `ladder_pick` reads it: as the tests it stands for, the
+copy of `ladder_pick` in the step's rare re-pick grew past the size at
+which Clang inlines `ladder_adopt` into the one-step find, and every
+Grapheme `test()` paid ~50 instructions for it. A dense start set stays on the
+scan: with `[a-z]` every word is a candidate, walked to its end, and once
+the walks have spent their budget the find starts over on the unfiltered
+scan (`\b[a-z]+\d\b` over the ASCII-folded Sherlock text: ~2.6 ms through
+the find, ~1.05 stepped). So does the byte family, where the walk has no
+byte form. And where a walk does give up, what answers the boolean is not
+what the find falls back to — the leftmost-first end, then the reverse scan
+back to its start — but the boolean's own scan, which stops at the first
+accept (`assert_find_span` with `span` false). The three now take what their
+finds take, ~115 µs; over the ASCII-folded Sherlock text `\b[0-9]{3}\b`
+went from ~155 µs to 18, and over a 60-byte subject from ~120 ns to ~60.
+
 **One step, or every match.** `ladder_step<All, Out>` is the one
 dispatch (the rungs that need only the cursor are `ladder_shallow`, the walk
 `ladder_walk`, the rest `ladder_deep`). `find_iter` takes a step per `++`; `find_all` takes the same step

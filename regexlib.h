@@ -10606,6 +10606,23 @@ private:
     bool assert_prefix_skips() const {
       return !assert_.prefix.empty() && !anchor_.prefix_dense();
     }
+    // Whether the word scan leads the assert find (no literal anchor priced
+    // below it: wop_after_anchor_) and is sparse, by the same bar: a boolean
+    // then takes the find (assert_bool_find_). Every candidate of a start
+    // set as common as `[a-z]` is a word, and the walks cost more than the
+    // boolean scan stepping through them (`\b[a-z]+\d\b` over the ASCII-
+    // folded Sherlock text: ~2.6 ms through the find, ~1.05 stepped).
+    bool word_scan_sparse() const {
+      return wop_.ok && !wop_after_anchor_ &&
+             anchor_.scan_cost < AnchorChoice::kDenseNs;
+    }
+    // Whether a boolean on the assert family takes the assert find where it
+    // can, by family: [0] the ASCII one, [1] the byte one. Worked out once
+    // (Regex::ladder_plan, which says why) and read by ladder_pick, whose
+    // copy in the step's rare re-pick is then no larger than it was: as the
+    // three tests it stands for, it took Clang over the size it inlines
+    // ladder_adopt at, and cost every Grapheme test() ~50 instructions.
+    bool assert_bool_find_[2] = {false, false};
 
     // EGC byte path: UTF-8 byte programs (forward + reverse), compiled like
     // UnicodeScalar mode, used to run a non-ASCII subject whose every grapheme
@@ -12178,15 +12195,19 @@ private:
   // The assert find: the leftmost-first match at or after `from` as [s, e).
   // Returns 1 (found), 0 (no match remains) or LazyDfa::kCap. `byte` selects
   // the byte programs' DFAs over the grapheme programs' (see above).
-  // `walk_budget` (optional) is the caller's loop-wide failed-walk allowance
-  // for the literal prefilters (see kWalkBail): the fill / iterator loops own
-  // one budget across all their calls — a per-call budget would reset at
-  // every match and still admit O(matches × n). A null budget (one-shot
-  // search/match callers) uses a per-call local. On exhaustion the literal
-  // prefilters are skipped and the unfiltered (linear) scan below answers.
+  // `budget` is the caller's loop-wide failed-walk allowance for the literal
+  // prefilters (see kWalkBail): the fill / iterator loops own one budget
+  // across all their calls — a per-call budget would reset at every match
+  // and still admit O(matches × n). On exhaustion the literal prefilters are
+  // skipped and the unfiltered (linear) scan below answers.
+  // `span` false is the boolean caller (test(), from 0), which reads only
+  // whether there is a match: what the unfiltered scan answers it is the
+  // first accept, and [s, e) is then no match's span. (A run-time argument:
+  // as a template one, the boolean's copy of this function changed what GCC
+  // inlined into test(), and cost two to four instructions of every call.)
   int assert_find_span(FindCache &fc, std::string_view text, int from, int &s,
-                       int &e, bool byte,
-                       WalkBudget *walk_budget = nullptr) const {
+                       int &e, bool byte, WalkBudget &budget,
+                       bool span) const {
     // What a scan that found nothing answers: nothing, or that it gave up.
     const auto none = [](int r) { return r == LazyDfa::kCap ? r : 0; };
     // Text-begin-anchored (e.g. the `^...$` validation shape): every match
@@ -12214,8 +12235,6 @@ private:
     if (!plan_->assert_.lit.empty())
       return assert_lit_find(fc, text, from, s, e, byte);
     if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
-    WalkBudget local_budget(text.size());
-    WalkBudget &budget = walk_budget ? *walk_budget : local_budget;
     // [Tier: WordOnePass] one walk per candidate replaces the forward scan +
     // per-match reverse start recovery (ASCII subjects: the walk has no byte
     // form). It looks at every byte, so a literal anchor the plan priced
@@ -12238,6 +12257,17 @@ private:
     if (wop && plan_->wop_after_anchor_) {
       int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
+    }
+    // A boolean takes the family's own scan (Rung::Bool's), which stops at
+    // the first accept. What follows is a find's: the leftmost-first end,
+    // which can be the end of the line, and the reverse scan back to the
+    // start.
+    if (!span) {
+      const int e0 = look_forward_first(byte ? fc.bfu(*this) : fc.fu(*this),
+                                        text, from);
+      if (e0 < 0) return none(e0);
+      s = e = e0;
+      return 1;
     }
     // Leftmost-first end from the ordered+cut forward DFA; the boolean
     // reverse scan recovers the leftmost start.
@@ -14306,9 +14336,9 @@ private:
   // And the skipping scan is an instantiation of its own: as a switch the
   // scan read, the plain one lost its inlining here, and with it ~5 ns of a
   // 22-byte test().)
-  REGEXLIB_NOINLINE int look_forward_first(LazyDfa &d,
-                                           std::string_view text) const {
-    int reach = 0, i = 0;
+  REGEXLIB_NOINLINE int look_forward_first(LazyDfa &d, std::string_view text,
+                                           int from) const {
+    int reach = from, i = from;
     if (d.look_pf) {
       const unsigned char *p =
           reinterpret_cast<const unsigned char *>(text.data());
@@ -16879,7 +16909,8 @@ private:
                                                Out &out) const {
     if (from > static_cast<int>(text.size())) return -1;
     int s = 0, e = 0;
-    const int r = assert_find_span(fc, text, from, s, e, byte, &wbudget);
+    const int r = assert_find_span(fc, text, from, s, e, byte, wbudget,
+                                   /*span=*/Out::kGroups);
     if (r <= 0) return r == LazyDfa::kCap ? r : -1;
     if (!emit_located(text, s, e, sc, saves, out)) return -1;
     if (plan_->ncap_ > 0 && Out::kGroups) { // the span as the groups have it
@@ -17459,6 +17490,27 @@ inline void Regex::ladder_plan(Plan &p) {
     p.match_guesses_[0] = byte_first ? byte : ascii;
     p.match_guesses_[1] = byte_first ? ascii : byte;
   }
+  // A boolean on the assert family takes the assert find (ladder_pick) when
+  // a literal anchor leads it and what follows a hit is bounded by the
+  // match up to that literal — the whole match as one fixed text, a
+  // trailing literal (the verify runs backwards from it), the word-suffix
+  // scan. A LEADING literal is not such an anchor: its verify walks forward
+  // to the leftmost-first end, which can be the end of the line, where the
+  // boolean scan stops at the first accepting state — and the boolean scan
+  // skips to that literal itself (LazyDfa::look_pf), so it pays for
+  // neither. Nor is anything an anchor for a text-anchored pattern, which
+  // the boolean scan decides from 0 (see Rung::Bool), where the find's
+  // verify from 0 goes on to the leftmost-first end (`^.*foo\b`).
+  const bool bounded = !p.assert_.lit.empty() || p.assert_.word_suffix ||
+                       !p.assert_.suffix.empty();
+  // The word scan is bounded too — a walk ends where the word does — and
+  // where its start set is sparse it reads a block of sixteen positions at
+  // a time, where the boolean scan steps every byte (`\b\d+\b` tested over
+  // a megabyte of prose it does not match: ~1.8 ms stepped, ~0.12 through
+  // the find). ASCII only: the walk has no byte form.
+  p.assert_bool_find_[0] =
+      !p.text_anchored_ && (bounded || p.word_scan_sparse());
+  p.assert_bool_find_[1] = !p.text_anchored_ && bounded;
   p.fused_ = p.egc_fused_ok()
                  ? (p.prefix_fused() ? Plan::Fused::Prefix
                                      : Plan::Fused::Suffix)
@@ -17588,23 +17640,14 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
   const bool walk = l.has(Ladder::kWalkOn) && !below_walk;
   if (l.has(Ladder::kAssert)) {
     if (rows) return walk ? Rung::Walk : Rung::AssertChain;
-    // A boolean takes the assert find when a literal anchor leads it and
-    // what follows a hit is bounded by the match up to that literal — the
-    // whole match as one fixed text, a trailing literal (the verify runs
-    // backwards from it), the word-suffix scan. A LEADING literal is not
-    // such an anchor: its verify walks forward to the leftmost-first end,
-    // which can be the end of the line, where the boolean scan stops at the
-    // first accepting state — and the boolean scan skips to that literal
-    // itself (LazyDfa::look_pf), so it pays for neither. Nor is any literal
-    // an anchor for a text-anchored pattern, which the boolean scan decides
-    // from 0 (see Rung::Bool), where the find's verify from 0 goes on to
-    // the leftmost-first end (`^.*foo\b`). That scan serves either engine in
-    // either unit, groups or not: a Save is an empty move to a DFA, and a
-    // scan that gives up hands the boolean to the find's rungs (Rung::Bool).
-    const bool bounded = !p.text_anchored_ &&
-                         (!p.assert_.lit.empty() || p.assert_.word_suffix ||
-                          !p.assert_.suffix.empty());
-    if (!(l.has(Ladder::kFindOk) && bounded)) return Rung::Bool;
+    // A boolean takes its own scan unless the family's find is bounded
+    // (Plan::assert_bool_find_: see ladder_plan). That scan serves either
+    // engine in either unit, groups or not: a Save is an empty move to a
+    // DFA, and a scan that gives up hands the boolean to the find's rungs
+    // (Rung::Bool).
+    if (!(l.has(Ladder::kFindOk) &&
+          p.assert_bool_find_[l.has(Ladder::kAssertByte)]))
+      return Rung::Bool;
     return Rung::AssertChain;
   }
   if (l.has(Ladder::kIpOn)) return Rung::IcasePrefix;
@@ -18083,7 +18126,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
                    : byte ? scr.cache->bfu(*this)
                           : scr.cache->fu(*this);
     if (l.has(Ladder::kAssert)) {
-      e2 = look_forward_first(dfa, text);
+      e2 = look_forward_first(dfa, text, 0);
     } else {
       // CodePoint: the start-state skip is a scan-time switch, on for a
       // subject long enough to repay it (see kBoolSkipBytes, and fu()).
