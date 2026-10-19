@@ -82,6 +82,24 @@ struct PlanProbe {
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
+  // Whether test() over an assert pattern skips to its leading literal.
+  static bool assert_prefix_skips(const Regex &re) {
+    return re.plan_->assert_prefix_skips();
+  }
+  // What test() answers with that skip off (LazyDfa::look_pf) — every byte
+  // stepped, as before there was one — on this thread's cache of `re`.
+  static bool test_unskipped(const Regex &re, std::string_view s) {
+    (void)re.test(s); // builds the DFA the boolean steps for this subject
+    Regex::FindCache &c = re.thread_cache();
+    std::optional<Regex::LazyDfa> *const dfas[] = {&c.fu_, &c.bfu_};
+    bool was[2] = {};
+    for (int k = 0; k < 2; k++)
+      if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
+    const bool r = re.test(s);
+    for (int k = 0; k < 2; k++)
+      if (*dfas[k]) (*dfas[k])->look_pf = was[k];
+    return r;
+  }
   // What the lazy DFA's start state skips with — the byte programs' DFAs
   // (`byte`), or the grapheme program's — and what prunes the positions of
   // the one-pass walk's scan. 'P' a literal prefix, 'T' Teddy, 'F' the
@@ -2168,6 +2186,91 @@ void test_find_ladder() {
       CHECK(agree(pat, filler + " EABCQ 12 " + tail));  // the other case
       CHECK(agree(pat, filler + tail + " testing"));    // at the very end
     }
+  }
+  // test() on an assert pattern led by a literal, which skips to it
+  // (look_forward_first), or anchored at the text's start. Behind an
+  // occurrence: a word character, a line break, a non-ASCII letter, the
+  // text's edge; occurrences that overlap, one inside a match still
+  // running, one only a later one completes.
+  {
+    CHECK(PlanProbe::assert_prefix_skips(Regex("\\bqzx\\w*\\b")));
+    CHECK(PlanProbe::assert_prefix_skips(Regex("\\bq[a-z]+e\\b")));
+    // A dense literal is stepped through, not skipped to (see
+    // Plan::assert_prefix_skips); and a pattern led by none has none.
+    CHECK(!PlanProbe::assert_prefix_skips(Regex("e\\w*\\d\\b")));
+    CHECK(!PlanProbe::assert_prefix_skips(Regex("[^?]+\\?.*\\b")));
+    const std::string pad(150, ' '), words = "the qz qzy xqzx aqzx_ lazy dog; ";
+    for (const char *pat :
+         {"\\bqzx\\w*\\b", "\\bqzx\\w*", "qzx\\w*\\b", "\\Bqzx\\w*", "qzx\\B",
+          "\\bq[a-z]+e\\b", "qzx[a-z]*$", "(?m)^qzx.*", "(?m)^qzx$",
+          "\\bqzx(\\w+)", "aab\\w*\\b", "x[^?]+\\?.*\\b", "^qzx\\b.*",
+          "\\Aqzx\\w*\\b", "^aab\\w*\\b", "^.*qzx\\b", "^qzx\\b"})
+      for (const std::string &subj :
+           {std::string(), std::string("qzx"), std::string("qzxa"),
+            std::string("aqzx b"), std::string("a qzx"), std::string("a.qzx."),
+            std::string("x\nqzx\n"), std::string("aaab"),
+            std::string("aaab aab"), std::string("qqzx qzxx"),
+            std::string("qzxqzx"), std::string("q?zx x?"), words + "qzx",
+            words + words, pad + "aqzx" + pad + "qzx" + pad,
+            "x" + pad + "?" + pad, std::string("\xC3\xA9qzx \xC3\xA9 qzx"),
+            std::string("qzx\xC3\xA9 qzx"), std::string("\xE6\x97\xA5qzx"),
+            pad + "\xC3\xA9qzx" + pad, std::string("qzx\r\nqzx")})
+        CHECK(agree(pat, subj));
+  }
+  // ... and on bytes that are no UTF-8 (look_restart_ok), the answers it
+  // gives without the skip. (search() and the Pike are no reference there:
+  // they read such bytes each their own way, and disagreed with test()
+  // before.)
+  {
+    const char *const pats[] = {"\\bqzx\\w*\\b", "qzx\\w*\\b", "\\Bqzx\\w*",
+                                "q[a-z]*x\\b", "\\bqz.\\b", "qzx[a-z]*$",
+                                "\\bq\\w*\\b"};
+    // (The last two subjects reach a start state behind bytes cp_before
+    // reads otherwise than the step took them: look_reads_back.)
+    const char *const subjs[] = {
+        "\xFFqzx \xE9qzx",
+        "\xE6q\xF0\xFF\n\xFFz\xE9q\xC3qzx\x80 ",
+        "\xA9\x9F\xFF\xF0\xFFq\xF0qx\x80" "a\xE6\x80" "aq\xE9\n q\xC3 x",
+        "x\xF0\xF0\x80x\xA9\x9F" "a\xE9" "a \xA9\xF0q\xE6\xA9qex\x9Fxe\xE9q",
+        "\xC3qzx \xE0\xE0\xE0qzx", "a\x80qzx \xBFqzx", "\xE9qz qzx",
+        "\xF0\x9F\x98qzx", "qz\xF0 \x9F\nq\x80",
+        "a\x9Fx\x80\n \xA9\nq\xE9\xE9\nq\x80\xFF\xE6\x9F" "e\xFF\xF0\x9F" "e"};
+    for (const char *pat : pats) {
+      Regex re(pat);
+      for (const char *s : subjs)
+        CHECK(re.test(s) == PlanProbe::test_unskipped(re, s));
+    }
+  }
+  // ... and what that costs: over a megabyte of prose with no occurrence of
+  // the literal, the boolean steps no byte, and a text-anchored one next to
+  // none (each used to step every byte of it); with an occurrence every 61
+  // bytes, it steps the words those begin; over CJK text, no further than
+  // the occurrence that fails at its start; and a text-anchored one with a
+  // trailing literal, no further than its first accept.
+  {
+    std::string big;
+    while (big.size() < (size_t{1} << 20))
+      big += "The quick brown fox jumps over the lazy dog. Holmes a@b skip ";
+    for (const char *pat : {"\\bqzx\\w*\\b", "\\bHolmesq\\w*\\b", "qzx[a-z]*$",
+                            "(?m)^qzx.*", "^qzx\\b.*", "\\Aqzx\\w*\\b"}) {
+      Regex re(pat);
+      CHECK(!re.test(big));
+      CHECK(PlanProbe::dfa_stats(re).scanned < 64);
+    }
+    Regex q("\\bq[a-z]+e\\b");
+    CHECK(!q.test(big));
+    CHECK(PlanProbe::dfa_stats(q).scanned < big.size() / 8);
+    CHECK(q.test(big + " quite"));
+    std::string cjk = "qzx";
+    while (cjk.size() < (size_t{1} << 18))
+      cjk += "\xE6\x97\xA5";
+    Regex d("\\bqzx\\d");
+    CHECK(!d.test(cjk));
+    CHECK(PlanProbe::dfa_stats(d).scanned < 64);
+    CHECK(d.test(cjk + " qzx7"));
+    Regex t("^.*foo\\b");
+    CHECK(t.test("foo " + big));
+    CHECK(PlanProbe::dfa_stats(t).scanned < 64);
   }
   // The interior-literal rung as a boolean looks back 32 bytes for where a
   // match through the literal could start, and leaves the subject to the

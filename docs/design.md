@@ -618,6 +618,49 @@ built in place; `NoSink`: nothing), so no entry point pays for another's
 form: `search()` building its result out of a row it had just written cost it
 a failed store-to-load forward, ~3 ns of a 20 ns call.
 
+**The assert families' boolean skips to its leading literal.** It used to be
+the scan alone: a leading literal is no bounded anchor for it (its verify
+walks to the leftmost-first end, above), and a DFA stepped with look had no
+start-state skip. So it stepped every byte where the find `memmem`'d the
+literal — `\bqzx\w*\b` tested over a megabyte of prose it does not match took
+~1.4 ms, the find ~40 µs. Now the scan skips to the assert prefix
+(`LazyDfa::look_pf`). A look state is a context as well as its pcs, and
+where a jump lands has a start state of its own, so the skip is not the call
+the other scans make from their start state: the scan *stops* in a start
+state (`LazyDfa::kAtStart`), and `look_forward_first` starts it again at the
+prefix's next occurrence, in the start state of what stands behind that —
+the assertion in front of the prefix sees its real left context. (As a call
+from inside the loop it ran a third slower under GCC with the occurrences
+dense: `\bq[a-z]+e\b` over prose with a `q` every 61 bytes, ~510 µs a MB
+against ~340, which is what the find takes; it was ~1.4 ms.) What one scan
+steps the next does not, the search for the prefix never goes back, and the
+scan still stops at its first accept, so `x[^?]+\?.*\b` costs one pass where
+the find's verify of each `x` walks on to the end of the line. Over the
+Sherlock text the three "test: leading …" bench rows went from ~0.65 GB/s to
+13-20. A text-anchored pattern's boolean is the anchored DFA's from 0
+(`^qzx\b.*` over the megabyte: ~1.5 ms → 12 µs), whatever literals it has:
+the find's verify from 0 goes on to the leftmost-first end (`^.*foo\b` over
+a megabyte line that begins `foo `: ~1.7 ms → ~20 µs).
+
+Two things keep the skip to what it is for. A dense prefix is stepped
+through, by the bar the DFA tiers leave one to their scan at
+(`Plan::assert_prefix_skips`; a scan restarted at every `e` costs more than
+one that steps through them — `e\w*\d\b` over the Sherlock text, 1.6 ms
+against 0.76). And on bytes that are no UTF-8 a lead byte takes the bytes
+after it for its own, whatever they are, so an occurrence of the literal can
+be inside what the scan steps as one code point, and what `cp_before` reads
+behind it need not be what the scan's steps saw: started there, the scan
+answered otherwise than the scan through every byte, finding a match that
+one does not and losing one it finds. It restarts only where the bytes
+behind the occurrence leave no doubt — a code point that a step takes there
+and `cp_before` reads back, claimed by no lead byte in front of it: every
+occurrence, in a UTF-8 subject (`look_restart_ok`) — and stops only where
+`cp_before` reads back what its last step took (`look_reads_back`), which in
+a UTF-8 subject is every start state it reaches; behind any other
+occurrence it steps the rest of the subject, as it did before. The fuzzer
+asks every subject of its layer for it twice, with the skip and without,
+malformed bytes among them.
+
 **One step, or every match.** `ladder_step<All, Out>` is the one
 dispatch (the rungs that need only the cursor are `ladder_shallow`, the walk
 `ladder_walk`, the rest `ladder_deep`). `find_iter` takes a step per `++`; `find_all` takes the same step
@@ -1709,7 +1752,8 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   so `\.([a-z]+)$` (capture) and `\.[a-z]+$` (capture-free) both skip the
   position-by-position assert scan (EGC ~640/~515 → ~220/~90 ns). memmem order is
   start order and every match starts with the prefix, so the first verifying hit
-  is leftmost-first.
+  is leftmost-first. A boolean verifies no occurrence: its scan skips to them
+  and stops at the first accept (§2, the find ladder).
 - **Single-pass pure-literal find** — a plain printable-ASCII literal pattern
   (`literal_only_`) used to pay *two* passes: classify the subject for the
   byte-path gate, then `memmem`. Printable ASCII is

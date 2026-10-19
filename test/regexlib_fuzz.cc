@@ -148,6 +148,21 @@ struct PlanProbe {
   static void dfa_cache(const Regex &re, size_t bytes, uint32_t min_clears) {
     dfa_cache(re, re.thread_cache(), bytes, min_clears);
   }
+  // What test() answers with the boolean look scan's skip to the assert
+  // prefix off (LazyDfa::look_pf): every byte stepped, as before there was
+  // one. On this thread's cache of `re`, whatever its budget.
+  static bool test_unskipped(const Regex &re, std::string_view s) {
+    (void)re.test(s); // builds the DFA the boolean steps for this subject
+    Regex::FindCache &c = re.thread_cache();
+    std::optional<Regex::LazyDfa> *const dfas[] = {&c.fu_, &c.bfu_};
+    bool was[2] = {};
+    for (int k = 0; k < 2; k++)
+      if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
+    const bool r = re.test(s);
+    for (int k = 0; k < 2; k++)
+      if (*dfas[k]) (*dfas[k])->look_pf = was[k];
+    return r;
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -2137,6 +2152,64 @@ void invariant_fuzz_assert_suffix(int iters) {
   }
 }
 
+// test() on an assert pattern led by a literal, which skips to it
+// (look_forward_first). The skip is a prefilter, so it may change what the
+// boolean costs and never what it answers: every subject's test() is
+// checked against the same Regex's with the skip off, on bytes that are no
+// UTF-8 too (look_restart_ok); on a UTF-8 subject, also against search()
+// and the Pike. Literals over a small alphabet, so that they occur, overlap
+// and come close to occurring; a left context of every kind; tails that end
+// a match at once, at the end of the line, never.
+void invariant_fuzz_assert_prefix_bool(int iters) {
+  static const char *LEAD[] = {"\\b", "\\B", "^", "", "\\b", ""};
+  static const char *BODY[] = {"\\w*", "[a-z]*", ".*", ".?", "[^?]+\\?.*",
+                               "\\w+", "",      "[a-y]{1,3}", "\\W"};
+  static const char *TAIL[] = {"\\b", "$", "\\B", "", "\\b"};
+  static const char *UNITS[] = {
+      "q", "z", "x", "a", "e", " ", "?", "\n", "_",
+      "\xC3\xA9" /*é*/, "\xE6\x97\xA5" /*日*/, "\xCC\x81" /*combining*/,
+      // bytes that are no UTF-8: lone leads, a continuation, an invalid byte
+      "\xE9", "\xC3", "\xF0", "\x80", "\xBF", "\xFF"};
+  static const int kValid = 12; // UNITS[0 .. kValid) are UTF-8
+  for (int it = 0; it < iters; it++) {
+    std::string lit;
+    for (int i = U(1, 3); i > 0; i--) lit += "qzx"[U(0, 2)];
+    std::string pat = std::string(LEAD[U(0, 5)]) + lit + BODY[U(0, 8)] +
+                      TAIL[U(0, 4)];
+    const unsigned flags = U(0, 2) == 0 ? reg::Multiline : 0u;
+    const reg::MatchUnit unit =
+        U(0, 3) == 0 ? reg::MatchUnit::CodePoint : reg::MatchUnit::Grapheme;
+    reg::Regex *re = nullptr;
+    try {
+      re = new reg::Regex(pat, flags, unit);
+    } catch (...) { continue; }
+    squeeze_dfa_cache(*re, pat, flags + (unit == reg::MatchUnit::CodePoint));
+    reg::Regex *pike = pike_reference(pat, flags, unit);
+    for (int s = 0; s < 8; s++) {
+      const bool malformed = U(0, 2) == 0;
+      std::string subj;
+      for (int i = U(0, 40); i > 0; i--)
+        subj += UNITS[U(0, malformed ? 17 : kValid - 1)];
+      if (U(0, 3) == 0) // past the boolean's short-subject limits
+        subj = std::string(U(60, 200), ' ') + subj + std::string(U(0, 70), 'a');
+      try {
+        const bool t = re->test(subj);
+        if (t != reg::detail::PlanProbe::test_unskipped(*re, subj))
+          fail("assert-prefix: test() != test() without the skip", pat, subj);
+        if (malformed) continue;
+        if (t != re->search(subj).matched())
+          fail("assert-prefix: test() != search", pat, subj);
+        if (pike && t != pike->search(subj).matched())
+          fail("assert-prefix: test() != Pike", pat, subj);
+      } catch (...) {
+        fail("assert-prefix: threw", pat, subj);
+      }
+    }
+    delete re;
+    delete pike;
+  }
+}
+
 void invariant_fuzz_assert_unicode(int iters) {
   for (int it = 0; it < iters; it++) {
     std::string pat = gen_alt(3); // produces ^ $ \b \d \w \s . [...] groups alt
@@ -2396,6 +2469,9 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   invariant_fuzz_multi_literal(share(inv / 5));
   // A tenth: four subjects of up to a few hundred bytes per pattern.
   invariant_fuzz_word_start(share(inv / 10));
+  // A tenth: eight subjects of up to a few hundred bytes per pattern, each
+  // asked twice (with the skip and without).
+  invariant_fuzz_assert_prefix_bool(share(inv / 10));
 }
 
 int main(int argc, char **argv) {

@@ -775,6 +775,19 @@ static void run_sherlock_bench(int iters) {
       {"test: common prefix, rare suffix", "e[a-z]{3,}q", true, {text}},
       {"test: class start, rare suffix", "[eE][a-z]{3,}q", true, {text}},
       {"test: interior literal", "[a-z]+-[0-9]{4}", true, {text}},
+      // test() on assert patterns led by a literal, none of which matches
+      // anywhere: the boolean skips from one occurrence of the literal to
+      // the next (LazyDfa::look_pf), and used to step every byte — ~30x
+      // behind the find. A literal that never occurs; one that nearly does
+      // (`Holmes` some 460 times, `Holmesq` never); a letter that begins
+      // some 260 words, each one stepped; a text-anchored pattern, decided
+      // at its first byte. The first is the find row's twin.
+      {"test: leading literal, \\b", "\\bqzx\\w*\\b", true, {text}},
+      {"leading literal, \\b", "\\bqzx\\w*\\b", false, {text}},
+      {"test: leading near-miss literal, \\b", "\\bHolmesq\\w*\\b", true,
+       {text}},
+      {"test: leading rare letter, \\b", "\\bq[a-z]+j\\b", true, {text}},
+      {"test: text-anchored, \\b", "^qzx\\b.*", true, {text}},
   };
   for (auto &c : cases)
     run_case(c, iters);
@@ -808,6 +821,10 @@ static void run_sherlock_bench(int iters) {
       // synthetic rows ("dense \w+", "(\w+) whole-match capture").
       {"words (\\w+) capture", "(\\w+)", false, {ascii}},
       {"letters \\p{L}+", "\\p{L}+", false, {ascii}},
+      // The boolean's skip to an assert prefix, on the ASCII assert tier
+      // (the rows above it in the first section run on the byte one).
+      {"test: leading literal, \\b", "\\bqzx\\w*\\b", true, {ascii}},
+      {"test: leading rare letter, \\b", "\\bq[a-z]+j\\b", true, {ascii}},
   };
   for (auto &c : ascii_cases)
     run_case(c, iters);
