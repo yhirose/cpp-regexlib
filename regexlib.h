@@ -14855,13 +14855,13 @@ public:
     // memmem jumps (`zqj`, before a CodePoint literal had the literal tier,
     // over 595 KB of prose: 0.67 GB/s, the find 89).
     // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
-    LazyDfa &fu(const Regex &re) {
-      if (!fu_) {
-        fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
-                    /*pf=*/!re.plan_->us_);
-        built(fu_);
-      }
-      return *fu_;
+    // (Built out of line, as bfu: inlined, the construction took the
+    // accessor past the size GCC inlines it into test() at.)
+    LazyDfa &fu(const Regex &re) { return fu_ ? *fu_ : make_fu(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_fu(const Regex &re) {
+      fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
+                  /*pf=*/!re.plan_->us_);
+      return built(fu_);
     }
 
     LazyDfa &rv(const Regex &re) {
@@ -14908,15 +14908,13 @@ public:
 
     // EGC byte-path DFAs: over the UTF-8 byte programs, prefilter off (the
     // grapheme program's ASCII-only first_bytes_.set would skip non-ASCII starts).
-    LazyDfa &bfu(const Regex &re) {
-      if (!bfu_) {
-        bfu_.emplace(re, re.plan_->byte_prog_.prog,
-                     re.plan_->byte_prog_.match_pc(), /*reseed=*/true,
-                     /*pf=*/false);
-        bfu_->byte_pf = re.plan_->byte_skips(); // sound byte-level dead-skip
-        built(bfu_);
-      }
-      return *bfu_;
+    LazyDfa &bfu(const Regex &re) { return bfu_ ? *bfu_ : make_bfu(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_bfu(const Regex &re) {
+      bfu_.emplace(re, re.plan_->byte_prog_.prog,
+                   re.plan_->byte_prog_.match_pc(), /*reseed=*/true,
+                   /*pf=*/false);
+      bfu_->byte_pf = re.plan_->byte_skips(); // sound byte-level dead-skip
+      return built(bfu_);
     }
 
     LazyDfa &brv(const Regex &re) {
@@ -18115,19 +18113,19 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // skip, and the scan is one pass.
   case Rung::Bool: {
     int e2;
-    // A text-anchored assert pattern matches at 0 or nowhere: the anchored
-    // DFA dies at the first byte no match can take, where the re-seeding one
-    // would go on to the end of the subject (as assert_find_span). Else the
-    // re-seeding scan, which on the assert family skips to the assert prefix
-    // when the plan has one (LazyDfa::look_pf).
     const bool byte = ladder_byte(l);
-    LazyDfa &dfa = l.has(Ladder::kAssert) && p.text_anchored_
-                       ? dfa_fwda(*scr.cache, byte)
-                   : byte ? scr.cache->bfu(*this)
-                          : scr.cache->fu(*this);
     if (l.has(Ladder::kAssert)) {
+      // A text-anchored pattern matches at 0 or nowhere: the anchored DFA
+      // dies at the first byte no match can take, where the re-seeding one
+      // would go on to the end of the subject (as assert_find_span). Else the
+      // re-seeding scan, which skips to the assert prefix when the plan has
+      // one (LazyDfa::look_pf).
+      LazyDfa &dfa = p.text_anchored_ ? dfa_fwda(*scr.cache, byte)
+                     : byte          ? scr.cache->bfu(*this)
+                                     : scr.cache->fu(*this);
       e2 = look_forward_first(dfa, text, 0);
     } else {
+      LazyDfa &dfa = byte ? scr.cache->bfu(*this) : scr.cache->fu(*this);
       // CodePoint: the start-state skip is a scan-time switch, on for a
       // subject long enough to repay it (see kBoolSkipBytes, and fu()).
       if (p.us_)
