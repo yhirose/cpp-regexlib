@@ -673,7 +673,8 @@ whose answer holds for the subject *as far as its scan read* answers
 - **How far a scan read** (`reach`): one past the furthest byte it examined —
   at least the match's end. A DFA scan reports it (the anchored DFAs have no
   start-state skip, and a scan consumes the byte that ends it); a one-pass
-  walk records it in its budget (`WalkBudget::read_to`) on every return.
+  walk's is one past the byte it ended on (`OnePassWalk::reach`), which the
+  `^body$` driver passes on in its budget (`WalkBudget::read_to`).
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:

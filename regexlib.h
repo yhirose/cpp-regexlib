@@ -5631,6 +5631,9 @@ class Regex {
     int walked = 0; // bytes consumed (the linearity charge)
     int skip = 0;   // candidates in [s + 1, skip) provably fail too
     int runs = 0;   // SIMD run skips taken (the expensive part of a failure)
+    // How far the walk from `s` read: one past the byte that ended it (a
+    // match() answer depends on no byte past it — see guess_held).
+    int reach(int s, int n) const { return s + walked < n ? s + walked + 1 : n; }
   };
   class WalkBudget {
     int left_;
@@ -5649,8 +5652,7 @@ class Regex {
     // candidates (see spend_at_candidate).
     int64_t cand_charge_ = 0;
     int64_t cand_chain_ = 0;
-    // One past the furthest byte a walk examined (read_to).
-    int reach_ = 0;
+    int reach_ = 0; // see read_to
 
     // The profitability yardstick: the distance the DRIVER covered — the
     // position reached less what the chain covered after local bails, which
@@ -5668,8 +5670,8 @@ class Regex {
     static constexpr int kCandChain = 3; // ... per candidate of the chain's
     explicit WalkBudget(size_t subject_len)
         : left_(static_cast<int>(subject_len)) {}
-    // How far the walks read: what a match() answered from depends on no
-    // byte past it (see guess_held).
+    // How far the walks of the `^body$` driver read (OnePassWalk::reach),
+    // for match() to judge its answer by (see guess_held).
     void read_to(int pos) {
       if (pos > reach_) reach_ = pos;
     }
@@ -15962,8 +15964,7 @@ private:
   // caller already knows the match START (a required-prefix candidate or a
   // non-absorbing ReverseInner floor). Returns -1 if no match starts at `s`,
   // kWalkLocal on a non-ASCII byte; `out` is scratch on any return but a
-  // match (see onepass_saves_begin). How far it read — up to the byte that
-  // ended it — goes to `budget` (WalkBudget::read_to), on every return.
+  // match (see onepass_saves_begin).
   //
   // Soundness rests on plan_->onepass_unbounded_ (see plan_capture_onepass):
   // the table is built with the leftmost-first cut (see build_cp_onepass),
@@ -15974,7 +15975,7 @@ private:
   // position, so tracking just (last accepting position, its match mask) —
   // instead of snapshotting the whole slot array at every accept — is exact.
   int cp_onepass_find(std::string_view t, int s, std::vector<int> &out,
-                      OnePassWalk &w, WalkBudget &budget) const {
+                      OnePassWalk &w) const {
     const detail::CpOnePass &op = plan_->cp_onepass_;
     int pos = s;
     // w.skip: when this walk FAILS, every candidate start in [s + 1, skip)
@@ -16030,7 +16031,6 @@ private:
     // walk can accept somewhere other than n) treats the walk as FAILED and
     // reads the report — so the accept path must fill it too.
     auto report = [&]() REGEXLIB_ALWAYS_INLINE {
-      budget.read_to(pos < n ? pos + 1 : n);
       w.walked = pos - s;
       w.skip = skip;
       w.runs = runs;
@@ -16327,7 +16327,7 @@ private:
       if (!h) return -1;
       int s = static_cast<int>(h - p);
       OnePassWalk w;
-      int e = cp_onepass_find(t, s, saves, w, budget);
+      int e = cp_onepass_find(t, s, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, s);
       if (e > s && onepass_end_ok(e, t)) {
         budget.matched_at_candidate(e - s);
@@ -16415,7 +16415,7 @@ private:
         }
       }
       OnePassWalk w;
-      int e = cp_onepass_find(t, pos, saves, w, budget);
+      int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, pos);
       // (A pruned scan's candidates are the chain's too: its start state
       // is left on the same bytes, and jumps to them with the same searcher
@@ -16455,7 +16455,8 @@ private:
     case Plan::WalkDriver::AnchoredStart: {
       if (from > 0) return -1;
       OnePassWalk w;
-      int e = cp_onepass_find(t, 0, saves, w, budget);
+      int e = cp_onepass_find(t, 0, saves, w);
+      budget.read_to(w.reach(0, static_cast<int>(t.size())));
       if (e == kWalkLocal) return kWalkLocal; // one candidate: nothing to count
       return (e > 0 && onepass_end_ok(e, t)) ? e : -1;
     }
@@ -16738,7 +16739,7 @@ private:
       if (s_floor == LazyDfa::kCap) return LazyDfa::kCap;
       if (s_floor >= 0) {
         OnePassWalk w;
-        int e = cp_onepass_find(text, s_floor, saves, w, budget);
+        int e = cp_onepass_find(text, s_floor, saves, w);
         if (e == kWalkLocal) return local_bail(budget, w, ls);
         if (e > s_floor && onepass_end_ok(e, text)) return e;
         if (!budget.spend_profitable(w, ls))
@@ -16771,9 +16772,8 @@ private:
     case kFamAscii:
       if (p.ncap_ > 0 && p.onepass_unbounded_) {
         OnePassWalk w;
-        WalkBudget budget(text.size()); // one candidate: its reach alone
-        const int e = cp_onepass_find(text, 0, sc.saves, w, budget);
-        reach = budget.reach();
+        const int e = cp_onepass_find(text, 0, sc.saves, w);
+        reach = w.reach(0, static_cast<int>(text.size()));
         // onepass_end_ok keeps the (onepass_unbounded_,
         // onepass_require_end_) pair-read local: today require_end implies
         // an assert plan, which is !dfa_ok_ and so never reaches this rung,
@@ -16795,7 +16795,7 @@ private:
     default: {
       const bool byte = f != kFamAssertAscii;
       if (p.onepass_anchored_start_ && (p.us_ || !byte)) {
-        WalkBudget budget(text.size()); // the anchored driver: its reach
+        WalkBudget budget(text.size()); // the `^body$` driver: its reach
         const int e =
             capture_find_dispatch(&cache, text, 0, sc.saves, budget, p.us_);
         reach = budget.reach();

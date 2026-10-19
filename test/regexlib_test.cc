@@ -1819,10 +1819,12 @@ void test_match_guess() {
   // A scan can read past where its answer ends, and what it read there
   // counts: the one-pass walk of `(a)(?:x[\r\n]b)?` takes `a` and goes on
   // into the optional part, which in Grapheme mode the CR-LF ahead (one
-  // cluster to `[\r\n]`) completes.
+  // cluster to `[\r\n]`) completes; the walk of `^(a)x([\r\n]b)$` (its one
+  // candidate, 0) fails on the LF, where the cluster matches.
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
     for (const char *s : {"ax\r\nb", "ax\r\nb\xFF", "ax\r\nc", "ax\rb"})
-      for (const char *pat : {"(a)(?:x[\\r\\n]b)?", "(\\w+)(?: x[\\r\\n]y)?"})
+      for (const char *pat : {"(a)(?:x[\\r\\n]b)?", "(\\w+)(?: x[\\r\\n]y)?",
+                              "^(a)x([\\r\\n]b)$"})
         CHECK(match_agrees(Regex(pat, 0, unit), pike_twin(pat, 0, unit), s));
 
   // What a guess's answer holds for: the code points that start at or
