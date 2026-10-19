@@ -695,12 +695,12 @@ whose answer holds for the subject *as far as its scan read* answers
   family is not tried at all (what it read would include it).
 
 Measured on `match()` over 4 MB of prose with a match at 0, in both units:
-`\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.14–1.3 ms to
-0.05–0.1 µs, and with a stray byte at 100 or at the end from 70–183 ms to the
-same. On ~60-byte subjects they run at 0.63–1.07× of before — save `.*fox`
-over one whose first non-ASCII byte follows 45 ASCII ones, 1.75× (+70 ns):
+`\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.15–1.5 ms to
+0.04–0.1 µs, and with a stray byte at 100 or at the end from 90–225 ms to the
+same. On ~60-byte subjects they run at 0.51–0.96× of before — save `.*fox`
+over one whose first non-ASCII byte follows 45 ASCII ones, 1.50× (+57 ns):
 the wrong guess's scan. A pattern whose scan reads to the end (`.*fox`, no
-line break) costs what it did.
+line break) costs what it did (the same instructions, to 0.5%).
 
 ### Linearity (the O(n²) trap)
 
