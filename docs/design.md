@@ -674,10 +674,13 @@ answer stands if the subject is one *as far as the scan read*
   first byte is not ASCII: what it read would include that byte.
 - **A CodePoint `search()` / `test()`** (`find_rest`) runs its plan's family
   (`Plan::us_ladder_`) with `Ladder::kSpec` set, and does not check for a
-  stray byte first. A rung that would leave the family — `Classify`, or the
-  Pike after a DFA gave up — stops the scan instead; the guess is then off,
-  as it is when its answer does not hold, and the Pike answers from the
-  start, with a fresh sink, cursor and budget.
+  stray byte first. An answer that does not hold is the Pike's, from the
+  start, with a fresh sink, cursor and budget (`find_pike`). The guess ends
+  where the scan leaves the family's rungs, which only a DFA that gave up
+  makes it do: at `Classify`, where a boolean hands over to the find's
+  rungs, the subject is classified whole, as it was before; at the Pike the
+  answer is the reference's — a one-step find moves its cursor only at a
+  yield, so the Pike starts at 0.
 
 The rules the two share:
 
@@ -720,6 +723,17 @@ same. On ~60-byte subjects they run at 0.51–0.96× of before — save `.*fox`
 over one whose first non-ASCII byte follows 45 ASCII ones, 1.50× (+57 ns):
 the wrong guess's scan. A pattern whose scan reads to the end (`.*fox`, no
 line break) costs what it did (the same instructions, to 0.5%).
+
+Measured on a CodePoint `search()` / `test()` over 4 MB of prose with a
+match in its first words: `\w+`, `(\w+) (\w+)`, `[a-z]+ing`, `(\w+)@(\w+)`,
+`\b\w+\b`, `\w+ \d+` went from 0.14–1.4 ms to 0.04–0.33 µs, and with a stray
+byte at 100 or at the end from 98–121 ms to the same. A find with no match
+reads to the end and costs what it did (to 0.001% of its instructions). On
+~60-byte subjects a call takes 123 fewer to 19 more instructions (of
+410–971; the fewer where the subject is not ASCII), and 11–56 more (to 4%)
+where the match is near the subject's end or there is none, so that the
+scan reads about what the old check did. A Grapheme find, which does not
+guess yet, takes 2–12 more (to 1.5%).
 
 ### Linearity (the O(n²) trap)
 

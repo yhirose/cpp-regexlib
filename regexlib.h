@@ -6148,8 +6148,9 @@ private:
       kSuffixOff = 1 << 7,
       kInnerOff = 1 << 8,
       // A guess (find_rest): the family is assumed to serve the subject and
-      // judged on what its scan read; a rung that would leave the family
-      // (Classify, the Pike) stops the scan instead.
+      // judged on what its scan read. It ends where the scan leaves the
+      // family's rungs: Classify classifies the subject whole, and the
+      // Pike is the reference.
       kSpec = 1 << 9,
     };
     uint16_t flags = kFindOk;
@@ -14623,17 +14624,22 @@ public:
     friend struct detail::PlanProbe;
 
     // How far forward the scans of a guess read (LazyDfa::hi): from 0, and
-    // the furthest. (The reverse DFAs read within what a forward one did.)
-    void reach_from_zero() {
-      for (std::optional<LazyDfa> *d : {&fu_, &lfu_, &lfa_, &bfu_, &blfu_, &blfa_})
-        if (*d) (*d)->hi = 0;
+    // the furthest — over the forward DFAs of one program set, the byte
+    // programs' (`byte`) or the others: a family's rungs run those alone
+    // (Regex::ladder_byte). (The reverse DFAs read within what a forward one
+    // did.)
+    void reach_from_zero(bool byte) {
+      each_forward(byte, [](LazyDfa &d) { d.hi = 0; });
     }
-    int reach() const {
+    int reach(bool byte) {
       int r = 0;
-      for (const std::optional<LazyDfa> *d :
-           {&fu_, &lfu_, &lfa_, &bfu_, &blfu_, &blfa_})
-        if (*d && (*d)->hi > r) r = (*d)->hi;
+      each_forward(byte, [&r](LazyDfa &d) { r = std::max(r, d.hi); });
       return r;
+    }
+    template <class F> void each_forward(bool byte, F f) {
+      if (std::optional<LazyDfa> &d = byte ? bfu_ : fu_) f(*d);
+      if (std::optional<LazyDfa> &d = byte ? blfu_ : lfu_) f(*d);
+      if (std::optional<LazyDfa> &d = byte ? blfa_ : lfa_) f(*d);
     }
     LazyDfa &built(std::optional<LazyDfa> &d) {
       d->budget = dfa_bytes_;
@@ -15061,6 +15067,11 @@ public:
   LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
     return dfa_rev(fc, l.has(Ladder::kByteDfas));
   }
+  // Whether a scan on `l` runs the byte programs' DFAs: the DFA family's
+  // byte ones, or the assert family's.
+  static bool ladder_byte(const Ladder &l) {
+    return (l.flags & (Ladder::kByteDfas | Ladder::kAssertByte)) != 0;
+  }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
   // every family that runs the walk). True when that is what happened — the
@@ -15145,6 +15156,11 @@ public:
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
+  // A guess of find_rest's that did not hold: the Pike's answer, from the
+  // start. Out of line: no subject the family serves reaches it.
+  template <class Out>
+  REGEXLIB_NOINLINE bool find_pike(std::string_view text, Scr &scr, Want want,
+                                   Out &out) const;
 
   // A scan that outlives the call that started it (find_iter, find_all,
   // find_at): the ladder, the cursor and what the rungs keep between
@@ -17481,7 +17497,10 @@ inline bool Regex::find_once(std::string_view text, Out &out) const {
 
 template <class Out>
 inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
+  Cursor c;
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
+  bool chain_once = false;
+  WalkBudget budget(text.size());
   if constexpr (!Out::kGroups) {
     // A boolean over a short subject gives the interior-literal rung up
     // before trying it (limits::kBoolSkipBytes): the plan's third ladder
@@ -17505,47 +17524,52 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
       l = ladder_adopt(plan_->us_ladder_[ladder_caller(l)], l);
     if (l.rung != Rung::Pike) l.set(Ladder::kSpec);
   }
-  for (;;) {
-    Cursor c;
-    bool chain_once = false;
-    WalkBudget budget(text.size());
+  bool found, stepped = false;
+  const Step st =
+      l.rung == Rung::Walk
+          ? ladder_walk<false>(text, scr, l, c, budget, chain_once, out)
+          : Step::Again;
+  if (st != Step::Again) {
+    found = st == Step::Yield;
+  } else {
+    // The rest of the ladder, over this thread's persistent lazy DFAs: built
+    // once and reused across calls, where rebuilding them was the dominant
+    // per-call cost.
+    if (!scr.cache) scr_fetch(scr);
+    if (l.has(Ladder::kSpec)) scr.cache->reach_from_zero(ladder_byte(l));
     Deep d;
-    bool found, stepped = false;
-    const Step st =
-        l.rung == Rung::Walk
-            ? ladder_walk<false>(text, scr, l, c, budget, chain_once, out)
-            : Step::Again;
-    if (st != Step::Again) {
-      found = st == Step::Yield;
-    } else {
-      // The rest of the ladder, over this thread's persistent lazy DFAs:
-      // built once and reused across calls, where rebuilding them was the
-      // dominant per-call cost.
-      if (!scr.cache) scr_fetch(scr);
-      if (l.has(Ladder::kSpec)) scr.cache->reach_from_zero();
-      // (Classified here rather than by the step's own case: one trip
-      // through the dispatch less on a Grapheme scan's way to its engine.)
-      if (l.rung == Rung::Classify)
-        l = ladder_classify(text, l, d.fna, d.probe);
-      found = ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
-      stepped = true;
-    }
-    if (!l.has(Ladder::kSpec)) return found;
-    // The guess: how far its scans read — a match's end, or past it as far
-    // as a DFA scan did (a walk reads no byte past its end that is not
-    // ASCII, so none a stray), the whole subject when there is no match —
-    // unless it stopped (the ladder stands on Classify).
-    if (l.rung != Rung::Classify) {
-      int reach = static_cast<int>(text.size());
-      if (found)
-        reach = stepped ? std::max(c.pos, scr.cache->reach()) : c.pos;
-      if (guess_held(l.has(Ladder::kAssert) ? kFamUsAssert : kFamUsDfa, text,
-                     reach))
-        return found;
-    }
-    out.clear();
-    l = pike_ladder(want);
+    // (Classified here rather than by the step's own case: one trip
+    // through the dispatch less on a Grapheme scan's way to its engine.)
+    if (l.rung == Rung::Classify)
+      l = ladder_classify(text, l, d.fna, d.probe);
+    found = ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
+    stepped = true;
   }
+  if (!l.has(Ladder::kSpec)) return found;
+  // The guess: how far its scans read — a match's end, or past it as far as
+  // a DFA scan did (a walk reads no byte past its end that is not ASCII, so
+  // none a stray), the whole subject when there is no match.
+  int reach = static_cast<int>(text.size());
+  if (found)
+    reach = stepped ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
+                    : c.pos;
+  if (guess_held(l.has(Ladder::kAssert) ? kFamUsAssert : kFamUsDfa, text,
+                 reach))
+    return found;
+  return find_pike(text, scr, want, out);
+}
+
+template <class Out>
+bool Regex::find_pike(std::string_view text, Scr &scr, Want want,
+                      Out &out) const {
+  out.clear();
+  if (!scr.cache) scr_fetch(scr);
+  Ladder l = pike_ladder(want);
+  Cursor c;
+  bool chain_once = false;
+  WalkBudget budget(text.size());
+  Deep d;
+  return ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
 }
 
 template <bool All, bool InlineWalk, class Out>
@@ -17665,7 +17689,6 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   const int n = static_cast<int>(text.size());
   switch (r) {
   case Rung::Classify:
-    if (l.has(Ladder::kSpec)) return Step::Over; // a guess stops (find_rest)
     l = ladder_reclassify(text, l, d.fna, d.probe);
     break;
   // Scan for the next prefix hit while verifying the gap is EGC-eligible
@@ -17922,10 +17945,9 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   }
   // The proven baseline (see pike_step).
   case Rung::Pike: {
-    if (l.has(Ladder::kSpec)) { // a guess stops (find_rest)
-      l.rung = l.below = Rung::Classify;
-      return Step::Over;
-    }
+    // A guess (find_rest) ends here: a one-step find moves its cursor only
+    // at a yield, so the Pike starts at 0, and its answer is the reference's.
+    l.set(Ladder::kSpec, false);
     if (!d.seg)
       c.gpos = ladder_segment(d.seg, text, c.pos);
     const detail::Segmented &sg = *d.seg;

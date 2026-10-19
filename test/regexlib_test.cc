@@ -319,6 +319,9 @@ struct PlanProbe {
     return re.guess_held(static_cast<Regex::Family>(kFamilies.find(fam)), s,
                          reach);
   }
+  // The calling thread's unanchored forward DFA of `re`, given up: the
+  // boolean's (Rung::Bool) on the DFA family.
+  static void quit_fu(const Regex &re) { re.thread_cache().fu(re).quit = true; }
   // Whether `f` — calls of `re` that draw on this thread's cache — ran the
   // Pike: it prepares the cache's scratch, which is emptied first.
   template <class F> static bool pike_ran(const Regex &re, F f) {
@@ -1643,6 +1646,18 @@ std::vector<std::string> cluster_subjects() {
   return subjects;
 }
 
+// `n` letters drawn from `alphabet` by a fixed generator.
+std::string noise(size_t n, const char *alphabet, unsigned seed) {
+  const size_t k = std::strlen(alphabet);
+  std::string s;
+  unsigned x = seed;
+  for (size_t i = 0; i < n; i++) {
+    x = x * 1664525u + 1013904223u;
+    s += alphabet[(x >> 16) % k];
+  }
+  return s;
+}
+
 // At least `bytes` of prose with an accent every few words: a Grapheme
 // subject the byte engines answer for, and whose first non-ASCII byte is
 // near its start.
@@ -1944,6 +1959,42 @@ void test_find_guess() {
   early += "\xFF" + words;
   CHECK(!re.test(words));
   CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(early)); }));
+
+  // Where a DFA of the guess gives up, the guess ends: at the Pike, which
+  // answers from the start, or — the boolean's DFA, which the find's rungs
+  // take over from — where the subject is classified whole. Over letters
+  // that take many DFA states, clean and with a piece of kDirt at the edges
+  // and inside: on caches too small for them (built afresh for each call),
+  // and with only the boolean's DFA given up, which on clean text leaves
+  // the find's own rungs to answer, not the Pike.
+  std::vector<std::string> hard;
+  for (const std::string &b :
+       {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
+    hard.push_back(b);
+    for (const char *d : {"\xFF", "\xC3", "\xC3\xA9"})
+      for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
+                        b.size() - 1, b.size()})
+        hard.push_back(b.substr(0, at) + d + b.substr(at));
+  }
+  for (const char *pat :
+       {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
+        "(a)[a-d]{8}(d)", "[^\\x00-\\x7f]", "\\b[ab]*a[ab]{9}\\b"}) {
+    const Regex re = make_us(pat),
+                pike = pike_twin(pat, 0, reg::MatchUnit::CodePoint);
+    for (const std::string &s : hard) {
+      for (size_t bytes : {size_t{512}, size_t{4096}})
+        for (uint32_t clears : {0u, 3u}) {
+          PlanProbe::dfa_cache(re, bytes, clears);
+          CHECK(first_agrees(re, pike, s));
+        }
+      PlanProbe::dfa_cache(re, reg::limits::kDfaCacheBytes,
+                           reg::limits::kDfaMinClears);
+      PlanProbe::quit_fu(re);
+      CHECK(first_agrees(re, pike, s));
+    }
+  }
+  PlanProbe::quit_fu(re);
+  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(words + "one 1")); }));
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -4140,18 +4191,6 @@ void test_dfa_cache() {
       }
     return v;
   };
-  // Letters drawn from `alphabet` by a fixed generator.
-  auto noise = [](size_t n, const char *alphabet, unsigned seed) {
-    const size_t k = std::strlen(alphabet);
-    std::string s;
-    unsigned x = seed;
-    for (size_t i = 0; i < n; i++) {
-      x = x * 1664525u + 1013904223u;
-      s += alphabet[(x >> 16) % k];
-    }
-    return s;
-  };
-
   // A row is as wide as the pattern is varied: the bytes a program does not
   // tell apart share a column. Five kinds of byte here (i, n, g, the other
   // lowercase letters, everything else), where a row used to be 256 wide.
