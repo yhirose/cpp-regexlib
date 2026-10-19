@@ -97,19 +97,24 @@ struct PlanProbe {
     const Regex::FindCache &c = re.thread_cache();
     return c.dfas_[0][Regex::kDfaFwd] || c.dfas_[1][Regex::kDfaFwd];
   }
-  // What test() answers with that skip off (LazyDfa::look_pf) — every byte
-  // stepped, as before there was one — on this thread's cache of `re`.
+  // What test() answers with the skip to the assert prefix off
+  // (LazyDfa::kSkipAssert) — every byte stepped, as before there was one —
+  // on this thread's cache of `re`.
   static bool test_unskipped(const Regex &re, std::string_view s) {
     (void)re.test(s); // builds the DFA the boolean steps for this subject
     Regex::FindCache &c = re.thread_cache();
     std::optional<Regex::LazyDfa> *const dfas[] = {
         &c.dfas_[0][Regex::kDfaBool], &c.dfas_[1][Regex::kDfaBool]};
+    using L = Regex::LazyDfa;
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
-      if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
+      if (*dfas[k] && (*dfas[k])->skip == L::kSkipAssert) {
+        was[k] = true;
+        (*dfas[k])->skip = L::kSkipNone;
+      }
     const bool r = re.test(s);
     for (int k = 0; k < 2; k++)
-      if (*dfas[k]) (*dfas[k])->look_pf = was[k];
+      if (was[k]) (*dfas[k])->skip = L::kSkipAssert;
     return r;
   }
   // What the lazy DFA's start state skips with — the byte programs' DFAs
@@ -4002,7 +4007,7 @@ void test_assert_literal_prefilter() {
 
 // Literal-prefix memmem on the ASCII DFA tier: the lf program's `(?s:.)*?` prefix
 // makes the first-byte set universal, so a literal-led pattern relies on the
-// rare-byte memmem (find_substr over prefix_) — added to the use_prefilter branch
+// rare-byte memmem (find_substr over prefix_) — added to the kSkipPlan skip
 // of the lf / boolean forward scans. Pin correctness vs the grapheme Pike (forced
 // by a trailing always-true lookahead) on PURE-ASCII subjects, across find_all /
 // scan / search / test, for sparse, common-first-byte, and near-miss literals.

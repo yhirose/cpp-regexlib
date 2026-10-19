@@ -7047,11 +7047,11 @@ private:
         }
         // UnicodeScalar mode: the byte-path prefilter machinery
         // (analyze_byte_*, byte_prog_) lives under the !us_ branch below, so
-        // the US kDfaFwd DFA would scan byte by byte with no literal /
+        // the US unanchored DFAs would scan byte by byte with no literal /
         // first-byte skip. Build the byte-level prefilter here from prog_
-        // (itself a byte automaton in US mode); the US kDfaFwd DFA wires
-        // byte_pf from byte_start_skip_. EGC builds it from byte_prog_ in the
-        // !us_ block.
+        // (itself a byte automaton in US mode); their skip is then the byte
+        // one (LazyDfa::kSkipByte). EGC builds it from byte_prog_ in the !us_
+        // block.
         if (us_) analyze_byte_prefilter(prog_);
       }
     }
@@ -10118,7 +10118,7 @@ private:
       bool icase = false; // grapheme prefix only: text is a lowercased ASCII
                           // literal matched case-insensitively
                           // (find_substr_icase). Only set for !us_ all-ASCII
-                          // prefixes: the use_prefilter branch that consults
+                          // prefixes: the kSkipPlan skip that consults
                           // it runs the lf/boolean DFA, which in non-US mode
                           // is reached only on an ASCII subject — where ASCII
                           // case folding is exact (no Kelvin->k / long-s->s
@@ -10606,7 +10606,7 @@ private:
     Compiled lf_prog_;
     bool assert_ascii_tier() const { return !dfa_ok_ && lf_prog_.ok(); }
     // Whether the boolean's look scan skips to the assert prefix
-    // (LazyDfa::look_pf): unless the prefix is dense — by the bar the DFA
+    // (LazyDfa::kSkipAssert): unless the prefix is dense — by the bar the DFA
     // tiers leave a dense prefix to their scan at (pick_anchor), since a scan
     // restarted at every `e` costs more than one that steps through them all
     // (`e\w*\d\b` tested over the Sherlock text: 1.6 ms skipping to each,
@@ -10630,7 +10630,7 @@ private:
     // backwards from it), the word-suffix scan. A LEADING literal is not
     // such an anchor: its verify walks forward to the leftmost-first end,
     // which can be the end of the line, where the boolean scan stops at the
-    // first accept — and skips to that literal itself (LazyDfa::look_pf).
+    // first accept — and skips to that literal itself (LazyDfa::kSkipAssert).
     // Nor is anything an anchor for a text-anchored pattern, which the
     // boolean scan decides from 0 (see Rung::Bool), where the find's verify
     // goes on to the leftmost-first end (`^.*foo\b`). The word scan is
@@ -12484,17 +12484,22 @@ private:
                // the scan needs no longest-safe predicate. States are NOT
                // sorted (order is identity) and the closure cuts at Match.
     bool look; // the program has assertions (see LOOK above)
-    bool use_prefilter =
-        true;             // first-byte dead-skip; off on the EGC byte path,
-                          // whose first_bytes_.set (from the grapheme program,
-                          // ASCII-only) would wrongly skip non-ASCII starts
-    bool byte_pf = false; // EGC byte path: use the byte-program prefilter
-                          // (byte_prefix_.text memmem / byte first-byte skip),
-                          // which is sound over arbitrary UTF-8
-    bool look_pf;         // look, re-seeding (the boolean's), and the plan has
-                          // an assert prefix to skip to
-                          // (Plan::assert_prefix_skips): see
-                          // look_forward_skip
+    // What a forward scan skips with, from a start state (FindCache::make
+    // decides): nothing; with look, the boolean's skip to the next assert
+    // prefix (look_forward_skip); without, the plan's prefilter over the
+    // grapheme / code-point program (plan_prefilter_skip) or the byte
+    // programs' (byte_prefilter_skip: sound over any UTF-8) — or that one
+    // only on a subject long enough to repay it (kBoolSkipBytes: the
+    // CodePoint boolean's). Ordered so that a scan without look skips on the
+    // last three alone.
+    enum Skip : uint8_t {
+      kSkipNone,
+      kSkipAssert,
+      kSkipPlan,
+      kSkipByte,
+      kSkipByteLong
+    };
+    Skip skip = kSkipNone;
     bool quit = false;    // gave up (see above): every miss answers kQuit.
                           // What is cached still answers, so a scan that
                           // stays on built transitions is still a DFA scan.
@@ -12508,8 +12513,9 @@ private:
     static constexpr uint32_t kUnknown = 0xFFFFFFFFu; // transition not built
     static constexpr uint32_t kQuit = 0xFFFFFFFEu;    // next(): gave up
     static constexpr int kCap = -2; // what a scan returns for kQuit
-    static constexpr int kAtStart = -3; // a look scan that skips (look_pf)
-                                        // stands in a start state again
+    static constexpr int kAtStart = -3; // a look scan that skips
+                                        // (kSkipAssert) stands in a start
+                                        // state again
     // State flags (the entry in front of the state's row).
     static constexpr uint32_t kDead = 1;   // empty set: nothing can match
     static constexpr uint32_t kFront = 2;  // lf: the match is the highest-
@@ -12578,12 +12584,9 @@ private:
     // LazyDfa. One instance is reused across every match in a find_all (and,
     // via FindCache, across find_all calls).
     LazyDfa(const Regex &r, const detail::Program &p, int mpc, bool rs,
-            bool pf = true, bool leftmost_first = false)
+            bool leftmost_first = false)
         : re(&r), prog(&p), match_pc(mpc), reseed(rs), lf(leftmost_first),
-          look(!r.plan_->dfa_ok_),
-          use_prefilter(pf && !look &&
-                        r.plan_->start_skip_ != Plan::StartSkip::None),
-          look_pf(look && rs && r.plan_->assert_prefix_skips()) {
+          look(!r.plan_->dfa_ok_) {
       // Nothing is worked out or allocated until the first scan
       // (make_start): a rung fetches its DFAs before it knows whether it
       // will step them.
@@ -13652,15 +13655,6 @@ private:
     return i;
   }
 
-  // Forward DFA scan over `d` (unanchored, d.reseed == true) from byte `from`:
-  // the end of the FIRST match at or after `from`, or -1 — the boolean test()
-  // tier. Returns kCap if the DFA gives up (see LazyDfa). `d` is reusable
-  // across calls.
-  int dfa_forward_scan(LazyDfa &d, std::string_view text, int from) const {
-    int reach = from;
-    return dfa_forward_lf_scan<true>(d, text, from, reach);
-  }
-
   // Reverse DFA scan over `d` (the reverse program). Given that some match ends
   // at byte `e`, scan leftward and return the leftmost start `s` (>= floor)
   // such that the forward pattern matches [s, e); -1 if none in range, kCap if
@@ -14344,9 +14338,10 @@ private:
   }
   // The boolean (Rung::Bool, and assert_find_span's for one), from 0: a
   // scan that stops at the first accept — skipping to the assert prefix
-  // where its DFA does (LazyDfa::look_pf).
+  // where its DFA does (LazyDfa::kSkipAssert).
   int look_forward_first(LazyDfa &d, std::string_view text) const {
-    return d.look_pf ? look_forward_skip(d, text) : look_forward_all(d, text);
+    return d.skip == LazyDfa::kSkipAssert ? look_forward_skip(d, text)
+                                          : look_forward_all(d, text);
   }
   REGEXLIB_NOINLINE int look_forward_all(LazyDfa &d,
                                          std::string_view text) const {
@@ -14416,16 +14411,17 @@ private:
   // its last accept on the stack.
   REGEXLIB_NOINLINE int dfa_start_skip(const LazyDfa &d, const unsigned char *p,
                                        int n, int i) const {
-    return d.use_prefilter ? plan_prefilter_skip(p, n, i)
-                           : byte_prefilter_skip(p, n, i);
+    return d.skip == LazyDfa::kSkipPlan ? plan_prefilter_skip(p, n, i)
+                                        : byte_prefilter_skip(p, n, i);
   }
 
   //
   // `Look`: `d` is over a program with assertions (see LazyDfa). The scan is
   // the same one; a state then says whether the boundary it was stepped FROM
   // accepts, and the text's end takes a step of its own. A look scan does not
-  // skip. With `AtStart` (the boolean's, over a DFA that marks its start
-  // states: LazyDfa::look_pf) it stops in a start state instead, and answers
+  // skip. With `AtStart` (the boolean's, over a DFA that skips to the
+  // assert prefix: LazyDfa::kSkipAssert) it stops in a start state instead,
+  // and answers
   // LazyDfa::kAtStart with `reach_out` where — look_forward_skip goes on
   // from there; a find puts its literals in front of the scan
   // (assert_find_span).
@@ -14451,7 +14447,11 @@ private:
     // ... and the one that only interrupts the stepping: in the pure-prefix
     // start state, jump to the next position the pattern can begin at (the
     // prefix would otherwise consume the dead bytes one by one).
-    const bool skips = Look ? AtStart : d.use_prefilter || d.byte_pf;
+    const bool skips =
+        Look ? AtStart
+             : d.skip > LazyDfa::kSkipAssert &&
+                   (d.skip != LazyDfa::kSkipByteLong ||
+                    n >= limits::kBoolSkipBytes);
     const uint32_t stops = ends | (skips ? LazyDfa::kStart : 0);
     int i = from;
     int mark = from; // stepped bytes are reported to `d` from here on
@@ -14851,13 +14851,13 @@ public:
     //             priority across starts holds.
     //   kDfaFwda  the bare program from the scan's start.
     //   kDfaRev   the reverse program.
-    // The start-state skip, of the two unanchored forward ones: the grapheme
-    // program's (use_prefilter) in Grapheme mode; over the byte programs, and
-    // kDfaFwd's in CodePoint mode, the byte one (byte_pf) — kDfaBool's in
-    // CodePoint mode is a switch Rung::Bool throws per scan, by the
-    // subject's length. Over the byte programs no skip reads the grapheme
-    // program's (ASCII-only) first bytes, which would pass over non-ASCII
-    // starts.
+    // The start-state skip (LazyDfa::skip), of the two unanchored ones:
+    // with look, the boolean's to the assert prefix; else the plan's in
+    // Grapheme mode, and the byte programs' over them and in CodePoint mode
+    // (the CodePoint program is a byte automaton) — the CodePoint boolean's
+    // only on a long subject. Over the byte programs no skip reads the
+    // grapheme program's (ASCII-only) first bytes, which would pass over
+    // non-ASCII starts.
     REGEXLIB_NOINLINE LazyDfa &make(const Regex &re, bool byte, DfaRole role) {
       const Plan &p = *re.plan_;
       const detail::Program *prog;
@@ -14875,10 +14875,20 @@ public:
       const bool unanchored = role == kDfaBool || role == kDfaFwd;
       std::optional<LazyDfa> &d = set(byte)[role];
       d.emplace(re, *prog, mpc, /*reseed=*/role == kDfaBool,
-                /*pf=*/unanchored && !byte && !p.us_,
                 /*leftmost_first=*/role == kDfaFwd || role == kDfaFwda);
-      d->byte_pf =
-          unanchored && (byte || (role == kDfaFwd && p.us_)) && p.byte_skips();
+      using S = LazyDfa::Skip;
+      if (!unanchored)
+        d->skip = S::kSkipNone;
+      else if (!p.dfa_ok_)
+        d->skip = role == kDfaBool && p.assert_prefix_skips() ? S::kSkipAssert
+                                                              : S::kSkipNone;
+      else if (!byte && !p.us_)
+        d->skip = p.start_skip_ != Plan::StartSkip::None ? S::kSkipPlan
+                                                         : S::kSkipNone;
+      else if (!p.byte_skips())
+        d->skip = S::kSkipNone;
+      else
+        d->skip = byte || role == kDfaFwd ? S::kSkipByte : S::kSkipByteLong;
       d->reverse = role == kDfaRev;
       return built(d);
     }
@@ -18011,18 +18021,13 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       // dies at the first byte no match can take, where the re-seeding one
       // would go on to the end of the subject (as assert_find_span). Else the
       // re-seeding scan, which skips to the assert prefix when the plan has
-      // one (LazyDfa::look_pf).
+      // one (LazyDfa::kSkipAssert).
       e2 = look_forward_first(p.text_anchored_
                                   ? scr.cache->dfa(*this, byte, kDfaFwda)
                                   : scr.cache->dfa(*this, byte, kDfaBool),
                               text);
     } else {
-      LazyDfa &b = scr.cache->dfa(*this, byte, kDfaBool);
-      // CodePoint: the start-state skip is a scan-time switch, on for a
-      // subject long enough to repay it (see kBoolSkipBytes, and
-      // FindCache::make).
-      if (p.us_) b.byte_pf = p.byte_skips() && n >= limits::kBoolSkipBytes;
-      e2 = dfa_forward_scan(b, text, 0);
+      e2 = dfa_forward_first(scr.cache->dfa(*this, byte, kDfaBool), text, 0);
     }
     if (e2 == LazyDfa::kCap) {
       // The DFA gave up: a regular pattern can still need exponentially

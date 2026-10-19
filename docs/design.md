@@ -622,7 +622,7 @@ a failed store-to-load forward, ~3 ns of a 20 ns call.
 step every byte: a leading literal is no bounded anchor for it (its verify
 walks to the leftmost-first end, above), and a DFA stepped with look had no
 start-state skip. Now the scan skips to the assert prefix
-(`LazyDfa::look_pf`). A look state is a context as well as its pcs, so the
+(`LazyDfa::kSkipAssert`). A look state is a context as well as its pcs, so the
 skip is not the jump the other scans make from inside their loop: the scan
 *stops* in a start state (`LazyDfa::kAtStart`), and `look_forward_skip`
 starts it again at the prefix's next occurrence, in the start state of what

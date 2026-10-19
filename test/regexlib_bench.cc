@@ -777,7 +777,7 @@ static void run_sherlock_bench(int iters) {
       {"test: interior literal", "[a-z]+-[0-9]{4}", true, {text}},
       // test() on assert patterns led by a literal, none of which matches
       // anywhere: the boolean skips from one occurrence of the literal to
-      // the next (LazyDfa::look_pf), and used to step every byte — ~30x
+      // the next (LazyDfa::kSkipAssert), and used to step every byte — ~30x
       // behind the find. A literal that never occurs; one that nearly does
       // (`Holmes` some 460 times, `Holmesq` never); a letter that begins
       // some 260 words, each one stepped; a text-anchored pattern, decided

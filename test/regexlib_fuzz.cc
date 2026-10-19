@@ -149,19 +149,23 @@ struct PlanProbe {
     dfa_cache(re, re.thread_cache(), bytes, min_clears);
   }
   // What test() answers with the boolean look scan's skip to the assert
-  // prefix off (LazyDfa::look_pf): every byte stepped, as before there was
+  // prefix off (LazyDfa::kSkipAssert): every byte stepped, as before there was
   // one. On this thread's cache of `re`, whatever its budget.
   static bool test_unskipped(const Regex &re, std::string_view s) {
     (void)re.test(s); // builds the DFA the boolean steps for this subject
     Regex::FindCache &c = re.thread_cache();
     std::optional<Regex::LazyDfa> *const dfas[] = {
         &c.dfas_[0][Regex::kDfaBool], &c.dfas_[1][Regex::kDfaBool]};
+    using L = Regex::LazyDfa;
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
-      if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
+      if (*dfas[k] && (*dfas[k])->skip == L::kSkipAssert) {
+        was[k] = true;
+        (*dfas[k])->skip = L::kSkipNone;
+      }
     const bool r = re.test(s);
     for (int k = 0; k < 2; k++)
-      if (*dfas[k]) (*dfas[k])->look_pf = was[k];
+      if (was[k]) (*dfas[k])->skip = L::kSkipAssert;
     return r;
   }
   // Whether test() over the ASCII assert tier takes the word scan, its
