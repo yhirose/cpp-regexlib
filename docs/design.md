@@ -671,31 +671,34 @@ answer stands if the subject is one *as far as the scan read*
   for a pattern with a CR-LF literal, which the ASCII family cannot match
   (`ascii_grapheme_ok`), so that on the subjects where it matters the first
   scan is not thrown away. An ASCII family is not tried on a subject whose
-  first byte is not ASCII: what it read would include that byte.
-- **A CodePoint `search()` / `test()`** (`find_rest`) runs its plan's family
-  (`Plan::us_ladder_`) with `Ladder::kSpec` set, and does not check for a
-  stray byte first. An answer that does not hold is the Pike's, from the
-  start, with a fresh sink, cursor and budget (`find_pike`). The guess ends
-  where the scan leaves the family's rungs, which only a DFA that gave up
-  makes it do: at `Classify`, where a boolean hands over to the find's
-  rungs, the subject is classified whole, as it was before; at the Pike the
-  answer is the reference's — a one-step find moves its cursor only at a
-  yield, so the Pike starts at 0.
+  first byte is not ASCII: what it read would include that byte. Each scan
+  reports how far it read: an anchored DFA scan (no start-state skip; a
+  scan consumes the byte that ends it) and a one-pass walk
+  (`OnePassWalk::reach`). A wrong guess costs its scan, to where it
+  stopped: on a non-ASCII subject the ASCII family's anchored DFA dies at
+  the first non-ASCII byte (`lazy_inst_matches` matches none), so it is the
+  ASCII run before that.
+- **A CodePoint `search()` / `test()`** (`find_rest`) runs the family its
+  plan guesses (`Plan::us_ladder_`) with `Ladder::kSpec` set, and does not
+  check for a stray byte first. A rung runs many scans, so each forward DFA
+  scan raises its DFA's high-water mark instead (`LazyDfa::hi`, a
+  start-state skip included), zeroed when the guess starts
+  (`FindCache::reach_from_zero`). No walk needs to report: a walk — the
+  one-pass one, the scalar chain, the suffix's scalar verify — gives up at
+  any non-ASCII byte and the DFA reads on from there, so what it reads past
+  the end holds no stray byte, the one thing a CodePoint subject can fail
+  on. An answer that does not hold is the Pike's, from the start, with a
+  fresh sink, cursor and budget (`find_pike`). The guess ends where the scan
+  leaves the family's rungs, which only a DFA that gave up makes it do: at
+  `Classify`, where a boolean hands over to the find's rungs, the subject is
+  classified whole, as it was before; at the Pike, which a one-step find
+  enters at 0 (its cursor moves only at a yield), the answer stands.
 
 The rules the two share:
 
 - **How far a scan read** (`reach`): one past the furthest byte any of its
   scans examined — at least the match's end; the whole subject when it found
-  none (a literal prefilter reads to the end without a DFA). Each scan
-  reports its own: an anchored DFA scan (no start-state skip; a scan consumes
-  the byte that ends it) and a one-pass walk (`OnePassWalk::reach`) in
-  `match()`; in a find, where a rung runs many scans, every forward DFA scan
-  raises its DFA's high-water mark (`LazyDfa::hi`, a start-state skip
-  included), zeroed when the guess starts (`FindCache::reach_from_zero`). A
-  CodePoint find needs no walk to report: a walk — the one-pass one, the
-  scalar chain, the suffix's scalar verify — gives up at any non-ASCII byte
-  and the DFA reads on from there, so what it reads past the end holds no
-  stray byte, the one thing a CodePoint subject can fail on.
+  none (a literal prefilter reads to the end without a DFA).
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:
@@ -707,14 +710,10 @@ The rules the two share:
   pure-ASCII subject to the ASCII family, which is faster there, and
   `byte_sound` is whether the byte programs answer for it at all — and only
   the soundness is asked.
-- **Why the Pike may answer when no guess holds**: it is the reference. And
-  it is no more often the Pike than before: a gate that holds for the whole
-  subject holds for each of its prefixes, so a subject no guess holds for is
-  one no family served before either.
-- **What a wrong guess costs**: its scan, to where it stopped. On a
-  non-ASCII subject the ASCII family's anchored DFA dies at the first
-  non-ASCII byte (`lazy_inst_matches` matches none), so it is the ASCII run
-  before that.
+- **Why the Pike may answer**: it is the reference. And it is no more often
+  the Pike than before: a gate that holds for the whole subject holds for
+  each of its prefixes, so a subject no guess holds for is one no family
+  served before either.
 
 Measured on `match()` over 4 MB of prose with a match at 0, in both units:
 `\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.15–1.5 ms to

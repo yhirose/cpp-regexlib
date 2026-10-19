@@ -459,14 +459,24 @@ inline bool finds_agree(const Regex &re, const std::vector<size_t> &want,
   return same_as_iter(re, subj);
 }
 
+// Whether two answers are one: no match, or the same groups.
+inline bool same_groups(const reg::MatchResult &a, const reg::MatchResult &b) {
+  std::vector<size_t> x, y;
+  if (a.matched()) add_spans(x, a);
+  if (b.matched()) add_spans(y, b);
+  return x == y;
+}
 // match()'s answer and its groups: the same from `re` as from its reference.
 inline bool match_agrees(const Regex &re, const Regex &pike,
                          std::string_view s) {
-  std::vector<size_t> a, b;
-  const reg::MatchResult got = re.match(s), want = pike.match(s);
-  if (got.matched()) add_spans(a, got);
-  if (want.matched()) add_spans(b, want);
-  return a == b;
+  return same_groups(re.match(s), pike.match(s));
+}
+// search() and test(): the first match, groups and all, and whether there is
+// one.
+inline bool first_agrees(const Regex &re, const Regex &pike,
+                         std::string_view s) {
+  const reg::MatchResult want = pike.search(s);
+  return same_groups(re.search(s), want) && re.test(s) == want.matched();
 }
 
 // ... and every find surface too: `re` against its reference `pike`.
@@ -1658,6 +1668,11 @@ std::string noise(size_t n, const char *alphabet, unsigned seed) {
   return s;
 }
 
+// `s` with `piece` put in at byte `at`.
+std::string inserted(std::string_view s, size_t at, std::string_view piece) {
+  return std::string(s.substr(0, at)).append(piece).append(s.substr(at));
+}
+
 // At least `bytes` of prose with an accent every few words: a Grapheme
 // subject the byte engines answer for, and whose first non-ASCII byte is
 // near its start.
@@ -1790,18 +1805,6 @@ void test_crlf_interior_anchors() {
     CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
 }
 
-// match() does not classify its subject. It tries the plan's families in
-// turn, each anchored at 0 (Plan::match_guesses_), and the first whose
-// answer holds for the subject as far as its scan read answers
-// (guess_held). So what a family cannot read — a stray byte, a combining
-// mark, a ZWJ sequence, a flag, a Prepend, Hangul jamo, an Indic conjunct
-// (GB9c), a CR-LF, a lone CR or LF, a NEL — is
-// placed at every offset of the first 48 bytes and further on, over ASCII,
-// accented and CR-LF text: match() agrees with the Pike, groups and all, in
-// both units. And it reads what its answer needs: over 1 MB of prose that
-// ends in a stray byte, a family answers from the first few bytes, where
-// the subject's class sent match() to the Pike, which segmented the whole
-// of it.
 // What an engine family can part from the unit's engine on, a piece each:
 // stray bytes, a combining mark (alone and on a base), a ZWJ, a flag, a
 // Prepend, Hangul jamo, an Indic conjunct (GB9c), a CR-LF, a lone CR and LF,
@@ -1820,21 +1823,28 @@ const char *const kGuessBodies[] = {
     "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
     "the quick brown fox\r\njumps over the dog\r\n"};
 // `agrees` over each of kGuessBodies (repeated to 160 bytes), and over each
-// with a piece of kDirt at each of its first 48 offsets and at 100.
+// with a piece of kDirt at each of the offsets 0-48 and at 100.
 template <class F> void each_dirty_subject(F agrees) {
   for (const char *body : kGuessBodies) {
     std::string base;
     while (base.size() < 160) base += body;
     CHECK(agrees(base));
-    for (const char *d : kDirt)
-      for (size_t at = 0; at <= 49; at++) {
-        std::string s = base;
-        s.insert(at < 49 ? at : 100, d);
-        CHECK(agrees(s));
-      }
+    for (const char *d : kDirt) {
+      for (size_t at = 0; at <= 48; at++) CHECK(agrees(inserted(base, at, d)));
+      CHECK(agrees(inserted(base, 100, d)));
+    }
   }
 }
 
+// match() does not classify its subject. It tries the plan's families in
+// turn, each anchored at 0 (Plan::match_guesses_), and the first whose
+// answer holds for the subject as far as its scan read answers
+// (guess_held). So what a family cannot read (kDirt), placed at every
+// offset of the first 48 bytes and further on, over ASCII, accented and
+// CR-LF text: match() agrees with the Pike, groups and all, in both units. And it reads what its answer needs: over 1 MB of prose that
+// ends in a stray byte, a family answers from the first few bytes, where
+// the subject's class sent match() to the Pike, which segmented the whole
+// of it.
 void test_match_guess() {
   const char *pats[] = {
       "\\w+", ".", "\\w", "[a-z]+ing", ".*fox", "[^ ]+ [^ ]+", "x\\w*z",
@@ -1908,16 +1918,6 @@ void test_match_guess() {
       }
 }
 
-// search() and test(): the first match, groups and all, and whether there is
-// one — the same from `re` as from its reference.
-bool first_agrees(const Regex &re, const Regex &pike, std::string_view s) {
-  std::vector<size_t> a, b;
-  const reg::MatchResult got = re.search(s), want = pike.search(s);
-  if (got.matched()) add_spans(a, got);
-  if (want.matched()) add_spans(b, want);
-  return a == b && re.test(s) == want.matched();
-}
-
 // A CodePoint find does not ask first whether its subject holds a stray
 // byte (us_stray). Its scan guesses it reads none, on the plan's family, and
 // keeps its answer when what it read holds none (find_rest, guess_held);
@@ -1952,6 +1952,8 @@ void test_find_guess() {
     CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
     CHECK(m.matched() && m.begin() < 64);
     CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(prose)); }));
+    // (A stray among what the scan read: the Pike.)
+    CHECK(PlanProbe::pike_ran(re, [&] { m = re.search("The\xFF" + prose); }));
   }
   const Regex re = make_us("\\w+ \\d+");
   std::string words, early = "one 1 ";
@@ -1959,14 +1961,18 @@ void test_find_guess() {
   early += "\xFF" + words;
   CHECK(!re.test(words));
   CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(early)); }));
+  // (A scan from the end does not guess: it vets what it read.)
+  const Regex end = make_us("\\w+$");
+  CHECK(!PlanProbe::pike_ran(
+      end, [&] { CHECK(end.search("\xFF" + words + "end").matched()); }));
 
   // Where a DFA of the guess gives up, the guess ends: at the Pike, which
   // answers from the start, or — the boolean's DFA, which the find's rungs
   // take over from — where the subject is classified whole. Over letters
-  // that take many DFA states, clean and with a piece of kDirt at the edges
-  // and inside: on caches too small for them (built afresh for each call),
-  // and with only the boolean's DFA given up, which on clean text leaves
-  // the find's own rungs to answer, not the Pike.
+  // that take many DFA states, clean and with a stray byte, a lone lead byte
+  // or an accent at the edges and inside: on caches too small for them
+  // (built afresh for each call), and with only the boolean's DFA given up,
+  // which on clean text leaves the find's own rungs to answer, not the Pike.
   std::vector<std::string> hard;
   for (const std::string &b :
        {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
@@ -1974,7 +1980,7 @@ void test_find_guess() {
     for (const char *d : {"\xFF", "\xC3", "\xC3\xA9"})
       for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
                         b.size() - 1, b.size()})
-        hard.push_back(b.substr(0, at) + d + b.substr(at));
+        hard.push_back(inserted(b, at, d));
   }
   for (const char *pat :
        {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
@@ -1993,8 +1999,10 @@ void test_find_guess() {
       CHECK(first_agrees(re, pike, s));
     }
   }
-  PlanProbe::quit_fu(re);
-  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(words + "one 1")); }));
+  const Regex walk = make_us("(a)[a-d]{8}(d)");
+  CHECK(PlanProbe::start(walk, true) == 'B');
+  PlanProbe::quit_fu(walk);
+  CHECK(!PlanProbe::pike_ran(walk, [&] { CHECK(walk.test(hard[0])); }));
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -4746,18 +4754,8 @@ void test_walk_budget_linearity() {
   // far as the DFA would have. It is that walk the budget is charged:
   // charged for the DFA's few bytes, these never bail, and take minutes.
   {
-    auto random_of = [](const char *alphabet, size_t n) {
-      const size_t k = std::strlen(alphabet);
-      std::string s;
-      unsigned x = 12345;
-      for (size_t i = 0; i < n; i++) {
-        x = x * 1664525u + 1013904223u;
-        s += alphabet[(x >> 16) % k];
-      }
-      return s;
-    };
-    const std::string ab = random_of("ab", 100000);
-    const std::string abing = "Z" + random_of("abing", 100000);
+    const std::string ab = noise(100000, "ab", 12345);
+    const std::string abing = "Z" + noise(100000, "abing", 12345);
     Case full[] = {
         // every `a` a candidate, every forward verify a walk to the end
         {"full-prefix", R"(a[ab]*a[ab]{12}\d\b)", ab, 0},

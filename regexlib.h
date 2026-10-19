@@ -6148,9 +6148,7 @@ private:
       kSuffixOff = 1 << 7,
       kInnerOff = 1 << 8,
       // A guess (find_rest): the family is assumed to serve the subject and
-      // judged on what its scan read. It ends where the scan leaves the
-      // family's rungs: Classify classifies the subject whole, and the
-      // Pike is the reference.
+      // judged on what its scan read.
       kSpec = 1 << 9,
     };
     uint16_t flags = kFindOk;
@@ -10037,7 +10035,8 @@ private:
     //   start_: where a scan starts — a plan that is its own locate, a
     //     walk from 0, a CodePoint plan's family, or Rung::Classify.
     //   us_ladder_: the family of a CodePoint plan (what start_ is, past
-    //     the literal and text-anchor rungs).
+    //     the literal and text-anchor rungs), which a one-step find guesses
+    //     (Regex::find_rest).
     //   family_: each family's ladder, for the subject to choose among.
     //   fused_: which fused EGC scan the plan has (egc_fused_ok /
     //     egc_fused_collapse_ok, asked once).
@@ -13374,18 +13373,18 @@ private:
     return egc_simple_from(text, i);
   }
 
-  // A guess (match(): Plan::match_guesses_): family `f` has answered for
-  // `text` from 0, and read nothing at or past `reach` — one past the
-  // furthest byte any of its scans examined, at least the match's end. Its
-  // answer is the unit's when the subject is one it answers for as far as it
-  // read: every code point that starts at or before `reach` (the one there
-  // is where its scan stopped, and whether it joins the code point before it
-  // is what the stop meant), and an LF after a CR there, so that no pair is
-  // split. What follows does not matter: the scan consumed none of it. The
-  // test over that prefix R is the family's gate less its route (see
-  // egc_byte_path). A gate that holds for the whole subject holds for R, so
-  // a subject no guess holds for is one no family served either, and the
-  // Pike answers it.
+  // A guess (match(): Plan::match_guesses_; find_rest: Plan::us_ladder_):
+  // family `f` has answered for `text` from 0, and read nothing at or past
+  // `reach` — one past the furthest byte any of its scans examined, at least
+  // the match's end. Its answer is the unit's when the subject is one it
+  // answers for as far as it read: every code point that starts at or
+  // before `reach` (the one there is where its scan stopped, and whether it
+  // joins the code point before it is what the stop meant), and an LF after
+  // a CR there, so that no pair is split. What follows does not matter: the
+  // scan consumed none of it. The test over that prefix R is the family's
+  // gate less its route (see egc_byte_path). A gate that holds for the whole
+  // subject holds for R, so a subject no guess holds for is one no family
+  // served either, and the Pike answers it.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach) const {
     const size_t n = text.size();
@@ -14201,7 +14200,8 @@ private:
   // the byte engine cut through (e.g. a ZWJ emoji) would otherwise pass
   // undetected (fuzzer-found at 400k). An out-parameter rather than a member:
   // a mutable member written under a const call would be a data race when one
-  // Regex is shared across threads.
+  // Regex is shared across threads. (LazyDfa::hi, how far the scans of a
+  // find's guess read, is the DFA's own: a FindCache is one thread's.)
   int dfa_forward_lf(LazyDfa &d, std::string_view text, int from,
                      int *reach_out = nullptr) const {
     int reach = from;
@@ -14985,7 +14985,8 @@ public:
     return l.want == Want::Rows ? 0 : l.has(Ladder::kInnerOff) ? 2 : 1;
   }
   // `n`, for a scan that was on `old`: the rungs the scan has given up stay
-  // given up.
+  // given up. Nothing else is carried — a guess (kSpec) ends on a ladder
+  // the subject chose.
   Ladder ladder_adopt(Ladder n, Ladder old) const {
     const uint16_t off =
         old.flags & (Ladder::kSuffixOff | Ladder::kInnerOff) & ~n.flags;
@@ -15057,20 +15058,20 @@ public:
   LazyDfa &dfa_rev(FindCache &fc, bool byte) const {
     return byte ? fc.brv(*this) : fc.rv(*this);
   }
-  // ... of a DFA-family scan on the ladder `l`.
-  LazyDfa &ladder_fwd(FindCache &fc, const Ladder &l) const {
-    return dfa_fwd(fc, l.has(Ladder::kByteDfas));
-  }
-  LazyDfa &ladder_fwda(FindCache &fc, const Ladder &l) const {
-    return dfa_fwda(fc, l.has(Ladder::kByteDfas));
-  }
-  LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
-    return dfa_rev(fc, l.has(Ladder::kByteDfas));
-  }
   // Whether a scan on `l` runs the byte programs' DFAs: the DFA family's
   // byte ones, or the assert family's.
   static bool ladder_byte(const Ladder &l) {
     return (l.flags & (Ladder::kByteDfas | Ladder::kAssertByte)) != 0;
+  }
+  // ... of a DFA-family scan on the ladder `l`.
+  LazyDfa &ladder_fwd(FindCache &fc, const Ladder &l) const {
+    return dfa_fwd(fc, ladder_byte(l));
+  }
+  LazyDfa &ladder_fwda(FindCache &fc, const Ladder &l) const {
+    return dfa_fwda(fc, ladder_byte(l));
+  }
+  LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
+    return dfa_rev(fc, ladder_byte(l));
   }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -15159,7 +15160,7 @@ public:
   // A guess of find_rest's that did not hold: the Pike's answer, from the
   // start. Out of line: no subject the family serves reaches it.
   template <class Out>
-  REGEXLIB_NOINLINE bool find_pike(std::string_view text, Scr &scr, Want want,
+  REGEXLIB_NOINLINE bool find_pike(std::string_view text, Scr &scr,
                                    Out &out) const;
 
   // A scan that outlives the call that started it (find_iter, find_all,
@@ -17331,7 +17332,7 @@ inline void Regex::ladder_plan(Plan &p) {
       }
     }
     // A CodePoint plan's family does not depend on the subject (only whether
-    // its byte DFAs may run does: us_stray). (Neither
+    // its byte DFAs may run does: us_stray), so a find guesses it. (Neither
     // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
     Ladder &us = p.us_ladder_[w];
     us.want = want;
@@ -17516,15 +17517,16 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   }
   // A CodePoint scan does not ask first whether its subject has a stray byte
   // (us_stray), which no byte automaton reads: it guesses it reads none, on
-  // its family, and the answer stands if what the scan read holds that out
-  // (guess_held). Else the Pike answers, from the start.
-  const Want want = l.want;
-  if (plan_->us_ && l.rung >= Rung::Classify && l.rung != Rung::Pike) {
+  // its family (Plan::us_ladder_), and the answer stands if what the scan
+  // read holds that out (guess_held). Else the Pike answers, from the
+  // start. (Not on a rung before Classify: EndAnchor reads from the end, and
+  // vets what it read.)
+  if (plan_->us_ && l.rung >= Rung::Classify) {
     if (l.rung == Rung::Classify)
       l = ladder_adopt(plan_->us_ladder_[ladder_caller(l)], l);
-    if (l.rung != Rung::Pike) l.set(Ladder::kSpec);
+    l.set(Ladder::kSpec);
   }
-  bool found, stepped = false;
+  bool found;
   const Step st =
       l.rung == Rung::Walk
           ? ladder_walk<false>(text, scr, l, c, budget, chain_once, out)
@@ -17543,28 +17545,31 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     if (l.rung == Rung::Classify)
       l = ladder_classify(text, l, d.fna, d.probe);
     found = ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
-    stepped = true;
   }
-  if (!l.has(Ladder::kSpec)) return found;
-  // The guess: how far its scans read — a match's end, or past it as far as
-  // a DFA scan did (a walk reads no byte past its end that is not ASCII, so
+  // The guess ends where the scan leaves the family's rungs: Classify
+  // classifies the subject whole (ladder_adopt drops kSpec), and the Pike,
+  // which a one-step find enters at 0 (its cursor moves only at a yield),
+  // is the reference.
+  if (!l.has(Ladder::kSpec) || l.rung == Rung::Pike) return found;
+  // How far the guess's scans read: a match's end, or past it as far as a
+  // DFA scan did (a walk reads no byte past its end that is not ASCII, so
   // none a stray), the whole subject when there is no match.
   int reach = static_cast<int>(text.size());
   if (found)
-    reach = stepped ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
-                    : c.pos;
+    reach = st == Step::Again
+                ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
+                : c.pos;
   if (guess_held(l.has(Ladder::kAssert) ? kFamUsAssert : kFamUsDfa, text,
                  reach))
     return found;
-  return find_pike(text, scr, want, out);
+  return find_pike(text, scr, out);
 }
 
 template <class Out>
-bool Regex::find_pike(std::string_view text, Scr &scr, Want want,
-                      Out &out) const {
+bool Regex::find_pike(std::string_view text, Scr &scr, Out &out) const {
   out.clear();
   if (!scr.cache) scr_fetch(scr);
-  Ladder l = pike_ladder(want);
+  Ladder l = pike_ladder(Out::kGroups ? Want::Rows : Want::Test);
   Cursor c;
   bool chain_once = false;
   WalkBudget budget(text.size());
@@ -17918,14 +17923,11 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // skip, and the scan is one pass.
   case Rung::Bool: {
     int e2;
+    LazyDfa &dfa =
+        ladder_byte(l) ? scr.cache->bfu(*this) : scr.cache->fu(*this);
     if (l.has(Ladder::kAssert)) {
-      e2 = look_forward_first(l.has(Ladder::kAssertByte)
-                                  ? scr.cache->bfu(*this)
-                                  : scr.cache->fu(*this),
-                              text, 0);
+      e2 = look_forward_first(dfa, text, 0);
     } else {
-      LazyDfa &dfa = l.has(Ladder::kByteDfas) ? scr.cache->bfu(*this)
-                                              : scr.cache->fu(*this);
       // CodePoint: the start-state skip is a scan-time switch, on for a
       // subject long enough to repay it (see kBoolSkipBytes, and fu()).
       if (p.us_)
@@ -17945,9 +17947,6 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   }
   // The proven baseline (see pike_step).
   case Rung::Pike: {
-    // A guess (find_rest) ends here: a one-step find moves its cursor only
-    // at a yield, so the Pike starts at 0, and its answer is the reference's.
-    l.set(Ladder::kSpec, false);
     if (!d.seg)
       c.gpos = ladder_segment(d.seg, text, c.pos);
     const detail::Segmented &sg = *d.seg;
