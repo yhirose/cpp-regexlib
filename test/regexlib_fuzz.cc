@@ -2158,12 +2158,13 @@ void invariant_fuzz_assert_suffix(int iters) {
 }
 
 // test() on an assert pattern led by a literal, which skips to it
-// (look_forward_first). The skip is a prefilter, so it may change what the
+// (look_forward_skip). The skip is a prefilter, so it may change what the
 // boolean costs and never what it answers: every subject's test() is
 // checked against the same Regex's with the skip off, against search() and
-// against the Pike, on bytes that are no UTF-8 too. Literals over a small alphabet, so that they occur, overlap
-// and come close to occurring; a left context of every kind; tails that end
-// a match at once, at the end of the line, never.
+// against the Pike, on bytes that are no UTF-8 too. Literals over a small
+// alphabet, so that they occur, overlap and come close to occurring; a left
+// context of every kind; tails that end a match at once, at the end of the
+// line, never.
 void invariant_fuzz_assert_prefix_bool(int iters) {
   static const char *LEAD[] = {"\\b", "\\B", "^", "", "\\b", ""};
   static const char *BODY[] = {"\\w*", "[a-z]*", ".*", ".?", "[^?]+\\?.*",
@@ -2174,7 +2175,6 @@ void invariant_fuzz_assert_prefix_bool(int iters) {
       "\xC3\xA9" /*é*/, "\xE6\x97\xA5" /*日*/, "\xCC\x81" /*combining*/,
       // bytes that are no UTF-8: lone leads, a continuation, an invalid byte
       "\xE9", "\xC3", "\xF0", "\x80", "\xBF", "\xFF"};
-  static const int kValid = 12; // UNITS[0 .. kValid) are UTF-8
   for (int it = 0; it < iters; it++) {
     std::string lit;
     for (int i = U(1, 3); i > 0; i--) lit += "qzx"[U(0, 2)];
@@ -2190,10 +2190,9 @@ void invariant_fuzz_assert_prefix_bool(int iters) {
     squeeze_dfa_cache(*re, pat, flags + (unit == reg::MatchUnit::CodePoint));
     reg::Regex *pike = pike_reference(pat, flags, unit);
     for (int s = 0; s < 8; s++) {
-      const bool malformed = U(0, 2) == 0;
       std::string subj;
       for (int i = U(0, 40); i > 0; i--)
-        subj += UNITS[U(0, malformed ? 17 : kValid - 1)];
+        subj += UNITS[U(0, 17)];
       if (U(0, 3) == 0) // past the boolean's short-subject limits
         subj = std::string(U(60, 200), ' ') + subj + std::string(U(0, 70), 'a');
       try {
@@ -2531,7 +2530,7 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A tenth: four subjects of up to a few hundred bytes per pattern.
   invariant_fuzz_word_start(share(inv / 10));
   // A tenth: eight subjects of up to a few hundred bytes per pattern, each
-  // asked twice (with the skip and without).
+  // asked four ways (with the skip, without it, search() and the Pike).
   invariant_fuzz_assert_prefix_bool(share(inv / 10));
   // A tenth: four subjects of up to a kilobyte or so per pattern, about a
   // third of the patterns kept.

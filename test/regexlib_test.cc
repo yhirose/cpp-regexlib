@@ -97,16 +97,6 @@ struct PlanProbe {
     const Regex::FindCache &c = re.thread_cache();
     return c.lfu_ || c.blfu_;
   }
-  // The code point a step takes at `at` (Regex::cp_at), and the one read
-  // back behind `at` (Regex::cp_before): its value and its length.
-  static std::pair<char32_t, int> cp_at(std::string_view t, int at) {
-    const Regex::Decoded d = Regex::cp_at(t, at);
-    return {d.cp, d.len};
-  }
-  static std::pair<char32_t, int> cp_before(std::string_view t, int at) {
-    const Regex::Decoded d = Regex::cp_before(t, at);
-    return {d.cp, d.len};
-  }
   // What test() answers with that skip off (LazyDfa::look_pf) — every byte
   // stepped, as before there was one — on this thread's cache of `re`.
   static bool test_unskipped(const Regex &re, std::string_view s) {
@@ -2249,42 +2239,9 @@ void test_find_ladder() {
         CHECK(agree(pat, subj));
   }
   // ... and on bytes that are no UTF-8, the answers it gives without the
-  // skip, and the Pike's. They hold because a step and cp_before read any
-  // bytes alike: a scan restarted at an occurrence is told what stands
-  // behind it as the steps from 0 saw it. Over random runs of lead,
-  // continuation, invalid and ASCII bytes, every element a step takes is the
-  // one read back behind it, and every byte that continues no code point is
-  // where a step lands.
-  {
-    const unsigned char bytes[] = {'a',  ' ',  0x80, 0x8F, 0x90, 0x9F, 0xA0,
-                                   0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0, 0xE2,
-                                   0xED, 0xEF, 0xF0, 0xF4, 0xF5, 0xFF};
-    unsigned x = 7;
-    for (int t = 0; t < 200000; t++) {
-      std::string s;
-      for (int i = 1 + t % 9; i > 0; i--) {
-        x = x * 1664525u + 1013904223u;
-        s += static_cast<char>(bytes[(x >> 16) % std::size(bytes)]);
-      }
-      const int n = static_cast<int>(s.size());
-      std::vector<bool> lands(static_cast<size_t>(n) + 1);
-      bool ok = true;
-      for (int i = 0; i < n;) {
-        lands[static_cast<size_t>(i)] = true;
-        const auto step = PlanProbe::cp_at(s, i);
-        i += step.second;
-        ok = ok && PlanProbe::cp_before(s, i) == step;
-      }
-      for (int j = 0; j < n; j++)
-        ok = ok && ((static_cast<unsigned char>(s[static_cast<size_t>(j)]) &
-                     0xC0) == 0x80 ||
-                    lands[static_cast<size_t>(j)]);
-      if (!ok) {
-        CHECK(ok);
-        break;
-      }
-    }
-  }
+  // skip, and the Pike's: a step and the read back behind it take any bytes
+  // alike (test_utf8_decoder_strict), so a restart is told what the steps
+  // from 0 saw.
   {
     const char *const pats[] = {"\\bqzx\\w*\\b", "qzx\\w*\\b", "\\Bqzx\\w*",
                                 "q[a-z]*x\\b", "\\bqz.\\b", "qzx[a-z]*$",
@@ -2301,7 +2258,7 @@ void test_find_ladder() {
       const Regex re(pat), pike = pike_twin(pat);
       for (const char *s : subjs) {
         CHECK(re.test(s) == PlanProbe::test_unskipped(re, s));
-        CHECK(re.test(s) == pike.test(s));
+        CHECK(first_agrees(re, pike, s));
       }
     }
   }
@@ -2311,10 +2268,10 @@ void test_find_ladder() {
   // bytes, it steps the words those begin; over CJK text, no further than
   // the occurrence that fails at its start; and a text-anchored one with a
   // trailing literal, no further than its first accept.
+  std::string big;
+  while (big.size() < (size_t{1} << 20))
+    big += "The quick brown fox jumps over the lazy dog. Holmes a@b skip ";
   {
-    std::string big;
-    while (big.size() < (size_t{1} << 20))
-      big += "The quick brown fox jumps over the lazy dog. Holmes a@b skip ";
     for (const char *pat : {"\\bqzx\\w*\\b", "\\bHolmesq\\w*\\b", "qzx[a-z]*$",
                             "(?m)^qzx.*", "^qzx\\b.*", "\\Aqzx\\w*\\b"}) {
       Regex re(pat);
@@ -2378,9 +2335,6 @@ void test_find_ladder() {
   // the boolean steps no DFA at all (it used to step every byte); a dense
   // start set is stepped through.
   {
-    std::string big;
-    while (big.size() < (size_t{1} << 20))
-      big += "The quick brown fox jumps over the lazy dog. Holmes a@b skip ";
     for (const char *pat : {"\\b\\d+\\b", "\\b[0-9]{3}\\b", "\\b[xz]\\w+\\b"}) {
       Regex re(pat);
       CHECK(!re.test(big));
@@ -6457,6 +6411,24 @@ void test_utf8_decoder_strict() {
       }
       return true;
     };
+    // ... and a step and the read back behind it take the same element, and
+    // a step lands on every byte that continues no code point: what the
+    // assert boolean's skip, restarted at an occurrence, is told stands
+    // behind it (Regex::look_forward_skip).
+    const auto reads_back = [](const std::string &s) {
+      std::vector<bool> lands(s.size());
+      for (size_t i = 0; i < s.size();) {
+        lands[i] = true;
+        char32_t a, b;
+        const size_t len = decode_or_byte(s.data() + i, s.size() - i, a);
+        i += len;
+        if (decode_before(s.data(), i, b) != len || b != a) return false;
+      }
+      for (size_t j = 0; j < s.size(); j++)
+        if ((static_cast<unsigned char>(s[j]) & 0xC0) != 0x80 && !lands[j])
+          return false;
+      return true;
+    };
     const unsigned char edge[] = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F,
                                   0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0,
                                   0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1,
@@ -6467,6 +6439,7 @@ void test_utf8_decoder_strict() {
       if (!s.empty() || depth == 0) {
         strings++;
         CHECK(reg::unicode::utf8::valid_from(s.data(), s.size()) == walk(s));
+        CHECK(reads_back(s));
       }
       if (depth == 0) return;
       for (unsigned char b : edge) {
@@ -6486,6 +6459,7 @@ void test_utf8_decoder_strict() {
                           : static_cast<char>(edge[(x >> 8) % sizeof edge]);
       }
       CHECK(reg::unicode::utf8::valid_from(r.data(), r.size()) == walk(r));
+      CHECK(reads_back(r));
     }
     // From a code-point boundary part-way in.
     const std::string t = "ab\xC3\xA9\xFF" "cd";

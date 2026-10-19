@@ -618,73 +618,51 @@ built in place; `NoSink`: nothing), so no entry point pays for another's
 form: `search()` building its result out of a row it had just written cost it
 a failed store-to-load forward, ~3 ns of a 20 ns call.
 
-**The assert families' boolean skips to its leading literal.** It used to be
-the scan alone: a leading literal is no bounded anchor for it (its verify
+**The assert families' boolean skips to its leading literal.** It used to
+step every byte: a leading literal is no bounded anchor for it (its verify
 walks to the leftmost-first end, above), and a DFA stepped with look had no
-start-state skip. So it stepped every byte where the find `memmem`'d the
-literal — `\bqzx\w*\b` tested over a megabyte of prose it does not match took
-~1.4 ms, the find ~40 µs. Now the scan skips to the assert prefix
-(`LazyDfa::look_pf`). A look state is a context as well as its pcs, and
-where a jump lands has a start state of its own, so the skip is not the call
-the other scans make from their start state: the scan *stops* in a start
-state (`LazyDfa::kAtStart`), and `look_forward_first` starts it again at the
-prefix's next occurrence, in the start state of what stands behind that —
-the assertion in front of the prefix sees its real left context. (As a call
-from inside the loop it ran a third slower under GCC with the occurrences
-dense: `\bq[a-z]+e\b` over prose with a `q` every 61 bytes, ~510 µs a MB
-against ~340, which is what the find takes; it was ~1.4 ms.) What one scan
-steps the next does not, the search for the prefix never goes back, and the
-scan still stops at its first accept, so `x[^?]+\?.*\b` costs one pass where
-the find's verify of each `x` walks on to the end of the line. Over the
-Sherlock text the three "test: leading …" bench rows went from ~0.65 GB/s to
-13-20. A text-anchored pattern's boolean is the anchored DFA's from 0
-(`^qzx\b.*` over the megabyte: ~1.5 ms → 12 µs), whatever literals it has:
-the find's verify from 0 goes on to the leftmost-first end (`^.*foo\b` over
-a megabyte line that begins `foo `: ~1.7 ms → ~20 µs).
-
-Two things keep the skip to what it is for. A dense prefix is stepped
-through, by the bar the DFA tiers leave one to their scan at
-(`Plan::assert_prefix_skips`; a scan restarted at every `e` costs more than
-one that steps through them — `e\w*\d\b` over the Sherlock text, 1.6 ms
-against 0.76). And a restart sees the left context the steps from 0 would
-have seen, on any bytes: an occurrence begins with a byte that continues no
-code point, so the steps land on it, and what `cp_before` reads behind it is
-what the last of them took — a byte that starts no code point is one element
-either way (`cp_at`, `cp_before`; on main, whose decoder took the length a
-lead byte says whatever followed it, the two could part, and the port of
-this skip from there needed two guards against it that are not needed here).
-A unit test asks that of random runs of malformed bytes, and the fuzzer asks
-every subject of its layer for the boolean three ways — with the skip,
-without it, and of the Pike — malformed bytes among them.
+start-state skip. Now the scan skips to the assert prefix
+(`LazyDfa::look_pf`). A look state is a context as well as its pcs, so the
+skip is not the jump the other scans make from inside their loop: the scan
+*stops* in a start state (`LazyDfa::kAtStart`), and `look_forward_skip`
+starts it again at the prefix's next occurrence, in the start state of what
+stands behind that — on any bytes, the left context the steps from 0 would
+have seen (an occurrence begins with a byte that continues no code point,
+and a byte that starts no code point is one element either way: `cp_at`,
+`cp_before`). What one scan steps the next does not, the search for the
+prefix never goes back, and the scan still stops at its first accept, so
+`x[^?]+\?.*\b` costs one pass where the find's verify of each `x` walks on
+to the end of the line. A dense prefix is stepped through, by the bar the
+DFA tiers leave one to their scan at (`Plan::assert_prefix_skips`): a scan
+restarted at every `e` costs more than one that steps through them. A
+text-anchored pattern's boolean is the anchored DFA's from 0, whatever
+literals it has: the find's verify from 0 goes on to the leftmost-first end
+(`^.*foo\b`). Tested over a megabyte of prose with no match, in either
+unit: `\bqzx\w*\b` and `(?m)^qzx.*` went from 1.5-1.9 ms to 41-43 µs, what
+the find takes; `^qzx\b.*` to 12 µs; `\bq[a-z]+e\b` with a `q` every 61
+bytes to ~0.3 ms. The fuzzer asks every subject of its layer for the
+boolean four ways — with the skip, without it, of `search()` and of the
+Pike — malformed bytes among them.
 
 **... and takes the word scan where its start set is sparse.** The
 `\b body \b` shapes the word scan serves (`Plan::wop_`) with no literal
 priced below the scan — `\b\d+\b`, `\b[0-9]{3}\b`, `\b[xz]\w+\b` — had the
 same gap, and nothing to skip to: the boolean stepped every byte, where the
 find reads sixteen positions at a time for a candidate (`word_start_block`)
-and walks the candidates alone. `\b\d+\b` tested over a megabyte of prose
-with no digit took ~1.8 ms, the find ~115 µs. A walk ends where its word
-does, so the word scan is a bounded anchor in the sense above, and
-`ladder_pick` gives a boolean on the ASCII assert family the find when the
-plan holds the scan sparse (`Plan::word_scan_sparse`): the scan leads (no
+and walks the candidates alone. A walk ends where its word does, so the word
+scan is a bounded anchor in the sense above: a boolean on the ASCII assert
+family takes the find (`Ladder::kBoolFind`, `Plan::assert_bool_finds`) when
+the plan holds the scan sparse (`Plan::word_scan_sparse`) — it leads (no
 literal anchor priced below it, `wop_after_anchor_`) and its estimate
-(`anchor_.scan_cost`) is under the bar the DFA tiers leave a dense prefix to
-their scan at (`AnchorChoice::kDenseNs`). The plan works the answer out with
-the ladders, for each assert family (`Plan::assert_bool_find_`, in
-`ladder_plan`), and `ladder_pick` reads it: as the tests it stands for, the
-copy of `ladder_pick` in the step's rare re-pick grew past the size at
-which Clang inlines `ladder_adopt` into the one-step find, and every
-Grapheme `test()` paid ~50 instructions for it. A dense start set stays on the
+(`anchor_.scan_cost`) is under the same bar. A dense start set stays on the
 scan: with `[a-z]` every word is a candidate, walked to its end, and once
 the walks have spent their budget the find starts over on the unfiltered
-scan (`\b[a-z]+\d\b` over the ASCII-folded Sherlock text: ~2.6 ms through
-the find, ~1.05 stepped). So does the byte family, where the walk has no
-byte form. And where a walk does give up, what answers the boolean is not
-what the find falls back to — the leftmost-first end, then the reverse scan
-back to its start — but the boolean's own scan, which stops at the first
-accept (`assert_find_span` with `span` false). The three now take what their
-finds take, ~115 µs; over the ASCII-folded Sherlock text `\b[0-9]{3}\b`
-went from ~155 µs to 18, and over a 60-byte subject from ~120 ns to ~60.
+scan. So do the byte family, where the walk has no byte form, and CodePoint,
+which has no word scan. Where the walks give up, the boolean's own scan
+answers (`assert_find_span` with `span` false), which stops at the first
+accept, not what the find falls back to — the leftmost-first end, then the
+reverse scan to its start. Over a megabyte of prose with no match the three
+went from ~1.5 ms to ~0.1, what their finds take.
 
 **One step, or every match.** `ladder_step<All, Out>` is the one
 dispatch (the rungs that need only the cursor are `ladder_shallow`, the walk

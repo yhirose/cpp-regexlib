@@ -6150,6 +6150,8 @@ private:
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
       kSpec = 1 << 9,
+      // The assert family: a boolean takes the find (Plan::assert_bool_finds).
+      kBoolFind = 1 << 10,
     };
     uint16_t flags = kFindOk;
     bool has(Flag f) const { return (flags & f) != 0; }
@@ -8865,6 +8867,7 @@ private:
       // costs about that whatever the subject holds.
       static constexpr int kDenseNs = 1000000;
       bool prefix_dense() const { return prefix_cost >= kDenseNs; }
+      bool scan_dense() const { return scan_cost >= kDenseNs; }
       // Teddy's own pace, per MB, whatever the subject holds: a vector of
       // lookups per 16 or 32 bytes (measured as a DFA's start skip: 14-17
       // GB/s with the 32-byte scan, about 9 with the 16-byte one).
@@ -10608,21 +10611,34 @@ private:
     }
     // Whether the word scan leads the assert find (no literal anchor priced
     // below it: wop_after_anchor_) and is sparse, by the same bar: a boolean
-    // then takes the find (assert_bool_find_). Every candidate of a start
+    // then takes the find (assert_bool_finds). Every candidate of a start
     // set as common as `[a-z]` is a word, and the walks cost more than the
     // boolean scan stepping through them (`\b[a-z]+\d\b` over the ASCII-
     // folded Sherlock text: ~2.6 ms through the find, ~1.05 stepped).
     bool word_scan_sparse() const {
-      return wop_.ok && !wop_after_anchor_ &&
-             anchor_.scan_cost < AnchorChoice::kDenseNs;
+      return wop_.ok && !wop_after_anchor_ && !anchor_.scan_dense();
     }
-    // Whether a boolean on the assert family takes the assert find where it
-    // can, by family: [0] the ASCII one, [1] the byte one. Worked out once
-    // (Regex::ladder_plan, which says why) and read by ladder_pick, whose
-    // copy in the step's rare re-pick is then no larger than it was: as the
-    // three tests it stands for, it took Clang over the size it inlines
-    // ladder_adopt at, and cost every Grapheme test() ~50 instructions.
-    bool assert_bool_find_[2] = {false, false};
+    // Whether a boolean on the assert family (`byte`: the byte one) takes
+    // the assert find (Ladder::kBoolFind): when a literal anchor leads it
+    // and what follows a hit is bounded by the match up to that literal —
+    // the whole match as one fixed text, a trailing literal (the verify runs
+    // backwards from it), the word-suffix scan. A LEADING literal is not
+    // such an anchor: its verify walks forward to the leftmost-first end,
+    // which can be the end of the line, where the boolean scan stops at the
+    // first accept — and skips to that literal itself (LazyDfa::look_pf).
+    // Nor is anything an anchor for a text-anchored pattern, which the
+    // boolean scan decides from 0 (see Rung::Bool), where the find's verify
+    // goes on to the leftmost-first end (`^.*foo\b`). The word scan is
+    // bounded too — a walk ends where the word does — and where it is sparse
+    // it reads sixteen positions at a time, where the boolean scan steps
+    // every byte (`\b\d+\b` tested over a megabyte of prose it does not
+    // match: 1.5 ms stepped, ~0.1 through the find). ASCII only: the walk
+    // has no byte form.
+    bool assert_bool_finds(bool byte) const {
+      const bool bounded = !assert_.lit.empty() || assert_.word_suffix ||
+                           !assert_.suffix.empty();
+      return !text_anchored_ && (bounded || (!byte && word_scan_sparse()));
+    }
 
     // EGC byte path: UTF-8 byte programs (forward + reverse), compiled like
     // UnicodeScalar mode, used to run a non-ASCII subject whose every grapheme
@@ -12201,8 +12217,10 @@ private:
   // and still admit O(matches × n). On exhaustion the literal prefilters are
   // skipped and the unfiltered (linear) scan below answers.
   // `span` false is the boolean caller (test(), from 0), which reads only
-  // whether there is a match: what the unfiltered scan answers it is the
-  // first accept, and [s, e) is then no match's span. (A run-time argument:
+  // whether there is a match: where the literal and word scans give up, the
+  // boolean's own scan answers it (Rung::Bool's), which stops at the first
+  // accept — not the leftmost-first end and the reverse scan back to the
+  // start — and [s, e) is then no match's span. (A run-time argument:
   // as a template one, the boolean's copy of this function changed what GCC
   // inlined into test(), and cost two to four instructions of every call.)
   int assert_find_span(FindCache &fc, std::string_view text, int from, int &s,
@@ -12258,13 +12276,8 @@ private:
       int r = word_onepass_find(text, from, s, e, budget);
       if (r != kWalkBail) return r > 0;
     }
-    // A boolean takes the family's own scan (Rung::Bool's), which stops at
-    // the first accept. What follows is a find's: the leftmost-first end,
-    // which can be the end of the line, and the reverse scan back to the
-    // start.
     if (!span) {
-      const int e0 = look_forward_first(byte ? fc.bfu(*this) : fc.fu(*this),
-                                        text, from);
+      const int e0 = look_forward_first(dfa_bool(fc, byte), text);
       if (e0 < 0) return none(e0);
       s = e = e0;
       return 1;
@@ -12473,7 +12486,7 @@ private:
     bool look_pf;         // look, re-seeding (the boolean's), and the plan has
                           // an assert prefix to skip to
                           // (Plan::assert_prefix_skips): see
-                          // look_forward_first
+                          // look_forward_skip
     bool quit = false;    // gave up (see above): every miss answers kQuit.
                           // What is cached still answers, so a scan that
                           // stays on built transitions is still a DFA scan.
@@ -14318,53 +14331,56 @@ private:
     if (reach_out) *reach_out = reach;
     return e;
   }
-  //
-  // The boolean, over a re-seeding DFA whose plan has an assert prefix
-  // (LazyDfa::look_pf), skips: every match begins with the prefix, so the
-  // scan starts at its next occurrence, and when it stands in a start state
-  // again — nothing in progress — it hands back where, and the next
-  // occurrence from there is where it goes on. Linear: what one scan steps
-  // the next does not, and the search for the prefix never goes back. The
-  // scan starts in the start state of what stands behind the occurrence, so
-  // an assertion in front of the prefix sees its left context: the one the
-  // steps from 0 would have seen, on any bytes. An occurrence begins with a
-  // byte that continues no code point, so the steps reach it, and what
-  // cp_before reads behind it is what the last of them took (a byte that
-  // starts no code point is one element either way: cp_at, cp_before).
-  // (The skip is a call the scan makes from its start state elsewhere —
-  // dfa_start_skip. Here it measured a third slower than this loop, under
-  // GCC, with the occurrences dense: `\bq[a-z]+e\b` over prose with a `q`
-  // every 61 bytes, ~510 µs a MB against ~340, where the find takes ~340.
-  // And the skipping scan is an instantiation of its own: as a switch the
-  // scan read, the plain one lost its inlining here, and with it ~5 ns of a
-  // 22-byte test().)
-  REGEXLIB_NOINLINE int look_forward_first(LazyDfa &d, std::string_view text,
-                                           int from) const {
-    int reach = from, i = from;
-    if (d.look_pf) {
-      const unsigned char *p =
-          reinterpret_cast<const unsigned char *>(text.data());
-      const int n = static_cast<int>(text.size());
-      const std::string &lit = plan_->assert_.prefix;
-      for (;;) {
-        const unsigned char *h =
-            find_substr(p + i, static_cast<size_t>(n - i),
-                        reinterpret_cast<const unsigned char *>(lit.data()),
-                        lit.size(), plan_->assert_.prefix_probe,
-                        plan_->assert_.prefix_probe2);
-        if (!h) return -1; // (no match is empty: each holds the prefix)
-        const int j = static_cast<int>(h - p);
-        const int e =
-            dfa_forward_lf_scan</*First=*/true, /*Look=*/true,
-                                /*AtStart=*/true>(d, text, j, reach);
-        if (e != LazyDfa::kAtStart) return e;
-        i = reach; // past the occurrence: the scan steps before it stops
-      }
-    }
-    return dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(d, text, i,
+  // The boolean (Rung::Bool, and assert_find_span's for one), from 0: a
+  // scan that stops at the first accept — skipping to the assert prefix
+  // where its DFA does (LazyDfa::look_pf).
+  int look_forward_first(LazyDfa &d, std::string_view text) const {
+    return d.look_pf ? look_forward_skip(d, text) : look_forward_all(d, text);
+  }
+  REGEXLIB_NOINLINE int look_forward_all(LazyDfa &d,
+                                         std::string_view text) const {
+    int reach = 0;
+    return dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(d, text, 0,
                                                                reach);
   }
-
+  // The skip: every match begins with the prefix, so the scan starts at its
+  // next occurrence, and when it stands in a start state again — nothing in
+  // progress — it hands back where, and the next occurrence from there is
+  // where it goes on. Linear: what one scan steps the next does not, and
+  // the search for the prefix never goes back. The scan starts in the start
+  // state of what stands behind the occurrence, so an assertion in front of
+  // the prefix sees the left context the steps from 0 would have seen, on
+  // any bytes: an occurrence begins with a byte that continues no code
+  // point, so the steps land on it, and what cp_before reads behind it is
+  // what the last of them took (a byte that starts no code point is one
+  // element either way: cp_at, cp_before). (A loop around the scan, not the
+  // start-state jump the other scans make from inside it, dfa_start_skip: a
+  // look state is a context too, and the jump measured a third slower with
+  // the occurrences dense. Its own function and its own instantiation of
+  // the scan: either inside the plain one cost every boolean its registers
+  // and inlining.)
+  REGEXLIB_NOINLINE int look_forward_skip(LazyDfa &d,
+                                          std::string_view text) const {
+    const unsigned char *p =
+        reinterpret_cast<const unsigned char *>(text.data());
+    const int n = static_cast<int>(text.size());
+    const std::string &lit = plan_->assert_.prefix;
+    for (int i = 0, reach = 0;;) {
+      const unsigned char *h =
+          find_substr(p + i, static_cast<size_t>(n - i),
+                      reinterpret_cast<const unsigned char *>(lit.data()),
+                      lit.size(), plan_->assert_.prefix_probe,
+                      plan_->assert_.prefix_probe2);
+      if (!h) return -1; // (no match is empty: each holds the prefix)
+      const int e =
+          dfa_forward_lf_scan</*First=*/true, /*Look=*/true,
+                              /*AtStart=*/true>(d, text,
+                                                static_cast<int>(h - p),
+                                                reach);
+      if (e != LazyDfa::kAtStart) return e;
+      i = reach; // past the occurrence: the scan steps before it stops
+    }
+  }
   template <bool First = false>
   REGEXLIB_NOINLINE int look_reverse(LazyDfa &d, std::string_view text, int e,
                                      int floor, int *low_out = nullptr) const {
@@ -14399,8 +14415,9 @@ private:
   // accepts, and the text's end takes a step of its own. A look scan does not
   // skip. With `AtStart` (the boolean's, over a DFA that marks its start
   // states: LazyDfa::look_pf) it stops in a start state instead, and answers
-  // LazyDfa::kAtStart with `reach_out` where — look_forward_first skips from
-  // there; a find puts its literals in front of the scan (assert_find_span).
+  // LazyDfa::kAtStart with `reach_out` where — look_forward_skip goes on
+  // from there; a find puts its literals in front of the scan
+  // (assert_find_span).
   template <bool First, bool Look = false, bool AtStart = false>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
                           int &reach_out) const {
@@ -14817,8 +14834,10 @@ public:
     // memmem jumps (`zqj`, before a CodePoint literal had the literal tier,
     // over 595 KB of prose: 0.67 GB/s, the find 89).
     // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
-    // (Built out of line, as bfu: inlined, the construction took the
-    // accessor past the size GCC inlines it into test() at.)
+    // The DFAs a short search() or test() reaches build out of line, so that
+    // the accessor inlines: inlined, the construction took it past the size
+    // GCC inlines into those at. (lfa and blfa, match()'s, measured either
+    // way between compilers.)
     LazyDfa &fu(const Regex &re) { return fu_ ? *fu_ : make_fu(re); }
     REGEXLIB_NOINLINE LazyDfa &make_fu(const Regex &re) {
       fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
@@ -14826,14 +14845,12 @@ public:
       return built(fu_);
     }
 
-    LazyDfa &rv(const Regex &re) {
-      if (!rv_) {
-        rv_.emplace(re, re.plan_->rev_prog_.prog,
-                    re.plan_->rev_prog_.match_pc(), /*reseed=*/false);
-        rv_->reverse = true;
-        built(rv_);
-      }
-      return *rv_;
+    LazyDfa &rv(const Regex &re) { return rv_ ? *rv_ : make_rv(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_rv(const Regex &re) {
+      rv_.emplace(re, re.plan_->rev_prog_.prog,
+                  re.plan_->rev_prog_.match_pc(), /*reseed=*/false);
+      rv_->reverse = true;
+      return built(rv_);
     }
 
     // Leftmost-first forward DFAs (ordered states + match cut). Unanchored
@@ -14842,21 +14859,19 @@ public:
     // once a match is live, so leftmost-first priority across start positions
     // is preserved. Anchored match() (lfa) runs the bare pattern from position
     // 0, prefilter off.
-    LazyDfa &lfu(const Regex &re) {
-      if (!lfu_) {
-        // EGC: lf_prog_ is the code-point/grapheme program — the ASCII first-
-        // byte / prefix_.text memmem skip (use_prefilter) applies. US: lf_prog_ is a
-        // byte automaton — use the byte-level prefilter (byte_pf, byte_prefix_.text /
-        // byte first-byte set) instead, mirroring blfu. The two are exclusive:
-        // use_prefilter reads prefix_.text (empty in US), byte_pf reads byte_prefix_.text.
-        lfu_.emplace(re, re.plan_->lf_prog_.prog,
-                     re.plan_->lf_prog_.match_pc(),
-                     /*reseed=*/false, /*pf=*/!re.plan_->us_,
-                     /*leftmost_first=*/true);
-        if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_skips();
-        built(lfu_);
-      }
-      return *lfu_;
+    LazyDfa &lfu(const Regex &re) { return lfu_ ? *lfu_ : make_lfu(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_lfu(const Regex &re) {
+      // EGC: lf_prog_ is the code-point/grapheme program — the ASCII first-
+      // byte / prefix_.text memmem skip (use_prefilter) applies. US: lf_prog_ is a
+      // byte automaton — use the byte-level prefilter (byte_pf, byte_prefix_.text /
+      // byte first-byte set) instead, mirroring blfu. The two are exclusive:
+      // use_prefilter reads prefix_.text (empty in US), byte_pf reads byte_prefix_.text.
+      lfu_.emplace(re, re.plan_->lf_prog_.prog,
+                   re.plan_->lf_prog_.match_pc(),
+                   /*reseed=*/false, /*pf=*/!re.plan_->us_,
+                   /*leftmost_first=*/true);
+      if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_skips();
+      return built(lfu_);
     }
 
     LazyDfa &lfa(const Regex &re) {
@@ -14879,29 +14894,25 @@ public:
       return built(bfu_);
     }
 
-    LazyDfa &brv(const Regex &re) {
-      if (!brv_) {
-        brv_.emplace(re, re.plan_->byte_rev_prog_.prog,
-                     re.plan_->byte_rev_prog_.match_pc(), /*reseed=*/false,
-                     /*pf=*/false);
-        brv_->reverse = true;
-        built(brv_);
-      }
-      return *brv_;
+    LazyDfa &brv(const Regex &re) { return brv_ ? *brv_ : make_brv(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_brv(const Regex &re) {
+      brv_.emplace(re, re.plan_->byte_rev_prog_.prog,
+                   re.plan_->byte_rev_prog_.match_pc(), /*reseed=*/false,
+                   /*pf=*/false);
+      brv_->reverse = true;
+      return built(brv_);
     }
 
     // Leftmost-first byte forward DFA over byte_lf_prog_ (`(?s:.)*?`+pattern);
     // the byte-program prefilter (byte_pf) preserves the literal byte path's
     // memmem skip.
-    LazyDfa &blfu(const Regex &re) {
-      if (!blfu_) {
-        blfu_.emplace(re, re.plan_->byte_lf_prog_.prog,
-                      re.plan_->byte_lf_prog_.match_pc(), /*reseed=*/false,
-                      /*pf=*/false, /*leftmost_first=*/true);
-        blfu_->byte_pf = re.plan_->byte_skips();
-        built(blfu_);
-      }
-      return *blfu_;
+    LazyDfa &blfu(const Regex &re) { return blfu_ ? *blfu_ : make_blfu(re); }
+    REGEXLIB_NOINLINE LazyDfa &make_blfu(const Regex &re) {
+      blfu_.emplace(re, re.plan_->byte_lf_prog_.prog,
+                    re.plan_->byte_lf_prog_.match_pc(), /*reseed=*/false,
+                    /*pf=*/false, /*leftmost_first=*/true);
+      blfu_->byte_pf = re.plan_->byte_skips();
+      return built(blfu_);
     }
 
     // Anchored leftmost-first byte DFA over byte_prog_ (no prefix), for
@@ -15193,6 +15204,10 @@ public:
   }
   LazyDfa &dfa_rev(FindCache &fc, bool byte) const {
     return byte ? fc.brv(*this) : fc.rv(*this);
+  }
+  // ... and the boolean's: re-seeding, stopping at the first accept.
+  LazyDfa &dfa_bool(FindCache &fc, bool byte) const {
+    return byte ? fc.bfu(*this) : fc.fu(*this);
   }
   // Whether a scan on `l` runs the byte programs' DFAs: the DFA family's
   // byte ones, or the assert family's.
@@ -17404,11 +17419,13 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     // the walk of a `body$` capture plan ahead of it.
     l.set(Ladder::kAssert);
     l.set(Ladder::kAssertByte);
+    l.set(Ladder::kBoolFind, p.assert_bool_finds(true));
     l.set(Ladder::kWalkOn, p.capture_scan_ok());
     l.set(Ladder::kWalkByte);
     break;
   case kFamAssertAscii:
     l.set(Ladder::kAssert);
+    l.set(Ladder::kBoolFind, p.assert_bool_finds(false));
     l.set(Ladder::kFindOk, p.assert_ascii_tier());
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
@@ -17418,6 +17435,7 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     // Grapheme: the same engine on a subject assert_byte_path_ok admits.
     l.set(Ladder::kAssert);
     l.set(Ladder::kAssertByte);
+    l.set(Ladder::kBoolFind, p.assert_bool_finds(true));
     break;
   case kFamilyCount: break;
   }
@@ -17450,27 +17468,6 @@ inline void Regex::ladder_plan(Plan &p) {
     p.match_guesses_[0] = byte_first ? byte : ascii;
     p.match_guesses_[1] = byte_first ? ascii : byte;
   }
-  // A boolean on the assert family takes the assert find (ladder_pick) when
-  // a literal anchor leads it and what follows a hit is bounded by the
-  // match up to that literal — the whole match as one fixed text, a
-  // trailing literal (the verify runs backwards from it), the word-suffix
-  // scan. A LEADING literal is not such an anchor: its verify walks forward
-  // to the leftmost-first end, which can be the end of the line, where the
-  // boolean scan stops at the first accepting state — and the boolean scan
-  // skips to that literal itself (LazyDfa::look_pf), so it pays for
-  // neither. Nor is anything an anchor for a text-anchored pattern, which
-  // the boolean scan decides from 0 (see Rung::Bool), where the find's
-  // verify from 0 goes on to the leftmost-first end (`^.*foo\b`).
-  const bool bounded = !p.assert_.lit.empty() || p.assert_.word_suffix ||
-                       !p.assert_.suffix.empty();
-  // The word scan is bounded too — a walk ends where the word does — and
-  // where its start set is sparse it reads a block of sixteen positions at
-  // a time, where the boolean scan steps every byte (`\b\d+\b` tested over
-  // a megabyte of prose it does not match: ~1.8 ms stepped, ~0.12 through
-  // the find). ASCII only: the walk has no byte form.
-  p.assert_bool_find_[0] =
-      !p.text_anchored_ && (bounded || p.word_scan_sparse());
-  p.assert_bool_find_[1] = !p.text_anchored_ && bounded;
   p.fused_ = p.egc_fused_ok()
                  ? (p.prefix_fused() ? Plan::Fused::Prefix
                                      : Plan::Fused::Suffix)
@@ -17601,12 +17598,10 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
   if (l.has(Ladder::kAssert)) {
     if (rows) return walk ? Rung::Walk : Rung::AssertChain;
     // A boolean takes its own scan unless the family's find is bounded
-    // (Plan::assert_bool_find_: see ladder_plan). That scan serves either
-    // engine in either unit, groups or not: a Save is an empty move to a
-    // DFA, and a scan that gives up hands the boolean to the find's rungs
-    // (Rung::Bool).
-    if (!(l.has(Ladder::kFindOk) &&
-          p.assert_bool_find_[l.has(Ladder::kAssertByte)]))
+    // (Plan::assert_bool_finds). That scan serves either engine in either
+    // unit, groups or not: a Save is an empty move to a DFA, and a scan
+    // that gives up hands the boolean to the find's rungs (Rung::Bool).
+    if (!(l.has(Ladder::kFindOk) && l.has(Ladder::kBoolFind)))
       return Rung::Bool;
     return Rung::AssertChain;
   }
@@ -18082,12 +18077,11 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       // would go on to the end of the subject (as assert_find_span). Else the
       // re-seeding scan, which skips to the assert prefix when the plan has
       // one (LazyDfa::look_pf).
-      LazyDfa &dfa = p.text_anchored_ ? dfa_fwda(*scr.cache, byte)
-                     : byte          ? scr.cache->bfu(*this)
-                                     : scr.cache->fu(*this);
-      e2 = look_forward_first(dfa, text, 0);
+      e2 = look_forward_first(p.text_anchored_ ? dfa_fwda(*scr.cache, byte)
+                                               : dfa_bool(*scr.cache, byte),
+                              text);
     } else {
-      LazyDfa &dfa = byte ? scr.cache->bfu(*this) : scr.cache->fu(*this);
+      LazyDfa &dfa = dfa_bool(*scr.cache, byte);
       // CodePoint: the start-state skip is a scan-time switch, on for a
       // subject long enough to repay it (see kBoolSkipBytes, and fu()).
       if (p.us_)
