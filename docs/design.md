@@ -646,20 +646,16 @@ Two things keep the skip to what it is for. A dense prefix is stepped
 through, by the bar the DFA tiers leave one to their scan at
 (`Plan::assert_prefix_skips`; a scan restarted at every `e` costs more than
 one that steps through them — `e\w*\d\b` over the Sherlock text, 1.6 ms
-against 0.76). And on bytes that are no UTF-8 a lead byte takes the bytes
-after it for its own, whatever they are, so an occurrence of the literal can
-be inside what the scan steps as one code point, and what `cp_before` reads
-behind it need not be what the scan's steps saw: started there, the scan
-answered otherwise than the scan through every byte, finding a match that
-one does not and losing one it finds. It restarts only where the bytes
-behind the occurrence leave no doubt — a code point that a step takes there
-and `cp_before` reads back, claimed by no lead byte in front of it: every
-occurrence, in a UTF-8 subject (`look_restart_ok`) — and stops only where
-`cp_before` reads back what its last step took (`look_reads_back`), which in
-a UTF-8 subject is every start state it reaches; behind any other
-occurrence it steps the rest of the subject, as it did before. The fuzzer
-asks every subject of its layer for it twice, with the skip and without,
-malformed bytes among them.
+against 0.76). And a restart sees the left context the steps from 0 would
+have seen, on any bytes: an occurrence begins with a byte that continues no
+code point, so the steps land on it, and what `cp_before` reads behind it is
+what the last of them took — a byte that starts no code point is one element
+either way (`cp_at`, `cp_before`; on main, whose decoder took the length a
+lead byte says whatever followed it, the two could part, and the port of
+this skip from there needed two guards against it that are not needed here).
+A unit test asks that of random runs of malformed bytes, and the fuzzer asks
+every subject of its layer for the boolean three ways — with the skip,
+without it, and of the Pike — malformed bytes among them.
 
 **... and takes the word scan where its start set is sparse.** The
 `\b body \b` shapes the word scan serves (`Plan::wop_`) with no literal

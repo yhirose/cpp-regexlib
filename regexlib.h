@@ -14326,9 +14326,11 @@ private:
   // occurrence from there is where it goes on. Linear: what one scan steps
   // the next does not, and the search for the prefix never goes back. The
   // scan starts in the start state of what stands behind the occurrence, so
-  // an assertion in front of the prefix sees its left context — where the
-  // bytes leave no doubt what that is (look_restart_ok); where they do, the
-  // rest of the subject is stepped, as it was before there was a skip.
+  // an assertion in front of the prefix sees its left context: the one the
+  // steps from 0 would have seen, on any bytes. An occurrence begins with a
+  // byte that continues no code point, so the steps reach it, and what
+  // cp_before reads behind it is what the last of them took (a byte that
+  // starts no code point is one element either way: cp_at, cp_before).
   // (The skip is a call the scan makes from its start state elsewhere —
   // dfa_start_skip. Here it measured a third slower than this loop, under
   // GCC, with the occurrences dense: `\bq[a-z]+e\b` over prose with a `q`
@@ -14352,7 +14354,6 @@ private:
                         plan_->assert_.prefix_probe2);
         if (!h) return -1; // (no match is empty: each holds the prefix)
         const int j = static_cast<int>(h - p);
-        if (j != i && !look_restart_ok(text, i, j)) break;
         const int e =
             dfa_forward_lf_scan</*First=*/true, /*Look=*/true,
                                 /*AtStart=*/true>(d, text, j, reach);
@@ -14364,41 +14365,6 @@ private:
                                                                reach);
   }
 
-  // Whether the code point a look step took as [at, end) is the one
-  // cp_before(end) reads back — what a scan started at `end` is told stands
-  // behind it: an ASCII byte, or a byte that is no continuation and then
-  // continuations only. On bytes that are no UTF-8 the two can differ: a
-  // step takes the length a lead byte says, whatever follows it
-  // (decode_codepoint), and cp_before reads back over continuation bytes,
-  // past a lone one too.
-  static bool look_reads_back(const unsigned char *p, int at, int end) {
-    if ((p[at] & 0xC0) == 0x80) return false;
-    for (int q = at + 1; q < end; q++)
-      if ((p[q] & 0xC0) != 0x80) return false;
-    return true;
-  }
-
-  // Whether a look scan started at `j` stands where the steps of one from
-  // `i` — a boundary they stop at — would have, seeing behind it what they
-  // would have seen: the code point before `j` is one a step from where it
-  // begins takes (cp_at) and cp_before reads back (look_reads_back), and no
-  // step in front of it would have taken any of it. Every occurrence in a
-  // UTF-8 subject is such a place; on other bytes an ASCII one can be part
-  // of what a step takes for one code point.
-  static bool look_restart_ok(std::string_view text, int i, int j) {
-    const unsigned char *p =
-        reinterpret_cast<const unsigned char *>(text.data());
-    int k = j - 1; // where the code point before j begins
-    if (p[k] >= 0x80) { // (an ASCII byte is one code point, read so both ways)
-      while (k > i && j - k < 4 && (p[k] & 0xC0) == 0x80)
-        k--;
-      if (cp_at(text, k).len != j - k || !look_reads_back(p, k, j))
-        return false;
-    }
-    for (int q = std::max(i, k - 3); q < k; q++)
-      if (p[q] >= 0x80 && q + cp_at(text, q).len > k) return false;
-    return true;
-  }
   template <bool First = false>
   REGEXLIB_NOINLINE int look_reverse(LazyDfa &d, std::string_view text, int e,
                                      int floor, int *low_out = nullptr) const {
@@ -14493,13 +14459,9 @@ private:
       if (f & stops) {
         if (f & ends) break;
         if constexpr (AtStart) {
-          // (Only where a scan started at `i` would be told what the step
-          // saw behind it: look_reads_back.)
-          if (p[at] < 0x80 || look_reads_back(p, at, i)) {
-            d.scanned += static_cast<uint64_t>(i - mark);
-            reach_out = i;
-            return LazyDfa::kAtStart;
-          }
+          d.scanned += static_cast<uint64_t>(i - mark);
+          reach_out = i;
+          return LazyDfa::kAtStart;
         } else if constexpr (!Look) {
           const int j = dfa_start_skip(d, p, n, i);
           mark += j - i; // jumped, not stepped

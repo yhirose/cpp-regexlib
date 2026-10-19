@@ -2160,9 +2160,8 @@ void invariant_fuzz_assert_suffix(int iters) {
 // test() on an assert pattern led by a literal, which skips to it
 // (look_forward_first). The skip is a prefilter, so it may change what the
 // boolean costs and never what it answers: every subject's test() is
-// checked against the same Regex's with the skip off, on bytes that are no
-// UTF-8 too (look_restart_ok); on a UTF-8 subject, also against search()
-// and the Pike. Literals over a small alphabet, so that they occur, overlap
+// checked against the same Regex's with the skip off, against search() and
+// against the Pike, on bytes that are no UTF-8 too. Literals over a small alphabet, so that they occur, overlap
 // and come close to occurring; a left context of every kind; tails that end
 // a match at once, at the end of the line, never.
 void invariant_fuzz_assert_prefix_bool(int iters) {
@@ -2201,7 +2200,6 @@ void invariant_fuzz_assert_prefix_bool(int iters) {
         const bool t = re->test(subj);
         if (t != reg::detail::PlanProbe::test_unskipped(*re, subj))
           fail("assert-prefix: test() != test() without the skip", pat, subj);
-        if (malformed) continue;
         if (t != re->search(subj).matched())
           fail("assert-prefix: test() != search", pat, subj);
         if (pike && t != pike->search(subj).matched())

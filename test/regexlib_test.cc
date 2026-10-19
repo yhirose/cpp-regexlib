@@ -97,6 +97,16 @@ struct PlanProbe {
     const Regex::FindCache &c = re.thread_cache();
     return c.lfu_ || c.blfu_;
   }
+  // The code point a step takes at `at` (Regex::cp_at), and the one read
+  // back behind `at` (Regex::cp_before): its value and its length.
+  static std::pair<char32_t, int> cp_at(std::string_view t, int at) {
+    const Regex::Decoded d = Regex::cp_at(t, at);
+    return {d.cp, d.len};
+  }
+  static std::pair<char32_t, int> cp_before(std::string_view t, int at) {
+    const Regex::Decoded d = Regex::cp_before(t, at);
+    return {d.cp, d.len};
+  }
   // What test() answers with that skip off (LazyDfa::look_pf) — every byte
   // stepped, as before there was one — on this thread's cache of `re`.
   static bool test_unskipped(const Regex &re, std::string_view s) {
@@ -2238,16 +2248,47 @@ void test_find_ladder() {
             pad + "\xC3\xA9qzx" + pad, std::string("qzx\r\nqzx")})
         CHECK(agree(pat, subj));
   }
-  // ... and on bytes that are no UTF-8 (look_restart_ok), the answers it
-  // gives without the skip. (search() and the Pike are no reference there:
-  // they read such bytes each their own way, and disagreed with test()
-  // before.)
+  // ... and on bytes that are no UTF-8, the answers it gives without the
+  // skip, and the Pike's. They hold because a step and cp_before read any
+  // bytes alike: a scan restarted at an occurrence is told what stands
+  // behind it as the steps from 0 saw it. Over random runs of lead,
+  // continuation, invalid and ASCII bytes, every element a step takes is the
+  // one read back behind it, and every byte that continues no code point is
+  // where a step lands.
+  {
+    const unsigned char bytes[] = {'a',  ' ',  0x80, 0x8F, 0x90, 0x9F, 0xA0,
+                                   0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0, 0xE2,
+                                   0xED, 0xEF, 0xF0, 0xF4, 0xF5, 0xFF};
+    unsigned x = 7;
+    for (int t = 0; t < 200000; t++) {
+      std::string s;
+      for (int i = 1 + t % 9; i > 0; i--) {
+        x = x * 1664525u + 1013904223u;
+        s += static_cast<char>(bytes[(x >> 16) % std::size(bytes)]);
+      }
+      const int n = static_cast<int>(s.size());
+      std::vector<bool> lands(static_cast<size_t>(n) + 1);
+      bool ok = true;
+      for (int i = 0; i < n;) {
+        lands[static_cast<size_t>(i)] = true;
+        const auto step = PlanProbe::cp_at(s, i);
+        i += step.second;
+        ok = ok && PlanProbe::cp_before(s, i) == step;
+      }
+      for (int j = 0; j < n; j++)
+        ok = ok && ((static_cast<unsigned char>(s[static_cast<size_t>(j)]) &
+                     0xC0) == 0x80 ||
+                    lands[static_cast<size_t>(j)]);
+      if (!ok) {
+        CHECK(ok);
+        break;
+      }
+    }
+  }
   {
     const char *const pats[] = {"\\bqzx\\w*\\b", "qzx\\w*\\b", "\\Bqzx\\w*",
                                 "q[a-z]*x\\b", "\\bqz.\\b", "qzx[a-z]*$",
                                 "\\bq\\w*\\b"};
-    // (The last two subjects reach a start state behind bytes cp_before
-    // reads otherwise than the step took them: look_reads_back.)
     const char *const subjs[] = {
         "\xFFqzx \xE9qzx",
         "\xE6q\xF0\xFF\n\xFFz\xE9q\xC3qzx\x80 ",
@@ -2257,9 +2298,11 @@ void test_find_ladder() {
         "\xF0\x9F\x98qzx", "qz\xF0 \x9F\nq\x80",
         "a\x9Fx\x80\n \xA9\nq\xE9\xE9\nq\x80\xFF\xE6\x9F" "e\xFF\xF0\x9F" "e"};
     for (const char *pat : pats) {
-      Regex re(pat);
-      for (const char *s : subjs)
+      const Regex re(pat), pike = pike_twin(pat);
+      for (const char *s : subjs) {
         CHECK(re.test(s) == PlanProbe::test_unskipped(re, s));
+        CHECK(re.test(s) == pike.test(s));
+      }
     }
   }
   // ... and what that costs: over a megabyte of prose with no occurrence of
