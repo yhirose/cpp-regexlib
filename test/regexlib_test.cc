@@ -319,6 +319,14 @@ struct PlanProbe {
     return re.guess_held(static_cast<Regex::Family>(kFamilies.find(fam)), s,
                          reach);
   }
+  // Whether `f` — calls of `re` that draw on this thread's cache — ran the
+  // Pike: it prepares the cache's scratch, which is emptied first.
+  template <class F> static bool pike_ran(const Regex &re, F f) {
+    Regex::Scratch &sc = re.thread_cache().sc_;
+    sc = Regex::Scratch{};
+    f();
+    return sc.clist.capacity() > 0;
+  }
   // For each lazy DFA with look that the calling thread's cache of `re` has
   // built: whether it steps a byte at a time (LazyDfa::bytewise), and
   // whether it re-seeds.
@@ -1779,6 +1787,39 @@ void test_crlf_interior_anchors() {
 // ends in a stray byte, a family answers from the first few bytes, where
 // the subject's class sent match() to the Pike, which segmented the whole
 // of it.
+// What an engine family can part from the unit's engine on, a piece each:
+// stray bytes, a combining mark (alone and on a base), a ZWJ, a flag, a
+// Prepend, Hangul jamo, an Indic conjunct (GB9c), a CR-LF, a lone CR and LF,
+// a NEL, a ZWJ sequence.
+const char *const kDirt[] = {
+    "\xFF", "\x80", "\xC3", "\xE6\xBC", "\xCC\x81", "e\xCC\x81", "\xE2\x80\x8D",
+    "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80",
+    "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7",
+    "\r\n", "\r", "\n", "\xC2\x85",
+    "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB"};
+// The texts the guesses are put to, each repeated to a length: ASCII prose,
+// accented prose (one starting with a non-ASCII byte) and CR-LF lines.
+const char *const kGuessBodies[] = {
+    "the quick brown fox jumps over the lazy dog ",
+    "the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over ",
+    "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
+    "the quick brown fox\r\njumps over the dog\r\n"};
+// `agrees` over each of kGuessBodies (repeated to 160 bytes), and over each
+// with a piece of kDirt at each of its first 48 offsets and at 100.
+template <class F> void each_dirty_subject(F agrees) {
+  for (const char *body : kGuessBodies) {
+    std::string base;
+    while (base.size() < 160) base += body;
+    CHECK(agrees(base));
+    for (const char *d : kDirt)
+      for (size_t at = 0; at <= 49; at++) {
+        std::string s = base;
+        s.insert(at < 49 ? at : 100, d);
+        CHECK(agrees(s));
+      }
+  }
+}
+
 void test_match_guess() {
   const char *pats[] = {
       "\\w+", ".", "\\w", "[a-z]+ing", ".*fox", "[^ ]+ [^ ]+", "x\\w*z",
@@ -1788,33 +1829,11 @@ void test_match_guess() {
       "(\\w+)\\b", "\\w+\\B", "(?m)^\\w+$", "\\w+$", "^(\\w+)-(\\w+)$",
       "(?m)(\\w+)$", "\\b(\\w+) (\\w+)\\b", "\\w+\\r\\n", "(\\w+)\\r\\n(\\w*)",
       "the\\s"};
-  const char *dirt[] = {
-      "\xFF", "\x80", "\xC3", "\xE6\xBC", "\xCC\x81", "e\xCC\x81",
-      "\xE2\x80\x8D", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80",
-      "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB", "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7",
-      "\r\n", "\r", "\n", "\xC2\x85",
-      "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB"};
-  const char *bodies[] = {"the quick brown fox jumps over the lazy dog ",
-                          "the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over ",
-                          "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
-                          "the quick brown fox\r\njumps over the dog\r\n"};
-  std::vector<size_t> offsets;
-  for (size_t at = 0; at <= 48; at++) offsets.push_back(at);
-  offsets.push_back(100);
   for (const char *pat : pats)
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
-      for (const char *body : bodies) {
-        std::string base;
-        while (base.size() < 160) base += body;
-        CHECK(match_agrees(re, pike, base));
-        for (const char *d : dirt)
-          for (size_t at : offsets) {
-            std::string s = base;
-            s.insert(at, d);
-            CHECK(match_agrees(re, pike, s));
-          }
-      }
+      each_dirty_subject(
+          [&](std::string_view s) { return match_agrees(re, pike, s); });
     }
   // A scan can read past where its answer ends, and what it read there
   // counts: the one-pass walk of `(a)(?:x[\r\n]b)?` takes `a` and goes on
@@ -1872,6 +1891,59 @@ void test_match_guess() {
         const PlanProbe::DfaStats st = PlanProbe::dfa_stats(re);
         CHECK(st.built == 1 && st.scanned < 16);
       }
+}
+
+// search() and test(): the first match, groups and all, and whether there is
+// one — the same from `re` as from its reference.
+bool first_agrees(const Regex &re, const Regex &pike, std::string_view s) {
+  std::vector<size_t> a, b;
+  const reg::MatchResult got = re.search(s), want = pike.search(s);
+  if (got.matched()) add_spans(a, got);
+  if (want.matched()) add_spans(b, want);
+  return a == b && re.test(s) == want.matched();
+}
+
+// A CodePoint find does not ask first whether its subject holds a stray
+// byte (us_stray). Its scan guesses it reads none, on the plan's family, and
+// keeps its answer when what it read holds none (find_rest, guess_held);
+// else the Pike answers, from the start. So the pieces a byte automaton
+// cannot read, or that a grapheme engine would join, placed at every offset
+// of the first 48 bytes and further on, change no answer of search() or
+// test() from the Pike's — on every rung, and where a DFA reads past the
+// match (`a.*b`, which a stray stops) or there is none to find
+// (`[^\x00-\x7f]`, which the stray is to the Pike). And over 1 MB of prose
+// that ends in a stray byte the first match is found without the Pike, which
+// segmented the whole subject — from what this call read: after a scan to
+// the end of another, a boolean that answers in the first words is not
+// judged on the bytes the other read.
+void test_find_guess() {
+  const char *pats[] = {
+      "\\w+", "(\\w+) (\\w+)", "[a-z]+ing", "\\w+@\\w+", "x\\w*z",
+      ".*fox", "a.*b", "(?s).+", "\\S+\\s+\\S+", "[^ ]+", "\\b\\w+\\b",
+      "\\w+$", "(\\w+)\\b", "\\B\\w+", "(?m)^\\w+$", "(?i)holmes",
+      "fox|dog", "quick", "[0-9]+", "\\W+", ".", "(?s).{3}", "[^\\x00-\\x7f]",
+      "(\\w)(\\w*)\\s(\\w+)", "\\w+ \\d+"};
+  for (const char *pat : pats) {
+    const Regex re = make_us(pat),
+                pike = pike_twin(pat, 0, reg::MatchUnit::CodePoint);
+    each_dirty_subject(
+        [&](std::string_view s) { return first_agrees(re, pike, s); });
+  }
+
+  const std::string prose = accented_prose(1u << 20) + "\xFF";
+  for (const char *pat : {"\\w+", "[a-z]+own", "\\b\\w+\\b", "(\\w+)\\s(\\w+)"}) {
+    const Regex re = make_us(pat);
+    reg::MatchResult m;
+    CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
+    CHECK(m.matched() && m.begin() < 64);
+    CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(prose)); }));
+  }
+  const Regex re = make_us("\\w+ \\d+");
+  std::string words, early = "one 1 ";
+  while (words.size() < (1u << 20)) words += "the quick brown fox ";
+  early += "\xFF" + words;
+  CHECK(!re.test(words));
+  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(early)); }));
 }
 
 // The find ladder: search, test, find_all, find_iter and find_at climb the
@@ -6317,6 +6389,7 @@ int main() {
   test_assert_byte_groups();
   test_crlf_interior_anchors();
   test_match_guess();
+  test_find_guess();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

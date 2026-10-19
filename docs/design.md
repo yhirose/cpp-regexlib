@@ -495,7 +495,7 @@ and `match` — anchored at 0, where no prefilter applies — takes one rung per
 family of that ladder (`match_end`): the family's DFA anchored at 0 locates
 the end, and `match_located` resolves any groups within it. Which family
 answers is not decided by the gates up front but by trying them in turn (see
-"`match()`: the families in turn" below). Every
+"Guessing the family" below). Every
 branch carries a `[Tier: …]` label in the source, with one canonical name per
 (pattern-class × subject-class) combination:
 
@@ -507,7 +507,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `EndAnchor` | `end_anchor_ok` (`end_anchored_`, the byte assert programs, and for groups the capture program) | the reverse byte DFA from `n` to the cursor: the leftmost start; groups in `[s, n)`; vets only the bytes it read (`end_region_ok`), else `Classify` |
 | `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — a state is the offset of its row (premultiplied, as the LazyDfa's), so each byte's one load waits on the load before it and nothing else; a row is 129 entries, the state's accept flag and then a column per ASCII byte — the flag is read off the dependency chain, and the odd width keeps one column of many rows out of one cache set (a 128-digit validator over varying subjects: 262 ns with 128-entry rows, 140 so); a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes, taken a block at a time (`word_start_block`, see the scan section) behind a short scalar entry ramp; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity). A subject with a stray byte (not RFC 3629 UTF-8; `us_stray`) starts on the code-point Pike instead — a byte automaton cannot match a byte that is no code point, and the Pike reads it as an element of its own |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity). A subject with a stray byte (not RFC 3629 UTF-8) is the code-point Pike's — a byte automaton cannot match a byte that is no code point, and the Pike reads it as an element of its own: a scan that outlives its call starts there (`us_stray`), a one-step find once the bytes it read hold one ("Guessing the family") |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | lazy DFA over the grapheme program (byte == grapheme); `+cap` as above |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | the lazy DFAs over the grapheme programs, with look (forward, and reverse for the start) + assert literal/prefix/suffix/word prefilters; `+cap`: assert-aware bitstate |
@@ -556,8 +556,8 @@ family's ladder for each kind of caller (`Plan::family_`; three kinds, see
 starts (`Plan::start_` — a CodePoint plan's family does not depend on the
 subject at all, so its scan starts on the family's first rung outright).
 `ladder_family` is the one place a family is defined, `ladder_classify` the
-one place a find reads the subject gates (`match()` asks them of what its
-guesses read — see below), and `ladder_pick` the one place the
+one place a find reads the subject gates (a guess asks them of what it
+read — see below), and `ladder_pick` the one place the
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts
 there by `ladder_plan`, and the fused scans are where `ladder_classify`
@@ -651,28 +651,48 @@ Three things keep the shared ladder from costing them anything:
 A scan that outlives the call (`Finder`: `find_iter`, `find_all`, `find_at`)
 stores the same ladder and cursor and takes the same steps.
 
-### `match()`: the families in turn, each judged on what it read
+### Guessing the family, judged on what the scan read
 
-`match()` is anchored at 0, so its answer is settled by the head of the
-subject — a few bytes, for a validator or the token that starts a line. It
-used to look at all of the subject first anyway: the gates a family is chosen
-by (`first_nonascii`, then `simple_from` or `contains_crlf`; `valid_from` in
-CodePoint mode) are passes over the whole of it, and a stray byte or a
-combining mark anywhere sent it to the Pike, which segmented all of it.
+A one-step call is often answered by the head of its subject: `match()`,
+anchored at 0, from a few bytes for a validator or the token that starts a
+line; `search()` and `test()` at the first match. They used to look at all of
+the subject first anyway. The gates a family is chosen by (`first_nonascii`,
+then `simple_from` or `contains_crlf`; `valid_from` in CodePoint mode,
+`us_stray`) are passes over the whole of it, and a stray byte or a combining
+mark anywhere sent the call to the Pike, which segmented all of it.
 
-It does not classify the subject now. The plan lists the families `match()`
-can run (`Plan::match_guesses_`, set by `ladder_plan`): a CodePoint plan's
-one; a Grapheme plan's ASCII family, then its byte family — the byte family
-first for a pattern with a CR-LF literal, which the ASCII family cannot match
-(`ascii_grapheme_ok`), so that on the subjects where it matters the first
-scan is not thrown away. Each runs anchored at 0 (`match_end`), and the first
-whose answer holds for the subject *as far as its scan read* answers
-(`guess_held`). When none holds, the Pike answers.
+They guess now. A family runs as if the subject were one it serves, and its
+answer stands if the subject is one *as far as the scan read*
+(`guess_held`); else the next guess, and at the last the Pike.
 
-- **How far a scan read** (`reach`): one past the furthest byte it examined —
-  at least the match's end. Each scan reports its own: a DFA scan (the
-  anchored DFAs have no start-state skip, and a scan consumes the byte that
-  ends it), a one-pass walk (`OnePassWalk::reach`).
+- **`match()`** tries the families of `Plan::match_guesses_` (set by
+  `ladder_plan`), each anchored at 0 (`match_end`): a CodePoint plan's one; a
+  Grapheme plan's ASCII family, then its byte family — the byte family first
+  for a pattern with a CR-LF literal, which the ASCII family cannot match
+  (`ascii_grapheme_ok`), so that on the subjects where it matters the first
+  scan is not thrown away. An ASCII family is not tried on a subject whose
+  first byte is not ASCII: what it read would include that byte.
+- **A CodePoint `search()` / `test()`** (`find_rest`) runs its plan's family
+  (`Plan::us_ladder_`) with `Ladder::kSpec` set, and does not check for a
+  stray byte first. A rung that would leave the family — `Classify`, or the
+  Pike after a DFA gave up — stops the scan instead; the guess is then off,
+  as it is when its answer does not hold, and the Pike answers from the
+  start, with a fresh sink, cursor and budget.
+
+The rules the two share:
+
+- **How far a scan read** (`reach`): one past the furthest byte any of its
+  scans examined — at least the match's end; the whole subject when it found
+  none (a literal prefilter reads to the end without a DFA). Each scan
+  reports its own: an anchored DFA scan (no start-state skip; a scan consumes
+  the byte that ends it) and a one-pass walk (`OnePassWalk::reach`) in
+  `match()`; in a find, where a rung runs many scans, every forward DFA scan
+  raises its DFA's high-water mark (`LazyDfa::hi`, a start-state skip
+  included), zeroed when the guess starts (`FindCache::reach_from_zero`). A
+  CodePoint find needs no walk to report: a walk — the one-pass one, the
+  scalar chain, the suffix's scalar verify — gives up at any non-ASCII byte
+  and the DFA reads on from there, so what it reads past the end holds no
+  stray byte, the one thing a CodePoint subject can fail on.
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:
@@ -684,15 +704,14 @@ whose answer holds for the subject *as far as its scan read* answers
   pure-ASCII subject to the ASCII family, which is faster there, and
   `byte_sound` is whether the byte programs answer for it at all — and only
   the soundness is asked.
-- **Why the Pike may answer when none holds**: it is the reference. And it
-  is no more often the Pike than before: a gate that holds for the whole
+- **Why the Pike may answer when no guess holds**: it is the reference. And
+  it is no more often the Pike than before: a gate that holds for the whole
   subject holds for each of its prefixes, so a subject no guess holds for is
   one no family served before either.
 - **What a wrong guess costs**: its scan, to where it stopped. On a
   non-ASCII subject the ASCII family's anchored DFA dies at the first
   non-ASCII byte (`lazy_inst_matches` matches none), so it is the ASCII run
-  before that — and nothing when that is the first byte, where an ASCII
-  family is not tried at all (what it read would include it).
+  before that.
 
 Measured on `match()` over 4 MB of prose with a match at 0, in both units:
 `\w+`, `(\w+) (\w+)`, `\b\w+\b`, `(\w+)@(\w+)` went from 0.15–1.5 ms to
@@ -1032,8 +1051,7 @@ check the ASCII prefix for a `CR×LF` fusion; from `start`, decode and reject th
 moment two adjacent code points fuse (`gb_fuses`); **SIMD-skip printable-ASCII
 runs** (a printable-ASCII run cannot hold a multi-code-point cluster). Any fusion
 → fall back to the grapheme Pike. (`match()` asks the same of the prefix its
-scan read, not of the whole subject: see §2, "`match()`: the families in
-turn".)
+scan read, not of the whole subject: see §2, "Guessing the family".)
 
 ### CRLF — the cliff, and `crlf_byte_safe`
 
