@@ -6112,33 +6112,25 @@ private:
   //   self-locating — the plan is its own find, needing no cache;
   //   shallow — those, and TextAnchor: ladder_shallow's, needing nothing of
   //     a scan but its cursor;
-  //   before Classify — reading no class of the subject (EndAnchor vets
-  //     what it reads);
+  //   classified — Classify and what follows it (before it, no rung reads
+  //     the subject's class; EndAnchor vets what it reads);
   //   on a family — the family rungs, from FusedPrefix to Bool.
   static constexpr bool rung_self_locates(Rung r) {
     return r < Rung::TextAnchor;
   }
   static constexpr bool rung_shallow(Rung r) { return r <= Rung::TextAnchor; }
-  static constexpr bool rung_before_classify(Rung r) {
-    return r < Rung::Classify;
+  static constexpr bool rung_classified(Rung r) {
+    return r >= Rung::Classify;
   }
   static constexpr bool rung_on_family(Rung r) {
     return r > Rung::Classify && r != Rung::Pike;
   }
-  static_assert(Rung::Literal < Rung::TextAnchor &&
-                    Rung::LiteralAlt < Rung::TextAnchor &&
-                    Rung::AssertAnchor < Rung::TextAnchor &&
+  static_assert(Rung::AssertAnchor < Rung::TextAnchor &&
                     Rung::TextAnchor < Rung::EndAnchor &&
                     Rung::EndAnchor < Rung::Classify &&
                     Rung::Classify < Rung::FusedPrefix &&
-                    Rung::FusedPrefix < Rung::FusedSuffix &&
-                    Rung::FusedSuffix < Rung::IcasePrefix &&
-                    Rung::IcasePrefix < Rung::Suffix &&
-                    Rung::Suffix < Rung::Inner && Rung::Inner < Rung::Walk &&
-                    Rung::Walk < Rung::Chain &&
-                    Rung::Chain < Rung::AssertChain &&
-                    Rung::AssertChain < Rung::Bool && Rung::Bool < Rung::Pike,
-                "the rung groups above are ranges of the declaration");
+                    Rung::Bool < Rung::Pike,
+                "the edges of the rung groups above");
   // What the caller wants of the scan. The rungs and their order are the
   // same; a caller that only asks WHETHER there is a match lets the last
   // rung stop at the first accepting state instead of locating a span
@@ -6164,30 +6156,25 @@ private:
       kAssert = 1 << 0, // the assert family (else the DFA family)
       kByte = 1 << 1,   // the byte programs' DFAs (EGC byte, the byte
                         // assert engine) rather than the grapheme /
-                        // code-point ones. (No assert ladder stands on
-                        // Suffix or Inner, which read it with
-                        // Plan::byte_crlf_collapse_: that one needs dfa_ok_.)
-      kFindOk = 1 << 2, // DFA family: it can locate a span (Want::Test
-                        // admits plans that can only answer the boolean)
-      kWalkByte = 1 << 3, // the walk reads the byte programs' first-byte
+                        // code-point ones (see ladder_byte)
+      kWalkByte = 1 << 2, // the walk reads the byte programs' first-byte
                           // sets (US, EGC byte) rather than the ASCII ones
       // Rungs the family has until they bail GLOBALLY (budget,
       // profitability). Cleared then and not set again by anything that
       // bail leads to: that is the linearity guarantee. A local bail clears
       // nothing.
-      kIpOn = 1 << 4,   // IcasePrefix (a probe applies)
-      kWalkOn = 1 << 5, // Walk
+      kIpOn = 1 << 3,   // IcasePrefix (a probe applies)
+      kWalkOn = 1 << 4, // Walk
       // Rungs the scan has given up, whatever family it lands on next.
-      kSuffixOff = 1 << 6,
-      kInnerOff = 1 << 7,
+      kSuffixOff = 1 << 5,
+      kInnerOff = 1 << 6,
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
-      kSpec = 1 << 8,
-      // The assert family: a boolean takes the find (Plan::assert_bool_finds,
-      // and on the ASCII family Plan::assert_ascii_tier: it has one).
-      kBoolFind = 1 << 9,
+      kSpec = 1 << 7,
+      // The assert family: a boolean takes the find (Plan::assert_bool_finds).
+      kBoolFind = 1 << 8,
     };
-    uint16_t flags = kFindOk;
+    uint16_t flags = 0;
     bool has(Flag f) const { return (flags & f) != 0; }
     void set(Flag f, bool on = true) {
       flags = static_cast<uint16_t>(on ? flags | f : flags & ~f);
@@ -6912,8 +6899,8 @@ private:
     bool dfa_find_ok() const { return dfa_ok_ && rev_prog_.ok(); }
     // ... as the find ladder admits a plan to the family. A boolean needs
     // no span, so it admits a plan whose find the family cannot serve (no
-    // reverse program) and runs it on Rung::Bool alone; Ladder::kFindOk
-    // says which it is.
+    // reverse program) and runs it on Rung::Bool alone (ladder_pick reads
+    // dfa_find_ok to say which it is).
     bool dfa_family_ok(bool boolean) const {
       return boolean ? dfa_ok_ : dfa_find_ok();
     }
@@ -10672,8 +10659,10 @@ private:
     // it reads sixteen positions at a time, where the boolean scan steps
     // every byte (`\b\d+\b` tested over a megabyte of prose it does not
     // match: 1.5 ms stepped, ~0.1 through the find). ASCII only: the walk
-    // has no byte form.
+    // has no byte form. (And the ASCII family has a find at all only with
+    // assert_ascii_tier.)
     bool assert_bool_finds(bool byte) const {
+      if (!byte && !assert_ascii_tier()) return false;
       const bool bounded = !assert_.lit.empty() || assert_.word_suffix ||
                            !assert_.suffix.empty();
       return !text_anchored_ && (bounded || (!byte && word_scan_sparse()));
@@ -15194,7 +15183,8 @@ public:
   REGEXLIB_ALWAYS_INLINE static void ladder_downgrade(Ladder &l) {
     l.rung = l.below = Rung::Pike;
   }
-  // Whether a scan on `l` runs the byte programs' DFAs.
+  // Whether a scan on `l` runs the byte programs' DFAs. (No assert ladder
+  // stands on Suffix or Inner, which read this with byte_crlf_collapse_.)
   static bool ladder_byte(const Ladder &l) { return l.has(Ladder::kByte); }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -17374,10 +17364,9 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
   switch (f) {
   case kFamUsDfa:
   case kFamAscii:
-    l.set(Ladder::kFindOk, p.dfa_find_ok());
     // The one-pass walk drives the find (prefix / inner / position-scan
     // candidates — see cp_onepass_find).
-    l.set(Ladder::kWalkOn, l.has(Ladder::kFindOk) && p.capture_scan_ok());
+    l.set(Ladder::kWalkOn, p.dfa_find_ok() && p.capture_scan_ok());
     l.set(Ladder::kWalkByte, f == kFamUsDfa);
     break;
   case kFamEgcByte:
@@ -17398,11 +17387,11 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     break;
   case kFamAssertAscii:
     l.set(Ladder::kAssert);
-    l.set(Ladder::kBoolFind,
-          p.assert_ascii_tier() && p.assert_bool_finds(false));
+    l.set(Ladder::kBoolFind, p.assert_bool_finds(false));
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
-    l.set(Ladder::kWalkOn, p.assert_ascii_tier() && p.capture_scan_ok());
+    // (A find reaches this family only with assert_ascii_tier.)
+    l.set(Ladder::kWalkOn, p.capture_scan_ok());
     break;
   case kFamAssertByte:
     // Grapheme: the same engine on a subject assert_byte_path_ok admits.
@@ -17589,12 +17578,12 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
   // Suffix is capture-free only. Inner is skipped on the CRLF-collapse byte
   // family: inner_.pre_rev is non-collapsed, so its floor can land
   // mid-CR-LF-cluster where the collapsed forward DFA cannot start.
-  const bool suffix = l.has(Ladder::kFindOk) && !l.has(Ladder::kSuffixOff) &&
+  const bool suffix = p.dfa_find_ok() && !l.has(Ladder::kSuffixOff) &&
                       p.ncap_ == 0 && p.suffix_.active();
   const bool inner =
-      l.has(Ladder::kFindOk) && !l.has(Ladder::kInnerOff) &&
+      p.dfa_find_ok() && !l.has(Ladder::kInnerOff) &&
       p.inner_.active() &&
-      !(p.byte_crlf_collapse_ && l.has(Ladder::kByte));
+      !(p.byte_crlf_collapse_ && ladder_byte(l));
   if (suffix) return Rung::Suffix;
   if (inner && (p.ncap_ == 0 || !rows)) return Rung::Inner;
   // A boolean has no use for the walk or the chain — both locate a span.
@@ -17642,7 +17631,7 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   // read holds that out (guess_held). Else the Pike answers, from the
   // start. (Not on a rung before Classify: EndAnchor reads from the end, and
   // vets what it read.)
-  if (plan_->us_ && !rung_before_classify(l.rung)) {
+  if (plan_->us_ && rung_classified(l.rung)) {
     if (l.rung == Rung::Classify)
       l = ladder_adopt(plan_->us_ladder_[ladder_caller(l)], l);
     l.set(Ladder::kSpec);
@@ -17933,7 +17922,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
     const bool byte = ladder_byte(l);
     LazyDfa &a = scr.cache->dfa(*this, byte, kDfaFwda),
             &rv = scr.cache->dfa(*this, byte, kDfaRev);
-    const bool collapse = l.has(Ladder::kByte) && p.byte_crlf_collapse_;
+    const bool collapse = ladder_byte(l) && p.byte_crlf_collapse_;
     for (;;) {
       int s2 = -1;
       int e2 = suffix_find(a, rv, text, c.pos, s2, budget, collapse,
@@ -18027,7 +18016,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   case Rung::AssertChain:
     for (;;) {
       int nx = assert_chain_step(*scr.cache, text, c.pos,
-                                 l.has(Ladder::kByte), budget, *scr.sc,
+                                 ladder_byte(l), budget, *scr.sc,
                                  *scr.saves, out);
       if (nx == LazyDfa::kCap) {
         ladder_downgrade(l);
