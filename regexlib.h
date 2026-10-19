@@ -12490,8 +12490,7 @@ private:
     // grapheme / code-point program (plan_prefilter_skip) or the byte
     // programs' (byte_prefilter_skip: sound over any UTF-8) — or that one
     // only on a subject long enough to repay it (kBoolSkipBytes: the
-    // CodePoint boolean's). Ordered so that a scan without look skips on the
-    // last three alone.
+    // CodePoint boolean's).
     enum Skip : uint8_t {
       kSkipNone,
       kSkipAssert,
@@ -12500,6 +12499,16 @@ private:
       kSkipByteLong
     };
     Skip skip = kSkipNone;
+    // Whether a scan without look skips from a start state, over a subject
+    // of `n` bytes (kSkipAssert is the look boolean's own: never this). By
+    // the order — spelled out, the test cost a scan 4 instructions more.
+    bool start_skips(int n) const {
+      static_assert(kSkipAssert < kSkipPlan && kSkipPlan < kSkipByte &&
+                        kSkipByte < kSkipByteLong,
+                    "the skips without look come last");
+      return skip > kSkipAssert &&
+             (skip != kSkipByteLong || n >= limits::kBoolSkipBytes);
+    }
     bool quit = false;    // gave up (see above): every miss answers kQuit.
                           // What is cached still answers, so a scan that
                           // stays on built transitions is still a DFA scan.
@@ -14421,9 +14430,8 @@ private:
   // accepts, and the text's end takes a step of its own. A look scan does not
   // skip. With `AtStart` (the boolean's, over a DFA that skips to the
   // assert prefix: LazyDfa::kSkipAssert) it stops in a start state instead,
-  // and answers
-  // LazyDfa::kAtStart with `reach_out` where — look_forward_skip goes on
-  // from there; a find puts its literals in front of the scan
+  // and answers LazyDfa::kAtStart with `reach_out` where — look_forward_skip
+  // goes on from there; a find puts its literals in front of the scan
   // (assert_find_span).
   template <bool First, bool Look = false, bool AtStart = false>
   int dfa_forward_lf_scan(LazyDfa &d, std::string_view text, int from,
@@ -14447,11 +14455,7 @@ private:
     // ... and the one that only interrupts the stepping: in the pure-prefix
     // start state, jump to the next position the pattern can begin at (the
     // prefix would otherwise consume the dead bytes one by one).
-    const bool skips =
-        Look ? AtStart
-             : d.skip > LazyDfa::kSkipAssert &&
-                   (d.skip != LazyDfa::kSkipByteLong ||
-                    n >= limits::kBoolSkipBytes);
+    const bool skips = Look ? AtStart : d.start_skips(n);
     const uint32_t stops = ends | (skips ? LazyDfa::kStart : 0);
     int i = from;
     int mark = from; // stepped bytes are reported to `d` from here on
@@ -14876,19 +14880,16 @@ public:
       std::optional<LazyDfa> &d = set(byte)[role];
       d.emplace(re, *prog, mpc, /*reseed=*/role == kDfaBool,
                 /*leftmost_first=*/role == kDfaFwd || role == kDfaFwda);
-      using S = LazyDfa::Skip;
-      if (!unanchored)
-        d->skip = S::kSkipNone;
-      else if (!p.dfa_ok_)
-        d->skip = role == kDfaBool && p.assert_prefix_skips() ? S::kSkipAssert
-                                                              : S::kSkipNone;
-      else if (!byte && !p.us_)
-        d->skip = p.start_skip_ != Plan::StartSkip::None ? S::kSkipPlan
-                                                         : S::kSkipNone;
-      else if (!p.byte_skips())
-        d->skip = S::kSkipNone;
-      else
+      using S = LazyDfa::Skip; // (kSkipNone unless set here)
+      if (!unanchored) {
+      } else if (d->look) {
+        if (role == kDfaBool && p.assert_prefix_skips())
+          d->skip = S::kSkipAssert;
+      } else if (!byte && !p.us_) {
+        if (p.start_skip_ != Plan::StartSkip::None) d->skip = S::kSkipPlan;
+      } else if (p.byte_skips()) {
         d->skip = byte || role == kDfaFwd ? S::kSkipByte : S::kSkipByteLong;
+      }
       d->reverse = role == kDfaRev;
       return built(d);
     }

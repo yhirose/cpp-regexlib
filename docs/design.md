@@ -612,7 +612,8 @@ and no further — a pre-part still alive there would be walked back to its
 start and then forward again, where the scan walks it once. (The boolean DFA
 of CodePoint mode had no start-state skip at all: `zqj` as a boolean over
 595 KB ran at 0.67 GB/s where the find did 89. It has the byte program's
-now, switched on per scan for a subject long enough to repay it.) And the
+now, taken only on a subject long enough to repay it:
+`LazyDfa::kSkipByteLong`.) And the
 match is handed to a *sink* (`RowSink`: a columnar row; `ResultSink`: the one `MatchResult`,
 built in place; `NoSink`: nothing), so no entry point pays for another's
 form: `search()` building its result out of a row it had just written cost it

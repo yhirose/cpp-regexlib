@@ -159,10 +159,8 @@ struct PlanProbe {
     using L = Regex::LazyDfa;
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
-      if (*dfas[k] && (*dfas[k])->skip == L::kSkipAssert) {
-        was[k] = true;
+      if ((was[k] = *dfas[k] && (*dfas[k])->skip == L::kSkipAssert))
         (*dfas[k])->skip = L::kSkipNone;
-      }
     const bool r = re.test(s);
     for (int k = 0; k < 2; k++)
       if (was[k]) (*dfas[k])->skip = L::kSkipAssert;
