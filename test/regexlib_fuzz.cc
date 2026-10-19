@@ -154,7 +154,9 @@ struct PlanProbe {
   static bool test_unskipped(const Regex &re, std::string_view s) {
     (void)re.test(s); // builds the DFA the boolean steps for this subject
     Regex::FindCache &c = re.thread_cache();
-    std::optional<Regex::LazyDfa> *const dfas[] = {&c.fu_, &c.bfu_};
+    std::optional<Regex::LazyDfa> *const dfas[] = {
+        &c.dfas_[0][Regex::FindCache::kBool],
+        &c.dfas_[1][Regex::FindCache::kBool]};
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
       if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);

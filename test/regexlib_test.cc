@@ -95,14 +95,17 @@ struct PlanProbe {
   // gives up, and a boolean never does (its scan is the re-seeding one).
   static bool lf_dfa_built(const Regex &re) {
     const Regex::FindCache &c = re.thread_cache();
-    return c.lfu_ || c.blfu_;
+    return c.dfas_[0][Regex::FindCache::kFwd] ||
+           c.dfas_[1][Regex::FindCache::kFwd];
   }
   // What test() answers with that skip off (LazyDfa::look_pf) — every byte
   // stepped, as before there was one — on this thread's cache of `re`.
   static bool test_unskipped(const Regex &re, std::string_view s) {
     (void)re.test(s); // builds the DFA the boolean steps for this subject
     Regex::FindCache &c = re.thread_cache();
-    std::optional<Regex::LazyDfa> *const dfas[] = {&c.fu_, &c.bfu_};
+    std::optional<Regex::LazyDfa> *const dfas[] = {
+        &c.dfas_[0][Regex::FindCache::kBool],
+        &c.dfas_[1][Regex::FindCache::kBool]};
     bool was[2] = {};
     for (int k = 0; k < 2; k++)
       if (*dfas[k]) was[k] = std::exchange((*dfas[k])->look_pf, false);
@@ -237,12 +240,10 @@ struct PlanProbe {
   }
   // `f(dfa, reverse)` for each lazy DFA a cache has built.
   template <class F> static void each_lazy(const Regex::FindCache &c, F f) {
-    const std::pair<const std::optional<Regex::LazyDfa> *, bool> all[] = {
-        {&c.fu_, false},  {&c.rv_, true},    {&c.lfu_, false},
-        {&c.lfa_, false}, {&c.bfu_, false},  {&c.brv_, true},
-        {&c.blfu_, false}, {&c.blfa_, false}, {&c.inrev_, true}};
-    for (const auto &[d, reverse] : all)
-      if (*d) f(**d, reverse);
+    for (const auto &set : c.dfas_)
+      for (int r = 0; r < Regex::FindCache::kRoles; r++)
+        if (set[r]) f(*set[r], r == Regex::FindCache::kRev);
+    if (c.inrev_) f(*c.inrev_, true);
   }
   // The lazy DFAs of a cache, built small: `bytes` of cache each, and
   // `min_clears` refills before a fill has to have paid for itself (see
@@ -360,7 +361,9 @@ struct PlanProbe {
   }
   // The calling thread's unanchored forward DFA of `re`, given up: the
   // boolean's (Rung::Bool) on the DFA family.
-  static void quit_fu(const Regex &re) { re.thread_cache().fu(re).quit = true; }
+  static void quit_fu(const Regex &re) {
+    re.thread_cache().dfa(re, false, Regex::FindCache::kBool).quit = true;
+  }
   // Whether `f` — calls of `re` that draw on this thread's cache — ran the
   // Pike: it prepares the cache's scratch, which is emptied first.
   template <class F> static bool pike_ran(const Regex &re, F f) {

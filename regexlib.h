@@ -7045,12 +7045,12 @@ private:
               /*us=*/false, /*reverse=*/false, dotall_, /*cp=*/false,
               /*icase=*/icase_);
         }
-        // UnicodeScalar mode: the byte-path prefilter machinery (analyze_byte_*,
-        // byte_prog_) lives under the !us_ branch below, so the US lfu would scan
-        // the byte DFA byte-by-byte with no literal/first-byte skip. Build the
-        // byte-level prefilter here from prog_ (itself a byte automaton in US
-        // mode); the US lfu wires byte_pf from byte_start_skip_. EGC builds it
-        // from byte_prog_ in the !us_ block.
+        // UnicodeScalar mode: the byte-path prefilter machinery
+        // (analyze_byte_*, byte_prog_) lives under the !us_ branch below, so
+        // the US kFwd DFA would scan byte by byte with no literal / first-byte
+        // skip. Build the byte-level prefilter here from prog_ (itself a byte
+        // automaton in US mode); the US kFwd DFA wires byte_pf from
+        // byte_start_skip_. EGC builds it from byte_prog_ in the !us_ block.
         if (us_) analyze_byte_prefilter(prog_);
       }
     }
@@ -7131,7 +7131,8 @@ private:
       // had NO usable prefilter and scanned the whole subject with the DFA
       // (~84 MB/s vs the EGC tier's ~1600). Compute them here from `root`; the
       // rare trailing/interior literal then drives a memmem-skip + reverse-DFA
-      // verify (suffix_find / inner_find) over US's own DFAs (lfa/rv/lfu/inrev).
+      // verify (suffix_find / inner_find) over US's own DFAs (kFwda / kRev /
+      // kFwd, and inrev).
       // Soundness is simpler than EGC: US matches code points, ASCII/UTF-8
       // literals memmem only at code-point boundaries (UTF-8 self-delimiting), and
       // there is no grapheme cluster to gate on — so the prefilter applies to ANY
@@ -10505,7 +10506,7 @@ private:
     // Case-insensitive literal-prefix byte prefilter (non-ASCII subjects). Forward
     // mirror of the suffix prefilter: scan for a rare folded-prefix char (a byte
     // memchr2 over its two ASCII cases), then verify each candidate start with the
-    // anchored byte DFA (blfa, over byte_prog_ with the full fold baked in).
+    // anchored byte DFA (kFwda, over byte_prog_ with the full fold baked in).
     //
     // A probe char is "clean" when its only case-fold pre-images are ASCII (its own
     // upper/lower case), so its ASCII bytes catch every occurrence on any UTF-8
@@ -12013,7 +12014,9 @@ private:
     // Fast path: the assertions are flag-anchors around the literal, so each
     // memmem hit is verified by two empty_flags() reads (no DFA). Otherwise
     // fetch the anchored assert DFA once for the candidate loop.
-    LazyDfa *d = plan_->assert_.anchor_ok ? nullptr : &dfa_fwda(fc, byte);
+    LazyDfa *d = plan_->assert_.anchor_ok
+                     ? nullptr
+                     : &fc.dfa(*this, byte, FindCache::kFwda);
     int scan = from;
     while (scan <= n) {
       const unsigned char *h =
@@ -12057,7 +12060,7 @@ private:
         reinterpret_cast<const unsigned char *>(plan_->assert_.prefix.data());
     int n = static_cast<int>(text.size());
     int m = static_cast<int>(plan_->assert_.prefix.size());
-    LazyDfa &d = dfa_fwda(fc, byte);
+    LazyDfa &d = fc.dfa(*this, byte, FindCache::kFwda);
     int scan = from;
     while (scan + m <= n) {
       const unsigned char *h =
@@ -12173,7 +12176,8 @@ private:
         reinterpret_cast<const unsigned char *>(plan_->assert_.suffix.data());
     int n = static_cast<int>(text.size());
     int m = static_cast<int>(plan_->assert_.suffix.size());
-    LazyDfa &rv = dfa_rev(fc, byte), &fwda = dfa_fwda(fc, byte);
+    LazyDfa &rv = fc.dfa(*this, byte, FindCache::kRev),
+            &fwda = fc.dfa(*this, byte, FindCache::kFwda);
     int scan = from;
     while (scan + m <= n) {
       // Cheap `\b` reject: a word byte right after a word-ending literal fails
@@ -12244,7 +12248,8 @@ private:
       int e0 = 0;
       const int r = anchored_onepass_try(text, e0);
       if (r == 0) return 0;
-      if (r < 0) e0 = look_forward_lf(dfa_fwda(fc, byte), text, 0);
+      if (r < 0)
+        e0 = look_forward_lf(fc.dfa(*this, byte, FindCache::kFwda), text, 0);
       if (e0 < 0) return none(e0);
       s = 0;
       e = e0;
@@ -12277,16 +12282,19 @@ private:
       if (r != kWalkBail) return r > 0;
     }
     if (!span) {
-      const int e0 = look_forward_first(dfa_bool(fc, byte), text);
+      const int e0 =
+          look_forward_first(fc.dfa(*this, byte, FindCache::kBool), text);
       if (e0 < 0) return none(e0);
       s = e = e0;
       return 1;
     }
     // Leftmost-first end from the ordered+cut forward DFA; the boolean
     // reverse scan recovers the leftmost start.
-    const int e0 = look_forward_lf(dfa_fwd(fc, byte), text, from);
+    const int e0 =
+        look_forward_lf(fc.dfa(*this, byte, FindCache::kFwd), text, from);
     if (e0 < 0) return none(e0);
-    s = look_reverse(dfa_rev(fc, byte), text, e0, /*floor=*/from);
+    s = look_reverse(fc.dfa(*this, byte, FindCache::kRev), text, e0,
+                     /*floor=*/from);
     if (s < 0) return none(s); // (-1: not of an end a real match gave)
     e = e0;
     return 1;
@@ -14737,26 +14745,24 @@ public:
   // Hyperscan scratch): used by a single thread, and destroyed before the
   // Regex it was bound to (its DFAs point at that Regex/program).
   class FindCache {
-    // DFA slot naming grammar — each name is built from these pieces:
-    //   b...   over the UTF-8 BYTE programs (byte_prog_ family); no prefix =
-    //          the grapheme/ASCII programs (prog_ family)
-    //   ...lf...  LEFTMOST-FIRST (ordered+cut states); no `lf` = boolean set
-    //   ...u | ...a  Unanchored (search; over the `(?s:.)*?`-prefixed program
-    //          or re-seeding) | Anchored (match(); over the bare program)
-    //   rv / brv   the REVERSE program's DFA (recovers a match start)
-    //   inrev      reverse DFA of the ReverseInner prefilter's pre part
-    // So: lfu = leftmost-first unanchored, blfa = byte leftmost-first
-    // anchored. An assert plan's DFAs are these: its programs carry the
-    // assertions, and a DFA over one steps with look (see LazyDfa).
+    // The DFAs, by program set and role: dfas_[byte][role], `byte` the UTF-8
+    // byte programs (byte_prog_ family) over the grapheme / code-point ones
+    // (prog_ family). An assert plan's DFAs are these too: its programs carry
+    // the assertions, and a DFA over one steps with look (see LazyDfa).
+    // (Engine parameters keep the old short names: fu / lfu / lfa / rv, with
+    // a leading b over the byte programs.)
+    enum Role : int {
+      kBool, // re-seeding, stops at the first accept (test())
+      kFwd,  // unanchored leftmost-first, over the `(?s:.)*?`-led program
+      kFwda, // anchored leftmost-first (match(), verifying a candidate)
+      kRev,  // the reverse program's (recovers a match start)
+      kRoles
+    };
     const Regex *owner_ = nullptr;
     uint64_t owner_gen_ = 0;           // identity guard against address reuse
     int pins_ = 0; // scans holding this entry of the thread's map across
                    // calls (Finder::Pin): eviction leaves it alone
-    std::optional<LazyDfa> fu_, rv_;   // fu: test() reseed scan; rv: lf start
-    std::optional<LazyDfa> lfu_, lfa_; // leftmost-first DFA (ordered+cut)
-    std::optional<LazyDfa> bfu_, brv_; // EGC byte path (over byte_prog_)
-    std::optional<LazyDfa> blfu_,
-        blfa_; // leftmost-first byte DFA (unanchored/anchored)
+    std::optional<LazyDfa> dfas_[2][kRoles];
     std::optional<LazyDfa> inrev_; // ReverseInner: reverse(pre) DFA
     Scratch sc_;                   // reused Pike / backtracker buffers
     // What this cache's DFAs are built with (see LazyDfa). The library never
@@ -14773,28 +14779,20 @@ public:
     // the furthest — over the forward DFAs of one program set, the byte
     // programs' (`byte`) or the others: a family's rungs run those alone
     // (Regex::ladder_byte). (The reverse DFAs read within what a forward one
-    // did. Spelled out, one branch on `byte`: through a callback the read
-    // was a call that kept its maximum in memory.)
+    // did. Spelled out: as a loop, the two cost a short test() 19
+    // instructions more.)
     void reach_from_zero(bool byte) {
-      if (byte)
-        zero_hi(bfu_, blfu_, blfa_);
-      else
-        zero_hi(fu_, lfu_, lfa_);
+      std::optional<LazyDfa> *d = byte ? dfas_[1] : dfas_[0];
+      if (d[kBool]) d[kBool]->hi = 0;
+      if (d[kFwd]) d[kFwd]->hi = 0;
+      if (d[kFwda]) d[kFwda]->hi = 0;
     }
     int reach(bool byte) const {
-      return byte ? hi_of(bfu_, blfu_, blfa_) : hi_of(fu_, lfu_, lfa_);
-    }
-    using Dfa = std::optional<LazyDfa>;
-    static void zero_hi(Dfa &a, Dfa &b, Dfa &c) {
-      if (a) a->hi = 0;
-      if (b) b->hi = 0;
-      if (c) c->hi = 0;
-    }
-    static int hi_of(const Dfa &a, const Dfa &b, const Dfa &c) {
-      int r = a ? a->hi : 0;
-      if (b && b->hi > r) r = b->hi;
-      if (c && c->hi > r) r = c->hi;
-      return r;
+      const std::optional<LazyDfa> *d = byte ? dfas_[1] : dfas_[0];
+      int hi = d[kBool] ? d[kBool]->hi : 0;
+      if (d[kFwd] && d[kFwd]->hi > hi) hi = d[kFwd]->hi;
+      if (d[kFwda] && d[kFwda]->hi > hi) hi = d[kFwda]->hi;
+      return hi;
     }
     LazyDfa &built(std::optional<LazyDfa> &d) {
       d->budget = dfa_bytes_;
@@ -14814,122 +14812,77 @@ public:
     REGEXLIB_NOINLINE void rebind(const Regex &re) {
       owner_ = &re;
       owner_gen_ = re.cache_gen_;
-      fu_.reset();
-      rv_.reset();
-      lfu_.reset();
-      lfa_.reset();
-      bfu_.reset();
-      brv_.reset();
-      blfu_.reset();
-      blfa_.reset();
+      for (auto &set : dfas_)
+        for (std::optional<LazyDfa> &d : set) d.reset();
       inrev_.reset();
       dfa_bytes_ = limits::kDfaCacheBytes;
       dfa_min_clears_ = limits::kDfaMinClears;
     }
 
-    // The boolean reseed DFA (test()). Its start-state skip follows lfu's
-    // rule below: the grapheme program's in Grapheme mode, the byte
-    // program's in CodePoint mode — where it had none, and a boolean over a
-    // literal-led pattern stepped the DFA through every byte the find's
-    // memmem jumps (`zqj`, before a CodePoint literal had the literal tier,
-    // over 595 KB of prose: 0.67 GB/s, the find 89).
-    // The CodePoint switch (byte_pf) is thrown per scan, by Rung::Bool.
-    // The DFAs a short search() or test() reaches build out of line, so that
-    // the accessor inlines: inlined, the construction took it past the size
-    // GCC inlines into those at. (lfa and blfa, match()'s, measured either
-    // way between compilers.)
-    LazyDfa &fu(const Regex &re) { return fu_ ? *fu_ : make_fu(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_fu(const Regex &re) {
-      fu_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/true,
-                  /*pf=*/!re.plan_->us_);
-      return built(fu_);
+    // The DFA of `role` over the byte programs (`byte`) or the others, built
+    // on first use. (Indexed by a branch on `byte`, not by `byte` itself:
+    // GCC then kept the CodePoint test() some 20 instructions shorter.)
+    REGEXLIB_ALWAYS_INLINE LazyDfa &dfa(const Regex &re, bool byte,
+                                        Role role) {
+      std::optional<LazyDfa> &d = byte ? dfas_[1][role] : dfas_[0][role];
+      return d ? *d : make(re, byte, role);
     }
-
-    LazyDfa &rv(const Regex &re) { return rv_ ? *rv_ : make_rv(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_rv(const Regex &re) {
-      rv_.emplace(re, re.plan_->rev_prog_.prog,
-                  re.plan_->rev_prog_.match_pc(), /*reseed=*/false);
-      rv_->reverse = true;
-      return built(rv_);
-    }
-
-    // Leftmost-first forward DFAs (ordered states + match cut). Unanchored
-    // search (lfu) runs over lf_prog_ = `(?s:.)*?` + pattern with NO re-seed:
-    // the lazy prefix expresses unanchoredness and the match cut removes it
-    // once a match is live, so leftmost-first priority across start positions
-    // is preserved. Anchored match() (lfa) runs the bare pattern from position
-    // 0, prefilter off.
-    LazyDfa &lfu(const Regex &re) { return lfu_ ? *lfu_ : make_lfu(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_lfu(const Regex &re) {
-      // EGC: lf_prog_ is the code-point/grapheme program — the ASCII first-
-      // byte / prefix_.text memmem skip (use_prefilter) applies. US: lf_prog_ is a
-      // byte automaton — use the byte-level prefilter (byte_pf, byte_prefix_.text /
-      // byte first-byte set) instead, mirroring blfu. The two are exclusive:
-      // use_prefilter reads prefix_.text (empty in US), byte_pf reads byte_prefix_.text.
-      lfu_.emplace(re, re.plan_->lf_prog_.prog,
-                   re.plan_->lf_prog_.match_pc(),
-                   /*reseed=*/false, /*pf=*/!re.plan_->us_,
-                   /*leftmost_first=*/true);
-      if (re.plan_->us_) lfu_->byte_pf = re.plan_->byte_skips();
-      return built(lfu_);
-    }
-
-    LazyDfa &lfa(const Regex &re) {
-      if (!lfa_) {
-        lfa_.emplace(re, re.plan_->prog_, re.plan_->match_pc(), /*reseed=*/false, /*pf=*/false,
-                     /*leftmost_first=*/true);
-        built(lfa_);
+    // Built out of line, so that dfa() inlines into the short calls.
+    //   kBool  re-seeding. Its start-state skip: the grapheme program's
+    //          (use_prefilter) in Grapheme mode; over the byte programs the
+    //          byte one (byte_pf) — in CodePoint mode a switch Rung::Bool
+    //          throws per scan, by the subject's length.
+    //   kFwd   over lf_prog_ = `(?s:.)*?` + pattern, no re-seed: the lazy
+    //          prefix makes it unanchored and the match cut removes it once
+    //          a match is live, so leftmost-first priority across starts
+    //          holds. Its skip as kBool's, but the CodePoint one always on.
+    //   kFwda  the bare program from the scan's start, no skip.
+    //   kRev   the reverse program.
+    // Over the byte programs no skip reads the grapheme program's (ASCII-
+    // only) first bytes, which would pass over non-ASCII starts.
+    REGEXLIB_NOINLINE LazyDfa &make(const Regex &re, bool byte, Role role) {
+      const Plan &p = *re.plan_;
+      std::optional<LazyDfa> &d = byte ? dfas_[1][role] : dfas_[0][role];
+      switch (role) {
+      case kBool:
+        if (byte) {
+          d.emplace(re, p.byte_prog_.prog, p.byte_prog_.match_pc(),
+                    /*reseed=*/true, /*pf=*/false);
+          d->byte_pf = p.byte_skips();
+        } else {
+          d.emplace(re, p.prog_, p.match_pc(), /*reseed=*/true,
+                    /*pf=*/!p.us_);
+        }
+        break;
+      case kFwd: {
+        const Plan::Compiled &c = byte ? p.byte_lf_prog_ : p.lf_prog_;
+        d.emplace(re, c.prog, c.match_pc(), /*reseed=*/false,
+                  /*pf=*/!byte && !p.us_, /*leftmost_first=*/true);
+        d->byte_pf = (byte || p.us_) && p.byte_skips();
+        break;
       }
-      return *lfa_;
-    }
-
-    // EGC byte-path DFAs: over the UTF-8 byte programs, prefilter off (the
-    // grapheme program's ASCII-only first_bytes_.set would skip non-ASCII starts).
-    LazyDfa &bfu(const Regex &re) { return bfu_ ? *bfu_ : make_bfu(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_bfu(const Regex &re) {
-      bfu_.emplace(re, re.plan_->byte_prog_.prog,
-                   re.plan_->byte_prog_.match_pc(), /*reseed=*/true,
-                   /*pf=*/false);
-      bfu_->byte_pf = re.plan_->byte_skips(); // sound byte-level dead-skip
-      return built(bfu_);
-    }
-
-    LazyDfa &brv(const Regex &re) { return brv_ ? *brv_ : make_brv(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_brv(const Regex &re) {
-      brv_.emplace(re, re.plan_->byte_rev_prog_.prog,
-                   re.plan_->byte_rev_prog_.match_pc(), /*reseed=*/false,
-                   /*pf=*/false);
-      brv_->reverse = true;
-      return built(brv_);
-    }
-
-    // Leftmost-first byte forward DFA over byte_lf_prog_ (`(?s:.)*?`+pattern);
-    // the byte-program prefilter (byte_pf) preserves the literal byte path's
-    // memmem skip.
-    LazyDfa &blfu(const Regex &re) { return blfu_ ? *blfu_ : make_blfu(re); }
-    REGEXLIB_NOINLINE LazyDfa &make_blfu(const Regex &re) {
-      blfu_.emplace(re, re.plan_->byte_lf_prog_.prog,
-                    re.plan_->byte_lf_prog_.match_pc(), /*reseed=*/false,
+      case kFwda:
+        if (byte)
+          d.emplace(re, p.byte_prog_.prog, p.byte_prog_.match_pc(),
+                    /*reseed=*/false, /*pf=*/false, /*leftmost_first=*/true);
+        else
+          d.emplace(re, p.prog_, p.match_pc(), /*reseed=*/false,
                     /*pf=*/false, /*leftmost_first=*/true);
-      blfu_->byte_pf = re.plan_->byte_skips();
-      return built(blfu_);
-    }
-
-    // Anchored leftmost-first byte DFA over byte_prog_ (no prefix), for
-    // match().
-    LazyDfa &blfa(const Regex &re) {
-      if (!blfa_) {
-        blfa_.emplace(re, re.plan_->byte_prog_.prog,
-                      re.plan_->byte_prog_.match_pc(), /*reseed=*/false,
-                      /*pf=*/false, /*leftmost_first=*/true);
-        built(blfa_);
+        break;
+      default: { // kRev
+        const Plan::Compiled &c = byte ? p.byte_rev_prog_ : p.rev_prog_;
+        d.emplace(re, c.prog, c.match_pc(), /*reseed=*/false,
+                  /*pf=*/!byte);
+        d->reverse = true;
+        break;
       }
-      return *blfa_;
+      }
+      return built(d);
     }
 
-    // ReverseInner: reverse byte DFA over the pre-literal part — recovers the
-    // floor start from a literal hit (like brv). The end / exact start then come
-    // from the existing full forward (blfu/lfu) and reverse (brv/rv) DFAs.
+    // ReverseInner: reverse DFA over the pre-literal part — recovers the
+    // floor start from a literal hit (like kRev). The end / exact start then
+    // come from the family's kFwd / kFwda and kRev DFAs.
     LazyDfa &inrev(const Regex &re) {
       if (!inrev_) {
         inrev_.emplace(re, re.plan_->inner_.pre_rev.prog,
@@ -15193,36 +15146,10 @@ public:
   REGEXLIB_ALWAYS_INLINE static void ladder_downgrade(Ladder &l) {
     l.rung = l.below = Rung::Pike;
   }
-  // The DFAs of a scan, by role: unanchored leftmost-first; anchored
-  // (verifies a candidate from its start); reverse (recovers the start).
-  // `byte`: over the UTF-8 byte programs, not the grapheme ones.
-  LazyDfa &dfa_fwd(FindCache &fc, bool byte) const {
-    return byte ? fc.blfu(*this) : fc.lfu(*this);
-  }
-  LazyDfa &dfa_fwda(FindCache &fc, bool byte) const {
-    return byte ? fc.blfa(*this) : fc.lfa(*this);
-  }
-  LazyDfa &dfa_rev(FindCache &fc, bool byte) const {
-    return byte ? fc.brv(*this) : fc.rv(*this);
-  }
-  // ... and the boolean's: re-seeding, stopping at the first accept.
-  LazyDfa &dfa_bool(FindCache &fc, bool byte) const {
-    return byte ? fc.bfu(*this) : fc.fu(*this);
-  }
   // Whether a scan on `l` runs the byte programs' DFAs: the DFA family's
   // byte ones, or the assert family's.
   static bool ladder_byte(const Ladder &l) {
     return (l.flags & (Ladder::kByteDfas | Ladder::kAssertByte)) != 0;
-  }
-  // ... of a DFA-family scan on the ladder `l`.
-  LazyDfa &ladder_fwd(FindCache &fc, const Ladder &l) const {
-    return dfa_fwd(fc, ladder_byte(l));
-  }
-  LazyDfa &ladder_fwda(FindCache &fc, const Ladder &l) const {
-    return dfa_fwda(fc, ladder_byte(l));
-  }
-  LazyDfa &ladder_rev(FindCache &fc, const Ladder &l) const {
-    return dfa_rev(fc, ladder_byte(l));
   }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -16834,7 +16761,8 @@ private:
     if (from > n) return -1;
     int low = n;
     const int s =
-        look_reverse<!Out::kGroups>(fc.brv(*this), text, n, from, &low);
+        look_reverse<!Out::kGroups>(fc.dfa(*this, true, FindCache::kRev), text,
+                                    n, from, &low);
     // What the scan read: from `low` (inside a code point, where a bytewise
     // scan stopped), and the code point before when it reached its floor.
     size_t q = static_cast<size_t>(low == from && low > 0 ? low - 1 : low);
@@ -16951,17 +16879,21 @@ private:
     const Plan &p = *plan_;
     switch (f) {
     // [Tier: Dfa/US | Dfa/EgcByte] the leftmost-first byte DFA.
-    case kFamUsDfa: return dfa_forward_lf(cache.lfa(*this), text, 0, &reach);
+    case kFamUsDfa:
+      return dfa_forward_lf(cache.dfa(*this, false, FindCache::kFwda), text, 0,
+                            &reach);
     case kFamEgcByte:
     case kFamEgcByteIp:
-      return dfa_forward_lf(cache.blfa(*this), text, 0, &reach);
+      return dfa_forward_lf(cache.dfa(*this, true, FindCache::kFwda), text, 0,
+                            &reach);
     // [Tier: Dfa/Ascii] the ordered+cut DFA over the grapheme program.
     case kFamAscii:
       if (p.ncap_ > 0 && p.onepass_unbounded_) {
         const int e = match_walk(text, sc, reach, walked);
         if (e != kWalkLocal) return e;
       }
-      return dfa_forward_lf(cache.lfa(*this), text, 0, &reach);
+      return dfa_forward_lf(cache.dfa(*this, false, FindCache::kFwda), text, 0,
+                            &reach);
     // [Tier: Assert/Ascii | Assert/Byte] the anchored lf assert DFA over the
     // grapheme programs, or over the byte ones (either unit) — after, for
     // `^body$` with captures, [Tier: AnchoredOnePass+cap]: the walk from the
@@ -16974,7 +16906,8 @@ private:
         const int e = match_walk(text, sc, reach, walked);
         if (e != kWalkLocal) return e;
       }
-      return look_forward_lf(dfa_fwda(cache, byte), text, 0, &reach);
+      return look_forward_lf(cache.dfa(*this, byte, FindCache::kFwda), text, 0,
+                             &reach);
     }
     }
   }
@@ -17855,7 +17788,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // whose failure was vetted, and a match starts at a candidate. (The
   // inputs that pin the failed side are in test_find_ladder.)
   case Rung::FusedPrefix: {
-    LazyDfa &blfa = scr.cache->blfa(*this);
+    LazyDfa &blfa = scr.cache->dfa(*this, true, FindCache::kFwda);
     for (;;) {
       bool bad = false;
       int s2 = egc_literal_fused_find(text, c.pos, p.byte_prefix_.text,
@@ -17899,7 +17832,8 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // (A DFA that really gave up re-primes too; the unfused family then meets
   // the same answer and downgrades.)
   case Rung::FusedSuffix: {
-    LazyDfa &blfa = scr.cache->blfa(*this), &brv = scr.cache->brv(*this);
+    LazyDfa &blfa = scr.cache->dfa(*this, true, FindCache::kFwda),
+            &brv = scr.cache->dfa(*this, true, FindCache::kRev);
     const bool collapse = p.fused_ == Plan::Fused::Collapse;
     for (;;) {
       int s2 = -1;
@@ -17931,7 +17865,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // verify, instead of the forward-DFA + reverse scan. Same leftmost-first
   // matches.
   case Rung::IcasePrefix: {
-    LazyDfa &blfa = scr.cache->blfa(*this);
+    LazyDfa &blfa = scr.cache->dfa(*this, true, FindCache::kFwda);
     for (;;) {
       int s2 = -1;
       int e2 = icase_prefix_find(blfa, text, c.pos, d.probe, s2, budget,
@@ -17957,8 +17891,9 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // leftmost-first matches; the variable-length case re-expands forward from
   // the start with the ANCHORED forward DFA.
   case Rung::Suffix: {
-    LazyDfa &a = ladder_fwda(*scr.cache, l),
-            &rv = ladder_rev(*scr.cache, l);
+    const bool byte = ladder_byte(l);
+    LazyDfa &a = scr.cache->dfa(*this, byte, FindCache::kFwda),
+            &rv = scr.cache->dfa(*this, byte, FindCache::kRev);
     const bool collapse = l.has(Ladder::kByteDfas) && p.byte_crlf_collapse_;
     for (;;) {
       int s2 = -1;
@@ -17983,9 +17918,10 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // ReverseInner prefilter: memmem the interior literal -> reverse(pre)
   // floor + the family's full forward / reverse DFAs.
   case Rung::Inner: {
-    LazyDfa &f = ladder_fwd(*scr.cache, l),
-            &a = ladder_fwda(*scr.cache, l),
-            &rv = ladder_rev(*scr.cache, l),
+    const bool byte = ladder_byte(l);
+    LazyDfa &f = scr.cache->dfa(*this, byte, FindCache::kFwd),
+            &a = scr.cache->dfa(*this, byte, FindCache::kFwda),
+            &rv = scr.cache->dfa(*this, byte, FindCache::kRev),
             &inrev = scr.cache->inrev(*this);
     for (;;) {
       int s2 = -1;
@@ -18012,8 +17948,9 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   }
   // One match from the located-span chain. A DFA that gives up downgrades.
   case Rung::Chain: {
-    LazyDfa &f = ladder_fwd(*scr.cache, l),
-            &rv = ladder_rev(*scr.cache, l);
+    const bool byte = ladder_byte(l);
+    LazyDfa &f = scr.cache->dfa(*this, byte, FindCache::kFwd),
+            &rv = scr.cache->dfa(*this, byte, FindCache::kRev);
     for (;;) {
       int nx = dfa_chain_step(text, c.pos, f, rv, *scr.sc, *scr.saves, out);
       if (nx == LazyDfa::kCap) {
@@ -18077,16 +18014,18 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       // would go on to the end of the subject (as assert_find_span). Else the
       // re-seeding scan, which skips to the assert prefix when the plan has
       // one (LazyDfa::look_pf).
-      e2 = look_forward_first(p.text_anchored_ ? dfa_fwda(*scr.cache, byte)
-                                               : dfa_bool(*scr.cache, byte),
-                              text);
+      e2 = look_forward_first(
+          scr.cache->dfa(*this, byte,
+                         p.text_anchored_ ? FindCache::kFwda
+                                          : FindCache::kBool),
+          text);
     } else {
-      LazyDfa &dfa = dfa_bool(*scr.cache, byte);
+      LazyDfa &b = scr.cache->dfa(*this, byte, FindCache::kBool);
       // CodePoint: the start-state skip is a scan-time switch, on for a
-      // subject long enough to repay it (see kBoolSkipBytes, and fu()).
-      if (p.us_)
-        dfa.byte_pf = p.byte_skips() && n >= limits::kBoolSkipBytes;
-      e2 = dfa_forward_scan(dfa, text, 0);
+      // subject long enough to repay it (see kBoolSkipBytes, and
+      // FindCache::make).
+      if (p.us_) b.byte_pf = p.byte_skips() && n >= limits::kBoolSkipBytes;
+      e2 = dfa_forward_scan(b, text, 0);
     }
     if (e2 == LazyDfa::kCap) {
       // The DFA gave up: a regular pattern can still need exponentially
