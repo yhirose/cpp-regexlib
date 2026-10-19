@@ -709,7 +709,11 @@ The rules the two share:
   gates are split into the route and the soundness — `egc_byte_path` sends a
   pure-ASCII subject to the ASCII family, which is faster there, and
   `byte_sound` is whether the byte programs answer for it at all — and only
-  the soundness is asked.
+  the soundness is asked. A CodePoint family's gate fails only on a stray
+  byte, and no code point joins another: its prefix is the bytes its scans
+  read, to the end of the code point they stopped in, with the code point
+  at `reach` only where a look read it for context (the assert family;
+  `us_guess_held`).
 - **Why the Pike may answer**: it is the reference. And it is no more often
   the Pike than before: a gate that holds for the whole subject holds for
   each of its prefixes, so a subject no guess holds for is one no family
@@ -728,11 +732,11 @@ match in its first words: `\w+`, `(\w+) (\w+)`, `[a-z]+ing`, `(\w+)@(\w+)`,
 `\b\w+\b`, `\w+ \d+` went from 0.14–1.4 ms to 0.04–0.33 µs, and with a stray
 byte at 100 or at the end from 98–121 ms to the same. A find with no match
 reads to the end and costs what it did (to 0.001% of its instructions). On
-~60-byte subjects a call takes 123 fewer to 19 more instructions (of
-410–971; the fewer where the subject is not ASCII), and 11–56 more (to 4%)
-where the match is near the subject's end or there is none, so that the
-scan reads about what the old check did. A Grapheme find, which does not
-guess yet, takes 2–12 more (to 1.5%).
+~60-byte subjects a call takes 209 fewer to 1 more instructions (of
+361–1341; the fewer where the subject is not ASCII), and 9 fewer to 29 more
+(to 2.2%) where the match is near the subject's end or there is none, so
+that the scan reads about what the old check did. A Grapheme find, which
+does not guess yet, takes 20 fewer to 10 more (to 1.3%).
 
 ### Linearity (the O(n²) trap)
 

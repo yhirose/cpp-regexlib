@@ -13333,7 +13333,11 @@ private:
                : l;
   }
   bool us_stray(std::string_view text) const {
-    if (!plan_->us_) return false;
+    return plan_->us_ && stray_in(text);
+  }
+  // Whether `text` is not all RFC 3629 UTF-8: a byte that starts no code
+  // point.
+  static bool stray_in(std::string_view text) {
     const size_t i = first_nonascii(text);
     return i < text.size() &&
            !unicode::utf8::valid_from(text.data(), text.size(), i);
@@ -13376,15 +13380,16 @@ private:
   // A guess (match(): Plan::match_guesses_; find_rest: Plan::us_ladder_):
   // family `f` has answered for `text` from 0, and read nothing at or past
   // `reach` — one past the furthest byte any of its scans examined, at least
-  // the match's end. Its answer is the unit's when the subject is one it
-  // answers for as far as it read: every code point that starts at or
-  // before `reach` (the one there is where its scan stopped, and whether it
-  // joins the code point before it is what the stop meant), and an LF after
-  // a CR there, so that no pair is split. What follows does not matter: the
-  // scan consumed none of it. The test over that prefix R is the family's
-  // gate less its route (see egc_byte_path). A gate that holds for the whole
-  // subject holds for R, so a subject no guess holds for is one no family
-  // served either, and the Pike answers it.
+  // the match's end. A Grapheme family's answer is the unit's when the
+  // subject is one it answers for as far as it read (a CodePoint family's:
+  // us_guess_held): every code point that starts at or before `reach` (the
+  // one there is where its scan stopped, and whether it joins the code
+  // point before it is what the stop meant), and an LF after a CR there, so
+  // that no pair is split. What follows does not matter: the scan consumed
+  // none of it. The test over that prefix R is the family's gate less its
+  // route (see egc_byte_path). A gate that holds for the whole subject holds
+  // for R, so a subject no guess holds for is one no family served either,
+  // and the Pike answers it.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach) const {
     const size_t n = text.size();
@@ -13397,10 +13402,13 @@ private:
     } else {
       end = n;
     }
+    // (R ahead of the switch, though a CodePoint family does not ask it:
+    // computed in the Grapheme cases alone it cost their match() 3-23
+    // instructions more, of code layout.)
     const std::string_view r = text.substr(0, end);
     switch (f) {
     case kFamUsDfa:
-    case kFamUsAssert: return !us_stray(r);
+    case kFamUsAssert: return us_guess_held(text, reach, f == kFamUsAssert);
     case kFamAscii:
     case kFamAssertAscii: return ascii_grapheme_ok(r, first_nonascii(r));
     case kFamEgcByte: return byte_sound(r, first_nonascii(r));
@@ -13410,6 +13418,22 @@ private:
       break;
     }
     return false;
+  }
+
+  // ... of a CodePoint family's (match(), find_rest: Plan::us_ladder_),
+  // which a subject fails only with a stray byte: none among the bytes its
+  // scans read, [0, reach) completed to a code point, and the code point at
+  // `reach` where a look read it for context (`look`: the assert family).
+  // No code point joins the one before it, and an LF is no stray, so
+  // nothing else is asked.
+  REGEXLIB_ALWAYS_INLINE bool us_guess_held(std::string_view text, int reach,
+                                            bool look) const {
+    const size_t n = text.size();
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
+    size_t end = static_cast<size_t>(reach);
+    if (look && end < n) end++;
+    while (end < n && (p[end] & 0xC0) == 0x80) end++;
+    return !stray_in(text.substr(0, end));
   }
 
   // True iff every CR is immediately followed by LF and every LF immediately
@@ -14627,19 +14651,28 @@ public:
     // the furthest — over the forward DFAs of one program set, the byte
     // programs' (`byte`) or the others: a family's rungs run those alone
     // (Regex::ladder_byte). (The reverse DFAs read within what a forward one
-    // did.)
+    // did. Spelled out, one branch on `byte`: through a callback the read
+    // was a call that kept its maximum in memory.)
     void reach_from_zero(bool byte) {
-      each_forward(byte, [](LazyDfa &d) { d.hi = 0; });
+      if (byte)
+        zero_hi(bfu_, blfu_, blfa_);
+      else
+        zero_hi(fu_, lfu_, lfa_);
     }
-    int reach(bool byte) {
-      int r = 0;
-      each_forward(byte, [&r](LazyDfa &d) { r = std::max(r, d.hi); });
+    int reach(bool byte) const {
+      return byte ? hi_of(bfu_, blfu_, blfa_) : hi_of(fu_, lfu_, lfa_);
+    }
+    using Dfa = std::optional<LazyDfa>;
+    static void zero_hi(Dfa &a, Dfa &b, Dfa &c) {
+      if (a) a->hi = 0;
+      if (b) b->hi = 0;
+      if (c) c->hi = 0;
+    }
+    static int hi_of(const Dfa &a, const Dfa &b, const Dfa &c) {
+      int r = a ? a->hi : 0;
+      if (b && b->hi > r) r = b->hi;
+      if (c && c->hi > r) r = c->hi;
       return r;
-    }
-    template <class F> void each_forward(bool byte, F f) {
-      if (std::optional<LazyDfa> &d = byte ? bfu_ : fu_) f(*d);
-      if (std::optional<LazyDfa> &d = byte ? blfu_ : lfu_) f(*d);
-      if (std::optional<LazyDfa> &d = byte ? blfa_ : lfa_) f(*d);
     }
     LazyDfa &built(std::optional<LazyDfa> &d) {
       d->budget = dfa_bytes_;
@@ -17559,9 +17592,7 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     reach = st == Step::Again
                 ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
                 : c.pos;
-  if (guess_held(l.has(Ladder::kAssert) ? kFamUsAssert : kFamUsDfa, text,
-                 reach))
-    return found;
+  if (us_guess_held(text, reach, l.has(Ladder::kAssert))) return found;
   return find_pike(text, scr, out);
 }
 

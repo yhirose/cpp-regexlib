@@ -1875,14 +1875,19 @@ void test_match_guess() {
   // before where its scan stopped — the one there is the last, even when it
   // joins the one before (a combining mark after `a`), or reach is inside it
   // — and the LF of a CR there, so that the pair is not split (a lone CR
-  // would refuse the collapsed byte programs of `[^x]{2}`).
+  // would refuse the collapsed byte programs of `[^x]{2}`). A CodePoint
+  // family's, the bytes it read, to a code point's end: the one at reach
+  // only where a look read it (the assert family).
   const Regex word("\\w"), pair("[^x]{2}"), us_word = make_us("\\w");
   CHECK(PlanProbe::guess_held(word, 'a', "ab", 1));
   CHECK(!PlanProbe::guess_held(word, 'a', "a\xCC\x81", 1));
   CHECK(PlanProbe::guess_held(word, 'b', "\xC3\xA9" "a", 1));
   CHECK(!PlanProbe::guess_held(word, 'b', "a\xCC\x81", 1));
   CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 1));
-  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 2));
+  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 2));
+  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 3));
+  CHECK(!PlanProbe::guess_held(us_word, 'u', "\xC3\xA9\xFF", 2));
+  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xE6\xBC", 3));
   CHECK(PlanProbe::guess_held(pair, 'b', "\xC3\xA9\r\nab", 2));
   CHECK(!PlanProbe::guess_held(pair, 'b', "\xC3\xA9\rab", 2));
 
