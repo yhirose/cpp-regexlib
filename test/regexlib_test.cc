@@ -360,12 +360,17 @@ struct PlanProbe {
   static std::string match_guesses(const Regex &re) {
     return guesses(re, 'm');
   }
+  // Whether `l`'s flags carry its family's traits (Ladder::set_family).
+  static bool traits_copied(const Regex::Ladder &l) {
+    return (l.flags & Regex::Ladder::kTraitBits) ==
+           Regex::kFamilyTraits[l.fam];
+  }
   // Whether every ladder of `re`'s plan names the family it runs on, and
   // reads the engine that family's letter says: the assert engine on u A
   // B, the byte programs' DFAs on u b i B, the walk's byte first-byte sets
-  // on U u b i (Regex::kFamilyTraits). A scan that starts on a family's
-  // rung starts on that family's ladder — for a CodePoint plan, the family
-  // its find / boolean guesses.
+  // on U u b i (Regex::kFamilyTraits) — carried in its flags. A scan that
+  // starts on a family's rung starts on that family's ladder — for a
+  // CodePoint plan, the family its find / boolean guesses.
   static bool ladders_name_families(const Regex &re) {
     const auto &p = *re.plan_;
     for (int f = 0; f < Regex::kFamilyCount; f++) {
@@ -378,10 +383,12 @@ struct PlanProbe {
           Regex::family_has(Regex::kTraitWalkByte, fam) != in("Uubi"))
         return false;
       for (int w = 0; w < 3; w++)
-        if (p.family_[f][w].fam != fam) return false;
+        if (p.family_[f][w].fam != fam || !traits_copied(p.family_[f][w]))
+          return false;
     }
     for (int w = 0; w < 3; w++) {
       const Regex::Ladder &st = p.start_[w];
+      if (!traits_copied(st)) return false;
       if (!Regex::rung_on_family(st.rung)) continue;
       const auto f = p.guesses_[Regex::guess_row(st)][0];
       if (!p.us_ || f == Regex::kFamilyCount || st.fam != f ||

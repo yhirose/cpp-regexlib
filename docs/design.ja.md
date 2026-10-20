@@ -517,8 +517,9 @@ subject 全体を分割する。
 真偽値。`ladder_caller` を参照）と、走査の始まる段（`Plan::start_`。CodePoint の
 プランの系統は主題に依らないので、その走査は系統の最初の段からじかに始まる）です。
 ラダーは自分の走る系統を名指します（`Ladder::fam`）。段がどの DFA を読むか、assert の
-エンジンを走らせるかは系統だけで決まり（`kFamilyTraits`。`ladder_byte` と
-`ladder_assert` で読む）、別の旗は持ちません。推測が試す系統も 1 つの表です
+エンジンを走らせるかは系統だけで決まります（`kFamilyTraits`）。ラダーはその写しを旗に
+持ちます。写しを書くのは系統と一緒に書く `Ladder::set_family` だけで、段の判定
+（`ladder_byte`、`ladder_assert`）は表を読まずにビットを調べるだけで済みます。推測が試す系統も 1 つの表です
 （`Plan::guesses_`。下を参照）。行は推測する側ごとで、`match()`・find・真偽値です。
 ゲートはこの表になっていません。`ladder_gated` はゲートを順に書き並べます。系統ごとの
 経路に固有の条件（選ぶプローブ、純 ASCII の CR-LF の例外）があり、Grapheme の走査の

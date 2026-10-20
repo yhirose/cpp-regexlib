@@ -557,8 +557,10 @@ starts (`Plan::start_` — a CodePoint plan's family does not depend on the
 subject at all, so its scan starts on the family's first rung outright).
 A ladder names the family it runs on (`Ladder::fam`); which DFAs its rungs
 read and whether they run the assert engine follow from the family alone
-(`kFamilyTraits`, read through `ladder_byte` and `ladder_assert`), not from
-flags of their own. The families a guess tries are one table too
+(`kFamilyTraits`). The ladder carries a copy of them in its flags, written
+with the family by `Ladder::set_family` and nothing else, so that a rung's
+test (`ladder_byte`, `ladder_assert`) is a bit test rather than a table
+load. The families a guess tries are one table too
 (`Plan::guesses_`, below), per guesser: `match()`, a find, a boolean.
 The gates are not such a table: `ladder_gated` writes them as a chain, since
 each family's route has conditions of its own (a probe to choose, a pure-ASCII

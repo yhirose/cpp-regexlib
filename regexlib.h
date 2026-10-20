@@ -6158,7 +6158,8 @@ private:
   // one); the byte programs' DFAs (EGC byte, the byte assert engine) rather
   // than the grapheme / code-point ones; a walk that reads the byte
   // programs' first-byte sets (US, EGC byte) rather than the ASCII ones.
-  // None for kFamilyCount. (A table: each test is one load.)
+  // None for kFamilyCount. The one definition of them: a ladder carries a
+  // copy in its flags (Ladder::set_family), a family alone reads it here.
   enum FamilyTrait : uint8_t {
     kTraitAssert = 1 << 0,
     kTraitByte = 1 << 1,
@@ -6189,33 +6190,46 @@ private:
     Rung rung = Rung::Pike;
     Rung below = Rung::Pike; // what a local bail of the walk steps down to
     Want want = Want::Rows;
-    Family fam = kFamilyCount; // set by ladder_family alone
+    Family fam = kFamilyCount; // written by set_family alone
     // (One word of flags, set and tested with has() / set(): a dozen bools
     // were a dozen stores on every call, and bit-fields were worse — each
     // copy of the value unpacked and repacked them one by one.)
     enum Flag : uint16_t {
+      // (Bits 0-2: the family's traits — kTraitBits, set_family.)
       // Rungs the family has until they bail GLOBALLY (budget,
       // profitability). Cleared then and not set again by anything that
       // bail leads to: that is the linearity guarantee. A local bail clears
       // nothing.
-      kIpOn = 1 << 0,   // IcasePrefix (a probe applies)
-      kWalkOn = 1 << 1, // Walk
+      kIpOn = 1 << 3,   // IcasePrefix (a probe applies)
+      kWalkOn = 1 << 4, // Walk
       // Rungs the scan has given up, whatever family it lands on next.
-      kSuffixOff = 1 << 2,
-      kInnerOff = 1 << 3,
+      kSuffixOff = 1 << 5,
+      kInnerOff = 1 << 6,
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
-      kSpec = 1 << 4,
+      kSpec = 1 << 7,
       // The assert family: a boolean takes the find (Plan::assert_bool_finds).
-      kBoolFind = 1 << 5,
+      kBoolFind = 1 << 8,
     };
+    static constexpr uint16_t kTraitBits =
+        kTraitAssert | kTraitByte | kTraitWalkByte;
     uint16_t flags = 0;
     bool has(Flag f) const { return (flags & f) != 0; }
     void set(Flag f, bool on = true) {
       flags = static_cast<uint16_t>(on ? flags | f : flags & ~f);
     }
+    // Stand on family `f`, its traits copied into the flags: a trait test
+    // is then a bit test of a value in a register, where a load from
+    // kFamilyTraits was two instructions more at each.
+    void set_family(Family f) {
+      fam = f;
+      flags = static_cast<uint16_t>((flags & ~kTraitBits) | kFamilyTraits[f]);
+    }
+    bool trait(FamilyTrait t) const { return (flags & t) != 0; }
   };
   static_assert(sizeof(Ladder) == 6, "a Ladder travels in one register");
+  static_assert(Ladder::kTraitBits < Ladder::kIpOn,
+                "the traits stay below the other flags");
 
   // ===== Teddy: the packed multi-literal searcher =====
   // (Hyperscan's Teddy, in the "slim" form of Rust's aho-corasick.)
@@ -15218,16 +15232,14 @@ public:
   }
   // Whether a scan on `l` runs the byte programs' DFAs. (No assert ladder
   // stands on Suffix or Inner, which read this with byte_crlf_collapse_.)
-  static bool ladder_byte(const Ladder &l) {
-    return family_has(kTraitByte, l.fam);
-  }
+  static bool ladder_byte(const Ladder &l) { return l.trait(kTraitByte); }
   // ... the assert engine.
   static bool ladder_assert(const Ladder &l) {
-    return family_has(kTraitAssert, l.fam);
+    return l.trait(kTraitAssert);
   }
   // ... a walk over the byte programs' first-byte sets.
   static bool ladder_walk_byte(const Ladder &l) {
-    return family_has(kTraitWalkByte, l.fam);
+    return l.trait(kTraitWalkByte);
   }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -17403,7 +17415,7 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
                                           Want want) {
   Ladder l;
   l.want = want;
-  l.fam = f; // (ladder_pick reads it: before the repick)
+  l.set_family(f); // (ladder_pick reads it: before the repick)
   switch (f) {
   case kFamUsDfa:
   case kFamAscii:
