@@ -369,25 +369,21 @@ struct PlanProbe {
   static bool ladders_name_families(const Regex &re) {
     const auto &p = *re.plan_;
     for (int f = 0; f < Regex::kFamilyCount; f++) {
-      const char c = kFamilies[f];
-      for (int w = 0; w < 3; w++) {
-        const Regex::Ladder &l = p.family_[f][w];
-        const auto fam = static_cast<Regex::Family>(f);
-        if (l.fam != fam) return false;
-        if (Regex::ladder_assert(l) != (std::string_view("uAB").find(c) !=
-                                        std::string_view::npos) ||
-            Regex::ladder_byte(l) != (std::string_view("ubiB").find(c) !=
-                                      std::string_view::npos) ||
-            Regex::family_has(Regex::kTraitWalkByte, fam) !=
-                (std::string_view("Uubi").find(c) != std::string_view::npos))
-          return false;
-      }
+      const auto fam = static_cast<Regex::Family>(f);
+      const auto in = [&](std::string_view fams) {
+        return fams.find(kFamilies[f]) != std::string_view::npos;
+      };
+      if (Regex::family_has(Regex::kTraitAssert, fam) != in("uAB") ||
+          Regex::family_has(Regex::kTraitByte, fam) != in("ubiB") ||
+          Regex::family_has(Regex::kTraitWalkByte, fam) != in("Uubi"))
+        return false;
+      for (int w = 0; w < 3; w++)
+        if (p.family_[f][w].fam != fam) return false;
     }
     for (int w = 0; w < 3; w++) {
       const Regex::Ladder &st = p.start_[w];
       if (!Regex::rung_on_family(st.rung)) continue;
-      const auto f =
-          p.guesses_[w ? Regex::Plan::kGuessTest : Regex::Plan::kGuessFind][0];
+      const auto f = p.guesses_[Regex::guess_row(st)][0];
       if (!p.us_ || f == Regex::kFamilyCount || st.fam != f ||
           st.flags != p.family_[f][w].flags || st.rung != p.family_[f][w].rung)
         return false;
@@ -2112,10 +2108,6 @@ void test_find_guess() {
   CHECK(!PlanProbe::pike_ran(walk, [&] { CHECK(walk.test(hard[0])); }));
 }
 
-// The find ladder: search, test, find_all, find_iter and find_at climb the
-// same rungs in the same order. These pin where a scan STARTS (so a fast path
-// cannot quietly stop being taken) and what the rungs that only some callers
-// reach hand back.
 // Every ladder names the family it runs on (Ladder::fam), and what engine
 // it reads follows from that family alone. A CodePoint find guesses its
 // plan's one family, a Grapheme one none yet; match() tries the families of
@@ -2152,6 +2144,10 @@ void test_ladder_family() {
   CHECK(PlanProbe::guesses(Regex("a\r\nb"), 'm') == "ba");
 }
 
+// The find ladder: search, test, find_all, find_iter and find_at climb the
+// same rungs in the same order. These pin where a scan STARTS (so a fast path
+// cannot quietly stop being taken) and what the rungs that only some callers
+// reach hand back.
 void test_find_ladder() {
   auto rows = [](const Regex &re) { return PlanProbe::start(re, false); };
   auto test = [](const Regex &re) { return PlanProbe::start(re, true); };

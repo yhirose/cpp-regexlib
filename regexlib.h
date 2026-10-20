@@ -6189,8 +6189,7 @@ private:
     Rung rung = Rung::Pike;
     Rung below = Rung::Pike; // what a local bail of the walk steps down to
     Want want = Want::Rows;
-    Family fam = kFamilyCount; // set by ladder_family alone (and the fused
-                               // rungs, which run the byte programs)
+    Family fam = kFamilyCount; // set by ladder_family alone
     // (One word of flags, set and tested with has() / set(): a dozen bools
     // were a dozen stores on every call, and bit-fields were worse — each
     // copy of the value unpacked and repacked them one by one.)
@@ -15155,12 +15154,17 @@ public:
   static Plan::Guesser guess_row(const Ladder &l) {
     return l.want == Want::Rows ? Plan::kGuessFind : Plan::kGuessTest;
   }
-  // A CodePoint scan on `l`, at Classify: on the family its plan guesses
-  // (the Pike with none).
+  // The ladder of the first family a scan on `l` guesses (the Pike with
+  // none): a CodePoint plan's one family.
+  static Ladder first_guess(const Plan &p, const Ladder &l) {
+    const Family f = p.guesses_[guess_row(l)][0];
+    return f == kFamilyCount ? pike_ladder(l.want)
+                             : p.family_[f][ladder_caller(l)];
+  }
+  // A CodePoint scan on `l`, at Classify, moved onto that ladder.
   Ladder ladder_guessed(Ladder l) const {
-    const Family f = plan_->guesses_[guess_row(l)][0];
-    if (f == kFamilyCount) return pike_ladder(l.want);
-    return ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
+    const Ladder n = first_guess(*plan_, l);
+    return n.rung == Rung::Pike ? n : ladder_adopt(n, l);
   }
   // Rung::Classify: which engine family serves this subject (a scan on `l`,
   // past its literal and text-anchor rungs). `fna` caches the subject's
@@ -15220,6 +15224,10 @@ public:
   // ... the assert engine.
   static bool ladder_assert(const Ladder &l) {
     return family_has(kTraitAssert, l.fam);
+  }
+  // ... a walk over the byte programs' first-byte sets.
+  static bool ladder_walk_byte(const Ladder &l) {
+    return family_has(kTraitWalkByte, l.fam);
   }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
@@ -17432,17 +17440,25 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
 }
 
 inline void Regex::ladder_plan(Plan &p) {
-  // match()'s families, each anchored at 0: a CodePoint plan's one; a
-  // Grapheme plan's ASCII family first — the subject a scan most often
-  // meets, and the cheaper engine there — then its byte family. Unless the
-  // pattern has a CR-LF literal: the ASCII family cannot match one (see
-  // ascii_grapheme_ok), so on the CRLF subjects that can, it would only be a
-  // scan to throw away.
+  // The families a guess tries (Plan::guesses_). match()'s, each anchored
+  // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
+  // the subject a scan most often meets, and the cheaper engine there —
+  // then its byte family. Unless the pattern has a CR-LF literal: the ASCII
+  // family cannot match one (see ascii_grapheme_ok), so on the CRLF
+  // subjects that can, it would only be a scan to throw away.
   {
     Family ascii = kFamilyCount, byte = kFamilyCount;
     if (p.us_) {
-      byte = p.dfa_ok_ ? kFamUsDfa
-                       : p.byte_assert_path_ ? kFamUsAssert : kFamilyCount;
+      // A CodePoint plan's family does not depend on the subject (only
+      // whether its byte DFAs may run does: us_stray), so a find guesses it
+      // too — the DFA family if it can serve the caller (dfa_family_ok),
+      // else the assert one. (Neither: a fresh ladder stands on the Pike.
+      // [Tier: Pike/cp])
+      const Family as = p.byte_assert_path_ ? kFamUsAssert : kFamilyCount;
+      byte = p.dfa_family_ok(true) ? kFamUsDfa : as;
+      p.guesses_[Plan::kGuessTest][0] = byte;
+      p.guesses_[Plan::kGuessFind][0] =
+          p.dfa_family_ok(false) ? kFamUsDfa : as;
     } else {
       ascii = p.dfa_ok_ ? kFamAscii
               : p.assert_ascii_tier() ? kFamAssertAscii
@@ -17455,16 +17471,6 @@ inline void Regex::ladder_plan(Plan &p) {
         ascii == kFamilyCount || (p.crlf_fused_lit_ && byte != kFamilyCount);
     p.guesses_[Plan::kGuessMatch][0] = byte_first ? byte : ascii;
     p.guesses_[Plan::kGuessMatch][1] = byte_first ? ascii : byte;
-    // A CodePoint plan's family does not depend on the subject (only whether
-    // its byte DFAs may run does: us_stray), so a find guesses it. (Neither
-    // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
-    if (p.us_) {
-      for (const bool test : {false, true})
-        p.guesses_[test ? Plan::kGuessTest : Plan::kGuessFind][0] =
-            p.dfa_family_ok(test) ? kFamUsDfa
-            : p.byte_assert_path_ ? kFamUsAssert
-                                  : kFamilyCount;
-    }
   }
   p.fused_ = p.egc_fused_ok()
                  ? (p.prefix_fused() ? Plan::Fused::Prefix
@@ -17507,8 +17513,7 @@ inline void Regex::ladder_plan(Plan &p) {
       // family is the one to take.
       st.rung = st.below = Rung::TextAnchor;
     } else if (p.us_) {
-      const Family f = p.guesses_[guess_row(st)][0];
-      st = f == kFamilyCount ? pike_ladder(want) : p.family_[f][w];
+      st = first_guess(p, st);
     } else {
       st.rung = st.below = Rung::Classify; // the subject chooses the family
     }
@@ -17534,7 +17539,6 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
     if (fna < text.size()) {
       l.rung = l.below = p.fused_ == Plan::Fused::Prefix ? Rung::FusedPrefix
                                                          : Rung::FusedSuffix;
-      l.fam = kFamEgcByte; // (the byte programs: nothing else asks)
       return l;
     }
   }
@@ -17546,7 +17550,6 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
   // DFA family.
   if (p.fused_ == Plan::Fused::Collapse) {
     l.rung = l.below = Rung::FusedSuffix;
-    l.fam = kFamEgcByte;
     return l;
   }
   return ladder_gated(text, l, fna, probe);
@@ -17702,7 +17705,8 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
                 : c.pos;
   // (Only a CodePoint family guesses here: spelled out, the choice lets
   // guess_held fold.)
-  if (guess_held(ladder_assert(l) ? kFamUsAssert : kFamUsDfa, text, reach))
+  if (guess_held(l.fam == kFamUsAssert ? kFamUsAssert : kFamUsDfa, text,
+                 reach))
     return found;
   return find_pike(text, scr, out);
 }
@@ -17803,10 +17807,10 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
   if constexpr (All) {
     // Rows until the walk stops; e2 says why (it is never a match end).
     e2 = onepass_fill_run(scr.cache, text, *scr.saves, out, c.pos, budget,
-                          family_has(kTraitWalkByte, l.fam));
+                          ladder_walk_byte(l));
   } else {
     e2 = capture_find_dispatch(scr.cache, text, c.pos, *scr.saves, budget,
-                               family_has(kTraitWalkByte, l.fam));
+                               ladder_walk_byte(l));
     if (e2 >= 0) {
       walk_yield(out, text, *scr.saves, e2);
       c.pos = e2; // !can_match_empty_ -> progress
