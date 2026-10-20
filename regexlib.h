@@ -15328,9 +15328,8 @@ public:
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
   // A boolean over a short subject gives the interior-literal rung up
-  // before trying it (limits::kBoolSkipBytes): the plan's third ladder
-  // (see ladder_caller). Taken past the shallow rungs, which have no such
-  // rung to give up — on a ladder a bail of theirs has moved to Classify,
+  // before trying it (limits::kBoolSkipBytes; see ladder_caller). A ladder
+  // at Classify (where a shallow rung's bail moves it) keeps its place:
   // the flag is what makes it the third.
   REGEXLIB_ALWAYS_INLINE Ladder ladder_short_test(std::string_view text,
                                                   Ladder l) const {
@@ -17700,6 +17699,8 @@ inline bool Regex::find_once(std::string_view text, Out &out) const {
 
 template <class Out>
 inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
+  // (The short boolean's ladder, past the shallow rungs: they have no
+  // interior-literal rung to give up.)
   if constexpr (!Out::kGroups) l = ladder_short_test(text, l);
   guess_begin(l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
@@ -17709,14 +17710,13 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   if (!guess_open(l)) return found;
   // How far the guess's scans read: a match's end, or past it as far as a
   // DFA scan did (a walk reads no byte past its end that is not ASCII, so
-  // none a stray), the whole subject when there is no match. (Written
-  // here: as a function of its own it cost a short test() register moves.)
+  // none a stray), the whole subject when there is no match.
   int reach = static_cast<int>(text.size());
   if (found)
     reach = walked ? c.pos
                    : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
   if (guess_held(guess_family(l), text, reach)) return found;
-  return find_pike(text, scr, out); // the Pike's answer, from the start
+  return find_pike(text, scr, out);
 }
 
 template <class Out>
@@ -17747,13 +17747,10 @@ inline bool Regex::find_run(std::string_view text, Scr &scr, Ladder &l,
 template <class Out>
 bool Regex::find_pike(std::string_view text, Scr &scr, Out &out) const {
   out.clear();
-  if (!scr.cache) scr_fetch(scr);
   Ladder l = pike_ladder(Out::kGroups ? Want::Rows : Want::Test);
   Cursor c;
-  bool chain_once = false;
-  WalkBudget budget(text.size());
-  Deep d;
-  return ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
+  bool walked = false;
+  return find_run(text, scr, l, c, walked, out);
 }
 
 template <bool All, bool InlineWalk, class Out>
