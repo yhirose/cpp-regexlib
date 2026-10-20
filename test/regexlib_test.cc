@@ -2194,7 +2194,7 @@ void test_find_guess_grapheme() {
            {"[^\\n]+ing", "a=ing\r\n\r\nbing"},
            {"(?i)[^\\n]+=", "a=ing\r\n\r\na="},
            {"\\w+", "ab\xCC\x81 c"},
-           {"[a-z]+", "abc.\xCC\x81d"},
+           {"[a-z]+", "abc.\xCC\x81" "d"},
            {"\\b\\w+\\b", "word\xCC\x81 x"},
            {"[a-z]+ing", "caf\xC3\xA9 et zz abxing\xCC\x81 x"}}) {
     const Regex re = make_egc(pat), pike = pike_twin(pat);
