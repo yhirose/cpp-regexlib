@@ -270,6 +270,34 @@ std::string gen_subject() {
   return s;
 }
 
+// `s` with one to three pieces that are no UTF-8 (RFC 3629) put in at byte
+// offsets drawn at random, a code point's interior among them: lone leads
+// and continuations, a byte that leads nothing, a sequence cut short, an
+// overlong form, a surrogate, a form past U+10FFFF. Every tier has to read
+// them as the Pike does. However the bytes around a piece complete it, the
+// code point made is Latin-1, CJK, currency, an emoji or private use: never
+// one that joins a cluster, so a subject of single-code-point clusters
+// stays one (what check_us_vs_pike and invariant_fuzz_us compare on).
+std::string with_strays(std::string s) {
+  static const char *const kStray[] = {
+      "\xC3",     "\xE9",         "\xF4",     "\x80",         "\xBF",
+      "\xFF",     "\xE2\x82",     "\xF0\x9F\x98", "\xC0\xAF", "\xED\xA0\x80",
+      "\xF4\x90\x80\x80"};
+  for (int k = U(1, 3); k > 0; k--)
+    s.insert(static_cast<size_t>(U(0, static_cast<int>(s.size()))),
+             kStray[U(0, 10)]);
+  return s;
+}
+
+// One of `subjects`, drawn at random, with strays put in (with_strays):
+// every pattern of the list's invariant meets one.
+void stray_one(std::vector<std::string> &subjects) {
+  if (subjects.empty()) return;
+  std::string &s = subjects[static_cast<size_t>(
+      U(0, static_cast<int>(subjects.size()) - 1))];
+  s = with_strays(std::move(s));
+}
+
 // --- UnicodeScalar-mode differential generators ---
 // A small alphabet of single-code-point, single-grapheme characters, so EGC
 // and US matching coincide and EGC (the proven engine) can be the oracle.
@@ -739,6 +767,7 @@ void invariant_fuzz_lookaround(int iters) {
     reg::Regex::FindCache cache; // reused across this pattern's subjects
     for (int s = 0; s < 5; s++) {
       std::string subj = gen_subject();
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       reg::MatchResult m;
       std::vector<reg::MatchResult> all;
       try {
@@ -788,6 +817,7 @@ void invariant_fuzz_unicode(int iters) {
     squeeze_dfa_cache(*re, pat, 0, &cache);
     for (int s = 0; s < 5; s++) {
       std::string subj = gen_usubject();
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       reg::MatchResult m;
       std::vector<reg::MatchResult> all;
       try {
@@ -917,6 +947,7 @@ void invariant_fuzz(int iters) {
     std::vector<std::string> subjects;
     for (int s = 0; s < 5; s++)
       subjects.push_back(gen_subject());
+    stray_one(subjects);
     check_pattern(gen_alt(3), subjects);
   }
 }
@@ -980,6 +1011,7 @@ void invariant_fuzz_onepass_repeat(int iters) {
     // thousands of matches for the Pike reference to reproduce.
     subjects.push_back(gen_subject() + std::string(4096, '\n') +
                        gen_subject());
+    stray_one(subjects);
     check_pattern(gen_onepass_repeat(), subjects);
   }
 }
@@ -1026,6 +1058,7 @@ void invariant_fuzz_word_start(int iters) {
       }
       subjects.push_back(subj);
     }
+    stray_one(subjects);
     check_pattern(gen_word_start(), subjects);
   }
 }
@@ -1175,6 +1208,7 @@ void invariant_fuzz_whole_match_capture(int iters) {
                        gen_subject());
     // One long match (the walk's SIMD run skip).
     subjects.push_back(gen_subject() + std::string(600, 'a') + gen_subject());
+    stray_one(subjects);
     // EGC: the full battery, groups included, against the forced Pike.
     check_pattern(pat, subjects);
 
@@ -1193,6 +1227,7 @@ void invariant_fuzz_whole_match_capture(int iters) {
       if (s == 3) subj += std::string(600, 'a') + " 1a";
       us_subjects.push_back(std::move(subj));
     }
+    stray_one(us_subjects);
     check_us_vs_pike(pat, us_subjects);
   }
 }
@@ -1261,6 +1296,7 @@ void invariant_fuzz_us_onewalk(int iters) {
     // bail, so the profitability rule trips partway.
     subjects.push_back(gen(3000, 1));
     if (it % 4 == 0) subjects.push_back(gen(4000, 12));
+    stray_one(subjects);
     check_us_vs_pike(pat, subjects);
   }
 }
@@ -1474,6 +1510,7 @@ void invariant_fuzz_anchor_choice(int iters) {
     subjects.push_back(gen(600, 0, 0));
     subjects.push_back(gen(600, kPlain + 1, 12));
     if (it % 8 == 0) subjects.push_back(gen(300, kPlain + 2, 30));
+    stray_one(subjects);
     check_pattern(pat, subjects);
 
     // CodePoint: the same choice in front of a different ladder. Single-code-
@@ -1489,6 +1526,7 @@ void invariant_fuzz_anchor_choice(int iters) {
       std::string subj = gen(300, 0, 0);
       us_subjects.push_back(subj + UNITS[kPlain + 1] + gen(300, 0, 0));
     }
+    stray_one(us_subjects);
     check_us_vs_pike(pat, us_subjects);
   }
 }
@@ -1584,6 +1622,7 @@ void invariant_fuzz_egc_onewalk(int iters) {
     // One combining mark: the same subject, off the byte tier.
     if (it % 8 == 0)
       subjects.push_back(gen(150, 2, 1) + UNITS[kMark] + gen(150, 2, 1));
+    stray_one(subjects);
     check_pattern(pat, subjects);
   }
 }
@@ -1869,6 +1908,8 @@ void invariant_fuzz_ladder(int iters) {
         }
       }
     }
+    stray_one(subjects);
+    stray_one(us_subjects);
     check_pattern(pat, subjects);
     check_us_vs_pike(pat, us_subjects);
   }
@@ -2006,6 +2047,7 @@ void invariant_fuzz_multi_literal(int iters) {
       subjects.push_back(gen(U(20, 120), 0, 0)); // several, and a tail
     for (int s = 0; s < 3; s++)
       subjects.push_back(gen(U(2, 40), 2, 5)); // with clusters
+    stray_one(subjects);
     check_pattern(pat, subjects);
 
     // CodePoint: the same alternation, over the byte program's
@@ -2015,6 +2057,7 @@ void invariant_fuzz_multi_literal(int iters) {
     for (int s = 0; s < 3; s++)
       us_subjects.push_back(gen(U(0, 14), 0, 0));
     us_subjects.push_back(gen(U(20, 80), 0, 8));
+    stray_one(us_subjects);
     check_us_vs_pike(pat, us_subjects);
     // ... and with the clusters, against the code-point Pike: a literal in
     // front of a combining mark is a match here, where Grapheme mode has
@@ -2022,6 +2065,7 @@ void invariant_fuzz_multi_literal(int iters) {
     us_subjects.clear();
     for (int s = 0; s < 3; s++)
       us_subjects.push_back(gen(U(2, 40), 2, 5));
+    stray_one(us_subjects);
     check_us_vs_pike(pat, us_subjects, reg::MatchUnit::CodePoint);
   }
 }
@@ -2061,6 +2105,7 @@ void invariant_fuzz_literal(int iters) {
       for (int i = 0; i < k; i++) subj += UNITS[U(0, 11)];
       subjects.push_back(subj);
     }
+    stray_one(subjects);
     check_pattern(pat, subjects);
     check_us_vs_pike(pat, subjects, reg::MatchUnit::CodePoint);
   }
@@ -2134,6 +2179,7 @@ void invariant_fuzz_assert_suffix(int iters) {
       int k = U(0, 16);
       std::string subj;
       for (int i = 0; i < k; i++) subj += UNITS[U(0, 11)];
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       std::vector<reg::MatchResult> all, ref;
       reg::MatchResult m;
       try {
@@ -2258,6 +2304,7 @@ void invariant_fuzz_word_bool(int iters) {
         subj += tok;
       for (int i = U(0, 12); i > 0; i--)
         subj += UNITS[U(0, 14)];
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       try {
         const bool t = re->test(subj);
         if (t != re->search(subj).matched())
@@ -2295,6 +2342,7 @@ void invariant_fuzz_assert_unicode(int iters) {
     reg::Regex *pike = pike_reference(pat, flags, unit);
     for (int s = 0; s < 6; s++) {
       std::string subj = gen_au_subject();
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       std::vector<reg::MatchResult> all;
       reg::MatchResult m;
       try {
@@ -2376,6 +2424,7 @@ void invariant_fuzz_us(int iters) {
     squeeze_dfa_cache(*us, pat, f + 1); // the oracle keeps the stock budget
     for (int s = 0; s < 6; s++) {
       std::string subj = gen_us_subject();
+      if (U(0, 3) == 0) subj = with_strays(std::move(subj));
       std::vector<reg::MatchResult> au, ae;
       try {
         au = find_all(*us, subj);
