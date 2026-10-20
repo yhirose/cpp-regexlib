@@ -758,9 +758,14 @@ answer stands if the subject is one *as far as the scan read*
 
 The rules the two share:
 
-- **How far a scan read** (`reach`): one past the furthest byte any of its
-  scans examined — at least the match's end; the whole subject when it found
-  none (a literal prefilter reads to the end without a DFA).
+- **How far a scan read** (`reach`): one past the furthest byte its DFA
+  scans and walks examined or skipped over — at least the match's end; the
+  whole subject when it found none (a literal prefilter reads to the end
+  without a DFA). A skip counts: it is a claim about the bytes it passes
+  (no match starts there), and a stray byte among them is a code point to
+  the Pike (0xE9 is U+00E9). One definition for every producer: the
+  anchored scans' `reach_out` (they never skip) and `LazyDfa::hi` (the
+  furthest any forward scan stopped since `FindCache::reach_from_zero`).
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:
@@ -776,8 +781,11 @@ The rules the two share:
   call. A CodePoint family's soundness fails only on a stray byte, and no
   code point joins another: its prefix is the bytes its scans read, to the
   end of the code point they stopped in, with the code point at `reach` only
-  where a look read it for context (the assert family); the LF after a CR,
-  no stray, changes nothing there (`guess_end`).
+  where a look reads it for context (the assert families: their
+  literal-led verifies decode it without a DFA scan, so no scan reports
+  it); the LF after a CR, no stray, changes nothing there. Both closures
+  are the family's traits (`guess_end`: `kTraitAssert`, `kTraitGrapheme`),
+  not something a scan reports.
 - **Why the Pike may answer**: it is the reference. And it is no more often
   the Pike than before: a gate that holds for the whole subject holds for
   each of its prefixes, so a subject no guess holds for is one no family

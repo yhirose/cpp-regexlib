@@ -368,7 +368,8 @@ struct PlanProbe {
   // Whether every ladder of `re`'s plan names the family it runs on, and
   // reads the engine that family's letter says: the assert engine on u A
   // B, the byte programs' DFAs on u b i B, the walk's byte first-byte sets
-  // on U u b i (Regex::kFamilyTraits) — carried in its flags. A scan that
+  // on U u b i, the Grapheme unit on b i a A B (Regex::kFamilyTraits) —
+  // carried in its flags. A scan that
   // starts on a family's rung starts on that family's ladder — for a
   // CodePoint plan, the family its find / boolean guesses.
   static bool ladders_name_families(const Regex &re) {
@@ -380,7 +381,8 @@ struct PlanProbe {
       };
       if (Regex::family_has(Regex::kTraitAssert, fam) != in("uAB") ||
           Regex::family_has(Regex::kTraitByte, fam) != in("ubiB") ||
-          Regex::family_has(Regex::kTraitWalkByte, fam) != in("Uubi"))
+          Regex::family_has(Regex::kTraitWalkByte, fam) != in("Uubi") ||
+          Regex::family_has(Regex::kTraitGrapheme, fam) != in("biaAB"))
         return false;
       for (int w = 0; w < 3; w++)
         if (p.family_[f][w].fam != fam || !traits_copied(p.family_[f][w]))
@@ -2053,6 +2055,28 @@ void test_find_guess() {
                 pike = pike_twin(pat, 0, reg::MatchUnit::CodePoint);
     each_dirty_subject(
         [&](std::string_view s) { return first_agrees(re, pike, s); });
+  }
+
+  // What a guess's answer depends on, past what its scans consumed: the code
+  // point an assert engine reads as context at the match's end (a stray
+  // byte there is a word character to the Pike: U+00FF), and the bytes a
+  // skip passes over (a stray 0xE9 is U+00E9 to the Pike, which the
+  // literal's or the first-byte set's skip passes). (No scan that finds a
+  // match ends on a skip today, so the last cases hold with or without
+  // LazyDfa::hi counting skips; they are here for when one does.)
+  for (const auto &[pat, subj] : std::initializer_list<
+           std::pair<const char *, const char *>>{
+           {"\\b\\w{1,5}ing\\b", "doing\xFF"},
+           {"\\b\\w{1,5}ing\\b", "xx doing\xC3 z"},
+           {"\\w+ing\\b", "a doing\xE9"},
+           {"\xC3\xA9", "\xE9"},
+           {"\xC3\xBF", "ab \xFF"},
+           {"[^a]", "\xFF"},
+           {"x[\xC3\xA9\xC3\xBF]", "x\xE9 x\xC3\xA9"}}) {
+    const Regex re = make_us(pat),
+                pike = pike_twin(pat, 0, reg::MatchUnit::CodePoint);
+    CHECK(first_agrees(re, pike, subj));
+    CHECK(match_agrees(re, pike, subj));
   }
 
   const std::string prose = accented_prose(1u << 20) + "\xFF";

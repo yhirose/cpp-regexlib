@@ -6157,27 +6157,38 @@ private:
   // What a family runs on, a bit each: the assert engine (else the DFA
   // one); the byte programs' DFAs (EGC byte, the byte assert engine) rather
   // than the grapheme / code-point ones; a walk that reads the byte
-  // programs' first-byte sets (US, EGC byte) rather than the ASCII ones.
+  // programs' first-byte sets (US, EGC byte) rather than the ASCII ones;
+  // the Grapheme unit's (else CodePoint's).
   // None for kFamilyCount. The one definition of them: a ladder carries a
   // copy in its flags (Ladder::set_family), a family alone reads it here.
   enum FamilyTrait : uint8_t {
     kTraitAssert = 1 << 0,
     kTraitByte = 1 << 1,
     kTraitWalkByte = 1 << 2,
+    kTraitGrapheme = 1 << 3,
   };
   static constexpr uint8_t kFamilyTraits[kFamilyCount + 1] = {
-      kTraitWalkByte,                            // kFamUsDfa
+      kTraitWalkByte,                             // kFamUsDfa
       kTraitAssert | kTraitByte | kTraitWalkByte, // kFamUsAssert
-      kTraitByte | kTraitWalkByte,               // kFamEgcByte
-      kTraitByte | kTraitWalkByte,               // kFamEgcByteIp
-      0,                                         // kFamAscii
-      kTraitAssert,                              // kFamAssertAscii
-      kTraitAssert | kTraitByte,                 // kFamAssertByte
-      0,                                         // kFamilyCount
+      kTraitByte | kTraitWalkByte | kTraitGrapheme, // kFamEgcByte
+      kTraitByte | kTraitWalkByte | kTraitGrapheme, // kFamEgcByteIp
+      kTraitGrapheme,                             // kFamAscii
+      kTraitAssert | kTraitGrapheme,              // kFamAssertAscii
+      kTraitAssert | kTraitByte | kTraitGrapheme, // kFamAssertByte
+      0,                                          // kFamilyCount
   };
   static constexpr bool family_has(FamilyTrait t, Family f) {
     return (kFamilyTraits[f] & t) != 0;
   }
+  // The families with any of `t`'s traits, a bit each (kFamilyTraits read
+  // at compile time): a test of a family at run time is then a shift of a
+  // constant, not a load.
+  template <uint8_t T> static constexpr uint32_t kFamiliesWith = [] {
+    uint32_t m = 0;
+    for (int f = 0; f <= kFamilyCount; f++)
+      if (kFamilyTraits[f] & T) m |= 1u << f;
+    return m;
+  }();
   // Where a scan stands on the ladder: the family serving this subject, the
   // rung, and what the scan has given up. A VALUE, and small enough to
   // travel in registers: every transition takes one and returns one.
@@ -6194,24 +6205,24 @@ private:
     // were a dozen stores on every call, and bit-fields were worse — each
     // copy of the value unpacked and repacked them one by one.)
     enum Flag : uint16_t {
-      // (Bits 0-2: the family's traits — kTraitBits, set_family.)
+      // (Bits 0-3: the family's traits — kTraitBits, set_family.)
       // Rungs the family has until they bail GLOBALLY (budget,
       // profitability). Cleared then and not set again by anything that
       // bail leads to: that is the linearity guarantee. A local bail clears
       // nothing.
-      kIpOn = 1 << 3,   // IcasePrefix (a probe applies)
-      kWalkOn = 1 << 4, // Walk
+      kIpOn = 1 << 4,   // IcasePrefix (a probe applies)
+      kWalkOn = 1 << 5, // Walk
       // Rungs the scan has given up, whatever family it lands on next.
-      kSuffixOff = 1 << 5,
-      kInnerOff = 1 << 6,
+      kSuffixOff = 1 << 6,
+      kInnerOff = 1 << 7,
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
-      kSpec = 1 << 7,
+      kSpec = 1 << 8,
       // The assert family: a boolean takes the find (Plan::assert_bool_finds).
-      kBoolFind = 1 << 8,
+      kBoolFind = 1 << 9,
     };
-    static constexpr uint16_t kTraitBits =
-        kTraitAssert | kTraitByte | kTraitWalkByte;
+    static constexpr uint16_t kTraitBits = // every FamilyTrait
+        kTraitAssert | kTraitByte | kTraitWalkByte | kTraitGrapheme;
     uint16_t flags = 0;
     bool has(Flag f) const { return (flags & f) != 0; }
     void set(Flag f, bool on = true) {
@@ -13522,30 +13533,34 @@ private:
     return unicode::utf8::valid_from(s, n, i);
   }
 
-  // A guess (match(), find_rest: Plan::guesses_):
-  // family `f` has answered for `text` from 0, and read nothing at or past
-  // `reach` — one past the furthest byte any of its scans examined, at least
-  // the match's end. Its answer is the unit's when the family is sound
-  // (family_sound) for the prefix R its scans depended on (guess_end). What
-  // follows does not matter: the scan consumed none of it. A gate that holds
-  // for the whole subject holds for R, so a subject no guess holds for is
-  // one no family served either, and the Pike answers it.
+  // A guess (match(), find_rest: Plan::guesses_): family `f` has answered
+  // for `text` from 0, and its scans read nothing at or past `reach`: one
+  // past the furthest byte its DFA scans and walks examined or skipped
+  // over (a skip is a claim about the bytes it passes: no match starts
+  // there), at least the match's end. Its answer is the unit's when the
+  // family is sound (family_sound) for the prefix R its answer depended on
+  // (guess_end). What follows does not matter: nothing read it. A gate that
+  // holds for the whole subject holds for R, so a subject no guess holds
+  // for is one no family served either, and the Pike answers it.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach) const {
-    const bool cp = f == kFamUsDfa || f == kFamUsAssert;
-    const std::string_view r = text.substr(
-        0, guess_end(text, reach, /*next=*/f != kFamUsDfa, /*pair=*/!cp));
+    // (Not substr: guess_end is within `text`, and GCC calls substr here.)
+    const std::string_view r(text.data(), guess_end(text, reach, f));
     return family_sound(f, r, first_nonascii(r));
   }
-  // ... R's end: [0, reach) completed to a code point; with `next` the code
-  // point at `reach` too — where the scan stopped, and whether it joins the
-  // one before it is what the stop meant (a Grapheme family's; a CodePoint
-  // one's only where a look read it for context: the assert family); with
-  // `pair` an LF after a CR there, so that no pair is split (a Grapheme
-  // family's: to a CodePoint one each is a code point of its own).
+  // ... R's end: [0, reach) completed to a code point, and closed by the
+  // family's own rules past what its scans read. The code point at `reach`
+  // too, where the answer can depend on it without a scan reporting it: an
+  // assert engine's look reads it as context (its literal-led verifies
+  // decode it without a DFA), and a Grapheme family's stop means what it
+  // does only if that code point does not join the one before. And for a
+  // Grapheme family an LF after a CR there, so that no pair is split (to a
+  // CodePoint one each is a code point of its own).
   REGEXLIB_ALWAYS_INLINE static size_t guess_end(std::string_view text,
-                                                 int reach, bool next,
-                                                 bool pair) {
+                                                 int reach, Family f) {
+    const bool pair = (kFamiliesWith<kTraitGrapheme> >> f) & 1;
+    const bool next =
+        (kFamiliesWith<kTraitGrapheme | kTraitAssert> >> f) & 1;
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
     size_t end = static_cast<size_t>(reach);
@@ -14520,6 +14535,7 @@ private:
         if (f & ends) break;
         if constexpr (AtStart) {
           d.scanned += static_cast<uint64_t>(i - mark);
+          if (i > d.hi) d.hi = i;
           reach_out = i;
           return LazyDfa::kAtStart;
         } else if constexpr (!Look) {
@@ -15337,11 +15353,6 @@ public:
   // at 0 (its cursor moves only at a yield), is the reference.
   static bool guess_open(const Ladder &l) {
     return l.has(Ladder::kSpec) && l.rung != Rung::Pike;
-  }
-  // The family a guess on `l` ran. (Only a CodePoint family guesses: spelled
-  // out, the choice lets guess_held fold.)
-  static Family guess_family(const Ladder &l) {
-    return l.fam == kFamUsAssert ? kFamUsAssert : kFamUsDfa;
   }
   // A guess of find_rest's that did not hold: the Pike's answer, from the
   // start. Out of line: no subject the family serves reaches it.
@@ -17668,7 +17679,11 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   if (found)
     reach = walked ? c.pos
                    : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
-  if (guess_held(guess_family(l), text, reach)) return found;
+  // (Only a CodePoint family guesses: each spelled out, so that guess_held
+  // folds for it.)
+  if (l.fam == kFamUsAssert ? guess_held(kFamUsAssert, text, reach)
+                            : guess_held(kFamUsDfa, text, reach))
+    return found;
   return find_pike(text, scr, out);
 }
 
