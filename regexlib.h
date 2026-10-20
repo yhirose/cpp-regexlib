@@ -6215,6 +6215,7 @@ private:
       // Rungs the scan has given up, whatever family it lands on next.
       kSuffixOff = 1 << 6,
       kInnerOff = 1 << 7,
+      kGivenUp = kSuffixOff | kInnerOff,
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
       kSpec = 1 << 8,
@@ -6949,6 +6950,14 @@ private:
     // dfa_find_ok to say which it is).
     bool dfa_family_ok(bool boolean) const {
       return boolean ? dfa_ok_ : dfa_find_ok();
+    }
+    // The ASCII family a find (a boolean: `test`) of a pure-ASCII subject
+    // runs on, if any. (A boolean needs only the assert DFAs, a find the lf
+    // program too.)
+    Family ascii_family(bool test) const {
+      return dfa_family_ok(test) ? kFamAscii
+             : (test ? dfa_assert_ok_ : assert_ascii_tier()) ? kFamAssertAscii
+                                                             : kFamilyCount;
     }
     bool dfa_find_free() const { return dfa_find_ok() && ncap_ == 0; }
     // [Tier: LiteralAlt]
@@ -10106,11 +10115,13 @@ private:
     //   family_: each family's ladder, for the subject to choose among.
     //   fused_: which fused EGC scan the plan has (egc_fused_ok /
     //     egc_fused_collapse_ok, asked once).
-    //   guesses_: the families a guess tries, in order, each judged on what
-    //     it read (Regex::guess_held); kFamilyCount past the last. Per
-    //     guesser: match(), a find, a boolean (Regex::guess_row). A one-step
-    //     find guesses a CodePoint plan's family (Regex::find_rest), which
-    //     does not depend on the subject: its first and only one.
+    //   guesses_: per guesser — match(), a find, a boolean (Regex::
+    //     guess_row) — the families it takes without classifying the
+    //     subject, kFamilyCount where none (Regex::guess_held judges what
+    //     each read). match() tries its two in turn. A find: a CodePoint
+    //     plan's one family, guessed ([0]); a Grapheme plan's ASCII family,
+    //     taken outright on a pure-ASCII subject ([0]), and its byte family,
+    //     guessed on any other ([1]) (Regex::guess_begin).
     enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
     Fused fused_ = Fused::None;
     Ladder start_[3];
@@ -15144,8 +15155,7 @@ public:
   // given up. Nothing else is carried — a guess (kSpec) ends on a ladder
   // the subject chose.
   Ladder ladder_adopt(Ladder n, Ladder old) const {
-    const uint16_t off =
-        old.flags & (Ladder::kSuffixOff | Ladder::kInnerOff) & ~n.flags;
+    const uint16_t off = old.flags & Ladder::kGivenUp & ~n.flags;
     if (off) {
       n.flags |= off;
       ladder_repick(*plan_, n);
@@ -15167,6 +15177,18 @@ public:
   Ladder ladder_guessed(Ladder l) const {
     const Ladder n = first_guess(*plan_, l);
     return n.rung == Rung::Pike ? n : ladder_adopt(n, l);
+  }
+  // A scan on `l` moved onto family `f`'s ladder.
+  REGEXLIB_ALWAYS_INLINE Ladder ladder_on(Family f, Ladder l) const {
+    return ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
+  }
+  // A scan on `l` back at Classify, from the start (a guess that did not
+  // hold): only the rungs it gave up stay given up.
+  static Ladder ladder_unguessed(const Ladder &l) {
+    Ladder n = pike_ladder(l.want);
+    n.flags = l.flags & Ladder::kGivenUp;
+    n.rung = n.below = Rung::Classify;
+    return n;
   }
   // Rung::Classify: which engine family serves this subject (a scan on `l`,
   // past its literal and text-anchor rungs). `fna` caches the subject's
@@ -15352,7 +15374,7 @@ public:
       const bool ascii = first_nonascii(text) == text.size();
       const Family f = row[ascii ? 0 : 1];
       if (f == kFamilyCount) return;
-      l = ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
+      l = ladder_on(f, l);
       if (ascii) return; // sound: no guess
     }
     l.set(Ladder::kSpec);
@@ -17506,27 +17528,16 @@ inline void Regex::ladder_plan(Plan &p) {
       byte = p.byte_path_ ? kFamEgcByte
              : p.byte_assert_path_ ? kFamAssertByte
                                    : kFamilyCount;
-      // A find's families (see guess_begin), where a CR-LF reads as the
+      // A find's families (guess_begin), where a CR-LF reads as the
       // grapheme engine reads it (crlf_byte_safe_, non-empty, no fused
-      // CR-LF literal): [0] the ASCII family, for the caller as ladder_gated
-      // has it, which a pure-ASCII subject takes outright
-      // (ascii_grapheme_ok holds); [1] the byte family, which a subject
-      // that is not guesses. Then no byte a walk reads past what the scans
-      // report changes the answer: past an ASCII byte it matched, a walk
-      // reads on, and gives up at a non-ASCII byte; a byte it did not
-      // match, a cluster on it does not match either. (No byte guess where
-      // the plan has a faster way over such a subject that needs no
-      // classifying: the fused rungs, and the (?i) prefix probe, chosen
-      // over the whole subject.)
+      // CR-LF literal), so that no byte a walk reads past what the scans
+      // report changes the answer (docs/design.md, "They guess now").
+      // No byte guess where the plan has a faster way over a non-ASCII
+      // subject that needs no classifying: the fused rungs, and the (?i)
+      // prefix probe.
       if (p.crlf_byte_safe_ && !p.can_match_empty_ && !p.crlf_fused_lit_) {
-        p.guesses_[Plan::kGuessFind][0] =
-            p.dfa_family_ok(false) ? kFamAscii
-            : p.assert_ascii_tier() ? kFamAssertAscii
-                                    : kFamilyCount;
-        p.guesses_[Plan::kGuessTest][0] =
-            p.dfa_family_ok(true) ? kFamAscii
-            : p.dfa_assert_ok_    ? kFamAssertAscii
-                                  : kFamilyCount;
+        p.guesses_[Plan::kGuessFind][0] = p.ascii_family(false);
+        p.guesses_[Plan::kGuessTest][0] = p.ascii_family(true);
         if (p.fused_ == Plan::Fused::None &&
             !(p.ncap_ == 0 && p.icase_prefix_.active()))
           p.guesses_[Plan::kGuessFind][1] = p.guesses_[Plan::kGuessTest][1] =
@@ -17633,19 +17644,16 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
                 icase_choose_probe(text, probe)
             ? kFamEgcByteIp
             : kFamEgcByte;
-  } else if (p.dfa_family_ok(test) && family_sound(kFamAscii, text, fna)) {
-    f = kFamAscii;
-  } else if ((test ? p.dfa_assert_ok_ : p.assert_ascii_tier()) &&
-             family_sound(kFamAssertAscii, text, fna)) {
-    // (The assert family on an ASCII subject: a boolean needs only the
-    // assert DFAs, a find the lf program too.)
-    f = kFamAssertAscii;
+  } else if (p.ascii_family(test) != kFamilyCount &&
+             family_sound(kFamAscii, text, fna)) {
+    // (Both ASCII families are sound on the same subjects.)
+    f = p.ascii_family(test);
   } else if (assert_byte_path_ok(text, fna)) {
     f = kFamAssertByte;
   } else { // [Tier: Pike]
     return pike_ladder(l.want);
   }
-  return ladder_adopt(p.family_[f][ladder_caller(l)], l);
+  return ladder_on(f, l);
 }
 
 inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
@@ -17723,21 +17731,16 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
       reach = walked ? c.pos
                      : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
     // A guess that does not hold: the scan again from the start, into a
-    // fresh sink — on the Pike (CodePoint), or classified whole (Grapheme;
-    // the rungs given up stay given up).
-    const Want want = l.want;
+    // fresh sink — on the Pike (CodePoint), or classified whole (Grapheme).
     if (plan_->us_) {
       // (Each CodePoint family spelled out, so that guess_held folds.)
       if (l.fam == kFamUsAssert ? guess_held(kFamUsAssert, text, reach)
                                 : guess_held(kFamUsDfa, text, reach))
         return found;
-      l = pike_ladder(want);
+      l = pike_ladder(l.want);
     } else {
       if (guess_held(l.fam, text, reach)) return found;
-      const uint16_t off = l.flags & (Ladder::kSuffixOff | Ladder::kInnerOff);
-      l = pike_ladder(want);
-      l.flags = off;
-      l.rung = l.below = Rung::Classify;
+      l = ladder_unguessed(l);
     }
     out.clear();
   }

@@ -2043,6 +2043,39 @@ void test_match_guess() {
 // segmented the whole subject — from what this call read: after a scan to
 // the end of another, a boolean that answers in the first words is not
 // judged on the bytes the other read.
+// Letters that take many DFA states, clean and with each piece of `dirt` at
+// the edges and inside.
+std::vector<std::string>
+hard_subjects(std::initializer_list<const char *> dirt) {
+  std::vector<std::string> hard;
+  for (const std::string &b :
+       {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
+    hard.push_back(b);
+    for (const char *d : dirt)
+      for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
+                        b.size() - 1, b.size()})
+        hard.push_back(inserted(b, at, d));
+  }
+  return hard;
+}
+// `re`'s first match and boolean agree with `pike`'s over `subjects` on
+// caches too small for them (built afresh for each call), and with only
+// the boolean's DFA given up.
+void check_squeezed(const Regex &re, const Regex &pike,
+                    const std::vector<std::string> &subjects) {
+  for (const std::string &s : subjects) {
+    for (size_t bytes : {size_t{512}, size_t{4096}})
+      for (uint32_t clears : {0u, 3u}) {
+        PlanProbe::dfa_cache(re, bytes, clears);
+        CHECK(first_agrees(re, pike, s));
+      }
+    PlanProbe::dfa_cache(re, reg::limits::kDfaCacheBytes,
+                         reg::limits::kDfaMinClears);
+    PlanProbe::quit_fu(re);
+    CHECK(first_agrees(re, pike, s));
+  }
+}
+
 void test_find_guess() {
   const char *pats[] = {
       "\\w+", "(\\w+) (\\w+)", "[a-z]+ing", "\\w+@\\w+", "x\\w*z",
@@ -2108,32 +2141,13 @@ void test_find_guess() {
   // or an accent at the edges and inside: on caches too small for them
   // (built afresh for each call), and with only the boolean's DFA given up,
   // which on clean text leaves the find's own rungs to answer, not the Pike.
-  std::vector<std::string> hard;
-  for (const std::string &b :
-       {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
-    hard.push_back(b);
-    for (const char *d : {"\xFF", "\xC3", "\xC3\xA9"})
-      for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
-                        b.size() - 1, b.size()})
-        hard.push_back(inserted(b, at, d));
-  }
+  const std::vector<std::string> hard =
+      hard_subjects({"\xFF", "\xC3", "\xC3\xA9"});
   for (const char *pat :
        {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
-        "(a)[a-d]{8}(d)", "[^\\x00-\\x7f]", "\\b[ab]*a[ab]{9}\\b"}) {
-    const Regex re = make_us(pat),
-                pike = pike_twin(pat, 0, reg::MatchUnit::CodePoint);
-    for (const std::string &s : hard) {
-      for (size_t bytes : {size_t{512}, size_t{4096}})
-        for (uint32_t clears : {0u, 3u}) {
-          PlanProbe::dfa_cache(re, bytes, clears);
-          CHECK(first_agrees(re, pike, s));
-        }
-      PlanProbe::dfa_cache(re, reg::limits::kDfaCacheBytes,
-                           reg::limits::kDfaMinClears);
-      PlanProbe::quit_fu(re);
-      CHECK(first_agrees(re, pike, s));
-    }
-  }
+        "(a)[a-d]{8}(d)", "[^\\x00-\\x7f]", "\\b[ab]*a[ab]{9}\\b"})
+    check_squeezed(make_us(pat), pike_twin(pat, 0, reg::MatchUnit::CodePoint),
+                   hard);
   const Regex walk = make_us("(a)[a-d]{8}(d)");
   CHECK(PlanProbe::start(walk, true) == 'B');
   PlanProbe::quit_fu(walk);
@@ -2192,31 +2206,12 @@ void test_find_guess_grapheme() {
   // Where a DFA of the guess gives up, the guess ends (the Pike, or the
   // subject classified whole): on caches too small, over letters that take
   // many DFA states, with a mark or a CR-LF at the edges and inside.
-  std::vector<std::string> hard;
-  for (const std::string &b :
-       {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
-    hard.push_back(b);
-    for (const char *d : {"\xCC\x81", "\r\n", "\xC3\xA9"})
-      for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
-                        b.size() - 1, b.size()})
-        hard.push_back(inserted(b, at, d));
-  }
+  const std::vector<std::string> hard =
+      hard_subjects({"\xCC\x81", "\r\n", "\xC3\xA9"});
   for (const char *pat :
        {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
-        "(a)[a-d]{8}(d)", "\\b[ab]*a[ab]{9}\\b"}) {
-    const Regex re = make_egc(pat), pike = pike_twin(pat);
-    for (const std::string &s : hard) {
-      for (size_t bytes : {size_t{512}, size_t{4096}})
-        for (uint32_t clears : {0u, 3u}) {
-          PlanProbe::dfa_cache(re, bytes, clears);
-          CHECK(first_agrees(re, pike, s));
-        }
-      PlanProbe::dfa_cache(re, reg::limits::kDfaCacheBytes,
-                           reg::limits::kDfaMinClears);
-      PlanProbe::quit_fu(re);
-      CHECK(first_agrees(re, pike, s));
-    }
-  }
+        "(a)[a-d]{8}(d)", "\\b[ab]*a[ab]{9}\\b"})
+    check_squeezed(make_egc(pat), pike_twin(pat), hard);
 }
 
 // Every ladder names the family it runs on (Ladder::fam), and what engine
