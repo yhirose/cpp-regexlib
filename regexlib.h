@@ -1720,8 +1720,8 @@ constexpr long kBitStateCap = 1 << 20; // prog_size * span entries
 constexpr size_t kUnfilteredBitStateBytes = 1 << 12; // 4 KiB
 
 // Where a boolean (test()) starts to use what skips ahead. Two things that
-// make a long subject cheap cost a short one more than they save, by about
-// the same amount — a fixed set-up against a scan that costs little a byte:
+// make a long subject cheap cost a short one more than they save: a fixed
+// set-up that a scan of a few dozen bytes does not repay —
 // the interior-literal rung (a memmem, a reverse scan for the floor, a
 // forward scan from it), and the boolean DFA's start-state skip in CodePoint
 // mode. Below this many bytes the boolean just scans.
@@ -5232,7 +5232,7 @@ public:
 
   // `k` more cells, unwritten: the caller writes every one of them. (Inlined
   // by name, the growing kept out of line: with both left to the compiler a
-  // row cost find_iter a call.)
+  // row would cost find_iter a call.)
   REGEXLIB_ALWAYS_INLINE uint32_t *append(size_t k) {
     if (cap_ - n_ < k) grow(k);
     uint32_t *cells = p_ + n_;
@@ -6003,10 +6003,11 @@ private:
     Saves::warm_pool();
     static thread_local std::unordered_map<const Regex *, FindCache> caches;
     // Single-entry MRU in front of the map: the common shape is many calls on
-    // one Regex per thread, and the hash lookup is the largest part of the
-    // per-call dispatch residue. bind() still runs (it revalidates
-    // cache_gen_ against address reuse in one compare); the MRU is dropped
-    // whenever the eviction below erases entries it might point to.
+    // one Regex per thread, and the hash lookup would otherwise be the
+    // largest part of the per-call dispatch residue. bind() still runs (it
+    // revalidates cache_gen_ against address reuse in one compare); the MRU
+    // is dropped whenever the eviction below erases entries it might point
+    // to.
     static thread_local std::pair<const Regex *, FindCache *> mru{nullptr,
                                                                   nullptr};
     if (mru.first == this) {
@@ -6413,16 +6414,16 @@ private:
     // The first occurrence of a fingerprint that starts in [from, slen),
     // and which fingerprint it is; pos == slen when there is none.
     // (This and find are inlined by name, down to the scan: they are a
-    // dispatch, and left to the compiler they go out of line with more than
-    // one caller — a call on every find of the alternation tier.)
+    // dispatch, and left to the compiler they can go out of line as callers
+    // are added — a call on every find of the alternation tier.)
     REGEXLIB_ALWAYS_INLINE Hit find_print(const unsigned char *p, size_t slen,
                                           size_t from) const {
       return find_with(pick(slen - from), p, slen, from, shared);
     }
     // ... for a caller that only asks where: slen when there is none. It
     // takes the word of every bucket that lets nothing else through, shared
-    // or not — a lookup less per candidate, which counts when the
-    // occurrences are dense.
+    // or not — a lookup less per candidate, which matters when candidates
+    // are close together.
     REGEXLIB_ALWAYS_INLINE size_t find(const unsigned char *p, size_t slen,
                                        size_t from) const {
       return find_with(pick(slen - from), p, slen, from, loose).pos;
@@ -6457,8 +6458,8 @@ private:
     //     which a walk of a few positions beats. (The threshold is x86's,
     //     taken for NEON.)
     //   kVec32From: a block of its own. Below that the 32-byte scan would
-    //     only put a partial block together, twice as wide (a dearer call
-    //     than the 16-byte scan).
+    //     only put a partial block together, twice as wide (and cost more
+    //     per call than the 16-byte scan).
     static constexpr size_t kVec16From = 6, kVec32From = 32;
     static Scan pick(size_t range) {
       if (range >= kVec32From && has(Scan::Vec32)) return Scan::Vec32;
@@ -7185,7 +7186,7 @@ private:
       // compiles), but the suffix / ReverseInner analyses live in the !us_
       // block above, so a class-led, class-tailed US pattern (e.g.
       // `[a-q][^u-z]{13}x`) would have NO usable prefilter and scan the whole
-      // subject with the DFA, far slower than the EGC tier. Compute them
+      // subject with the DFA, where EGC has a prefilter. Compute them
       // here from `root`; the rare trailing/interior literal then drives a
       // memmem-skip + reverse-DFA verify (suffix_find / inner_find) over US's
       // own DFAs (kDfaFwda / kDfaRev / kDfaFwd, and inrev).
@@ -8907,17 +8908,17 @@ private:
                                             // beat the prefix by
       static constexpr int kWordEdgeThin = 3; // a letter is at a word's edge
                                               // about one time in three
-      // WordOnePass's candidate scan (word_start_block), per MB, as
-      // measured: three table lookups per 16 bytes whatever the start set
-      // holds.
+      // The two scan rates are measured. WordOnePass's candidate scan
+      // (word_start_block), per MB: three table lookups per 16 bytes
+      // whatever the start set holds.
       static constexpr int kWordScanNs = 70000;
       // A prefix estimated at 1 ns per byte or more is dense: the DFA scan
       // costs about that whatever the subject holds.
       static constexpr int kDenseNs = 1000000;
       bool prefix_dense() const { return prefix_cost >= kDenseNs; }
       bool scan_dense() const { return scan_cost >= kDenseNs; }
-      // Teddy's own pace, per MB, as measured, whatever the subject holds: a
-      // vector of lookups per 16 or 32 bytes.
+      // Teddy's own pace, per MB, whatever the subject holds: a vector of
+      // lookups per 16 or 32 bytes.
       static constexpr int kTeddyScanNs = 70000;
     };
 
@@ -10289,7 +10290,7 @@ private:
       // of one-code-point repeats whose ADJACENT ASCII byte sets are disjoint,
       // the parse around a suffix occurrence is FORCED — each repeat's span is
       // the maximal byte run of its class — so a candidate is confirmed by
-      // plain byte walks, far cheaper than a reverse DFA scan plus a forward
+      // plain byte walks instead of a reverse DFA scan plus a forward
       // re-expansion. `absorb_last` marks the `[a-zA-Z]+ing` family (every
       // suffix byte inside the LAST class): there the greedy end is the LAST
       // suffix occurrence inside the final class run, which the verifier
@@ -10814,9 +10815,9 @@ private:
   // fast loop out once: four 16-byte blocks per iteration with a single cheap
   // any-hit test per 64 bytes (per-block hit masks are extracted only after a
   // hit), then a 16-byte loop and a scalar loop for the tail. 64 bytes per
-  // iteration, and no call per stop, is what makes a stop-free scan fast
-  // (libc memchr takes 16 bytes per iteration plus a call per stop); every
-  // scan expressed through scan64 gets that rate.
+  // iteration with one any-hit test is what makes a stop-free scan fast
+  // (libc memchr takes 16 bytes per iteration, plus a call per stop); every
+  // scan expressed through scan64 gets that speed.
   //
   // A predicate supplies the platform lane mask and the matching scalar test:
   //   NEON: uint8x16_t lanes(uint8x16_t v) — 0xFF lanes where it holds
@@ -11180,8 +11181,8 @@ private:
   // A probe byte in all 16 lanes, widened from a 32-bit value. Not
   // _mm_set1_epi8: a predicate keeps the byte as a member, and GCC then
   // splats it by reading that one-byte slot back as four (movd) right after
-  // writing it — a load no store can forward to, a stall per predicate
-  // built, which weighs on a literal search over a short subject.
+  // writing it — a load no store can forward to: a stall per predicate
+  // built, a large share of a literal search over a short subject.
   static __m128i simd_splat(unsigned char c) {
     return _mm_set1_epi32(static_cast<int>(c * 0x01010101u));
   }
@@ -11525,8 +11526,8 @@ private:
   // of the cruise rate where the byte really is rare, but rare is the
   // table's word about English prose, and a subject is whatever it is:
   // `fox` over a list of random words meets an `x` every 26 bytes, and a
-  // single probe stops at each. The pair costs prose a little; a single
-  // probe can cost such a subject most of its rate.
+  // single probe stops at each. The pair is somewhat slower on prose; a
+  // single probe is many times slower on such a subject.
   static size_t pair_probe(const std::string &s, size_t probe) {
     return pair_probe(reinterpret_cast<const unsigned char *>(s.data()),
                       s.size(), probe);
