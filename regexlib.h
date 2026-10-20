@@ -1518,9 +1518,8 @@ inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
 //      just can't be CALLED outside an ssse3 context) and enable the SSSE3 code
 //      paths, but gate every call behind a cached __builtin_cpu_supports("ssse3")
 //      check; the PSHUFB Teddy scan itself carries __attribute__((target("ssse3")))
-//      so it compiles at the SSE2 baseline. This closes the perf cliff where a
-//      default Linux build silently ran the scalar Teddy fallback (~10-18x slower
-//      on literal-alternation patterns) despite the CPU supporting SSSE3.
+//      so it compiles at the SSE2 baseline. So a default Linux build does not
+//      run the scalar Teddy fallback on a CPU that has SSSE3.
 //
 //   3. Neither: scalar Teddy fallback (correct, just slower). This is where
 //      clang-cl without -mssse3 lands — __builtin_cpu_supports is unreliable on
@@ -1605,11 +1604,10 @@ namespace reg {
 // transparent comparator lets group(name) look up a std::string_view directly:
 // with std::unordered_map the lookup has to materialize a std::string per call
 // (heterogeneous lookup on the unordered containers is C++20, and this header is
-// C++17), which allocates for any name past the small-string limit. Measured
-// 1.2x faster for short names and 4.3x for a 30-character one; the map also
-// copies with one fewer allocation into each owning MatchResult. The cost is
-// slower iteration, paid once per find_all()/find_iter() call rather than per
-// match. RE2's NamedCapturingGroups() returns the same shape.
+// C++17), which allocates for any name past the small-string limit. The map
+// also copies with one fewer allocation into each owning MatchResult. The cost
+// is slower iteration, paid once per find_all()/find_iter() call rather than
+// per match. RE2's NamedCapturingGroups() returns the same shape.
 using NameMap = std::map<std::string, int, std::less<>>;
 
 //------------------------------------------------------------------------------
@@ -1723,18 +1721,16 @@ constexpr size_t kUnfilteredBitStateBytes = 1 << 12; // 4 KiB
 
 // Where a boolean (test()) starts to use what skips ahead. Two things that
 // make a long subject cheap cost a short one more than they save, by about
-// the same amount — some 10-30 ns of set-up against a scan of ~1 ns a byte:
+// the same amount — a fixed set-up against a scan that costs little a byte:
 // the interior-literal rung (a memmem, a reverse scan for the floor, a
-// forward scan from it: `[^?]+\?.*` over a 23-byte path took 48 ns that way
-// and 15 scanned), and the boolean DFA's start-state skip in CodePoint mode
-// (`//.*` over 20 bytes: 22 ns against 11).
-// Below this many bytes the boolean just scans.
+// forward scan from it), and the boolean DFA's start-state skip in CodePoint
+// mode. Below this many bytes the boolean just scans.
 constexpr int kBoolSkipBytes = 64;
 // ... and how far back the interior-literal rung looks for its floor on a
 // boolean's behalf before it leaves the subject to the scan (see
 // inner_find): a pre-part that runs back further is walked twice, once each
 // way, where the scan walks it once. What the look costs when it comes back
-// with nothing is the look itself: ~50 ns at 32 bytes, ~110 at 64.
+// with nothing is the look itself, and it grows with this bound.
 constexpr int kBoolFloorBytes = 32;
 
 } // namespace limits
@@ -1761,11 +1757,10 @@ REGEXLIB_ALWAYS_INLINE inline const T *walk_column(const T *table,
 // row's address is made a value of its own, and the flags are read through
 // it. Read as table[state - 1] they are a second load indexed by the state
 // the moment it arrives, beside the next step's own — and the two can get
-// in each other's way, a cycle of every byte (the lazy DFA's look scans; a
-// boolean one over prose it does not match: 865 MB/s so, 1,035 with the
-// address taken first). Not a rule: the same scans without look, the same
-// instructions but for this, run at full speed either way over a long
-// subject and a little quicker the plain way over a short one.
+// in each other's way, a cycle of every byte (the lazy DFA's look scans).
+// Not a rule: the same scans without look, the same instructions but for
+// this, run at full speed either way over a long subject and a little
+// quicker the plain way over a short one.
 template <class T>
 REGEXLIB_ALWAYS_INLINE inline T walk_flags(const T *table, size_t state) {
   const T *row = table + state;
@@ -1860,8 +1855,7 @@ inline bool is_word_cp(char32_t cp) {
 // word_start_block). No byte >= 0x80 is a member: its row has no bit that
 // high. Aligned, so that the one load of it never straddles a cache line:
 // unaligned in a heap object it does or does not as the heap places the
-// object, and a scan through it is 3% slower when it does (dense `\w+`, a
-// run state's table at one placement in four).
+// object, and a scan through it is slower when it does.
 struct alignas(16) NibbleSet : std::array<uint8_t, 16> {};
 constexpr void nibble_set_add(NibbleSet &set, unsigned char c) {
   set[c & 15] = static_cast<uint8_t>(set[c & 15] | (1u << (c >> 4)));
@@ -2636,10 +2630,10 @@ inline Node unwrap_groups(Node n, bool caps) {
 //    group in the pattern the slots are real work and the wrappers stay.
 //
 // The analyses read the root's shape (a Concat ending in a literal, a bare
-// literal run, ...), so a wrapper that survives to the plan hides it: before
-// this, ([a-zA-Z]+ing) and (?:[a-zA-Z]+ing) both ran at an eighth of
-// [a-zA-Z]+ing's speed over prose, and ([a-q][^u-z]{13}x) fell to the Pike on
-// CRLF text — 9.6 MB/s where its twin runs at 20,000.
+// literal run, ...), so a wrapper that survives to the plan hides it:
+// ([a-zA-Z]+ing) and (?:[a-zA-Z]+ing) would miss the plan [a-zA-Z]+ing gets,
+// and ([a-q][^u-z]{13}x) would fall to the Pike on CRLF text where its twin
+// does not.
 inline Node peel_root_groups(Node root, int ncap, int &alias_groups) {
   const bool whole = ncap > 0 && count_wrapping_capture_groups(root) == ncap;
   alias_groups = whole ? ncap : 0;
@@ -4716,8 +4710,8 @@ struct CpOnePass {
     // bit h of loop_tbl[l] is set iff ASCII byte (h << 4 | l) self-loops.
     // Two 16-lane table lookups (low nibble -> row, high nibble -> bit) test
     // 16 bytes at once, exact for ANY ASCII set — no exit-count cap, and no
-    // per-call splat of an exit list (the old PredInList form's fixed cost,
-    // which lost on the short runs real data is made of). A byte >= 0x80
+    // per-call splat of an exit list (a fixed cost, which would lose on the
+    // short runs real data is made of). A byte >= 0x80
     // never tests as a member, so a run stops there and the per-byte loop
     // bails as usual.
     bool loop_ok = false;
@@ -4731,13 +4725,12 @@ struct CpOnePass {
     bool restart_ok = false;
     // Packed per-byte transition for the hot walks: the next state — as its
     // OFFSET in `states`, in bytes, so that a walk has nothing to multiply
-    // between one step's load and the next (five groups of a UUID, searched:
-    // 117 ns with an id there, 80 so) — plus the two flags the per-byte loop
-    // needs: whether this (state, byte) writes a slot (kStepWrite -> consult
-    // mask[b]) and whether the NEXT state accepts (kStepAccept -> update the
-    // last-accept tracking). One
-    // dependent load per byte instead of three (next[b], the mask_nonzero
-    // bitmap and the next state's can_match live on three cache lines).
+    // between one step's load and the next — plus the two flags the per-byte
+    // loop needs: whether this (state, byte) writes a slot (kStepWrite ->
+    // consult mask[b]) and whether the NEXT state accepts (kStepAccept ->
+    // update the last-accept tracking). One dependent load per byte instead
+    // of three (next[b], the mask_nonzero bitmap and the next state's
+    // can_match live on three cache lines).
     // kStepDead = no transition. 256 entries: [128, 256) hold kStepDead, so
     // the per-byte loop has no `>= 0x80` test — a non-ASCII byte reads dead
     // and is told apart from a real dead transition only on that cold path.
@@ -5190,8 +5183,7 @@ namespace detail {
 //    allocation of that size is new pages, faulted in again.
 // append() hands out cells without writing them, and the block grows by
 // realloc(), which can extend it where it stands or remap it — no copy, no
-// page touched twice (glibc does, for a block of this size). `\w+` over
-// 512 KB of words, find_all, on glibc: 437 MB/s on the vector, 757 on this.
+// page touched twice (glibc does, for a block of this size).
 class SpanRows {
   uint32_t *p_ = nullptr;
   size_t n_ = 0, cap_ = 0;
@@ -5240,7 +5232,7 @@ public:
 
   // `k` more cells, unwritten: the caller writes every one of them. (Inlined
   // by name, the growing kept out of line: with both left to the compiler a
-  // row cost find_iter a call — 20 instructions where this is five.)
+  // row cost find_iter a call.)
   REGEXLIB_ALWAYS_INLINE uint32_t *append(size_t k) {
     if (cap_ - n_ < k) grow(k);
     uint32_t *cells = p_ + n_;
@@ -5470,12 +5462,9 @@ private:
   // to 7 capture groups (group 0 + 7 => 16 slots) — so an owning result for a
   // captured match needs no heap allocation up through the wide
   // validate-and-extract shapes (an ISO-8601 datetime is 6 groups, a
-  // Combined-Log line 7). At 8 slots (3 groups) the six-group ISO date paid a
-  // malloc per search(): 114 ns against 96 here (EGC 119 / 101). The extra 32
-  // inline bytes cost nothing measurable on the 1-3 group results, which were
-  // inline either way (`^(\d{4})-(\d{2})-(\d{2})$` 54/55, `/users/(\d+)`
-  // 40/42). Measured -O3 -DNDEBUG, median of 25x200 calls, US mode, each
-  // binary run alone, the two headers differing in this line only.
+  // Combined-Log line 7); with fewer slots those shapes pay a malloc per
+  // search(). The extra inline bytes cost the 1-3 group results nothing:
+  // they are inline either way.
   small_vector<uint32_t, 16> spans_;
   NameMap names_; // name -> group index
 };
@@ -5598,22 +5587,21 @@ class Regex {
   //     the proven single-pass machinery. Worst case: one wasted
   //     subject-length of walking, once — O(n) total.
   //   - The one-pass candidate drivers use spend_profitable(walk, scanned),
-  //     which adds a PROFITABILITY rule on top of the same bound. A candidate + verify
-  //     driver only pays off when candidates are sparse or verifies succeed;
-  //     whether they do depends on the subject, not the pattern
-  //     (`(\w+)\s+(\d+)`: every word is a candidate and every walk runs the
-  //     word and fails — chain-beating on key=value text, half the chain's
-  //     speed on prose). The rule estimates the driver's work in chain-bytes
-  //     (the chain's single dependent-load DFA pass, ~2.6 ns/byte) and bails
-  //     as soon as that estimate exceeds the distance scanned: from there the
-  //     chain would already have been ahead. What a failed walk costs is
-  //     what it did, not how far it got: a SIMD run skip that ended in
-  //     failure is the expensive part (its setup plus an exit mispredict —
-  //     the prose candidate above, two runs and three steps, measured ~24 ns
-  //     = kRunCost chain-bytes per run), while plain table steps overlap
+  //     which adds a PROFITABILITY rule on top of the same bound. A
+  //     candidate + verify driver only pays off when candidates are sparse
+  //     or verifies succeed; whether they do depends on the subject, not the
+  //     pattern (`(\w+)\s+(\d+)`: every word is a candidate and every walk
+  //     runs the word and fails — ahead of the chain on key=value text,
+  //     behind it on prose). The rule estimates the driver's work in
+  //     chain-bytes (a byte of the chain's single dependent-load DFA pass)
+  //     and bails as soon as that estimate exceeds the distance scanned: from
+  //     there the chain would already have been ahead. What a failed walk
+  //     costs is what it did, not how far it got: a SIMD run skip that ended
+  //     in failure is the expensive part (its setup plus an exit mispredict,
+  //     kRunCost chain-bytes per run), while plain table steps overlap
   //     across the independent candidate walks and cost about half a chain
   //     byte each (`(\d{3}) (\d+)$` over a log: three-step, run-free failed
-  //     candidates at ~4 ns, a driver FASTER than the chain, which a flat
+  //     candidates, a driver FASTER than the chain, which a flat
   //     per-candidate charge would wrongly bail). kMinScan gives the driver
   //     a window to prove itself, so a short subject never bails on the rule
   //     (per-call latency keeps the one-walk shape) and the wasted prefix on
@@ -5624,8 +5612,8 @@ class Regex {
   //     prefix, Teddy, a sparse first-byte set) uses spend_at_candidate /
   //     matched_at_candidate instead: between such candidates the chain
   //     walks nothing either, so the distance is no yardstick, and both
-  //     sides are counted per candidate — there a fixed per-candidate cost
-  //     is what was measured (see spend_at_candidate).
+  //     sides are counted per candidate, a fixed cost each plus the bytes
+  //     (see spend_at_candidate).
   // What a cp_onepass_find walk reports to its driver. Filled on every
   // return: an accept is not necessarily a match the caller keeps (a
   // require_end `body$` plan rejects one that does not land at n), and such a
@@ -5687,20 +5675,17 @@ class Regex {
     // DFA skips from its start state with the very scan the driver runs (or,
     // for a set that is small but common, steps to the same bytes). The
     // distance scanned is then nobody's work, and measured against it the
-    // charge does not trip where it should: `e[a-z]+s` over prose, one
-    // candidate in 13 a match and the rest a failed run each, charged 0.96
-    // of the distance and ran at 393 MB/s where the chain does 505.
+    // charge does not trip where it should: `e[a-z]+s` over prose, most
+    // candidates a failed run each, stays under the distance while the
+    // driver runs behind the chain.
     //
     // The yardstick here is what the chain would have done on the SAME
     // candidates, and both sides are counted per candidate, in half
-    // chain-bytes. Measured over 595 KB of prose, per candidate: an
-    // all-matching `e\w*` (4.5 bytes) costs the walk 7 chain-bytes and the
-    // chain 10.9; a failing `e[a-z]+s` candidate (3.4 bytes walked) 6.5 and
-    // 4.5. That is a call's fixed cost of ~5 for the walk and ~1.5 for the
-    // chain (back at its start state, into the skip), plus the bytes: half
-    // a chain-byte each for the walk, one for the chain on a failure and
-    // two on a match (forward for the end, reverse for the start). A run
-    // that ends in failure is a chain-byte more.
+    // chain-bytes: a call's fixed cost (kCandWalk for the walk, kCandChain
+    // for the chain, back at its start state, into the skip), plus the
+    // bytes: half a chain-byte each for the walk, one for the chain on a
+    // failure and two on a match (forward for the end, reverse for the
+    // start). A run that ends in failure is a chain-byte more.
     bool spend_at_candidate(const OnePassWalk &w) {
       cand_charge_ += kCandWalk + w.walked + 2 * w.runs;
       cand_chain_ += kCandChain + 2 * static_cast<int64_t>(w.walked);
@@ -5717,13 +5702,11 @@ class Regex {
     // stopped paying on this subject and is given up for good.
     //
     // The bail is charged what a failed walk is, plus kBailCost for the
-    // call that produced nothing (measured: `\w+` over words that each begin
-    // with a non-ASCII letter, so every find bails on its first byte, ran
-    // ~7 ns per find behind the chain alone — about three chain-bytes). And
-    // the distance the chain then covers is taken OFF the yardstick
-    // (resumed_at): on such a subject the position still advances, but none
-    // of it is the driver's doing, and measured against it the charge would
-    // never trip.
+    // call that produced nothing (a find that bails on its first byte runs
+    // behind the chain alone by about that much). And the distance the
+    // chain then covers is taken OFF the yardstick (resumed_at): on such a
+    // subject the position still advances, but none of it is the driver's
+    // doing, and measured against it the charge would never trip.
     //
     // The linearity allowance is NOT drawn on: the chain step that follows
     // reads every byte the bailing walk read (the walk's start is the
@@ -5739,7 +5722,7 @@ class Regex {
     // at `from`: [the bail, from) is what the chain covered in the driver's
     // place. Called by the loop that ran the chain step, not by the driver's
     // front door — it is needed once per local bail, and a test for it on
-    // every find measured 5% on find_all over dense ASCII `\w+`.
+    // every find slows a dense find_all.
     void resumed_at(int from) {
       if (bail_at_ < 0) return;
       if (from > bail_at_) chained_ += from - bail_at_;
@@ -6011,18 +5994,17 @@ private:
   // demand) but is pure once built — reusable across calls and subjects.
   // search/ match/test would otherwise rebuild it on every call, which
   // dominates per-call latency on short subjects (e.g. routing a request path
-  // against `/users/(\w+)`: ~7.8us rebuilding vs ~0.3us reusing). Persist it
-  // per (thread, Regex): each thread keeps its own FindCache so the DFAs need
-  // no locking on the scan path. The map is bounded; on overflow it is cleared
-  // (a rare warm-cache reset).
+  // against `/users/(\w+)`). Persist it per (thread, Regex): each thread
+  // keeps its own FindCache so the DFAs need no locking on the scan path. The
+  // map is bounded; on overflow it is cleared (a rare warm-cache reset).
   FindCache &thread_cache() const {
     // Construct the Saves pool before the cache map so it outlives it: the
     // map's teardown returns Bufs to the pool (see Saves::warm_pool).
     Saves::warm_pool();
     static thread_local std::unordered_map<const Regex *, FindCache> caches;
     // Single-entry MRU in front of the map: the common shape is many calls on
-    // one Regex per thread, and the hash lookup (~8 ns) was the largest part
-    // of the per-call dispatch residue. bind() still runs (it revalidates
+    // one Regex per thread, and the hash lookup is the largest part of the
+    // per-call dispatch residue. bind() still runs (it revalidates
     // cache_gen_ against address reuse in one compare); the MRU is dropped
     // whenever the eviction below erases entries it might point to.
     static thread_local std::pair<const Regex *, FindCache *> mru{nullptr,
@@ -6034,10 +6016,9 @@ private:
     if (caches.size() > 1024) {
       // Bounded eviction. A bare clear() would free EVERY FindCache — including
       // one an outer frame already holds a reference into: search() keeps
-      // `cache.sc_` live across a find that re-enters thread_cache() (the
-      // assert scans re-fetched it, once), and the re-entrant call could tip
-      // the map past the cap and clear it underneath the outer Scratch& — a
-      // use-after-free the fuzzer caught at exactly 1025 entries. Erase only the
+      // `cache.sc_` live across a find that can re-enter thread_cache(), and
+      // the re-entrant call could tip the map past the cap and clear it
+      // underneath the outer Scratch& — a use-after-free. Erase only the
       // OTHER entries instead: unordered_map::erase leaves references to the
       // surviving element valid, and all re-entrancy is on the same Regex, so
       // caches[this] is precisely what an outer frame may still hold.
@@ -6432,17 +6413,16 @@ private:
     // The first occurrence of a fingerprint that starts in [from, slen),
     // and which fingerprint it is; pos == slen when there is none.
     // (This and find are inlined by name, down to the scan: they are a
-    // dispatch, and left to the compiler they went out of line once there
-    // was one more caller — a call and some 25 instructions on every find
-    // of the alternation tier, 3 to 6% of a dense scan.)
+    // dispatch, and left to the compiler they go out of line with more than
+    // one caller — a call on every find of the alternation tier.)
     REGEXLIB_ALWAYS_INLINE Hit find_print(const unsigned char *p, size_t slen,
                                           size_t from) const {
       return find_with(pick(slen - from), p, slen, from, shared);
     }
     // ... for a caller that only asks where: slen when there is none. It
     // takes the word of every bucket that lets nothing else through, shared
-    // or not — a lookup less per candidate, which is 2 to 5 ns of a call
-    // that takes 7 to 14 when the occurrences are a dozen bytes apart.
+    // or not — a lookup less per candidate, which counts when the
+    // occurrences are dense.
     REGEXLIB_ALWAYS_INLINE size_t find(const unsigned char *p, size_t slen,
                                        size_t from) const {
       return find_with(pick(slen - from), p, slen, from, loose).pos;
@@ -6472,14 +6452,13 @@ private:
 
     // The scan for a range of `range` bytes: the widest there is among those
     // the range is long enough for.
-    //   kVec16From: a vector scan costs the same ~4 ns whatever is in its
-    //     one block (tables into registers, the partial block put
-    //     together), which a walk of a few positions beats — 1 to 3 ns, a
-    //     fifth of what a search of a three-byte token takes in all.
-    //     (Measured on x86 and taken for NEON.)
+    //   kVec16From: a vector scan costs the same whatever is in its one
+    //     block (tables into registers, the partial block put together),
+    //     which a walk of a few positions beats. (The threshold is x86's,
+    //     taken for NEON.)
     //   kVec32From: a block of its own. Below that the 32-byte scan would
-    //     only put a partial block together, twice as wide (~1.5 ns a call
-    //     more than the 16-byte scan).
+    //     only put a partial block together, twice as wide (a dearer call
+    //     than the 16-byte scan).
     static constexpr size_t kVec16From = 6, kVec32From = 32;
     static Scan pick(size_t range) {
       if (range >= kVec32From && has(Scan::Vec32)) return Scan::Vec32;
@@ -6565,7 +6544,7 @@ private:
     // loads that overlap inside [q, q + len) and never leave it — and not by
     // copying the bytes into a buffer for the vector load to read back: that
     // load would wait for the copy's stores to retire, on every call with a
-    // short subject (it was ~12 ns of a 30 ns search).
+    // short subject.
     // (Both targets with a vector scan are little-endian.)
     struct Words {
       uint64_t lo = 0, hi = 0;
@@ -7205,12 +7184,11 @@ private:
       // automaton as the EGC byte path (prog_/rev_prog_/lf_prog_ are us=true
       // compiles), but the suffix / ReverseInner analyses live in the !us_
       // block above, so a class-led, class-tailed US pattern (e.g.
-      // `[a-q][^u-z]{13}x`) had NO usable prefilter and scanned the whole
-      // subject with the DFA
-      // (~84 MB/s vs the EGC tier's ~1600). Compute them here from `root`; the
-      // rare trailing/interior literal then drives a memmem-skip + reverse-DFA
-      // verify (suffix_find / inner_find) over US's own DFAs (kDfaFwda /
-      // kDfaRev / kDfaFwd, and inrev).
+      // `[a-q][^u-z]{13}x`) would have NO usable prefilter and scan the whole
+      // subject with the DFA, far slower than the EGC tier. Compute them
+      // here from `root`; the rare trailing/interior literal then drives a
+      // memmem-skip + reverse-DFA verify (suffix_find / inner_find) over US's
+      // own DFAs (kDfaFwda / kDfaRev / kDfaFwd, and inrev).
       // Soundness is simpler than EGC: US matches code points, ASCII/UTF-8
       // literals memmem only at code-point boundaries (UTF-8 self-delimiting),
       // and there is no grapheme cluster to gate on — so the prefilter applies
@@ -7331,12 +7309,8 @@ private:
         // extract shape, `^(\d{4})-(\d{2})-(\d{2})$`) is the same admission
         // with the single candidate 0: strip_boundary_asserts already
         // dropped both anchors from the one-pass program, and the drivers
-        // read onepass_anchored_start_. Without it such a pattern paid the
-        // assert DFA locate + the bitstate: search() on a six-group ISO
-        // date measured 147 ns, against 38 for its capture-free twin on the
-        // AnchoredOnePass tier (96 with this, the rest being the six
-        // groups' materialization). Measured -O3 -DNDEBUG, median of
-        // 25x200 calls, US mode, each binary run alone.
+        // read onepass_anchored_start_. Without it such a pattern pays the
+        // assert DFA locate + the bitstate.
         if (cp_onepass_.ok && !icase_ && !can_match_empty_ &&
             root.kind == detail::Node::Kind::Concat && !root.kids.empty() &&
             is_text_end_anchor(root.kids.back())) {
@@ -7386,9 +7360,8 @@ private:
         // builds one only at ncap > 0, and the grapheme program cannot serve
         // the walk (it interns a literal as ONE op over its code points, where
         // the walk steps bytes). Compile it here — but only for a pattern
-        // `unb` has just admitted, so the construction cost (this repo's
-        // headline is a ~35 ns constructor) lands on the patterns that get
-        // the one walk, not on every capture-free pattern.
+        // `unb` has just admitted, so the construction cost lands on the
+        // patterns that get the one walk, not on every capture-free pattern.
         if (unb && ncap_ == 0 && !us_ && dfa_ok_ && cp_prog_.insts.empty())
           cp_prog_ = detail::Compiler::compile(root, /*ncap=*/0, /*us=*/false,
                                                /*reverse=*/false, dotall_,
@@ -7396,10 +7369,9 @@ private:
         // At ncap == 0 the table has exactly one consumer, the unbounded
         // walk, so an inadmissible pattern must not build one: capture
         // resolution (the other consumer, at ncap > 0) has no groups to
-        // resolve here. Building it anyway put a multi-KB table in every
-        // capture-free Plan and cost the patterns that cannot use it
-        // 6-14% per call — `/\*.*?\*/` 122 -> 130 ns, `"(?:\\.|[^"\\])*"`
-        // 87 -> 99 — purely from the fatter Plan.
+        // resolve here. Building it anyway would put a multi-KB table in
+        // every capture-free Plan and slow every call of the patterns that
+        // cannot use it, purely from the fatter Plan.
         if (!cp_prog_.insts.empty() && (ncap_ > 0 || unb))
           cp_onepass_ =
               detail::build_cp_onepass(cp_prog_, icase_, dotall_, /*cut=*/unb);
@@ -7447,7 +7419,7 @@ private:
     //    capture slot written on some paths and not others), and what it
     //    admits writes each slot as a function of (state, byte) — one
     //    assignment, no priority to resolve. Insisting on the cut rules here
-    //    kept `^(a|aa)+$` and `^(?:a|a)*$` on the assert DFA.
+    //    would keep `^(a|aa)+$` and `^(?:a|a)*$` on the assert DFA.
     static bool onepass_body_ok(const detail::Node &body, bool cut) {
       for (const auto &k : body.kids)
         if (node_has_assert(k)) return false;
@@ -7474,16 +7446,15 @@ private:
     //
     // A state is the offset of its row in `next` (premultiplied as the
     // LazyDfa's are, and in bytes), and that is what an entry holds: each
-    // byte's load waits on the load before it, and an index had to be shifted
-    // into a row's place in between (a UUID validated: 56 -> 45 ns;
-    // onepass_walk_impl has the rest of it).
+    // byte's load waits on the load before it, and an index would have to be
+    // shifted into a row's place in between (onepass_walk_impl has the rest
+    // of it).
     //
     // A row is NOT a power of two wide. Of rows 512 bytes apart, the same
     // column falls in one of eight sets of the first-level cache — a hundred
     // lines between them, or fewer — and a walk through more states than
-    // that reloads its table from the second level at every byte (128 hex
-    // digits validated, a different subject each time: 262 ns so, 140 with
-    // the odd entry, which spreads a column over every set).
+    // that reloads its table from the second level at every byte. The odd
+    // entry spreads a column over every set.
     struct AnchoredOnePass {
       std::vector<uint32_t> next; // kStride entries a state (see above)
       uint32_t start = 0; // the start state's row
@@ -7523,11 +7494,9 @@ private:
     // walk decides the span, which is all test() and every no-match need,
     // and a capture consumer resolves the groups on the decided [0, e)
     // (`^body$` goes one better — see onepass_anchored_start_). Barring
-    // ncap != 0 here sent `^(a+)+$` on its ReDoS input to the assert DFA —
-    // search() 75 ns where its capture-free twin `^(?:a+)+$` took 44 — and
-    // test() on a captured validator all the way to search()'s bitstate (the
-    // six-group ISO date: 161 ns, against 20 for the twin). Measured
-    // -O3 -DNDEBUG, median of 25x200 calls, US mode, each binary run alone.
+    // ncap != 0 here would send `^(a+)+$` on its ReDoS input to the assert
+    // DFA, and test() on a captured validator all the way to search()'s
+    // bitstate.
     void plan_anchored_onepass(const detail::Node &root) {
       using K = detail::Node::Kind;
       aop_.ok = false;
@@ -7746,10 +7715,10 @@ private:
     // The tiers whose table is built UNCUT neither need this nor may pay for
     // it: `body$` / `^body$` (the accept must land at n, so a longer parse is
     // not a wrong answer) and WordOnePass WITH a trailing `\b` (which picks
-    // the accept). Folding the rule into onepass_unbounded_ast_ok charged
-    // them too and cost the IPv4 extraction row —
+    // the accept). Folding the rule into onepass_unbounded_ast_ok would
+    // charge them too and refuse the IPv4 extraction —
     // `\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`, whose `{3}` body is
-    // variable-width — 613 -> 264 MB/s.
+    // variable-width.
     static bool onepass_cut_ast_ok(const detail::Node &n) {
       CutScan cs;
       return onepass_cut_scan(n, cs, /*tail_nullable=*/true);
@@ -8437,12 +8406,12 @@ private:
       // business: it reports the suffix anchor the pattern offers, and
       // plan_anchor weighs it against the prefix (`e[a-z]{3,}q` is driven
       // from its `q`, `Sherlock\s+Holmes` from its `Sherlock`).
-      // Coalesce the MAXIMAL trailing run of ASCII literal kids into the suffix
-      // needle. The parser emits one Lit node per character, so a literal "Holmes"
-      // suffix is six kids; taking only the last kid (`s`) would memmem a single
-      // common byte and reverse-verify ~50x more candidates than memmem-ing the
-      // whole "Holmes" (461 vs 27128 hits on the Sherlock corpus). Walk back while
-      // the kid is an all-ASCII (no \r/\n) literal; `run_lo` is the first kid of
+      // Coalesce the MAXIMAL trailing run of ASCII literal kids into the
+      // suffix needle. The parser emits one Lit node per character, so a
+      // literal "Holmes" suffix is six kids; taking only the last kid (`s`)
+      // would memmem a single common byte and reverse-verify far more
+      // candidates than memmem-ing the whole "Holmes". Walk back while the
+      // kid is an all-ASCII (no \r/\n) literal; `run_lo` is the first kid of
       // the run, and kids before it form the bounded pre-suffix.
       size_t run_lo = root.kids.size();
       std::string sfx;
@@ -8847,8 +8816,8 @@ private:
       // `(\w+)=(\S+)`). The capture chain re-walks the located span anyway
       // (anchored forward + capture resolution), so with a long pre-part the
       // prefilter's extra reverse(pre) pass is a net LOSS when matches are
-      // dense (the access-log pattern regressed 13%); a one-atom pre keeps the
-      // reverse scan short and the memmem gap-skip dominant.
+      // dense; a one-atom pre keeps the reverse scan short and the memmem
+      // gap-skip dominant.
       if (ncap_ != 0 && best.lo != 1) return InnerRun{};
       // If the pre part cannot consume the literal's first byte, it can never
       // extend across the literal, so the reverse-pre floor is the exact start.
@@ -8906,11 +8875,11 @@ private:
     // what each anchor the pattern offers was estimated to cost (plan_anchor).
     // A pattern can offer three: its required prefix (byte_prefix_), its
     // required suffix (suffix_) and a required interior literal (inner_).
-    // They used to be taken in that order — a prefix switched the other two
-    // off — which is right when the prefix is rare (`Sherlock\s+Holmes`) and
-    // 23-90x wrong when it is a common letter in front of a rare suffix
-    // (`e[a-z]{3,}q`: every `e` was a candidate, where `q` almost never
-    // occurs). The order is now by estimated cost.
+    // Taking them in that order — a prefix switching the other two off — is
+    // right when the prefix is rare (`Sherlock\s+Holmes`) and wrong when it
+    // is a common letter in front of a rare suffix (`e[a-z]{3,}q`: every `e`
+    // a candidate, where `q` almost never occurs). The order is by estimated
+    // cost.
     struct AnchorChoice {
       enum class Kind : unsigned char {
         Scan,   // none: the unanchored DFA scan (with its start-state skip)
@@ -8938,18 +8907,17 @@ private:
                                             // beat the prefix by
       static constexpr int kWordEdgeThin = 3; // a letter is at a word's edge
                                               // about one time in three
-      // WordOnePass's candidate scan (word_start_block), per MB: three
-      // table lookups per 16 bytes whatever the start set holds (measured
-      // 14-15 GB/s).
+      // WordOnePass's candidate scan (word_start_block), per MB, as
+      // measured: three table lookups per 16 bytes whatever the start set
+      // holds.
       static constexpr int kWordScanNs = 70000;
       // A prefix estimated at 1 ns per byte or more is dense: the DFA scan
       // costs about that whatever the subject holds.
       static constexpr int kDenseNs = 1000000;
       bool prefix_dense() const { return prefix_cost >= kDenseNs; }
       bool scan_dense() const { return scan_cost >= kDenseNs; }
-      // Teddy's own pace, per MB, whatever the subject holds: a vector of
-      // lookups per 16 or 32 bytes (measured as a DFA's start skip: 14-17
-      // GB/s with the 32-byte scan, about 9 with the 16-byte one).
+      // Teddy's own pace, per MB, as measured, whatever the subject holds: a
+      // vector of lookups per 16 or 32 bytes.
       static constexpr int kTeddyScanNs = 70000;
     };
 
@@ -9081,10 +9049,9 @@ private:
                                     AnchorChoice::kWordEdgeThin
                               : AnchorChoice::kVerifyRevFwdNs);
       // No scan for a dense prefix here: the assert find's DFA has no
-      // start-state skip, and its unfiltered scan measured slower than the
-      // dense prefix (`\bt[a-z]+` over prose: 430 MB/s driven from `t`, 310
-      // scanned). (The boolean's has one; it does not take a dense prefix
-      // either: Plan::assert_prefix_skips.)
+      // start-state skip, and its unfiltered scan is slower than the dense
+      // prefix (`\bt[a-z]+` over prose). (The boolean's has one; it does not
+      // take a dense prefix either: Plan::assert_prefix_skips.)
       c.kind = assert_.word_suffix ? Kind::Suffix
                                    : pick_anchor(c, /*dense_scans=*/false);
       if (c.kind != Kind::Prefix) assert_.prefix.clear();
@@ -10217,20 +10184,14 @@ private:
       // ... for the lazy DFA's start state: small AND rare. Each stop of the
       // skip costs what the DFA steps a dozen bytes in, so the jump has to
       // be longer than that on average to be worth asking for — and a set of
-      // common letters stops every few bytes (the first letters of 16
-      // keywords: 280 MB/s with the skip, 860 stepping). See rate().
+      // common letters stops every few bytes. See rate().
       bool dfa_skip = false;
 
       // The bar: the summed commonness of the set's bytes (byte_commonness,
       // per-mille of prose) up to which the skip pays. It depends on the
       // scan behind the skip (skip_to_set_byte): a SIMD compare per member
       // for a set of up to kSimdSetMax bytes, a table lookup per subject
-      // byte for a larger one. Measured over prose, the skip against the
-      // bare scan:
-      //   3 bytes   at 115: 1.4x    144: 1.1x    195: 0.85x
-      //   5 bytes   at 128: 1.3x
-      //   8 bytes   at  58: 1.5x     97: 1.2x    142: 0.9x
-      //   9+ bytes  at  44: 1.6x     83: 1.0x    120: 0.85x
+      // byte for a larger one.
       static int dfa_skip_bar(size_t members) {
         return members <= kSimdSetMax ? 180 - 8 * static_cast<int>(members)
                                       : 72;
@@ -10273,13 +10234,11 @@ private:
     //
     // Teddy goes ahead of the first-byte set always, not by estimate. It
     // stops where a match very likely begins, at a pace that does not
-    // depend on the subject (14-17 GB/s). The first-byte scan is faster only
-    // for two or three bytes that are rare in the subject (`(?:Xavier|Zulu)s?`
-    // over prose: 34 GB/s against 15), and several times slower when they
-    // turn out not to be (`(?:xyzzy|quux)s?` over random letters: 1.5 against
-    // 14; `(?:fox|dog|cat)s?` over prose: 1.4 against 17) — and what the
-    // subject holds is not the plan's to know. A first-byte set is jumped to
-    // only when it is rare as well as small (FirstBytes::dfa_skip).
+    // depend on the subject. The first-byte scan is faster only for two or
+    // three bytes that are rare in the subject, and several times slower
+    // when they turn out not to be — and what the subject holds is not the
+    // plan's to know. A first-byte set is jumped to only when it is rare as
+    // well as small (FirstBytes::dfa_skip).
     //
     // What comes after the prefix — Teddy, then the first-byte set — is one
     // rule (scan_skip, which never answers Prefix), and each reader says
@@ -10330,14 +10289,14 @@ private:
       // of one-code-point repeats whose ADJACENT ASCII byte sets are disjoint,
       // the parse around a suffix occurrence is FORCED — each repeat's span is
       // the maximal byte run of its class — so a candidate is confirmed by
-      // plain byte walks (~0.3 ns/B) instead of a reverse DFA scan plus a
-      // forward re-expansion (~2.2 ns/B each). `absorb_last` marks the
-      // `[a-zA-Z]+ing` family (every suffix byte inside the LAST class): there
-      // the greedy end is the LAST suffix occurrence inside the final class
-      // run, which the verifier finds directly — otherwise no byte of the
-      // suffix fits the last class and the occurrence IS the end. A non-ASCII
-      // byte anywhere near the candidate bails to the DFA verify, so the
-      // scalar path never has to reason about UTF-8 or clusters.
+      // plain byte walks, far cheaper than a reverse DFA scan plus a forward
+      // re-expansion. `absorb_last` marks the `[a-zA-Z]+ing` family (every
+      // suffix byte inside the LAST class): there the greedy end is the LAST
+      // suffix occurrence inside the final class run, which the verifier
+      // finds directly — otherwise no byte of the suffix fits the last class
+      // and the occurrence IS the end. A non-ASCII byte anywhere near the
+      // candidate bails to the DFA verify, so the scalar path never has to
+      // reason about UTF-8 or clusters.
       enum class Verify : unsigned char { Dfa, Scalar };
       struct ChainElem {
         std::array<bool, 128> in{}; // ASCII membership of the repeat's class
@@ -10855,9 +10814,9 @@ private:
   // fast loop out once: four 16-byte blocks per iteration with a single cheap
   // any-hit test per 64 bytes (per-block hit masks are extracted only after a
   // hit), then a 16-byte loop and a scalar loop for the tail. 64 bytes per
-  // iteration is what lifts a stop-free scan from ~25 GB/s (libc memchr: 16
-  // bytes per iteration plus a call per stop) to ~65 GB/s; every scan
-  // expressed through scan64 gets that rate.
+  // iteration, and no call per stop, is what makes a stop-free scan fast
+  // (libc memchr takes 16 bytes per iteration plus a call per stop); every
+  // scan expressed through scan64 gets that rate.
   //
   // A predicate supplies the platform lane mask and the matching scalar test:
   //   NEON: uint8x16_t lanes(uint8x16_t v) — 0xFF lanes where it holds
@@ -11099,18 +11058,16 @@ private:
   // against a byte known only at run time spreads it with simd_splat (see its
   // note), never with the set1 intrinsic.
   //
-  // Deliberately NO runtime AVX2 dispatch here (unlike Teddy's scans):
-  // it was tried — shared always_inline body, target("avx2") wrapper, cached
-  // __builtin_cpu_supports pick, fully VEX-encoded per objdump — and measured
-  // a net LOSS (Sherlock memmem cases 0.72x, [a-q][^u-z]{13}x 0.87x, P-core
-  // pinned A/B). VEX encoding gains ~25% only while the scan stays inlined
-  // into its caller (whole-TU -mavx builds); an attributed wrapper cannot be
-  // inlined into baseline callers, and outlining this function loses the
-  // caller fusion (find_substr's probe+verify compile as one unit), which
-  // costs more than VEX wins. Teddy tolerates that because its scan was
-  // already a call of its own, and what its 32-byte scan gains is the
-  // vector's width (twice the bytes a step), not the encoding. Host-tuned builds (-march=native / -mavx2) get the VEX
-  // win the sound way: the whole TU is VEX, nothing is outlined.
+  // Deliberately NO runtime AVX2 dispatch here (unlike Teddy's scans): VEX
+  // encoding gains only while the scan stays inlined into its caller
+  // (whole-TU -mavx builds); an attributed wrapper cannot be inlined into
+  // baseline callers, and outlining this function loses the caller fusion
+  // (find_substr's probe+verify compile as one unit), which costs more than
+  // VEX wins. Teddy tolerates that because its scan is already a call of its
+  // own, and what its 32-byte scan gains is the vector's width (twice the
+  // bytes a step), not the encoding. Host-tuned builds (-march=native /
+  // -mavx2) get the VEX win the sound way: the whole TU is VEX, nothing is
+  // outlined.
   template <class Pred, class Visit>
   static size_t scan64_visit(const unsigned char *p, size_t n, size_t off,
                              const Pred &pr, Visit visit) {
@@ -11122,8 +11079,8 @@ private:
     // that regime at the cheap one-block cost instead of paying a mostly
     // wasted 64-byte stride (whose hit extraction is also pricier) per
     // resume. When hits are sparse the ramp is eight quick clean blocks and
-    // the stride loop takes over — measured within a few percent of the best
-    // fixed shape at BOTH extremes (probe byte every ~70 bytes vs ~1300).
+    // the stride loop takes over: near the best fixed shape at both
+    // extremes, dense hits and sparse.
     for (int r = 0; r < 8 && off + 16 + la <= n; r++, off += 16) {
       uint64_t mask = lane_bits(pr.lanes(p, off));
       while (mask) {
@@ -11223,8 +11180,8 @@ private:
   // A probe byte in all 16 lanes, widened from a 32-bit value. Not
   // _mm_set1_epi8: a predicate keeps the byte as a member, and GCC then
   // splats it by reading that one-byte slot back as four (movd) right after
-  // writing it — a load no store can forward to, 5-7 ns per predicate built,
-  // which was 40% of a literal search on a short subject.
+  // writing it — a load no store can forward to, a stall per predicate
+  // built, which weighs on a literal search over a short subject.
   static __m128i simd_splat(unsigned char c) {
     return _mm_set1_epi32(static_cast<int>(c * 0x01010101u));
   }
@@ -11317,7 +11274,7 @@ private:
       return p[i] >= 0x80 || inner.scalar(p, i);
     }
   };
-  // (Built through this, not spelled at the call: the fused scans ran 6-17%
+  // (Built through this, not spelled at the call: the fused scans run
   // slower with the type written out, on the same instructions.)
   template <class P> static PredOrNonAscii<P> or_nonascii(const P &inner) {
     return PredOrNonAscii<P>(inner);
@@ -11563,17 +11520,13 @@ private:
   // `probe` itself for a one-byte needle, which has no other. O(m), at plan
   // time.
   //
-  // Every needle of two bytes or more scans as a pair. A single probe used
-  // to serve when the table called the rarest byte rare (capitals, digits,
-  // punctuation, the rare lowercase letters): the pair's second load per
-  // block costs a fifth to a third of the cruise rate where the byte really
-  // is rare. But rare is the table's word about English prose, and a
-  // subject is whatever it is: `fox` over a list of random words stops at
-  // an `x` every 26 bytes, and ran at 3.1 GB/s where the pair runs at 18.6
-  // (`qux`: 3.6 -> 50.6). The pair costs prose 0.70x at worst (`zqj`,
-  // absent: 87 -> 61 GB/s; `Sherlock` 64 -> 51); the single probe cost the
-  // word list 0.07x. (Looking at the second byte only where the first hit
-  // was tried, and got neither: `Sherlock` 52, `fox` 10.5.)
+  // Every needle of two bytes or more scans as a pair, even when the table
+  // calls the rarest byte rare: the pair's second load per block costs some
+  // of the cruise rate where the byte really is rare, but rare is the
+  // table's word about English prose, and a subject is whatever it is:
+  // `fox` over a list of random words meets an `x` every 26 bytes, and a
+  // single probe stops at each. The pair costs prose a little; a single
+  // probe can cost such a subject most of its rate.
   static size_t pair_probe(const std::string &s, size_t probe) {
     return pair_probe(reinterpret_cast<const unsigned char *>(s.data()),
                       s.size(), probe);
@@ -11716,9 +11669,8 @@ private:
 
   // The literal scans' compare of a candidate (find_substr, the literal
   // alternation, the fused grapheme scan). Inline for a short literal, where a
-  // libc memcmp CALL costs more than the compare itself (~20% of the
-  // alternation tier, 1-2 ns of a single literal's search); long needles
-  // still take memcmp.
+  // libc memcmp CALL costs more than the compare itself; long needles still
+  // take memcmp.
   static bool bytes_eq(const unsigned char *a, const unsigned char *b,
                        size_t m) {
     if (m > 16) return std::memcmp(a, b, m) == 0;
@@ -11805,10 +11757,9 @@ private:
   // down costs the scan its next hit, in place, where a caller that looked
   // at what find_substr returned and called again restarted the scan at
   // every occurrence — the assert tier's trailing `\b`, which most
-  // occurrences of a letter fail (`\b\w+n\b` 960 -> 1110 MB/s,
-  // `\b[0-9]+th\b` 3.0 -> 4.2 GB/s). `needle` is not empty. find_substr is
-  // not this with an accept that takes everything: written so, the scans
-  // that call it moved (`Holmes.{0,25}Watson|Watson.{0,25}Holmes` 0.92x).
+  // occurrences of a letter fail. `needle` is not empty. find_substr is not
+  // this with an accept that takes everything: written so, the scans that
+  // call it run slower.
   template <class Accept>
   static const unsigned char *
   find_substr_if(const unsigned char *hay, size_t n,
@@ -12093,8 +12044,7 @@ private:
   // (Out of line, as the three finds after it: each is a candidate loop
   // around a literal scan, and that scan is inlined into it. All inlined
   // into assert_find_span instead — which calls each once — the compiler
-  // left the scans as calls, one a candidate: `t[a-z]+ly\b` over prose,
-  // 8.7 GB/s -> 7.8.)
+  // leaves the scans as calls, one a candidate.)
   REGEXLIB_NOINLINE int assert_lit_find(FindCache &fc, std::string_view text,
                                         int from, int &s_out, int &e_out,
                                         bool byte) const {
@@ -12579,7 +12529,7 @@ private:
     Skip skip = kSkipNone;
     // Whether a scan without look skips from a start state, over a subject
     // of `n` bytes (kSkipAssert is the look boolean's own: never this). By
-    // the order — spelled out, the test cost a scan 4 instructions more.
+    // the order — spelled out, the test costs every scan more instructions.
     bool start_skips(int n) const {
       static_assert(kSkipAssert < kSkipPlan && kSkipPlan < kSkipByte &&
                         kSkipByte < kSkipByteLong,
@@ -12851,7 +12801,7 @@ private:
 
     // The start state: the closure of {0} — or, with look, {0} itself behind
     // the context `ctx`. The same on every scan, so computed once: find_all
-    // calls start() ~3x per match on the reused DFAs.
+    // calls start() several times per match on the reused DFAs.
     uint32_t start(uint8_t ctx = 0) {
       if (start_state[ctx] != kUnknown) return start_state[ctx];
       return make_start(ctx);
@@ -12955,11 +12905,11 @@ private:
     }
 
     // NOTE: a state's flags (accept / front / dead) are deliberately NOT
-    // packed into the transition value. They are per-STATE, and the scan loops load them OFF the step's
-    // dependency chain (in parallel with the next step's load, from the same
-    // row); packing them into the id would put an extra AND ON the chain —
-    // measured ~12% slower. (With look, too: what is true of the boundary
-    // behind a state is part of which state it is.)
+    // packed into the transition value. They are per-STATE, and the scan
+    // loops load them OFF the step's dependency chain (in parallel with the
+    // next step's load, from the same row); packing them into the id would
+    // put an extra AND ON the chain. (With look, too: what is true of the
+    // boundary behind a state is part of which state it is.)
 
     // The cache-miss path of a step: build the transition from state `s` on
     // byte `b`. `stepped` is how many subject bytes the scan has stepped
