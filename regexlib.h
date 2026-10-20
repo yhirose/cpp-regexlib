@@ -10728,14 +10728,15 @@ private:
     // analyze_crlf_byte_safe.
     bool crlf_byte_safe_ = false; // byte DFA == grapheme engine on a CRLF subject
     // A Lit node holds a \r or \n (has_crlf_literal). With crlf_byte_safe_
-    // that is a `\r\n` pair the parser fused into one grapheme
-    // (fuse_literal_graphemes): the one element whose byte and grapheme
-    // forms differ. The BYTE programs match it as its own two bytes — why
+    // (and a pattern that cannot match empty) that is a `\r\n` pair the
+    // parser fused into one grapheme (fuse_literal_graphemes): the one
+    // element whose byte and grapheme forms differ. The BYTE programs match it as its own two bytes — why
     // crlf_byte_safe_ admits it. The GRAPHEME programs (prog_, lf_prog_:
     // compiled cp=false, one Op::Char for the whole literal) hold it as one
     // two-code-point unit, which their DFAs, stepping bytes, cannot consume.
-    // (cp_prog_ and the one-pass tables compile cp=true, which splits the
-    // pair: see onepass_walk_bails_cr.) So on a pure-ASCII subject with a
+    // (cp_prog_ only resolves groups in a span these DFAs located; the
+    // one-pass tables compile cp=true, splitting the pair: see
+    // onepass_walk_bails_cr.) So on a pure-ASCII subject with a
     // CR-LF in it, the ASCII families refuse the subject
     // (ascii_grapheme_ok), and the byte programs take it: egc_byte_path's
     // pure-ASCII rung for a byte_path_ pattern (which admits any
@@ -10743,6 +10744,7 @@ private:
     // pattern. And match() tries the byte family first (ladder_plan): on
     // any subject, and for a lone \r/\n literal too, which crlf_byte_safe_
     // rejects — the order only spares a scan, the guess's verdict decides.
+    // (The entry points' answers this keeps whole: test_body_dollar.)
     bool crlf_fused_lit_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
@@ -13102,9 +13104,7 @@ private:
   // subject has no CR-LF at all, byte ≡ cluster and the fast path is correct.
   // The first-non-ASCII index is precomputed by the caller (is_ascii ⟺ fna ==
   // size) and shared with egc_byte_path at the dispatch site. Stricter than
-  // the byte path by !crlf_fused_lit_: the DFAs behind this gate run the
-  // grapheme programs, which cannot consume a fused CR-LF literal (see
-  // Plan::crlf_fused_lit_).
+  // the byte path by !crlf_fused_lit_ (Plan::crlf_fused_lit_).
   bool ascii_grapheme_ok(std::string_view text, size_t fna) const {
     return fna == text.size() &&
            ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
@@ -13462,8 +13462,8 @@ private:
   // EXCEPT a CR-LF-bearing one that a byte program reads as the grapheme
   // engine does: collapsed, or a crlf_byte_safe, non-empty pattern's, which
   // matches `\r\n`'s two bytes exactly (byte_sound on pure ASCII, spelled
-  // out). That rung also takes the subjects a fused CR-LF literal keeps
-  // from the ASCII tier (Plan::crlf_fused_lit_).
+  // out) — the subjects Plan::crlf_fused_lit_ keeps from the ASCII tier
+  // among them.
   bool egc_byte_path(std::string_view text, size_t i) const {
     if (!plan_->byte_path_) return false;
     if (i == text.size())
@@ -13511,8 +13511,8 @@ private:
   }
 
   // ... a CodePoint family's: `text` from `i` is RFC 3629 UTF-8. (The pass
-  // from a non-ASCII byte on is out of line: inlined, it spoils the code of
-  // the scan loop it joins.)
+  // from a non-ASCII byte on is out of line: inlined, its loop crowds the
+  // code of the scan it joins.)
   static bool utf8_from(std::string_view text, size_t i) {
     return i >= text.size() || utf8_valid_rest(text.data(), text.size(), i);
   }
@@ -15157,8 +15157,8 @@ public:
   // first non-ASCII byte once something computes it; `probe` receives the
   // (?i) prefix scan if the family has that rung. Inlined, with
   // ladder_gated: a Grapheme scan passes through here on its first step,
-  // where two calls handing a Ladder back and forth are most of a short
-  // test().
+  // where two calls handing a Ladder back and forth through memory weigh
+  // on a short test().
   REGEXLIB_ALWAYS_INLINE Ladder ladder_classify(std::string_view text,
                                                 Ladder l, size_t &fna,
                                                 Plan::IcaseScan &probe) const;
@@ -15235,8 +15235,8 @@ public:
   }
   // What the walk works with, for a find that came without it (find_once):
   // the save slots alone when its driver reads no DFA, else this thread's
-  // cache. Fetching that cache is a sizeable part of a short call, and it
-  // sits in front of the engine: hence on demand.
+  // cache. Fetching that cache is not free on a short call, and it sits in
+  // front of the engine: hence on demand.
   REGEXLIB_ALWAYS_INLINE void scr_walk(Scr &scr) const {
     if (plan_->walk_driver_ == Plan::WalkDriver::Inner)
       scr_fetch(scr);
@@ -15279,8 +15279,8 @@ public:
   // `chain_once` is set when the walk bails LOCALLY (kWalkLocal): this one
   // match comes from the rung below it, and the walk stays on.
   //
-  // Always inlined into its callers: as a call it costs every rung a call
-  // per match, and a one-step find its registers.
+  // Always inlined into its callers: it runs once per match on every rung,
+  // and a one-step find needs its registers.
   template <bool All, class Out>
   REGEXLIB_ALWAYS_INLINE bool
   ladder_step(std::string_view text, Scr &scr, Ladder &l, Cursor &c,
@@ -16215,9 +16215,8 @@ private:
     // one the first transition enters — exactly the two whose end is a sound
     // `skip` (every start before it is already proven to fail). Deciding that
     // inside run_skip, which runs once per state ENTRY rather than per byte,
-    // keeps the loop below at the one packed load and one dead test it was
-    // built around (not a shared step function taking a return code, nor
-    // an in-loop "is this the first step" test).
+    // keeps the loop below at the one packed load and one dead test, with
+    // no per-step branch.
     int base = s;
     auto run_skip = [&]() REGEXLIB_ALWAYS_INLINE {
       if (!S->loop_ok) return;
@@ -16379,7 +16378,7 @@ private:
     return anchored_onepass_once(text, e_out);
   }
   // The same, inlined: for the one-step find, where a validator's whole call
-  // is this walk, and a call to it a sizeable part of that.
+  // is this walk, and a call is a real share of it.
   REGEXLIB_ALWAYS_INLINE int anchored_onepass_once(std::string_view text,
                                                    int &e_out) const {
     if (!plan_->aop_.ok) return -1;
@@ -16813,8 +16812,8 @@ private:
   // they stopped. The rows appended so far are exact (each is a
   // leftmost-first match, and the loop advanced past it), so the ladder keeps
   // them and goes on from `from`. Its own function, NOT inlined: inside the
-  // step this loop makes its own inlining decision about the dispatch
-  // below, where the one shared loop is the faster.
+  // step this loop would make its own inlining decision about the dispatch
+  // below and take a call per match; the one shared loop does not.
   REGEXLIB_NOINLINE int onepass_fill_run(FindCache *fc, std::string_view bytes,
                        std::vector<int> &saves, RowSink &out, int &from,
                        WalkBudget &budget, bool byte) const {
@@ -17456,7 +17455,7 @@ inline void Regex::ladder_plan(Plan &p) {
   // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
   // the subject a scan most often meets, and the cheaper engine there —
   // then its byte family. The byte family first for a CR-LF literal, which
-  // the ASCII family cannot match (Plan::crlf_fused_lit_).
+  // the ASCII family refuses on a CR-LF subject (Plan::crlf_fused_lit_).
   {
     Family ascii = kFamilyCount, byte = kFamilyCount;
     if (p.us_) {

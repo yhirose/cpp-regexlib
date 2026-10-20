@@ -569,7 +569,7 @@ folds where a loop over families would not.
 `ladder_family` is the one place a family is defined, `ladder_gated`
 (through `ladder_classify`) the one place a find picks a family for its
 subject, `family_sound` the one test of whether a family serves a subject
-(asked by the gates, by the guesses of what they read — see below — by
+(asked by the gates, by each guess of what it read — see below — by
 `unstray` and by `end_region_ok`), and `ladder_pick` the one place the
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts

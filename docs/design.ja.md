@@ -526,9 +526,9 @@ subject 全体を分割する。
 最初の一歩にインライン化されると、書き並べたものは畳まれ、系統を回すループは畳まれない
 からです。
 系統を定義する場所は `ladder_family` の 1 か所、find が主題に系統を選ぶ場所は
-`ladder_gated`（`ladder_classify` から）の 1 か所、系統が主題を受け持てるかの判定は
-`family_sound` の 1 か所（ゲート、読んだ範囲についての推測（下を参照）、`unstray`、
-`end_region_ok` がこれを問います）、系統の中の
+`ladder_gated`（`ladder_classify` が呼びます）の 1 か所、系統が主題を受け持てるかの判定は
+`family_sound` の 1 か所（問うのはゲート、読んだ範囲についての推測〔下を参照〕、`unstray`、
+`end_region_ok` です）、系統の中の
 段の順序を書く場所は `ladder_pick` の 1 か所です（系統より前の段は系統のものでは
 ありません。それ自体で位置が決まるプランやテキスト先頭固定のプランは `ladder_plan` が
 そこから始め、融合スキャンは、主題が ASCII でない Grapheme の走査を `ladder_classify` が
