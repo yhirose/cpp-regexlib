@@ -6182,10 +6182,9 @@ private:
   // rung, and what the scan has given up. A VALUE, and small enough to
   // travel in registers: every transition takes one and returns one.
   // That is what lets a one-step find (search, test) keep its whole scan in
-  // its own frame, where the compiler dissolves it — as an object the rungs
-  // reached through a pointer it cost search() ~100 instructions a call, a
-  // fifth of a short validator's time. A scan that outlives the call
-  // (find_iter) stores the same value in a Finder.
+  // its own frame, where the compiler dissolves it; an object the rungs
+  // reached through a pointer would be loads and stores. A scan that
+  // outlives the call (find_iter) stores the same value in a Finder.
   struct Ladder {
     Rung rung = Rung::Pike;
     Rung below = Rung::Pike; // what a local bail of the walk steps down to
@@ -9486,15 +9485,7 @@ private:
       }
     }
 
-    // Does a Lit node hold a `\r` or `\n`? Under crlf_byte_safe such a literal
-    // is always a `\r\n` PAIR, which the parser fuses into one grapheme (see
-    // fuse_literal_graphemes) — and that is the one element whose byte form and
-    // grapheme form are not interchangeable. The BYTE programs match it as two
-    // code points, exactly the cluster's bytes, which is why crlf_byte_safe
-    // admits it. The GRAPHEME programs hold it as a single two-code-point unit,
-    // and the DFAs over them step BYTES: they cannot consume it at all. See
-    // ascii_grapheme_ok, the one gate that pairs crlf_byte_safe_ with a
-    // grapheme program.
+    // Does a Lit node hold a `\r` or `\n`? (Plan::crlf_fused_lit_.)
     static bool has_crlf_literal(const detail::Node &n) {
       using K = detail::Node::Kind;
       switch (n.kind) {
@@ -10667,9 +10658,8 @@ private:
     // Whether the boolean's look scan skips to the assert prefix
     // (LazyDfa::kSkipAssert): unless the prefix is dense — by the bar the DFA
     // tiers leave a dense prefix to their scan at (pick_anchor), since a scan
-    // restarted at every `e` costs more than one that steps through them all
-    // (`e\w*\d\b` tested over the Sherlock text: 1.6 ms skipping to each,
-    // 0.76 stepping).
+    // restarted at every `e` costs more than one that steps through them
+    // all.
     bool assert_prefix_skips() const {
       return !assert_.prefix.empty() && !anchor_.prefix_dense();
     }
@@ -10677,8 +10667,7 @@ private:
     // below it: wop_after_anchor_) and is sparse, by the same bar: a boolean
     // then takes the find (assert_bool_finds). Every candidate of a start
     // set as common as `[a-z]` is a word, and the walks cost more than the
-    // boolean scan stepping through them (`\b[a-z]+\d\b` over the ASCII-
-    // folded Sherlock text: ~2.6 ms through the find, ~1.05 stepped).
+    // boolean scan stepping through them.
     bool word_scan_sparse() const {
       return wop_.ok && !wop_after_anchor_ && !anchor_.scan_dense();
     }
@@ -10695,8 +10684,7 @@ private:
     // goes on to the leftmost-first end (`^.*foo\b`). The word scan is
     // bounded too — a walk ends where the word does — and where it is sparse
     // it reads sixteen positions at a time, where the boolean scan steps
-    // every byte (`\b\d+\b` tested over a megabyte of prose it does not
-    // match: 1.5 ms stepped, ~0.1 through the find). ASCII only: the walk
+    // every byte. ASCII only: the walk
     // has no byte form. (And the ASCII family has a find at all only with
     // assert_ascii_tier.)
     bool assert_bool_finds(bool byte) const {
@@ -10739,11 +10727,22 @@ private:
     // together) that is the atom of an unbounded greedy repetition. See
     // analyze_crlf_byte_safe.
     bool crlf_byte_safe_ = false; // byte DFA == grapheme engine on a CRLF subject
-    // A Lit node holds a \r or \n (see has_crlf_literal). Under
-    // crlf_byte_safe_ — the only place this is read — that is necessarily a
-    // parser-fused CR-LF grapheme: byte-safe, grapheme-program-UNSAFE. On its
-    // own it also covers a lone \r/\n literal, which crlf_byte_safe rejects
-    // anyway.
+    // A Lit node holds a \r or \n (has_crlf_literal). With crlf_byte_safe_
+    // that is a `\r\n` pair the parser fused into one grapheme
+    // (fuse_literal_graphemes): the one element whose byte and grapheme
+    // forms differ. The BYTE programs match it as its own two bytes — why
+    // crlf_byte_safe_ admits it. The GRAPHEME programs (prog_, lf_prog_:
+    // compiled cp=false, one Op::Char for the whole literal) hold it as one
+    // two-code-point unit, which their DFAs, stepping bytes, cannot consume.
+    // (cp_prog_ and the one-pass tables compile cp=true, which splits the
+    // pair: see onepass_walk_bails_cr.) So on a pure-ASCII subject with a
+    // CR-LF in it, the ASCII families refuse the subject
+    // (ascii_grapheme_ok), and the byte programs take it: egc_byte_path's
+    // pure-ASCII rung for a byte_path_ pattern (which admits any
+    // crlf_byte_safe_, non-empty one), assert_byte_path_ok's for an assert
+    // pattern. And match() tries the byte family first (ladder_plan): on
+    // any subject, and for a lone \r/\n literal too, which crlf_byte_safe_
+    // rejects — the order only spares a scan, the guess's verdict decides.
     bool crlf_fused_lit_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
@@ -12380,17 +12379,14 @@ private:
   bool assert_byte_path_ok(std::string_view text, size_t fna) const {
     if (!plan_->byte_assert_path_) return false;
     if (fna == text.size())
-      // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT when that
-      // tier has just refused a fused CR-LF literal on a CR-LF-bearing subject
-      // (ascii_grapheme_ok's !crlf_fused_lit_), where the only rung left below
-      // is the grapheme Pike. An assert pattern has no byte_path_, so it cannot
-      // take egc_byte_path's pure-ASCII rung, which exists for exactly this
-      // case and on exactly this condition. Same argument: the byte assert
-      // program holds the pair as its own two bytes, on pure ASCII a code point
-      // IS a byte, crlf_byte_safe_ keeps every match boundary out of the pair
-      // (and is false for any multiline anchor), and !can_match_empty_ keeps an
-      // empty match off its interior. crlf_fused_lit_ leads so no other pattern
-      // pays the contains_crlf scan.
+      // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT a
+      // CR-LF-bearing subject that tier refuses for a fused CR-LF literal
+      // (Plan::crlf_fused_lit_): an assert pattern has no byte_path_, so
+      // this is its pure-ASCII rung. On pure ASCII a code point IS a byte,
+      // crlf_byte_safe_ keeps every match boundary out of the pair (and is
+      // false for any multiline anchor), and !can_match_empty_ keeps an
+      // empty match off its interior. crlf_fused_lit_ leads so no other
+      // pattern pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
     return family_sound(kFamAssertByte, text, fna);
@@ -13105,26 +13101,10 @@ private:
   // cluster — a byte position the grapheme engine has no boundary for. If the
   // subject has no CR-LF at all, byte ≡ cluster and the fast path is correct.
   // The first-non-ASCII index is precomputed by the caller (is_ascii ⟺ fna ==
-  // size) and shared with egc_byte_path at the dispatch site.
-  //
-  // !crlf_fused_lit_ is the one place this gate is STRICTER than the byte
-  // path's. The DFAs behind it locate the span over the GRAPHEME programs
-  // (prog_, lf_prog_ — compiled cp=false, where a Lit is ONE Op::Char
-  // interning the whole code-point string) while stepping BYTES, so a
-  // parser-fused CR-LF literal is a two-code-point unit no byte can match and
-  // the walk dies on it. crlf_byte_safe admits the pair because the BYTE
-  // programs match it as its own two bytes, which is true of them and not of
-  // these. `\r\n$` over "x\r\n" was no-match here while the grapheme Pike
-  // matched [1,3), and `(\r\n)$` split the entry points: search / find_all /
-  // find_iter matched [1,3) while test() said no.
-  // (Not cp_prog_, nor the one-pass tables: those compile cp=true, where
-  // emit_cp_lit splits the pair into one op per code point. cp_prog_ only
-  // resolves groups inside a span these DFAs already located.)
-  //
-  // egc_byte_path makes the same exception from the other side — it admits a
-  // pure-ASCII CRLF subject precisely so a crlf_byte_safe pattern reaches the
-  // byte programs instead of this tier. That covers byte_path_ patterns; an
-  // assert pattern has no byte_path_, so it needs this gate.
+  // size) and shared with egc_byte_path at the dispatch site. Stricter than
+  // the byte path by !crlf_fused_lit_: the DFAs behind this gate run the
+  // grapheme programs, which cannot consume a fused CR-LF literal (see
+  // Plan::crlf_fused_lit_).
   bool ascii_grapheme_ok(std::string_view text, size_t fna) const {
     return fna == text.size() &&
            ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
@@ -13479,12 +13459,11 @@ private:
   // byte, shared with ascii_grapheme_ok at the dispatch site so the subject
   // is classified once): one the byte programs answer for (byte_sound), and
   // not pure ASCII — the plain ASCII tier is faster there and handles it —
-  // EXCEPT a CR-LF-bearing one, which the ASCII tier segments as two
-  // graphemes and so cannot match a fused `\r\n` literal against. A byte
-  // program that reads the pair as the grapheme engine does takes those
-  // instead: collapsed, or a crlf_byte_safe, non-empty pattern's, which
+  // EXCEPT a CR-LF-bearing one that a byte program reads as the grapheme
+  // engine does: collapsed, or a crlf_byte_safe, non-empty pattern's, which
   // matches `\r\n`'s two bytes exactly (byte_sound on pure ASCII, spelled
-  // out).
+  // out). That rung also takes the subjects a fused CR-LF literal keeps
+  // from the ASCII tier (Plan::crlf_fused_lit_).
   bool egc_byte_path(std::string_view text, size_t i) const {
     if (!plan_->byte_path_) return false;
     if (i == text.size())
@@ -13532,8 +13511,8 @@ private:
   }
 
   // ... a CodePoint family's: `text` from `i` is RFC 3629 UTF-8. (The pass
-  // from a non-ASCII byte on is out of line: inlined into search(), Clang's
-  // loop over a megabyte took 13% more instructions.)
+  // from a non-ASCII byte on is out of line: inlined, it spoils the code of
+  // the scan loop it joins.)
   static bool utf8_from(std::string_view text, size_t i) {
     return i >= text.size() || utf8_valid_rest(text.data(), text.size(), i);
   }
@@ -13665,8 +13644,8 @@ private:
   // Teddy (SIMD multi-substring), else a first-byte set that is small and
   // rare skips to the next viable byte.
   // (Tested in turn, here and below, not switched on: these are inlined into
-  // the DFA scans' start-state path, where the switch measured 6% slower on a
-  // scan that stops every few bytes.)
+  // the DFA scans' start-state path, where a switch is slower on a scan that
+  // stops every few bytes.)
   REGEXLIB_ALWAYS_INLINE int plan_prefilter_skip(const unsigned char *p, int n,
                                                  int i) const {
     const Plan::StartSkip skip = plan_->start_skip_;
@@ -14351,15 +14330,14 @@ private:
   // (kDfaFwda) runs the bare pattern from `from` and likewise dies when no
   // thread extends.
   //
-  // `reach_out`, when non-null, receives the furthest byte index (+1) the scan
-  // EXAMINED. A greedy match examines code points past its end during
+  // `reach_out`, when non-null, receives the furthest byte index (+1) THIS
+  // scan examined. A greedy match examines code points past its end during
   // expansion/backtracking, so the fused EGC verify must check eligibility
   // over [s, reach), not just the matched [s, e) — a multi-code-point cluster
   // the byte engine cut through (e.g. a ZWJ emoji) would otherwise pass
-  // undetected (fuzzer-found at 400k). An out-parameter rather than a member:
-  // a mutable member written under a const call would be a data race when one
-  // Regex is shared across threads. (LazyDfa::hi, how far the scans of a
-  // find's guess read, is the DFA's own: a FindCache is one thread's.)
+  // undetected. (LazyDfa::hi is a different quantity: the furthest any scan
+  // of the DFA reached since FindCache::reach_from_zero, across a guess's
+  // many scans.)
   int dfa_forward_lf(LazyDfa &d, std::string_view text, int from,
                      int *reach_out = nullptr) const {
     int reach = from;
@@ -14387,8 +14365,7 @@ private:
   // leftmost start of a match that ends at `e`.
   // Out of line on purpose, each of them: a stepping loop that is inlined
   // into the rung that calls it shares that function's registers, and keeps
-  // its own state on the stack (the boolean, inlined into the ladder's
-  // step: 740 MB/s over prose it does not match, 1,050 as a call).
+  // its own state on the stack.
   REGEXLIB_NOINLINE int look_forward_lf(LazyDfa &d, std::string_view text,
                                         int from,
                                         int *reach_out = nullptr) const {
@@ -14423,10 +14400,9 @@ private:
   // what the last of them took (a byte that starts no code point is one
   // element either way: cp_at, cp_before). (A loop around the scan, not the
   // start-state jump the other scans make from inside it, dfa_start_skip: a
-  // look state is a context too, and the jump measured a third slower with
-  // the occurrences dense. Its own function and its own instantiation of
-  // the scan: either inside the plain one cost every boolean its registers
-  // and inlining.)
+  // look state is a context too, and the jump is slower with the
+  // occurrences dense. Its own function and its own instantiation of the
+  // scan, so that the plain boolean scan keeps its registers and inlining.)
   REGEXLIB_NOINLINE int look_forward_skip(LazyDfa &d,
                                           std::string_view text) const {
     const unsigned char *p =
@@ -14516,8 +14492,7 @@ private:
     // (A look scan is started at its candidate: see look_forward_first.)
     if (!Look && skips) i = mark = dfa_start_skip(d, p, n, i);
     while (i < n) {
-      // The state is all that one load hands the next (see REGEXLIB_OPAQUE;
-      // `[a-z]+[0-9]` tested over prose it does not match: 746 MB/s -> 894).
+      // The state is all that one load hands the next (see REGEXLIB_OPAQUE).
       uint32_t nx = detail::walk_column(tr, d.cls[p[i]])[s];
       int len = 1;
       if (nx == LazyDfa::kUnknown) {
@@ -14537,8 +14512,7 @@ private:
       const int at = i;
       reach = i += len; // consumed p[at..i)
       // (Which way the flags are read is measured, per instantiation: see
-      // walk_flags. The look loops lose a cycle a byte to tr[s - 1]; this
-      // one loses 3-7% of a short test() to the other.)
+      // walk_flags.)
       f = Look ? detail::walk_flags(tr, s) : tr[s - 1];
       if (f & LazyDfa::kAccept) e = Look ? at : i;
       if (f & stops) {
@@ -14608,8 +14582,7 @@ private:
   // engine declined the span), or LazyDfa::kCap. This is the chain's whole
   // per-match step (Rung::Chain).
   // Always inlined, with the locate above: it is the per-match hot path of
-  // a scan on the chain, and as plain calls the pair cost dense `\w+` over
-  // non-ASCII prose ~5% (measured against the open-coded tail it replaced).
+  // a scan on the chain.
   template <class Out>
   REGEXLIB_ALWAYS_INLINE int dfa_chain_step(std::string_view text, int from,
                                             LazyDfa &lfu, LazyDfa &rv,
@@ -14633,8 +14606,7 @@ private:
     return r;
   }
   // The same into a fresh result the caller holds (ResultSink): built in
-  // place, where returning it by value would be a second, moved-from one
-  // (+7-11 ns per search() on the httplib latency set when that was tried).
+  // place, where returning it by value would be a second, moved-from one.
   void set_dfa_result(MatchResult &r, std::string_view text, int b,
                       int e) const {
     // group 0 only (ncap_ == 0); _init sets the whole-match span.
@@ -14859,7 +14831,7 @@ public:
     }
 
     // One program set's DFAs. (A branch on `byte`, not dfas_[byte]: GCC
-    // then kept the CodePoint test() some 20 instructions shorter.)
+    // compiles the index into more code around it.)
     REGEXLIB_ALWAYS_INLINE std::optional<LazyDfa> *set(bool byte) {
       return byte ? dfas_[1] : dfas_[0];
     }
@@ -15033,8 +15005,8 @@ public:
   // What a find hands its match to. The ladder's rungs and the engines under
   // them write through one of these, so each entry point gets its match in
   // the form it returns — and none of them pays for another's: search()
-  // building its result out of a row it had just written cost it a failed
-  // store-to-load forward (~3 ns on a 20 ns call).
+  // building its result out of a row it had just written would be a failed
+  // store-to-load forward.
   //   span(re, text, s, e)    a capture-free match, byte offsets
   //   groups(re, text, saves) byte-offset saves, ncap_ + 1 pairs
   //   groups(re, seg, saves)  grapheme / code-point index saves (the Pike)
@@ -15185,8 +15157,8 @@ public:
   // first non-ASCII byte once something computes it; `probe` receives the
   // (?i) prefix scan if the family has that rung. Inlined, with
   // ladder_gated: a Grapheme scan passes through here on its first step,
-  // and as two calls handing a Ladder back and forth it was 230
-  // instructions of a 20 ns test().
+  // where two calls handing a Ladder back and forth are most of a short
+  // test().
   REGEXLIB_ALWAYS_INLINE Ladder ladder_classify(std::string_view text,
                                                 Ladder l, size_t &fna,
                                                 Plan::IcaseScan &probe) const;
@@ -15263,8 +15235,8 @@ public:
   }
   // What the walk works with, for a find that came without it (find_once):
   // the save slots alone when its driver reads no DFA, else this thread's
-  // cache. Fetching that cache is some 35 instructions, a tenth of a short
-  // call, and it sits in front of the engine: hence on demand.
+  // cache. Fetching that cache is a sizeable part of a short call, and it
+  // sits in front of the engine: hence on demand.
   REGEXLIB_ALWAYS_INLINE void scr_walk(Scr &scr) const {
     if (plan_->walk_driver_ == Plan::WalkDriver::Inner)
       scr_fetch(scr);
@@ -15307,8 +15279,8 @@ public:
   // `chain_once` is set when the walk bails LOCALLY (kWalkLocal): this one
   // match comes from the rung below it, and the walk stays on.
   //
-  // Always inlined into its callers: as a call it cost every rung ~5% per
-  // match, and a one-step find its registers.
+  // Always inlined into its callers: as a call it costs every rung a call
+  // per match, and a one-step find its registers.
   template <bool All, class Out>
   REGEXLIB_ALWAYS_INLINE bool
   ladder_step(std::string_view text, Scr &scr, Ladder &l, Cursor &c,
@@ -16076,11 +16048,10 @@ private:
     return true;
   }
 
-  // The one-pass walks write the caller's slots, in place. They used to fill
-  // an array of their own and copy it out at the accept, and the copy read
-  // back, 16 bytes at a time, slots written 4 bytes at a time a moment
-  // earlier: a load that waits for its stores to retire, some 3 ns of a
-  // 15 ns match (dense `\w+`).
+  // The one-pass walks write the caller's slots, in place: a copy out of an
+  // array of their own at the accept would read back, 16 bytes at a time,
+  // slots written 4 bytes at a time a moment earlier — a load that waits
+  // for its stores to retire.
   //
   // onepass_saves_begin readies `out` and returns its slots, every one unset.
   // A length-`nslots` fill becomes a libc memset CALL (loop idiom), one per
@@ -16245,9 +16216,8 @@ private:
     // `skip` (every start before it is already proven to fail). Deciding that
     // inside run_skip, which runs once per state ENTRY rather than per byte,
     // keeps the loop below at the one packed load and one dead test it was
-    // built around: a shared step function taking a return code, and an
-    // in-loop "is this the first step" test, each measured 3-4% on short
-    // dense matches (`\[([^\]]+)\]\(([^)]+)\)`, ~10 steps per match).
+    // built around (not a shared step function taking a return code, nor
+    // an in-loop "is this the first step" test).
     int base = s;
     auto run_skip = [&]() REGEXLIB_ALWAYS_INLINE {
       if (!S->loop_ok) return;
@@ -16344,8 +16314,7 @@ private:
         bail = true;
         break;
       }
-      // The row is all that one load hands the next (see REGEXLIB_OPAQUE; a
-      // UUID validated: 45 ns with the column added to it first, 39 so).
+      // The row is all that one load hands the next (see REGEXLIB_OPAQUE).
       const unsigned char *col =
           detail::walk_column(tb, sizeof(uint32_t) * b);
       uint32_t e = entry(col + st);
@@ -16373,11 +16342,10 @@ private:
   // CR. This is what makes the one-walk tiers sound on ANY subject (no caller
   // gate needed).
   //
-  // ascii_grapheme_ok adds !crlf_fused_lit_ on top of the same pair; this walk
-  // does NOT need it, and the asymmetry is deliberate. compact_onepass_table
-  // and build_cp_onepass compile cp=true, where emit_cp_lit splits a fused
-  // CR-LF literal into one step per code point — the walk consumes it. It is
-  // the cp=false grapheme programs behind ascii_grapheme_ok that cannot.
+  // (Not !crlf_fused_lit_ as well, which ascii_grapheme_ok adds:
+  // compact_onepass_table and build_cp_onepass compile cp=true, where
+  // emit_cp_lit splits a fused CR-LF literal into one step per code point,
+  // and the walk consumes it. See Plan::crlf_fused_lit_.)
   bool onepass_walk_bails_cr() const {
     return !plan_->us_ &&
            !(plan_->crlf_byte_safe_ && !plan_->can_match_empty_);
@@ -16404,17 +16372,14 @@ private:
   // or a non-ASCII byte bailed; the caller falls to its own chain).
   // The CALLED twin of anchored_onepass_once, for the entries that come here
   // once a scan and must not carry the walk: out of line by contract, as the
-  // other rung entries are. (Left to the inliner, Clang put it into the
-  // per-match iterator, and dense `\w+` finds, which never come here, lost
-  // 4%.)
+  // other rung entries are. (Left to the inliner, Clang puts it into the
+  // per-match iterator, where it costs finds that never come here.)
   REGEXLIB_NOINLINE int anchored_onepass_try(std::string_view text,
                                              int &e_out) const {
     return anchored_onepass_once(text, e_out);
   }
   // The same, inlined: for the one-step find, where a validator's whole call
-  // is this walk and a call to it was 30 instructions of 13 ns
-  // (`^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$` as a boolean: 14.2 ns called, 13.7
-  // inlined).
+  // is this walk, and a call to it a sizeable part of that.
   REGEXLIB_ALWAYS_INLINE int anchored_onepass_once(std::string_view text,
                                                    int &e_out) const {
     if (!plan_->aop_.ok) return -1;
@@ -16442,20 +16407,14 @@ private:
   // find resuming after a match usually has its next candidate a byte or
   // two on (the word after the space), and a branch the predictor has
   // learnt hands the walk its start at once, where a block's mask keeps it
-  // waiting on a dozen operations in a row (`\b\w+\b` over prose: 221 MB/s
-  // with the ramp, 203 without). Past the ramp candidates are far apart, or
-  // failing: one that fails goes on to the next bit of its block's mask,
-  // with no test for the scan to mispredict (`\b[0-9]+\b` over prose, where
-  // a digit is rare: 3.4 -> 14 GB/s; IPv4 extraction over a log, where most
-  // numbers are not addresses: 890 -> 1100 MB/s).
+  // waiting on a dozen operations in a row. Past the ramp candidates are
+  // far apart, or failing: one that fails goes on to the next bit of its
+  // block's mask, with no test for the scan to mispredict.
   //
-  // Out of line on purpose. Inlined into assert_find_span — which it was
-  // while that had one call to it — the candidate loop shared the caller's
-  // registers with every other rung and ran a quarter slower: IPv4
-  // extraction over a log, 640 MB/s inlined and 850 as its own function
-  // (the same at every heap and code placement tried). And in two parts:
-  // with the block scan's call in it, the ramp's loop kept its operands on
-  // the stack.
+  // Out of line on purpose: inlined into assert_find_span, the candidate
+  // loop shares the caller's registers with every other rung. And in two
+  // parts: with the block scan's call in it, the ramp's loop keeps its
+  // operands on the stack.
   static constexpr int kWordStartRamp = 4;
   REGEXLIB_NOINLINE int word_onepass_find(std::string_view t, int from,
                                           int &s_out, int &e_out,
@@ -16608,10 +16567,8 @@ private:
     // US plans never compute it). The 256-wide byte_first_bytes_ (from the
     // byte program) is the prune, sound on any UTF-8: a non-ASCII lead byte
     // that can start a match is a member, and the walk then bails on it.
-    // Without this the US walk started at EVERY position, which on a
-    // sparse-start pattern lost to the located-span chain it replaced
-    // (`(\d+)\s+(\w+)` over ASCII prose,
-    // find_all: 2834 MB/s chain alone, 250 unpruned, 2940 pruned).
+    // Without it the US walk would start at EVERY position, which on a
+    // sparse-start pattern loses to the located-span chain.
     const Plan::StartSkip skip = plan_->walk_skip(byte);
     const bool teddy = skip == Plan::StartSkip::Teddy;
     const bool pruned = skip != Plan::StartSkip::None;
@@ -16732,10 +16689,9 @@ private:
   // capture_find_inline is the body, and it and everything down to the
   // drivers are always inlined: once into capture_find_dispatch, the call
   // every one-step caller makes, and once into the walk's find_all loop
-  // (onepass_fill_run), whose per-match path it is. The compiler used to
-  // decide that, and decided by how many callers there were: with one more
-  // step instantiated (find_at's) the loop got a call per match, and
-  // `(\w+)=(\S+)` over key=value text ran 5% slower.
+  // (onepass_fill_run), whose per-match path it is. Left to the compiler,
+  // that depends on how many callers there are: one more instantiated step
+  // gives the loop a call per match.
   REGEXLIB_ALWAYS_INLINE int
   capture_find_inline(FindCache *fc, std::string_view t, int from,
                       std::vector<int> &saves, WalkBudget &budget,
@@ -16857,9 +16813,8 @@ private:
   // they stopped. The rows appended so far are exact (each is a
   // leftmost-first match, and the loop advanced past it), so the ladder keeps
   // them and goes on from `from`. Its own function, NOT inlined: inside the
-  // step this loop made its own inlining decision about the dispatch below —
-  // find_all over dense ASCII `\w+` measured 10% slower that way than with
-  // the one shared loop.
+  // step this loop makes its own inlining decision about the dispatch
+  // below, where the one shared loop is the faster.
   REGEXLIB_NOINLINE int onepass_fill_run(FindCache *fc, std::string_view bytes,
                        std::vector<int> &saves, RowSink &out, int &from,
                        WalkBudget &budget, bool byte) const {
@@ -17441,7 +17396,7 @@ inline void Regex::MatchIter::advance() {
   // every group reads as the match (alias_rows, for a single row).
   // one_.ngroups_ already says so; the engines above wrote the twin's single
   // pair. Written out, not a call to alias_rows: this runs once per match,
-  // and that is a loop over rows (dense `(\w+)`: 26 instructions a match).
+  // and that is a loop over rows.
   if (alias_groups_ && !done_) {
     const uint32_t b = one_.spans_.data()[0], e = one_.spans_.data()[1];
     uint32_t *o = one_.spans_.append(2 * static_cast<size_t>(alias_groups_));
@@ -17500,9 +17455,8 @@ inline void Regex::ladder_plan(Plan &p) {
   // The families a guess tries (Plan::guesses_). match()'s, each anchored
   // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
   // the subject a scan most often meets, and the cheaper engine there —
-  // then its byte family. Unless the pattern has a CR-LF literal: the ASCII
-  // family cannot match one (see ascii_grapheme_ok), so on the CRLF
-  // subjects that can, it would only be a scan to throw away.
+  // then its byte family. The byte family first for a CR-LF literal, which
+  // the ASCII family cannot match (Plan::crlf_fused_lit_).
   {
     Family ascii = kFamilyCount, byte = kFamilyCount;
     if (p.us_) {
@@ -17660,9 +17614,8 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
   if (l.has(Ladder::kIpOn)) return Rung::IcasePrefix;
   // The rare-literal prefilters. A capture-free find takes them BEFORE the
   // walk: they answer from a memmem hit, where the walk tries candidates
-  // until its profitability rule gives it up — on `[a-q][^u-z]{13}x`
-  // (CodePoint, 594 KB of prose) that proving window was half of the find:
-  // ~17 GB/s with the walk first, ~33 with the suffix scan first. With
+  // until its profitability rule gives it up, and that proving window can
+  // be most of a find. With
   // captures the walk goes first (it yields the groups in its one pass; the
   // inner rung needs a capture pass per match), unless the caller wants no
   // groups.

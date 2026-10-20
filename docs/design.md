@@ -566,9 +566,11 @@ The gates are not such a table: `ladder_gated` writes them as a chain, since
 each family's route has conditions of its own (a probe to choose, a pure-ASCII
 CR-LF exception), and inlined into a Grapheme scan's first step the chain
 folds where a loop over families would not.
-`ladder_family` is the one place a family is defined, `ladder_classify` the
-one place a find reads the subject gates (a guess asks them of what it
-read — see below), and `ladder_pick` the one place the
+`ladder_family` is the one place a family is defined, `ladder_gated`
+(through `ladder_classify`) the one place a find picks a family for its
+subject, `family_sound` the one test of whether a family serves a subject
+(asked by the gates, by the guesses of what they read — see below — by
+`unstray` and by `end_region_ok`), and `ladder_pick` the one place the
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts
 there by `ladder_plan`, and the fused scans are where `ladder_classify`
