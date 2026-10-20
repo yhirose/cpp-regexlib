@@ -750,11 +750,31 @@ answer stands if the subject is one *as far as the scan read*
   any non-ASCII byte and the DFA reads on from there, so what it reads past
   the end holds no stray byte, the one thing a CodePoint subject can fail
   on. An answer that does not hold is the Pike's, from the start, with a
-  fresh sink, cursor and budget (`find_pike`). The guess ends where the scan
+  fresh sink, cursor and budget (`find_rest` runs `find_run` again, on the
+  Pike's ladder). The guess ends where the scan
   leaves the family's rungs, which only a DFA that gave up makes it do: at
   `Classify`, where a boolean hands over to the find's rungs, the subject is
   classified whole, as it was before; at the Pike, which a one-step find
   enters at 0 (its cursor moves only at a yield), the answer stands.
+- **A Grapheme `search()` / `test()`** at `Classify` (`guess_begin`) finds
+  the subject's first non-ASCII byte, a fast pass, and does not check its
+  clusters, the slow one (`egc_simple_from`, some 5 instructions a byte
+  where `first_nonascii` is a quarter of one). A pure-ASCII subject takes
+  the plan's ASCII family outright: no guess, it is sound there. Any other
+  guesses the byte family, judged on what it read (`guess_held`); one that
+  does not hold is classified whole, from the start, as before. Both only
+  where a CR-LF reads as the grapheme engine reads it (`crlf_byte_safe_`,
+  non-empty, no fused CR-LF literal): then a walk that reads past what the
+  scans report reads ASCII, which no cluster changes the meaning of (past
+  an ASCII byte it matched it reads on, and gives up at a non-ASCII one;
+  a byte it did not match, a cluster on it does not match either). No byte
+  guess where the plan has a faster way over a non-ASCII subject that needs
+  no classifying (the fused rungs; the (?i) prefix probe, chosen over the
+  whole subject). The other orders were measured and dropped: guessing the
+  ASCII family first wastes a whole scan on a subject with a non-ASCII byte
+  anywhere and no match (a prefilter's skip passes the byte), and guessing
+  the byte family first runs the slower engine on the ASCII subjects that
+  are most of what a line-by-line search meets.
 
 The rules the two share:
 
@@ -807,8 +827,18 @@ reads to the end and costs what it did (to 0.001% of its instructions). On
 ~60-byte subjects a call takes 209 fewer to 1 more instructions (of
 361–1341; the fewer where the subject is not ASCII), and 9 fewer to 29 more
 (to 2.2%) where the match is near the subject's end or there is none, so
-that the scan reads about what the old check did. A Grapheme find, which
-does not guess yet, takes 20 fewer to 10 more (to 1.3%).
+that the scan reads about what the old check did.
+
+Measured on a Grapheme `search()` / `test()` (instructions, GCC -O2): over
+1 MB with a match in its first words, `\w+`, `\b\w+\b`, `(\w+) (\w+)` went
+from 5.0 M to 0.5–1.1 K on accented prose, and from 263–370 K to 263 K on
+ASCII (what remains is `first_nonascii`); with no match, the same as
+before. Over real text — eight server logs, source code, English, French
+and Japanese Markdown, JSON, CSV; twelve patterns of the kind such text is
+searched with — line by line 4–12% fewer, document by document 17% fewer
+to 0.7% more (the worst single pattern and corpus 11% more). On ~60-byte
+subjects 10% fewer (ASCII), 7% (accented), 2% (starting with CJK); a
+CodePoint find, now one turn of the guess loop, 4–14 more.
 
 ### Linearity (the O(n²) trap)
 

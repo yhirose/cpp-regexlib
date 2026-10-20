@@ -2140,9 +2140,89 @@ void test_find_guess() {
   CHECK(!PlanProbe::pike_ran(walk, [&] { CHECK(walk.test(hard[0])); }));
 }
 
+// A Grapheme search() / test() does not check its subject's clusters
+// (Plan::guesses_): a pure-ASCII subject takes the ASCII family outright,
+// any other guesses the byte family, judged on what it read; a guess that
+// does not hold classifies the subject whole, as before. So over ASCII,
+// accented and CR-LF text with what a family cannot read at every early
+// offset (kDirt: marks, ZWJ, flags, CR-LF, lone CR / LF, strays), the first
+// match and the boolean are the grapheme Pike's — on patterns the plan
+// guesses for and patterns it does not (a CR-LF read part-way: the pairs
+// below, which a guess would answer wrongly), and with the cluster that
+// begins where the scan stopped (`[a-z]+ing` over "...abxing" + a mark: the
+// mark makes "g" + U+0301 no `g`).
+void test_find_guess_grapheme() {
+  const char *pats[] = {
+      "\\w+", "(\\w+) (\\w+)", "[a-z]+ing", "\\w+@\\w+", "x\\w*z",
+      ".*fox", "a.*b", "(?s).+", "\\S+\\s+\\S+", "[^ ]+", "\\b\\w+\\b",
+      "\\w+$", "(\\w+)\\b", "\\B\\w+", "(?m)^\\w+$", "(?i)holmes",
+      "fox|dog", "quick", "[0-9]+", "\\W+", ".", "(?s).{3}", "[^\\x00-\\x7f]",
+      "(\\w)(\\w*)\\s(\\w+)", "\\w+ \\d+", "\\w+qzxing", "qz\\w+",
+      "[^\\n]*[^\\n]*[ -~]", "[^\\n]+ing", "(?i)[^\\n]+=", "\\w\\s+\\w"};
+  for (const char *pat : pats) {
+    const Regex re = make_egc(pat), pike = pike_twin(pat);
+    each_dirty_subject(
+        [&](std::string_view s) { return first_agrees(re, pike, s); });
+  }
+  for (const auto &[pat, subj] : std::initializer_list<
+           std::pair<const char *, const char *>>{
+           {"[^\\n]*[^\\n]*[ -~]", "c\r\r\n\xEF\xB8\x8F b "},
+           {"[^\\n]+ing", "a=ing\r\n\r\nbing"},
+           {"(?i)[^\\n]+=", "a=ing\r\n\r\na="},
+           {"\\w+", "ab\xCC\x81 c"},
+           {"[a-z]+", "abc.\xCC\x81d"},
+           {"\\b\\w+\\b", "word\xCC\x81 x"},
+           {"[a-z]+ing", "caf\xC3\xA9 et zz abxing\xCC\x81 x"}}) {
+    const Regex re = make_egc(pat), pike = pike_twin(pat);
+    CHECK(first_agrees(re, pike, subj));
+  }
+  // It reads what its answer needs: over 1 MB of accented prose that ends
+  // in a stray byte, the ASCII family answers from the first bytes, where
+  // the subject's class sent the find to the Pike, which segmented it all.
+  const std::string prose = accented_prose(1u << 20) + "\xFF";
+  // (Not `(\\w+)\\s(\\w+)`: `\\s` takes a CR or an LF alone, so it is no
+  // guess.)
+  for (const char *pat : {"\\w+", "\\b\\w+\\b", "(\\w+) (\\w+)"}) {
+    const Regex re = make_egc(pat);
+    reg::MatchResult m;
+    CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
+    CHECK(m.matched() && m.begin() < 64);
+    CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(prose)); }));
+  }
+  // Where a DFA of the guess gives up, the guess ends (the Pike, or the
+  // subject classified whole): on caches too small, over letters that take
+  // many DFA states, with a mark or a CR-LF at the edges and inside.
+  std::vector<std::string> hard;
+  for (const std::string &b :
+       {noise(6000, "abcd", 1), noise(3000, "aaaaaaabbbbbbbb ", 3)}) {
+    hard.push_back(b);
+    for (const char *d : {"\xCC\x81", "\r\n", "\xC3\xA9"})
+      for (size_t at : {size_t{0}, size_t{3}, size_t{100}, size_t{1500},
+                        b.size() - 1, b.size()})
+        hard.push_back(inserted(b, at, d));
+  }
+  for (const char *pat :
+       {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
+        "(a)[a-d]{8}(d)", "\\b[ab]*a[ab]{9}\\b"}) {
+    const Regex re = make_egc(pat), pike = pike_twin(pat);
+    for (const std::string &s : hard) {
+      for (size_t bytes : {size_t{512}, size_t{4096}})
+        for (uint32_t clears : {0u, 3u}) {
+          PlanProbe::dfa_cache(re, bytes, clears);
+          CHECK(first_agrees(re, pike, s));
+        }
+      PlanProbe::dfa_cache(re, reg::limits::kDfaCacheBytes,
+                           reg::limits::kDfaMinClears);
+      PlanProbe::quit_fu(re);
+      CHECK(first_agrees(re, pike, s));
+    }
+  }
+}
+
 // Every ladder names the family it runs on (Ladder::fam), and what engine
 // it reads follows from that family alone. A CodePoint find guesses its
-// plan's one family, a Grapheme one none yet; match() tries the families of
+// plan's one family, a Grapheme one its ASCII family on a pure-ASCII
+// subject and its byte family on any other; match() tries the families of
 // Plan::guesses_ too.
 void test_ladder_family() {
   const char *pats[] = {"\\w+",        "(\\w+)@(\\w+)", "\\b\\w+\\b",
@@ -2153,10 +2233,11 @@ void test_ladder_family() {
     for (const auto u : {reg::MatchUnit::CodePoint, reg::MatchUnit::Grapheme}) {
       const Regex re(pat, 0, u);
       CHECK(PlanProbe::ladders_name_families(re));
-      if (u == reg::MatchUnit::Grapheme) {
-        CHECK(PlanProbe::guesses(re, 'f').empty());
-        CHECK(PlanProbe::guesses(re, 't').empty());
-      }
+      if (u == reg::MatchUnit::Grapheme) // the ASCII family, the byte one
+        for (const char who : {'f', 't'}) {
+          const std::string g = PlanProbe::guesses(re, who);
+          CHECK(g.size() <= 2 && g.find_first_not_of("aAbB") == g.npos);
+        }
     }
   // CodePoint: the DFA family, else the byte assert one.
   {
@@ -2170,6 +2251,15 @@ void test_ladder_family() {
     CHECK(PlanProbe::guesses(re, 'f') == "u");
     CHECK(PlanProbe::guesses(re, 't') == "u");
   }
+  // Grapheme: a find's ASCII family (a pure-ASCII subject) and byte family
+  // (any other), where a CR-LF reads as the grapheme engine reads it; no
+  // byte guess where a fused rung or the (?i) prefix probe serves such a
+  // subject.
+  CHECK(PlanProbe::guesses(Regex("\\w+"), 'f') == "ab");
+  CHECK(PlanProbe::guesses(Regex("\\b\\w+\\b"), 't') == "AB");
+  CHECK(PlanProbe::guesses(Regex("x\\w*z"), 'f') == "a");
+  CHECK(PlanProbe::guesses(Regex("(?i)holmes"), 'f') == "a");
+  CHECK(PlanProbe::guesses(Regex("(\\w+)\\s(\\w+)"), 'f').empty());
   // Grapheme: match()'s ASCII family first, its byte family first for a
   // CR-LF literal.
   CHECK(PlanProbe::guesses(Regex("\\w+"), 'm') == "ab");
@@ -6797,6 +6887,7 @@ int main() {
   test_crlf_interior_anchors();
   test_match_guess();
   test_find_guess();
+  test_find_guess_grapheme();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

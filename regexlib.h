@@ -15157,13 +15157,13 @@ public:
     return l.want == Want::Rows ? Plan::kGuessFind : Plan::kGuessTest;
   }
   // The ladder of the first family a scan on `l` guesses (the Pike with
-  // none): a CodePoint plan's one family.
+  // none).
   static Ladder first_guess(const Plan &p, const Ladder &l) {
     const Family f = p.guesses_[guess_row(l)][0];
     return f == kFamilyCount ? pike_ladder(l.want)
                              : p.family_[f][ladder_caller(l)];
   }
-  // A CodePoint scan on `l`, at Classify, moved onto that ladder.
+  // A scan on `l`, at Classify, moved onto that ladder.
   Ladder ladder_guessed(Ladder l) const {
     const Ladder n = first_guess(*plan_, l);
     return n.rung == Rung::Pike ? n : ladder_adopt(n, l);
@@ -15328,14 +15328,33 @@ public:
     }
     return plan_->start_[2];
   }
+  // A scan that would classify its subject guesses instead (Plan::guesses_),
+  // and the answer stands if what the scan read holds it out (guess_held).
   // A CodePoint scan does not ask first whether its subject has a stray
   // byte (us_stray), which no byte automaton reads: it guesses it reads
-  // none, on its family (Plan::guesses_), and the answer stands if what the
-  // scan read holds that out (guess_held). (Not on a rung before Classify:
-  // EndAnchor reads from the end, and vets what it read.)
-  REGEXLIB_ALWAYS_INLINE void guess_begin(Ladder &l) const {
-    if (!plan_->us_ || !rung_classified(l.rung)) return;
-    if (l.rung == Rung::Classify) l = ladder_guessed(l);
+  // none, on its family. (Not on a rung before Classify: EndAnchor reads
+  // from the end, and vets what it read.) A Grapheme one, at Classify,
+  // finds the subject's first non-ASCII byte, a fast pass, but does not
+  // check its clusters, which is the slow one: a pure-ASCII subject takes
+  // the plan's ASCII family outright (no guess: it is sound there), any
+  // other guesses the byte family — where the plan has them (see
+  // ladder_plan).
+  REGEXLIB_ALWAYS_INLINE void guess_begin(std::string_view text,
+                                          Ladder &l) const {
+    if (plan_->us_) {
+      if (!rung_classified(l.rung)) return;
+      if (l.rung == Rung::Classify) l = ladder_guessed(l);
+    } else {
+      const Family *row = plan_->guesses_[guess_row(l)];
+      if (l.rung != Rung::Classify ||
+          (row[0] == kFamilyCount && row[1] == kFamilyCount))
+        return;
+      const bool ascii = first_nonascii(text) == text.size();
+      const Family f = row[ascii ? 0 : 1];
+      if (f == kFamilyCount) return;
+      l = ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
+      if (ascii) return; // sound: no guess
+    }
     l.set(Ladder::kSpec);
   }
   // A one-step scan on `l` from 0, to its first answer: the walk first,
@@ -15353,11 +15372,6 @@ public:
   static bool guess_open(const Ladder &l) {
     return l.has(Ladder::kSpec) && l.rung != Rung::Pike;
   }
-  // A guess of find_rest's that did not hold: the Pike's answer, from the
-  // start. Out of line: no subject the family serves reaches it.
-  template <class Out>
-  REGEXLIB_NOINLINE bool find_pike(std::string_view text, Scr &scr,
-                                   Out &out) const;
 
   // A scan that outlives the call that started it (find_iter, find_all,
   // find_at): the ladder, the cursor and what the rungs keep between
@@ -17462,6 +17476,11 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
 }
 
 inline void Regex::ladder_plan(Plan &p) {
+  p.fused_ = p.egc_fused_ok()
+                 ? (p.prefix_fused() ? Plan::Fused::Prefix
+                                     : Plan::Fused::Suffix)
+                 : p.egc_fused_collapse_ok() ? Plan::Fused::Collapse
+                                             : Plan::Fused::None;
   // The families a guess tries (Plan::guesses_). match()'s, each anchored
   // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
   // the subject a scan most often meets, and the cheaper engine there —
@@ -17487,17 +17506,38 @@ inline void Regex::ladder_plan(Plan &p) {
       byte = p.byte_path_ ? kFamEgcByte
              : p.byte_assert_path_ ? kFamAssertByte
                                    : kFamilyCount;
+      // A find's families (see guess_begin), where a CR-LF reads as the
+      // grapheme engine reads it (crlf_byte_safe_, non-empty, no fused
+      // CR-LF literal): [0] the ASCII family, for the caller as ladder_gated
+      // has it, which a pure-ASCII subject takes outright
+      // (ascii_grapheme_ok holds); [1] the byte family, which a subject
+      // that is not guesses. Then no byte a walk reads past what the scans
+      // report changes the answer: past an ASCII byte it matched, a walk
+      // reads on, and gives up at a non-ASCII byte; a byte it did not
+      // match, a cluster on it does not match either. (No byte guess where
+      // the plan has a faster way over such a subject that needs no
+      // classifying: the fused rungs, and the (?i) prefix probe, chosen
+      // over the whole subject.)
+      if (p.crlf_byte_safe_ && !p.can_match_empty_ && !p.crlf_fused_lit_) {
+        p.guesses_[Plan::kGuessFind][0] =
+            p.dfa_family_ok(false) ? kFamAscii
+            : p.assert_ascii_tier() ? kFamAssertAscii
+                                    : kFamilyCount;
+        p.guesses_[Plan::kGuessTest][0] =
+            p.dfa_family_ok(true) ? kFamAscii
+            : p.dfa_assert_ok_    ? kFamAssertAscii
+                                  : kFamilyCount;
+        if (p.fused_ == Plan::Fused::None &&
+            !(p.ncap_ == 0 && p.icase_prefix_.active()))
+          p.guesses_[Plan::kGuessFind][1] = p.guesses_[Plan::kGuessTest][1] =
+              byte;
+      }
     }
     const bool byte_first =
         ascii == kFamilyCount || (p.crlf_fused_lit_ && byte != kFamilyCount);
     p.guesses_[Plan::kGuessMatch][0] = byte_first ? byte : ascii;
     p.guesses_[Plan::kGuessMatch][1] = byte_first ? ascii : byte;
   }
-  p.fused_ = p.egc_fused_ok()
-                 ? (p.prefix_fused() ? Plan::Fused::Prefix
-                                     : Plan::Fused::Suffix)
-                 : p.egc_fused_collapse_ok() ? Plan::Fused::Collapse
-                                             : Plan::Fused::None;
   // Three kinds of caller (see ladder_caller): a find, a boolean, and a
   // boolean over a short subject — the boolean's ladders with the
   // interior-literal rung given up (limits::kBoolSkipBytes).
@@ -17665,25 +17705,42 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   // (The short boolean's ladder, past the shallow rungs: they have no
   // interior-literal rung to give up.)
   if constexpr (!Out::kGroups) l = ladder_short_test(text, l);
-  guess_begin(l);
+  guess_begin(text, l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
-  Cursor c;
-  bool walked = false;
-  const bool found = find_run(text, scr, l, c, walked, out);
-  if (!guess_open(l)) return found;
-  // How far the guess's scans read: a match's end, or past it as far as a
-  // DFA scan did (a walk reads no byte past its end that is not ASCII, so
-  // none a stray), the whole subject when there is no match.
-  int reach = static_cast<int>(text.size());
-  if (found)
-    reach = walked ? c.pos
-                   : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
-  // (Only a CodePoint family guesses: each spelled out, so that guess_held
-  // folds for it.)
-  if (l.fam == kFamUsAssert ? guess_held(kFamUsAssert, text, reach)
-                            : guess_held(kFamUsDfa, text, reach))
-    return found;
-  return find_pike(text, scr, out);
+  for (;;) {
+    Cursor c;
+    bool walked = false;
+    const bool found = find_run(text, scr, l, c, walked, out);
+    if (!guess_open(l)) return found;
+    // How far the guess's scans read: a match's end, or past it as far as
+    // a DFA scan did, the whole subject when there is no match. A walk
+    // reads past its end only ASCII bytes: no stray (CodePoint), and no
+    // byte whose cluster could change what the walk saw (Grapheme: the
+    // plan guesses only where a CR-LF reads as the grapheme engine reads
+    // it — see ladder_plan).
+    int reach = static_cast<int>(text.size());
+    if (found)
+      reach = walked ? c.pos
+                     : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
+    // A guess that does not hold: the scan again from the start, into a
+    // fresh sink — on the Pike (CodePoint), or classified whole (Grapheme;
+    // the rungs given up stay given up).
+    const Want want = l.want;
+    if (plan_->us_) {
+      // (Each CodePoint family spelled out, so that guess_held folds.)
+      if (l.fam == kFamUsAssert ? guess_held(kFamUsAssert, text, reach)
+                                : guess_held(kFamUsDfa, text, reach))
+        return found;
+      l = pike_ladder(want);
+    } else {
+      if (guess_held(l.fam, text, reach)) return found;
+      const uint16_t off = l.flags & (Ladder::kSuffixOff | Ladder::kInnerOff);
+      l = pike_ladder(want);
+      l.flags = off;
+      l.rung = l.below = Rung::Classify;
+    }
+    out.clear();
+  }
 }
 
 template <class Out>
@@ -17711,14 +17768,6 @@ inline bool Regex::find_run(std::string_view text, Scr &scr, Ladder &l,
   return ladder_step<false>(text, scr, l, c, budget, d, chain_once, out);
 }
 
-template <class Out>
-bool Regex::find_pike(std::string_view text, Scr &scr, Out &out) const {
-  out.clear();
-  Ladder l = pike_ladder(Out::kGroups ? Want::Rows : Want::Test);
-  Cursor c;
-  bool walked = false;
-  return find_run(text, scr, l, c, walked, out);
-}
 
 template <bool All, bool InlineWalk, class Out>
 inline Regex::Step Regex::ladder_shallow(std::string_view text, Ladder &l,
