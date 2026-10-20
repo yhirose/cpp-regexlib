@@ -10730,8 +10730,9 @@ private:
     // A Lit node holds a \r or \n (has_crlf_literal). With crlf_byte_safe_
     // (and a pattern that cannot match empty) that is a `\r\n` pair the
     // parser fused into one grapheme (fuse_literal_graphemes): the one
-    // element whose byte and grapheme forms differ. The BYTE programs match it as its own two bytes — why
-    // crlf_byte_safe_ admits it. The GRAPHEME programs (prog_, lf_prog_:
+    // element whose byte and grapheme forms differ. The BYTE programs match
+    // it as its own two bytes — why crlf_byte_safe_ admits it. The GRAPHEME
+    // programs (prog_, lf_prog_:
     // compiled cp=false, one Op::Char for the whole literal) hold it as one
     // two-code-point unit, which their DFAs, stepping bytes, cannot consume.
     // (cp_prog_ only resolves groups in a span these DFAs located; the
