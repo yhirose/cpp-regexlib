@@ -10121,8 +10121,8 @@ private:
     // (match(), a CodePoint find) or the subject's classified whole (a
     // Grapheme find).
     //   match_guesses_: match()'s, tried in turn.
-    //   find_guess_: a find's and a boolean's ([0] / [1]: Regex::
-    //     guess_row) — a CodePoint plan's one family; a Grapheme plan's
+    //   find_guess_: a find's and a boolean's (Row: Regex::guess_row) — a
+    //     CodePoint plan's one family; a Grapheme plan's
     //     byte family, on a subject that is not pure ASCII.
     //   ascii_route_: a Grapheme find's or boolean's family on a pure-ASCII
     //     subject, taken outright: it is sound there, so no guess.
@@ -10130,6 +10130,7 @@ private:
     Fused fused_ = Fused::None;
     Ladder start_[3];
     Ladder family_[kFamilyCount][3];
+    enum Row : uint8_t { kFindRow, kTestRow }; // find_guess_, ascii_route_
     Family match_guesses_[2] = {kFamilyCount, kFamilyCount};
     Family find_guess_[2] = {kFamilyCount, kFamilyCount};
     Family ascii_route_[2] = {kFamilyCount, kFamilyCount};
@@ -15168,19 +15169,19 @@ public:
   }
   // A scan on `l`'s row of Plan::find_guess_ / ascii_route_: a find's, a
   // boolean's.
-  static int guess_row(const Ladder &l) {
-    return l.want == Want::Rows ? 0 : 1;
+  static Plan::Row guess_row(const Ladder &l) {
+    return l.want == Want::Rows ? Plan::kFindRow : Plan::kTestRow;
   }
-  // The ladder of the family a CodePoint scan on `l` guesses (the Pike
-  // with none).
-  static Ladder first_guess(const Plan &p, const Ladder &l) {
+  // The ladder of the family a scan on `l` guesses (the Pike with none):
+  // a CodePoint plan's, where a scan starts (ladder_plan) and at Classify.
+  static Ladder find_guess_ladder(const Plan &p, const Ladder &l) {
     const Family f = p.find_guess_[guess_row(l)];
     return f == kFamilyCount ? pike_ladder(l.want)
                              : p.family_[f][ladder_caller(l)];
   }
   // A scan on `l`, at Classify, moved onto that ladder.
   Ladder ladder_guessed(Ladder l) const {
-    const Ladder n = first_guess(*plan_, l);
+    const Ladder n = find_guess_ladder(*plan_, l);
     return n.rung == Rung::Pike ? n : ladder_adopt(n, l);
   }
   // A scan on `l` moved onto family `f`'s ladder.
@@ -15373,7 +15374,7 @@ public:
       if (!rung_classified(l.rung)) return;
       if (l.rung == Rung::Classify) l = ladder_guessed(l);
     } else {
-      const int row = guess_row(l);
+      const Plan::Row row = guess_row(l);
       const Family route = plan_->ascii_route_[row],
                    guess = plan_->find_guess_[row];
       if (l.rung != Rung::Classify ||
@@ -17526,8 +17527,8 @@ inline void Regex::ladder_plan(Plan &p) {
       // [Tier: Pike/cp])
       const Family as = p.byte_assert_path_ ? kFamUsAssert : kFamilyCount;
       byte = p.dfa_family_ok(true) ? kFamUsDfa : as;
-      p.find_guess_[1] = byte;
-      p.find_guess_[0] = p.dfa_family_ok(false) ? kFamUsDfa : as;
+      p.find_guess_[Plan::kTestRow] = byte;
+      p.find_guess_[Plan::kFindRow] = p.dfa_family_ok(false) ? kFamUsDfa : as;
     } else {
       ascii = p.dfa_ok_ ? kFamAscii
               : p.assert_ascii_tier() ? kFamAssertAscii
@@ -17543,8 +17544,8 @@ inline void Regex::ladder_plan(Plan &p) {
       // subject that needs no classifying: the fused rungs, and the (?i)
       // prefix probe.
       if (p.crlf_byte_safe_ && !p.can_match_empty_ && !p.crlf_fused_lit_) {
-        p.ascii_route_[0] = p.ascii_family(false);
-        p.ascii_route_[1] = p.ascii_family(true);
+        p.ascii_route_[Plan::kFindRow] = p.ascii_family(false);
+        p.ascii_route_[Plan::kTestRow] = p.ascii_family(true);
         if (p.fused_ == Plan::Fused::None &&
             !(p.ncap_ == 0 && p.icase_prefix_.active()))
           p.find_guess_[0] = p.find_guess_[1] = byte;
@@ -17591,7 +17592,7 @@ inline void Regex::ladder_plan(Plan &p) {
       // family is the one to take.
       st.rung = st.below = Rung::TextAnchor;
     } else if (p.us_) {
-      st = first_guess(p, st);
+      st = find_guess_ladder(p, st);
     } else {
       st.rung = st.below = Rung::Classify; // the subject chooses the family
     }

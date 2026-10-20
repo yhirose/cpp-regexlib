@@ -350,21 +350,21 @@ struct PlanProbe {
   // (Plan::match_guesses_), 'f' a find's, 't' a boolean's
   // (Plan::find_guess_).
   static std::string guesses(const Regex &re, char who) {
-    std::string s;
     const auto &p = *re.plan_;
-    if (who == 'm') {
-      for (const auto f : p.match_guesses_)
-        if (f != Regex::kFamilyCount) s += kFamilies[f];
-    } else if (p.find_guess_[who == 't'] != Regex::kFamilyCount) {
-      s += kFamilies[p.find_guess_[who == 't']];
-    }
-    return s;
+    if (who != 'm') return name(p.find_guess_[row(who)]);
+    return name(p.match_guesses_[0]) + name(p.match_guesses_[1]);
   }
   // ... and the family a find ('f') or a boolean ('t') takes outright on a
-  // pure-ASCII subject (Plan::ascii_route_), "" for none.
+  // pure-ASCII subject (Plan::ascii_route_).
   static std::string ascii_route(const Regex &re, char who) {
-    const auto f = re.plan_->ascii_route_[who == 't'];
+    return name(re.plan_->ascii_route_[row(who)]);
+  }
+  // A family's letter, "" for none; a caller's row.
+  static std::string name(Regex::Family f) {
     return f == Regex::kFamilyCount ? "" : std::string(1, kFamilies[f]);
+  }
+  static Regex::Plan::Row row(char who) {
+    return who == 't' ? Regex::Plan::kTestRow : Regex::Plan::kFindRow;
   }
   static std::string match_guesses(const Regex &re) {
     return guesses(re, 'm');
@@ -2166,9 +2166,10 @@ void test_find_guess() {
 // A Grapheme search() / test() does not check its subject's clusters
 // (Plan::ascii_route_, find_guess_): a pure-ASCII subject takes the ASCII
 // family outright, any other guesses the byte family, judged on what it
-// read; a guess that does not hold classifies the subject whole, as before. So over ASCII,
-// accented and CR-LF text with what a family cannot read at every early
-// offset (kDirt: marks, ZWJ, flags, CR-LF, lone CR / LF, strays), the first
+// read; a guess that does not hold classifies the subject whole, as
+// before. So over ASCII, accented and CR-LF text with what a family cannot
+// read at every early offset (kDirt: marks, ZWJ, flags, CR-LF, lone CR /
+// LF, strays), the first
 // match and the boolean are the grapheme Pike's — on patterns the plan
 // guesses for and patterns it does not (a CR-LF read part-way: the pairs
 // below, which a guess would answer wrongly), and with the cluster that
