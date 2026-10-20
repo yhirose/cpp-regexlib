@@ -1523,7 +1523,7 @@ std::string gen_egc_onewalk() {
     // Only non-ASCII members (or nearly): every match starts where the
     // ASCII first-byte set says nothing can.
     static const char *CLS[] = {"[\xC3\xA9\xE6\x97\xA5]", "[\xF0\x9F\x98\x80\xE6\xBC\xA2]",
-                                "[\xC3\xA9" "a]", "\\p{L}", "[^ -~\\n\\r]"};
+                                ("[\xC3\xA9" "a]"), "\\p{L}", "[^ -~\\n\\r]"};
     static const char *Q[] = {"+", "{1,}", "{1,3}", ""};
     static const char *LEAD[] = {"", "", "a?", "(", " "};
     const char *lead = LEAD[U(0, 4)];

@@ -1935,7 +1935,7 @@ const char *const kDirt[] = {
 // accented prose (one starting with a non-ASCII byte) and CR-LF lines.
 const char *const kGuessBodies[] = {
     "the quick brown fox jumps over the lazy dog ",
-    "the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over ",
+    ("the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over "),
     "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
     "the quick brown fox\r\njumps over the dog\r\n"};
 // `agrees` over each of kGuessBodies (repeated to 160 bytes), and over each
