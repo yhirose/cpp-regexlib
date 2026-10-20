@@ -519,8 +519,11 @@ subject 全体を分割する。
 ラダーは自分の走る系統を名指します（`Ladder::fam`）。段がどの DFA を読むか、assert の
 エンジンを走らせるかは系統だけで決まります（`kFamilyTraits`）。ラダーはその写しを旗に
 持ちます。写しを書くのは系統と一緒に書く `Ladder::set_family` だけで、段の判定
-（`ladder_byte`、`ladder_assert`）は表を読まずにビットを調べるだけで済みます。推測が試す系統も 1 つの表です
-（`Plan::guesses_`。下を参照）。行は推測する側ごとで、`match()`・find・真偽値です。
+（`ladder_byte`、`ladder_assert`）は表を読まずにビットを調べるだけで済みます。
+対象を分類せずに走査が取る系統も、プランを作るときに求めます（下を参照）。`match()` が
+順に試す推測（`Plan::match_guesses_`）、find と真偽値の推測（`Plan::find_guess_`）、
+Grapheme の find と真偽値が純 ASCII の対象でそのまま取る系統（`Plan::ascii_route_`。
+そこでは健全なので推測ではありません）です。
 ゲートはこの表になっていません。`ladder_gated` はゲートを順に書き並べます。系統ごとの
 経路に固有の条件（選ぶプローブ、純 ASCII の CR-LF の例外）があり、Grapheme の走査の
 最初の一歩にインライン化されると、書き並べたものは畳まれ、系統を回すループは畳まれない
@@ -674,7 +677,7 @@ find は絞り込みのないスキャンで最初からやり直すからです
 *走査が読んだ範囲で*主題がそうであれば、その答えを採ります（`guess_held`）。そうでなければ
 次の推測へ、最後は Pike です。
 
-- **`match()`** は `Plan::guesses_` の自分の行（`ladder_plan` が決める）の系統を順に、位置 0 から
+- **`match()`** は `Plan::match_guesses_`（`ladder_plan` が決める）の系統を順に、位置 0 から
   走らせます（`match_end`）。
   - CodePoint のプランは、その 1 つの系統。
   - Grapheme のプランは、ASCII 系統、次にバイト系統。
@@ -691,7 +694,7 @@ find は絞り込みのないスキャンで最初からやり直すからです
     一致させない）。無駄になるのは、その前の ASCII の部分です。
 - **CodePoint の `search()` / `test()`**（`find_rest`。`guess_begin`、走査の `find_run`、
   そして判定）は、プランが推測する系統
-  （`Plan::guesses_` の find・真偽値の行。`ladder_guessed`）を `Ladder::kSpec` を立てて
+  （`Plan::find_guess_`。`ladder_guessed`）を `Ladder::kSpec` を立てて
   走らせ、迷子のバイトを先に調べません。
   - 1 つの段が多くの走査をするので、前向きの DFA の走査がそれぞれ、その DFA の
     最高到達点（`LazyDfa::hi`。開始状態の読み飛ばしを含む）を引き上げます。最高到達点は
@@ -710,9 +713,9 @@ find は絞り込みのないスキャンで最初からやり直すからです
 - **Grapheme の `search()` / `test()`** は、`Classify` で（`guess_begin`）検索対象の
   最初の非 ASCII バイトを求めます（速いパス）。まとまりの検査（遅いパス：
   `egc_simple_from` は 1 バイトあたり約 5 命令、`first_nonascii` は 0.25 命令）はしません。
-  - 純 ASCII の対象は、プランの ASCII 系統へそのまま進みます。推測ではありません
-    （そこでは健全です）。
-  - それ以外は、バイト系統を推測し、読んだ範囲で判定します（`guess_held`）。成り立たな
+  - 純 ASCII の対象は、プランの ASCII 系統（`Plan::ascii_route_`）へそのまま進みます。
+    推測ではありません（そこでは健全です）。
+  - それ以外は、バイト系統（`Plan::find_guess_`）を推測し、読んだ範囲で判定します（`guess_held`）。成り立たな
     ければ、以前と同じく最初から対象全体を分類します。
   - どちらも、CR-LF が書記素のエンジンと同じに読まれるパターン（`crlf_byte_safe_`、
     空に一致しない、融合した CR-LF リテラルがない）だけです。そうであれば、走査が報告した

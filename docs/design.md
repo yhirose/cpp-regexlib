@@ -560,8 +560,11 @@ read and whether they run the assert engine follow from the family alone
 (`kFamilyTraits`). The ladder carries a copy of them in its flags, written
 with the family by `Ladder::set_family` and nothing else, so that a rung's
 test (`ladder_byte`, `ladder_assert`) is a bit test rather than a table
-load. The families a guess tries are one table too
-(`Plan::guesses_`, below), per guesser: `match()`, a find, a boolean.
+load. The families a scan takes without classifying its subject are worked
+out once too (below): `match()`'s guesses in turn (`Plan::match_guesses_`),
+a find's and a boolean's guess (`Plan::find_guess_`), and the family a
+Grapheme find or boolean takes outright on a pure-ASCII subject
+(`Plan::ascii_route_`: no guess, it is sound there).
 The gates are not such a table: `ladder_gated` writes them as a chain, since
 each family's route has conditions of its own (a probe to choose, a pure-ASCII
 CR-LF exception), and inlined into a Grapheme scan's first step the chain
@@ -725,7 +728,7 @@ They guess now. A family runs as if the subject were one it serves, and its
 answer stands if the subject is one *as far as the scan read*
 (`guess_held`); else the next guess, and at the last the Pike.
 
-- **`match()`** tries its families in `Plan::guesses_` (set by
+- **`match()`** tries its families in `Plan::match_guesses_` (set by
   `ladder_plan`), each anchored at 0 (`match_end`): a CodePoint plan's one; a
   Grapheme plan's ASCII family, then its byte family — the byte family first
   for a pattern with a CR-LF literal, which the ASCII family cannot match
@@ -740,7 +743,7 @@ answer stands if the subject is one *as far as the scan read*
   ASCII run before that.
 - **A CodePoint `search()` / `test()`** (`find_rest`: `guess_begin`, then
   the scan, `find_run`, then the verdict) runs the family its
-  plan guesses (its row of `Plan::guesses_`, `ladder_guessed`) with
+  plan guesses (`Plan::find_guess_`, `ladder_guessed`) with
   `Ladder::kSpec` set, and does not
   check for a stray byte first. A rung runs many scans, so each forward DFA
   scan raises its DFA's high-water mark instead (`LazyDfa::hi`, a
@@ -760,9 +763,10 @@ answer stands if the subject is one *as far as the scan read*
   the subject's first non-ASCII byte, a fast pass, and does not check its
   clusters, the slow one (`egc_simple_from`, some 5 instructions a byte
   where `first_nonascii` is a quarter of one). A pure-ASCII subject takes
-  the plan's ASCII family outright: no guess, it is sound there. Any other
-  guesses the byte family, judged on what it read (`guess_held`); one that
-  does not hold is classified whole, from the start, as before. Both only
+  the plan's ASCII family outright (`Plan::ascii_route_`): no guess, it is
+  sound there. Any other guesses the byte family (`Plan::find_guess_`),
+  judged on what it read (`guess_held`); one that does not hold is
+  classified whole, from the start, as before. Both only
   where a CR-LF reads as the grapheme engine reads it (`crlf_byte_safe_`,
   non-empty, no fused CR-LF literal): then a walk that reads past what the
   scans report reads ASCII, which no cluster changes the meaning of (past

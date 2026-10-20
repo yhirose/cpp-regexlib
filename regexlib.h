@@ -5834,14 +5834,14 @@ public:
     }
     FindCache &cache = thread_cache(); // reuse this thread's persistent DFAs
     Scratch &sc = cache.sc_;
-    // The plan's families in turn (Plan::guesses_), each anchored at
+    // The plan's families in turn (Plan::match_guesses_), each anchored at
     // 0: the first whose answer holds for the subject as far as it read
     // (guess_held) answers. The subject is never classified as a whole — a
     // stray byte or a combining mark past the end of a match is no reason
     // to segment the subject for the Pike, and nor is the length of a clean
     // one a reason to scan it. [Tier: Pike] / [Tier: Pike/cp] when no family
     // holds: a subject none of them serves.
-    for (const Family f : plan_->guesses_[Plan::kGuessMatch]) {
+    for (const Family f : plan_->match_guesses_) {
       if (f == kFamilyCount) break;
       // An ASCII family holds for no subject whose first byte is not: what
       // it read always includes that byte.
@@ -10115,21 +10115,24 @@ private:
     //   family_: each family's ladder, for the subject to choose among.
     //   fused_: which fused EGC scan the plan has (egc_fused_ok /
     //     egc_fused_collapse_ok, asked once).
-    //   guesses_: per guesser — match(), a find, a boolean (Regex::
-    //     guess_row) — the families it takes without classifying the
-    //     subject, kFamilyCount where none (Regex::guess_held judges what
-    //     each read). match() tries its two in turn. A find: a CodePoint
-    //     plan's one family, guessed ([0]); a Grapheme plan's ASCII family,
-    //     taken outright on a pure-ASCII subject ([0]), and its byte family,
-    //     guessed on any other ([1]) (Regex::guess_begin).
+    // The families a scan takes without classifying its subject,
+    // kFamilyCount where none. A guess is judged on what it read
+    // (Regex::guess_held); one that does not hold is the Pike's answer
+    // (match(), a CodePoint find) or the subject's classified whole (a
+    // Grapheme find).
+    //   match_guesses_: match()'s, tried in turn.
+    //   find_guess_: a find's and a boolean's ([0] / [1]: Regex::
+    //     guess_row) — a CodePoint plan's one family; a Grapheme plan's
+    //     byte family, on a subject that is not pure ASCII.
+    //   ascii_route_: a Grapheme find's or boolean's family on a pure-ASCII
+    //     subject, taken outright: it is sound there, so no guess.
     enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
     Fused fused_ = Fused::None;
     Ladder start_[3];
     Ladder family_[kFamilyCount][3];
-    enum Guesser : uint8_t { kGuessMatch, kGuessFind, kGuessTest, kGuessers };
-    Family guesses_[kGuessers][2] = {{kFamilyCount, kFamilyCount},
-                                     {kFamilyCount, kFamilyCount},
-                                     {kFamilyCount, kFamilyCount}};
+    Family match_guesses_[2] = {kFamilyCount, kFamilyCount};
+    Family find_guess_[2] = {kFamilyCount, kFamilyCount};
+    Family ascii_route_[2] = {kFamilyCount, kFamilyCount};
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
@@ -13544,15 +13547,15 @@ private:
     return unicode::utf8::valid_from(s, n, i);
   }
 
-  // A guess (match(), find_rest: Plan::guesses_): family `f` has answered
-  // for `text` from 0, and its scans read nothing at or past `reach`: one
-  // past the furthest byte its DFA scans and walks examined or skipped
-  // over (a skip is a claim about the bytes it passes: no match starts
-  // there), at least the match's end. Its answer is the unit's when the
-  // family is sound (family_sound) for the prefix R its answer depended on
-  // (guess_end). What follows does not matter: nothing read it. A gate that
-  // holds for the whole subject holds for R, so a subject no guess holds
-  // for is one no family served either, and the Pike answers it.
+  // A guess (match(), find_rest: Plan::match_guesses_, find_guess_): family
+  // `f` has answered for `text` from 0, and its scans read nothing at or
+  // past `reach`: one past the furthest byte its DFA scans and walks
+  // examined or skipped over (a skip is a claim about the bytes it passes:
+  // no match starts there), at least the match's end. Its answer is the
+  // unit's when the family is sound (family_sound) for the prefix R its
+  // answer depended on (guess_end). What follows does not matter: nothing
+  // read it. A gate that holds for the whole subject holds for R, so a
+  // subject no guess holds for is one no family served either.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach) const {
     // (Not substr: guess_end is within `text`, and GCC calls substr here.)
@@ -15138,8 +15141,9 @@ public:
   // A family's ladder for a caller: what the family has, and the rung that
   // leads it. The one place a family is defined.
   static Ladder ladder_family(const Plan &p, Family f, Want want);
-  // Work out the plan's ladders (Plan::start_, family_) and guesses
-  // (Plan::guesses_).
+  // Work out the plan's ladders (Plan::start_, family_) and the families
+  // taken without classifying (Plan::match_guesses_, find_guess_,
+  // ascii_route_).
   // Everything a scan's set-up does not need the subject for happens here,
   // once: a short search() is mostly its set-up, and picking the rungs on
   // every call was half of that.
@@ -15162,14 +15166,15 @@ public:
     }
     return n;
   }
-  // The guesser a scan on `l` is (Plan::guesses_).
-  static Plan::Guesser guess_row(const Ladder &l) {
-    return l.want == Want::Rows ? Plan::kGuessFind : Plan::kGuessTest;
+  // A scan on `l`'s row of Plan::find_guess_ / ascii_route_: a find's, a
+  // boolean's.
+  static int guess_row(const Ladder &l) {
+    return l.want == Want::Rows ? 0 : 1;
   }
-  // The ladder of the first family a scan on `l` guesses (the Pike with
-  // none).
+  // The ladder of the family a CodePoint scan on `l` guesses (the Pike
+  // with none).
   static Ladder first_guess(const Plan &p, const Ladder &l) {
-    const Family f = p.guesses_[guess_row(l)][0];
+    const Family f = p.find_guess_[guess_row(l)];
     return f == kFamilyCount ? pike_ladder(l.want)
                              : p.family_[f][ladder_caller(l)];
   }
@@ -15350,8 +15355,9 @@ public:
     }
     return plan_->start_[2];
   }
-  // A scan that would classify its subject guesses instead (Plan::guesses_),
-  // and the answer stands if what the scan read holds it out (guess_held).
+  // A scan that would classify its subject guesses instead
+  // (Plan::find_guess_), and the answer stands if what the scan read holds
+  // it out (guess_held).
   // A CodePoint scan does not ask first whether its subject has a stray
   // byte (us_stray), which no byte automaton reads: it guesses it reads
   // none, on its family. (Not on a rung before Classify: EndAnchor reads
@@ -15367,12 +15373,14 @@ public:
       if (!rung_classified(l.rung)) return;
       if (l.rung == Rung::Classify) l = ladder_guessed(l);
     } else {
-      const Family *row = plan_->guesses_[guess_row(l)];
+      const int row = guess_row(l);
+      const Family route = plan_->ascii_route_[row],
+                   guess = plan_->find_guess_[row];
       if (l.rung != Rung::Classify ||
-          (row[0] == kFamilyCount && row[1] == kFamilyCount))
+          (route == kFamilyCount && guess == kFamilyCount))
         return;
       const bool ascii = first_nonascii(text) == text.size();
-      const Family f = row[ascii ? 0 : 1];
+      const Family f = ascii ? route : guess;
       if (f == kFamilyCount) return;
       l = ladder_on(f, l);
       if (ascii) return; // sound: no guess
@@ -17503,7 +17511,7 @@ inline void Regex::ladder_plan(Plan &p) {
                                      : Plan::Fused::Suffix)
                  : p.egc_fused_collapse_ok() ? Plan::Fused::Collapse
                                              : Plan::Fused::None;
-  // The families a guess tries (Plan::guesses_). match()'s, each anchored
+  // The families a scan takes without classifying. match()'s, each anchored
   // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
   // the subject a scan most often meets, and the cheaper engine there —
   // then its byte family. The byte family first for a CR-LF literal, which
@@ -17518,9 +17526,8 @@ inline void Regex::ladder_plan(Plan &p) {
       // [Tier: Pike/cp])
       const Family as = p.byte_assert_path_ ? kFamUsAssert : kFamilyCount;
       byte = p.dfa_family_ok(true) ? kFamUsDfa : as;
-      p.guesses_[Plan::kGuessTest][0] = byte;
-      p.guesses_[Plan::kGuessFind][0] =
-          p.dfa_family_ok(false) ? kFamUsDfa : as;
+      p.find_guess_[1] = byte;
+      p.find_guess_[0] = p.dfa_family_ok(false) ? kFamUsDfa : as;
     } else {
       ascii = p.dfa_ok_ ? kFamAscii
               : p.assert_ascii_tier() ? kFamAssertAscii
@@ -17536,18 +17543,17 @@ inline void Regex::ladder_plan(Plan &p) {
       // subject that needs no classifying: the fused rungs, and the (?i)
       // prefix probe.
       if (p.crlf_byte_safe_ && !p.can_match_empty_ && !p.crlf_fused_lit_) {
-        p.guesses_[Plan::kGuessFind][0] = p.ascii_family(false);
-        p.guesses_[Plan::kGuessTest][0] = p.ascii_family(true);
+        p.ascii_route_[0] = p.ascii_family(false);
+        p.ascii_route_[1] = p.ascii_family(true);
         if (p.fused_ == Plan::Fused::None &&
             !(p.ncap_ == 0 && p.icase_prefix_.active()))
-          p.guesses_[Plan::kGuessFind][1] = p.guesses_[Plan::kGuessTest][1] =
-              byte;
+          p.find_guess_[0] = p.find_guess_[1] = byte;
       }
     }
     const bool byte_first =
         ascii == kFamilyCount || (p.crlf_fused_lit_ && byte != kFamilyCount);
-    p.guesses_[Plan::kGuessMatch][0] = byte_first ? byte : ascii;
-    p.guesses_[Plan::kGuessMatch][1] = byte_first ? ascii : byte;
+    p.match_guesses_[0] = byte_first ? byte : ascii;
+    p.match_guesses_[1] = byte_first ? ascii : byte;
   }
   // Three kinds of caller (see ladder_caller): a find, a boolean, and a
   // boolean over a short subject — the boolean's ladders with the

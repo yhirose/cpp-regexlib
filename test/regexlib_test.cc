@@ -346,16 +346,25 @@ struct PlanProbe {
   // u Assert/Byte (CodePoint), b Dfa/EgcByte, i the same with the (?i)
   // probe, a Dfa/Ascii, A Assert/Ascii, B Assert/Byte (Grapheme).
   static constexpr std::string_view kFamilies = "UubiaAB";
-  // The families a guesser tries, in order: 'm' match(), 'f' a find, 't' a
-  // boolean (Plan::guesses_).
+  // The families a scan guesses, in order: 'm' match()'s
+  // (Plan::match_guesses_), 'f' a find's, 't' a boolean's
+  // (Plan::find_guess_).
   static std::string guesses(const Regex &re, char who) {
     std::string s;
-    const auto g = who == 'm'   ? Regex::Plan::kGuessMatch
-                   : who == 'f' ? Regex::Plan::kGuessFind
-                                : Regex::Plan::kGuessTest;
-    for (const auto f : re.plan_->guesses_[g])
-      if (f != Regex::kFamilyCount) s += kFamilies[f];
+    const auto &p = *re.plan_;
+    if (who == 'm') {
+      for (const auto f : p.match_guesses_)
+        if (f != Regex::kFamilyCount) s += kFamilies[f];
+    } else if (p.find_guess_[who == 't'] != Regex::kFamilyCount) {
+      s += kFamilies[p.find_guess_[who == 't']];
+    }
     return s;
+  }
+  // ... and the family a find ('f') or a boolean ('t') takes outright on a
+  // pure-ASCII subject (Plan::ascii_route_), "" for none.
+  static std::string ascii_route(const Regex &re, char who) {
+    const auto f = re.plan_->ascii_route_[who == 't'];
+    return f == Regex::kFamilyCount ? "" : std::string(1, kFamilies[f]);
   }
   static std::string match_guesses(const Regex &re) {
     return guesses(re, 'm');
@@ -392,7 +401,7 @@ struct PlanProbe {
       const Regex::Ladder &st = p.start_[w];
       if (!traits_copied(st)) return false;
       if (!Regex::rung_on_family(st.rung)) continue;
-      const auto f = p.guesses_[Regex::guess_row(st)][0];
+      const auto f = p.find_guess_[Regex::guess_row(st)];
       if (!p.us_ || f == Regex::kFamilyCount || st.fam != f ||
           st.flags != p.family_[f][w].flags || st.rung != p.family_[f][w].rung)
         return false;
@@ -1944,7 +1953,7 @@ template <class F> void each_dirty_subject(F agrees) {
 }
 
 // match() does not classify its subject. It tries the plan's families in
-// turn, each anchored at 0 (Plan::guesses_), and the first whose
+// turn, each anchored at 0 (Plan::match_guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
 // (guess_held). So what a family cannot read (kDirt), placed at every
 // offset of the first 48 bytes and further on, over ASCII, accented and
@@ -2155,9 +2164,9 @@ void test_find_guess() {
 }
 
 // A Grapheme search() / test() does not check its subject's clusters
-// (Plan::guesses_): a pure-ASCII subject takes the ASCII family outright,
-// any other guesses the byte family, judged on what it read; a guess that
-// does not hold classifies the subject whole, as before. So over ASCII,
+// (Plan::ascii_route_, find_guess_): a pure-ASCII subject takes the ASCII
+// family outright, any other guesses the byte family, judged on what it
+// read; a guess that does not hold classifies the subject whole, as before. So over ASCII,
 // accented and CR-LF text with what a family cannot read at every early
 // offset (kDirt: marks, ZWJ, flags, CR-LF, lone CR / LF, strays), the first
 // match and the boolean are the grapheme Pike's — on patterns the plan
@@ -2218,7 +2227,7 @@ void test_find_guess_grapheme() {
 // it reads follows from that family alone. A CodePoint find guesses its
 // plan's one family, a Grapheme one its ASCII family on a pure-ASCII
 // subject and its byte family on any other; match() tries the families of
-// Plan::guesses_ too.
+// Plan::match_guesses_.
 void test_ladder_family() {
   const char *pats[] = {"\\w+",        "(\\w+)@(\\w+)", "\\b\\w+\\b",
                         "^(\\w+)$",    "(?i)holmes",   "x\\w*z",
@@ -2228,11 +2237,15 @@ void test_ladder_family() {
     for (const auto u : {reg::MatchUnit::CodePoint, reg::MatchUnit::Grapheme}) {
       const Regex re(pat, 0, u);
       CHECK(PlanProbe::ladders_name_families(re));
-      if (u == reg::MatchUnit::Grapheme) // the ASCII family, the byte one
-        for (const char who : {'f', 't'}) {
-          const std::string g = PlanProbe::guesses(re, who);
-          CHECK(g.size() <= 2 && g.find_first_not_of("aAbB") == g.npos);
-        }
+      for (const char who : {'f', 't'}) { // the byte family, the ASCII one
+        const std::string g = PlanProbe::guesses(re, who),
+                          r = PlanProbe::ascii_route(re, who);
+        if (u == reg::MatchUnit::Grapheme)
+          CHECK(g.find_first_not_of("bB") == g.npos &&
+                r.find_first_not_of("aA") == r.npos);
+        else
+          CHECK(g.find_first_not_of("Uu") == g.npos && r.empty());
+      }
     }
   // CodePoint: the DFA family, else the byte assert one.
   {
@@ -2250,11 +2263,17 @@ void test_ladder_family() {
   // (any other), where a CR-LF reads as the grapheme engine reads it; no
   // byte guess where a fused rung or the (?i) prefix probe serves such a
   // subject.
-  CHECK(PlanProbe::guesses(Regex("\\w+"), 'f') == "ab");
-  CHECK(PlanProbe::guesses(Regex("\\b\\w+\\b"), 't') == "AB");
-  CHECK(PlanProbe::guesses(Regex("x\\w*z"), 'f') == "a");
-  CHECK(PlanProbe::guesses(Regex("(?i)holmes"), 'f') == "a");
-  CHECK(PlanProbe::guesses(Regex("(\\w+)\\s(\\w+)"), 'f').empty());
+  for (const auto &[pat, who, route, guess] :
+       std::initializer_list<
+           std::tuple<const char *, char, const char *, const char *>>{
+           {"\\w+", 'f', "a", "b"},
+           {"\\b\\w+\\b", 't', "A", "B"},
+           {"x\\w*z", 'f', "a", ""},
+           {"(?i)holmes", 'f', "a", ""},
+           {"(\\w+)\\s(\\w+)", 'f', "", ""}}) {
+    CHECK(PlanProbe::ascii_route(Regex(pat), who) == route);
+    CHECK(PlanProbe::guesses(Regex(pat), who) == guess);
+  }
   // Grapheme: match()'s ASCII family first, its byte family first for a
   // CR-LF literal.
   CHECK(PlanProbe::guesses(Regex("\\w+"), 'm') == "ab");
