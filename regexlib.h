@@ -6158,7 +6158,7 @@ private:
   // one); the byte programs' DFAs (EGC byte, the byte assert engine) rather
   // than the grapheme / code-point ones; a walk that reads the byte
   // programs' first-byte sets (US, EGC byte) rather than the ASCII ones;
-  // the Grapheme unit's (else CodePoint's).
+  // the Grapheme unit (else CodePoint).
   // None for kFamilyCount. The one definition of them: a ladder carries a
   // copy in its flags (Ladder::set_family), a family alone reads it here.
   enum FamilyTrait : uint8_t {
@@ -6177,18 +6177,18 @@ private:
       kTraitAssert | kTraitByte | kTraitGrapheme, // kFamAssertByte
       0,                                          // kFamilyCount
   };
-  static constexpr bool family_has(FamilyTrait t, Family f) {
-    return (kFamilyTraits[f] & t) != 0;
-  }
-  // The families with any of `t`'s traits, a bit each (kFamilyTraits read
-  // at compile time): a test of a family at run time is then a shift of a
-  // constant, not a load.
+  // The families with any of the traits `T`, a bit each (kFamilyTraits
+  // read at compile time), and whether `f` is one: a shift of a constant,
+  // not a load, when `f` is known only at run time.
   template <uint8_t T> static constexpr uint32_t kFamiliesWith = [] {
     uint32_t m = 0;
     for (int f = 0; f <= kFamilyCount; f++)
       if (kFamilyTraits[f] & T) m |= 1u << f;
     return m;
   }();
+  template <uint8_t T> static constexpr bool family_has(Family f) {
+    return (kFamiliesWith<T> >> f) & 1;
+  }
   // Where a scan stands on the ladder: the family serving this subject, the
   // rung, and what the scan has given up. A VALUE, and small enough to
   // travel in registers: every transition takes one and returns one.
@@ -13558,9 +13558,8 @@ private:
   // CodePoint one each is a code point of its own).
   REGEXLIB_ALWAYS_INLINE static size_t guess_end(std::string_view text,
                                                  int reach, Family f) {
-    const bool pair = (kFamiliesWith<kTraitGrapheme> >> f) & 1;
-    const bool next =
-        (kFamiliesWith<kTraitGrapheme | kTraitAssert> >> f) & 1;
+    const bool pair = family_has<kTraitGrapheme>(f);
+    const bool next = family_has<kTraitGrapheme | kTraitAssert>(f);
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
     size_t end = static_cast<size_t>(reach);
@@ -16997,7 +16996,7 @@ private:
     // onepass_anchored_start_), on the family the find ladder's walk takes it
     // on.
     default: {
-      const bool byte = family_has(kTraitByte, f);
+      const bool byte = family_has<kTraitByte>(f);
       if (p.onepass_anchored_start_ && (p.us_ || !byte)) {
         const int e = match_walk(text, sc, reach, walked);
         if (e != kWalkLocal) return e;
