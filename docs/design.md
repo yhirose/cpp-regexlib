@@ -698,7 +698,7 @@ Three things keep the shared ladder from costing them anything:
 - The rungs that can answer alone are tried before what the others work with
   exists: the shallow rungs with a cursor and nothing else (`find_once`; the
   text-anchored walk is inlined there — a validator's whole call is that
-  walk), then the walk (`find_rest`: the budget, and thread-local save slots
+  walk), then the walk (`find_run`: the budget, and thread-local save slots
   — a walk whose driver reads no DFA runs without the thread's cache, which
   is 35 instructions to fetch, `scr_walk`), then the rest.
 - Nothing about the pattern is decided per call (the plan's ladders, above),
@@ -736,7 +736,8 @@ answer stands if the subject is one *as far as the scan read*
   stopped: on a non-ASCII subject the ASCII family's anchored DFA dies at
   the first non-ASCII byte (`lazy_inst_matches` matches none), so it is the
   ASCII run before that.
-- **A CodePoint `search()` / `test()`** (`find_rest`) runs the family its
+- **A CodePoint `search()` / `test()`** (`find_rest`: `guess_begin`, then
+  the scan, `find_run`, then the verdict) runs the family its
   plan guesses (its row of `Plan::guesses_`, `ladder_guessed`) with
   `Ladder::kSpec` set, and does not
   check for a stray byte first. A rung runs many scans, so each forward DFA
