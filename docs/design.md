@@ -756,11 +756,13 @@ The rules the two share:
   gates are split into the route and the soundness — `egc_byte_path` sends a
   pure-ASCII subject to the ASCII family, which is faster there, and
   `byte_sound` is whether the byte programs answer for it at all — and only
-  the soundness is asked. A CodePoint family's gate fails only on a stray
-  byte, and no code point joins another: its prefix is the bytes its scans
-  read, to the end of the code point they stopped in, with the code point
-  at `reach` only where a look read it for context (the assert family;
-  `us_guess_held`).
+  the soundness is asked: `Regex::family_sound`, the one test of it, which
+  the gates, the guesses and the end anchor's check (`end_region_ok`) all
+  call. A CodePoint family's soundness fails only on a stray byte, and no
+  code point joins another: its prefix is the bytes its scans read, to the
+  end of the code point they stopped in, with the code point at `reach` only
+  where a look read it for context (the assert family); the LF after a CR,
+  no stray, changes nothing there (`guess_end`).
 - **Why the Pike may answer**: it is the reference. And it is no more often
   the Pike than before: a gate that holds for the whole subject holds for
   each of its prefixes, so a subject no guess holds for is one no family

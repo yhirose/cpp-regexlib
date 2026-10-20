@@ -12329,7 +12329,8 @@ private:
   // assert_byte_path_ok's. `fna` is the dispatch site's precomputed
   // first-non-ASCII index, so the gate adds no extra O(n) classification pass.
   bool assert_find_ok(std::string_view text, size_t fna) const {
-    return plan_->assert_ascii_tier() && ascii_grapheme_ok(text, fna);
+    return plan_->assert_ascii_tier() &&
+           family_sound(kFamAssertAscii, text, fna);
   }
 
   // Whether the non-ASCII assertion byte tier serves this (Grapheme pattern,
@@ -12363,7 +12364,7 @@ private:
       // pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
-    return egc_simple_from(text, fna);
+    return family_sound(kFamAssertByte, text, fna);
   }
 
   // Priority-ordered ε-closure with the leftmost-first match cut, for the
@@ -13443,14 +13444,7 @@ private:
                : l;
   }
   bool us_stray(std::string_view text) const {
-    return plan_->us_ && stray_in(text);
-  }
-  // Whether `text` is not all RFC 3629 UTF-8: a byte that starts no code
-  // point.
-  static bool stray_in(std::string_view text) {
-    const size_t i = first_nonascii(text);
-    return i < text.size() &&
-           !unicode::utf8::valid_from(text.data(), text.size(), i);
+    return plan_->us_ && !family_sound(kFamUsDfa, text, first_nonascii(text));
   }
 
   // Whether the EGC byte family serves this subject (`i` its first non-ASCII
@@ -13470,7 +13464,7 @@ private:
                  ? contains_crlf(text) && no_lone_crlf(text)
                  : plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
                        contains_crlf(text);
-    return byte_sound(text, i);
+    return family_sound(kFamEgcByte, text, i);
   }
   // Whether the byte programs' engine answers for `text` as the grapheme
   // engine does (`i` its first non-ASCII byte). The CRLF-collapse programs
@@ -13487,63 +13481,68 @@ private:
     return egc_simple_from(text, i);
   }
 
-  // A guess (match(): Plan::match_guesses_; find_rest: Plan::us_ladder_):
-  // family `f` has answered for `text` from 0, and read nothing at or past
-  // `reach` — one past the furthest byte any of its scans examined, at least
-  // the match's end. A Grapheme family's answer is the unit's when the
-  // subject is one it answers for as far as it read (a CodePoint family's:
-  // us_guess_held): every code point that starts at or before `reach` (the
-  // one there is where its scan stopped, and whether it joins the code
-  // point before it is what the stop meant), and an LF after a CR there, so
-  // that no pair is split. What follows does not matter: the scan consumed
-  // none of it. The test over that prefix R is the family's gate less its
-  // route (see egc_byte_path). A gate that holds for the whole subject holds
-  // for R, so a subject no guess holds for is one no family served either,
-  // and the Pike answers it.
-  REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
-                                         int reach) const {
-    const size_t n = text.size();
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
-    size_t end = static_cast<size_t>(reach);
-    if (end < n) {
-      end++; // the code point at reach, or the one reach is inside
-      while (end < n && (p[end] & 0xC0) == 0x80) end++;
-      if (end < n && p[end - 1] == '\r' && p[end] == '\n') end++;
-    } else {
-      end = n;
-    }
-    // (R ahead of the switch, though a CodePoint family does not ask it:
-    // computed in the Grapheme cases alone it cost their match() 3-23
-    // instructions more, of code layout.)
-    const std::string_view r = text.substr(0, end);
+  // Whether family `f`'s engine answers for `text` as the unit's own does
+  // — its soundness, apart from its route (whether the plan has the family,
+  // and whether a cheaper one takes a pure-ASCII subject: see ladder_gated).
+  // `i`: the first non-ASCII byte of `text` (the ASCII and byte families
+  // ask about all of `text`), or a code-point boundary the code-point and
+  // assert-byte checks read on from. A CodePoint family's: no stray byte,
+  // which no byte automaton reads.
+  REGEXLIB_ALWAYS_INLINE bool family_sound(Family f, std::string_view text,
+                                           size_t i) const {
     switch (f) {
     case kFamUsDfa:
-    case kFamUsAssert: return us_guess_held(text, reach, f == kFamUsAssert);
+    case kFamUsAssert: return utf8_from(text, i);
     case kFamAscii:
-    case kFamAssertAscii: return ascii_grapheme_ok(r, first_nonascii(r));
-    case kFamEgcByte: return byte_sound(r, first_nonascii(r));
-    case kFamAssertByte: return egc_simple_from(r, first_nonascii(r));
-    case kFamEgcByteIp: // no guess list holds it: its (?i) probe's own test
-    case kFamilyCount:  // of the subject (icase_choose_probe) is not asked here
-      break;
+    case kFamAssertAscii: return ascii_grapheme_ok(text, i);
+    case kFamEgcByte:
+    case kFamEgcByteIp: return byte_sound(text, i);
+    case kFamAssertByte: return egc_simple_from(text, i);
+    case kFamilyCount: break;
     }
     return false;
   }
 
-  // ... of a CodePoint family's (match(), find_rest: Plan::us_ladder_),
-  // which a subject fails only with a stray byte: none among the bytes its
-  // scans read, [0, reach) completed to a code point, and the code point at
-  // `reach` where a look read it for context (`look`: the assert family).
-  // No code point joins the one before it, and an LF is no stray, so
-  // nothing else is asked.
-  REGEXLIB_ALWAYS_INLINE bool us_guess_held(std::string_view text, int reach,
-                                            bool look) const {
+  // ... a CodePoint family's: `text` from `i` is RFC 3629 UTF-8. (The pass
+  // from a non-ASCII byte on is out of line: inlined into search(), Clang's
+  // loop over a megabyte took 13% more instructions.)
+  static bool utf8_from(std::string_view text, size_t i) {
+    return i >= text.size() || utf8_valid_rest(text, i);
+  }
+  REGEXLIB_NOINLINE static bool utf8_valid_rest(std::string_view text,
+                                                size_t i) {
+    return unicode::utf8::valid_from(text.data(), text.size(), i);
+  }
+
+  // A guess (match(): Plan::match_guesses_; find_rest: Plan::us_ladder_):
+  // family `f` has answered for `text` from 0, and read nothing at or past
+  // `reach` — one past the furthest byte any of its scans examined, at least
+  // the match's end. Its answer is the unit's when the family is sound
+  // (family_sound) for the prefix R its scans depended on (guess_end). What
+  // follows does not matter: the scan consumed none of it. A gate that holds
+  // for the whole subject holds for R, so a subject no guess holds for is
+  // one no family served either, and the Pike answers it.
+  REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
+                                         int reach) const {
+    const std::string_view r =
+        text.substr(0, guess_end(text, reach, f != kFamUsDfa));
+    return family_sound(f, r, first_nonascii(r));
+  }
+  // ... R's end: [0, reach) completed to a code point; with `next` the code
+  // point at `reach` too — where the scan stopped, and whether it joins the
+  // one before it is what the stop meant (a Grapheme family's; a CodePoint
+  // one's only where a look read it for context: the assert family); and
+  // an LF after a CR there, so that no pair is split (harmless to a
+  // CodePoint family: an LF is no stray).
+  REGEXLIB_ALWAYS_INLINE static size_t guess_end(std::string_view text,
+                                                 int reach, bool next) {
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
     size_t end = static_cast<size_t>(reach);
-    if (look && end < n) end++;
+    if (next && end < n) end++;
     while (end < n && (p[end] & 0xC0) == 0x80) end++;
-    return !stray_in(text.substr(0, end));
+    if (end < n && p[end] == '\n' && end > 0 && p[end - 1] == '\r') end++;
+    return end;
   }
 
   // True iff every CR is immediately followed by LF and every LF immediately
@@ -16812,8 +16811,7 @@ private:
   // (CodePoint); clusters of one code point, or a CR-LF to a pattern that
   // cannot split one, from a boundary nothing before `q` can join (Grapheme).
   bool end_region_ok(std::string_view text, size_t q) const {
-    if (plan_->us_)
-      return unicode::utf8::valid_from(text.data(), text.size(), q);
+    if (plan_->us_) return family_sound(kFamUsAssert, text, q);
     // Back past pairs that fuse, and past an Extend or ZWJ left side (GB9c
     // and GB11 look further back from those). A stray byte is no code point.
     using GB = unicode::GraphemeBreak;
@@ -16827,7 +16825,7 @@ private:
         break;
       q -= static_cast<size_t>(l.len);
     }
-    return egc_simple_from(text.substr(q), 0);
+    return family_sound(kFamAssertByte, text.substr(q), 0);
   }
 
   // One assert-tier chain match handed to `out` (the assert twin
@@ -17494,8 +17492,7 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
   const int w = ladder_caller(l);
   if (p.us_) {
     if (fna == kUnclassified) fna = first_nonascii(text);
-    if (fna < text.size() &&
-        !unicode::utf8::valid_from(text.data(), text.size(), fna))
+    if (!family_sound(kFamUsDfa, text, fna))
       return pike_ladder(l.want); // a stray byte: see us_stray
     return ladder_adopt(p.us_ladder_[w], l);
   }
@@ -17540,9 +17537,9 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
                 icase_choose_probe(text, probe)
             ? kFamEgcByteIp
             : kFamEgcByte;
-  } else if (p.dfa_family_ok(test) && ascii_grapheme_ok(text, fna)) {
+  } else if (p.dfa_family_ok(test) && family_sound(kFamAscii, text, fna)) {
     f = kFamAscii;
-  } else if (test ? p.dfa_assert_ok_ && ascii_grapheme_ok(text, fna)
+  } else if (test ? p.dfa_assert_ok_ && family_sound(kFamAssertAscii, text, fna)
                   : assert_find_ok(text, fna)) {
     f = kFamAssertAscii;
   } else if (assert_byte_path_ok(text, fna)) {
@@ -17669,7 +17666,11 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     reach = st == Step::Again
                 ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
                 : c.pos;
-  if (us_guess_held(text, reach, l.has(Ladder::kAssert))) return found;
+  // (Either CodePoint family is sound by the same test: one constant, so
+  // the call folds to it.)
+  const std::string_view r =
+      text.substr(0, guess_end(text, reach, l.has(Ladder::kAssert)));
+  if (family_sound(kFamUsDfa, r, first_nonascii(r))) return found;
   return find_pike(text, scr, out);
 }
 
