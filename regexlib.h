@@ -5834,14 +5834,14 @@ public:
     }
     FindCache &cache = thread_cache(); // reuse this thread's persistent DFAs
     Scratch &sc = cache.sc_;
-    // The plan's families in turn (Plan::match_guesses_), each anchored at
+    // The plan's families in turn (Plan::guesses_), each anchored at
     // 0: the first whose answer holds for the subject as far as it read
     // (guess_held) answers. The subject is never classified as a whole — a
     // stray byte or a combining mark past the end of a match is no reason
     // to segment the subject for the Pike, and nor is the length of a clean
     // one a reason to scan it. [Tier: Pike] / [Tier: Pike/cp] when no family
     // holds: a subject none of them serves.
-    for (const Family f : plan_->match_guesses_) {
+    for (const Family f : plan_->guesses_[Plan::kGuessMatch]) {
       if (f == kFamilyCount) break;
       // An ASCII family holds for no subject whose first byte is not: what
       // it read always includes that byte.
@@ -6073,12 +6073,12 @@ private:
   //
   // The rungs. Coarser than the canonical [Tier: ...] labels (see design.md
   // "Tier dispatch"): the DFA family's rungs serve Dfa/US, Dfa/EgcByte and
-  // Dfa/Ascii alike (Ladder::kByte selects the DFAs, ncap_ the capture
-  // resolution), the assert family's serve Assert/Ascii and Assert/Byte
-  // (Ladder::kByte again), Pike is Pike and Pike/cp (the plan's unit). The
-  // order they are tried in is ladder_pick's, not this declaration's — but
-  // the declaration groups them, and the scan reads the groups off it
-  // (rung_self_locates and the predicates after it).
+  // Dfa/Ascii alike (Ladder::fam selects the DFAs — see ladder_byte —,
+  // ncap_ the capture resolution), the assert family's serve Assert/Ascii
+  // and Assert/Byte (Ladder::fam again), Pike is Pike and Pike/cp (the
+  // plan's unit). The order they are tried in is ladder_pick's, not this
+  // declaration's — but the declaration groups them, and the scan reads the
+  // groups off it (rung_self_locates and the predicates after it).
   enum class Rung : uint8_t {
     // A plan that is its own locate; these never fall.
     Literal,      // pure printable-ASCII literal: memmem, no classification
@@ -6140,49 +6140,6 @@ private:
   // (Rung::Bool), and resolves no groups.
   enum class Want : uint8_t { Rows, Test };
 
-  // Where a scan stands on the ladder: the family serving this subject, the
-  // rung, and what the scan has given up. A VALUE, and small enough to
-  // travel in registers: every transition takes one and returns one.
-  // That is what lets a one-step find (search, test) keep its whole scan in
-  // its own frame, where the compiler dissolves it — as an object the rungs
-  // reached through a pointer it cost search() ~100 instructions a call, a
-  // fifth of a short validator's time. A scan that outlives the call
-  // (find_iter) stores the same value in a Finder.
-  struct Ladder {
-    Rung rung = Rung::Pike;
-    Rung below = Rung::Pike; // what a local bail of the walk steps down to
-    Want want = Want::Rows;
-    // (One word of flags, set and tested with has() / set(): a dozen bools
-    // were a dozen stores on every call, and bit-fields were worse — each
-    // copy of the value unpacked and repacked them one by one.)
-    enum Flag : uint16_t {
-      kAssert = 1 << 0, // the assert family (else the DFA family)
-      kByte = 1 << 1,   // the byte programs' DFAs (EGC byte, the byte
-                        // assert engine) rather than the grapheme /
-                        // code-point ones (see ladder_byte)
-      kWalkByte = 1 << 2, // the walk reads the byte programs' first-byte
-                          // sets (US, EGC byte) rather than the ASCII ones
-      // Rungs the family has until they bail GLOBALLY (budget,
-      // profitability). Cleared then and not set again by anything that
-      // bail leads to: that is the linearity guarantee. A local bail clears
-      // nothing.
-      kIpOn = 1 << 3,   // IcasePrefix (a probe applies)
-      kWalkOn = 1 << 4, // Walk
-      // Rungs the scan has given up, whatever family it lands on next.
-      kSuffixOff = 1 << 5,
-      kInnerOff = 1 << 6,
-      // A guess (find_rest): the family is assumed to serve the subject and
-      // judged on what its scan read.
-      kSpec = 1 << 7,
-      // The assert family: a boolean takes the find (Plan::assert_bool_finds).
-      kBoolFind = 1 << 8,
-    };
-    uint16_t flags = 0;
-    bool has(Flag f) const { return (flags & f) != 0; }
-    void set(Flag f, bool on = true) {
-      flags = static_cast<uint16_t>(on ? flags | f : flags & ~f);
-    }
-  };
   // The engine families a ladder runs on (see ladder_family). Which one
   // serves a scan is the only thing the SUBJECT decides; everything else
   // about a family's ladder is the pattern's, and worked out when the plan
@@ -6195,8 +6152,71 @@ private:
     kFamAscii,       // [Tier: Dfa/Ascii]
     kFamAssertAscii, // [Tier: Assert/Ascii]
     kFamAssertByte,  // [Tier: Assert/Byte], Grapheme
-    kFamilyCount
+    kFamilyCount     // none: a ladder on no family's rung
   };
+  // What a family runs on, a bit each: the assert engine (else the DFA
+  // one); the byte programs' DFAs (EGC byte, the byte assert engine) rather
+  // than the grapheme / code-point ones; a walk that reads the byte
+  // programs' first-byte sets (US, EGC byte) rather than the ASCII ones.
+  // None for kFamilyCount. (A table: each test is one load.)
+  enum FamilyTrait : uint8_t {
+    kTraitAssert = 1 << 0,
+    kTraitByte = 1 << 1,
+    kTraitWalkByte = 1 << 2,
+  };
+  static constexpr uint8_t kFamilyTraits[kFamilyCount + 1] = {
+      kTraitWalkByte,                            // kFamUsDfa
+      kTraitAssert | kTraitByte | kTraitWalkByte, // kFamUsAssert
+      kTraitByte | kTraitWalkByte,               // kFamEgcByte
+      kTraitByte | kTraitWalkByte,               // kFamEgcByteIp
+      0,                                         // kFamAscii
+      kTraitAssert,                              // kFamAssertAscii
+      kTraitAssert | kTraitByte,                 // kFamAssertByte
+      0,                                         // kFamilyCount
+  };
+  static constexpr bool family_has(FamilyTrait t, Family f) {
+    return (kFamilyTraits[f] & t) != 0;
+  }
+  // Where a scan stands on the ladder: the family serving this subject, the
+  // rung, and what the scan has given up. A VALUE, and small enough to
+  // travel in registers: every transition takes one and returns one.
+  // That is what lets a one-step find (search, test) keep its whole scan in
+  // its own frame, where the compiler dissolves it — as an object the rungs
+  // reached through a pointer it cost search() ~100 instructions a call, a
+  // fifth of a short validator's time. A scan that outlives the call
+  // (find_iter) stores the same value in a Finder.
+  struct Ladder {
+    Rung rung = Rung::Pike;
+    Rung below = Rung::Pike; // what a local bail of the walk steps down to
+    Want want = Want::Rows;
+    Family fam = kFamilyCount; // set by ladder_family alone (and the fused
+                               // rungs, which run the byte programs)
+    // (One word of flags, set and tested with has() / set(): a dozen bools
+    // were a dozen stores on every call, and bit-fields were worse — each
+    // copy of the value unpacked and repacked them one by one.)
+    enum Flag : uint16_t {
+      // Rungs the family has until they bail GLOBALLY (budget,
+      // profitability). Cleared then and not set again by anything that
+      // bail leads to: that is the linearity guarantee. A local bail clears
+      // nothing.
+      kIpOn = 1 << 0,   // IcasePrefix (a probe applies)
+      kWalkOn = 1 << 1, // Walk
+      // Rungs the scan has given up, whatever family it lands on next.
+      kSuffixOff = 1 << 2,
+      kInnerOff = 1 << 3,
+      // A guess (find_rest): the family is assumed to serve the subject and
+      // judged on what its scan read.
+      kSpec = 1 << 4,
+      // The assert family: a boolean takes the find (Plan::assert_bool_finds).
+      kBoolFind = 1 << 5,
+    };
+    uint16_t flags = 0;
+    bool has(Flag f) const { return (flags & f) != 0; }
+    void set(Flag f, bool on = true) {
+      flags = static_cast<uint16_t>(on ? flags | f : flags & ~f);
+    }
+  };
+  static_assert(sizeof(Ladder) == 6, "a Ladder travels in one register");
 
   // ===== Teddy: the packed multi-literal searcher =====
   // (Hyperscan's Teddy, in the "slim" form of Rust's aho-corasick.)
@@ -10068,20 +10088,22 @@ private:
     // Regex::ladder_plan.
     //   start_: where a scan starts — a plan that is its own locate, a
     //     walk from 0, a CodePoint plan's family, or Rung::Classify.
-    //   us_ladder_: the family of a CodePoint plan (what start_ is, past
-    //     the literal and text-anchor rungs), which a one-step find guesses
-    //     (Regex::find_rest).
     //   family_: each family's ladder, for the subject to choose among.
     //   fused_: which fused EGC scan the plan has (egc_fused_ok /
     //     egc_fused_collapse_ok, asked once).
-    //   match_guesses_: the families match() tries, in order, each judged
-    //     on what it read (Regex::guess_held); kFamilyCount past the last.
+    //   guesses_: the families a guess tries, in order, each judged on what
+    //     it read (Regex::guess_held); kFamilyCount past the last. Per
+    //     guesser: match(), a find, a boolean (Regex::guess_row). A one-step
+    //     find guesses a CodePoint plan's family (Regex::find_rest), which
+    //     does not depend on the subject: its first and only one.
     enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
     Fused fused_ = Fused::None;
     Ladder start_[3];
-    Ladder us_ladder_[3];
     Ladder family_[kFamilyCount][3];
-    Family match_guesses_[2] = {kFamilyCount, kFamilyCount};
+    enum Guesser : uint8_t { kGuessMatch, kGuessFind, kGuessTest, kGuessers };
+    Family guesses_[kGuessers][2] = {{kFamilyCount, kFamilyCount},
+                                     {kFamilyCount, kFamilyCount},
+                                     {kFamilyCount, kFamilyCount}};
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
@@ -13507,7 +13529,7 @@ private:
     return unicode::utf8::valid_from(s, n, i);
   }
 
-  // A guess (match(): Plan::match_guesses_; find_rest: Plan::us_ladder_):
+  // A guess (match(), find_rest: Plan::guesses_):
   // family `f` has answered for `text` from 0, and read nothing at or past
   // `reach` — one past the furthest byte any of its scans examined, at least
   // the match's end. Its answer is the unit's when the family is sound
@@ -15104,7 +15126,8 @@ public:
   // A family's ladder for a caller: what the family has, and the rung that
   // leads it. The one place a family is defined.
   static Ladder ladder_family(const Plan &p, Family f, Want want);
-  // Work out the plan's ladders (Plan::start_, us_ladder_, family_).
+  // Work out the plan's ladders (Plan::start_, family_) and guesses
+  // (Plan::guesses_).
   // Everything a scan's set-up does not need the subject for happens here,
   // once: a short search() is mostly its set-up, and picking the rungs on
   // every call was half of that.
@@ -15127,6 +15150,17 @@ public:
       ladder_repick(*plan_, n);
     }
     return n;
+  }
+  // The guesser a scan on `l` is (Plan::guesses_).
+  static Plan::Guesser guess_row(const Ladder &l) {
+    return l.want == Want::Rows ? Plan::kGuessFind : Plan::kGuessTest;
+  }
+  // A CodePoint scan on `l`, at Classify: on the family its plan guesses
+  // (the Pike with none).
+  Ladder ladder_guessed(Ladder l) const {
+    const Family f = plan_->guesses_[guess_row(l)][0];
+    if (f == kFamilyCount) return pike_ladder(l.want);
+    return ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
   }
   // Rung::Classify: which engine family serves this subject (a scan on `l`,
   // past its literal and text-anchor rungs). `fna` caches the subject's
@@ -15180,7 +15214,13 @@ public:
   }
   // Whether a scan on `l` runs the byte programs' DFAs. (No assert ladder
   // stands on Suffix or Inner, which read this with byte_crlf_collapse_.)
-  static bool ladder_byte(const Ladder &l) { return l.has(Ladder::kByte); }
+  static bool ladder_byte(const Ladder &l) {
+    return family_has(kTraitByte, l.fam);
+  }
+  // ... the assert engine.
+  static bool ladder_assert(const Ladder &l) {
+    return family_has(kTraitAssert, l.fam);
+  }
   // A rung below the walk has yielded the one match the walk bailed on
   // locally: tell the budget how far it got (`pos` is the byte cursor of
   // every family that runs the walk). True when that is what happened — the
@@ -16926,7 +16966,7 @@ private:
     // onepass_anchored_start_), on the family the find ladder's walk takes it
     // on.
     default: {
-      const bool byte = f != kFamAssertAscii;
+      const bool byte = family_has(kTraitByte, f);
       if (p.onepass_anchored_start_ && (p.us_ || !byte)) {
         const int e = match_walk(text, sc, reach, walked);
         if (e != kWalkLocal) return e;
@@ -17355,32 +17395,26 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
                                           Want want) {
   Ladder l;
   l.want = want;
+  l.fam = f; // (ladder_pick reads it: before the repick)
   switch (f) {
   case kFamUsDfa:
   case kFamAscii:
     // The one-pass walk drives the find (prefix / inner / position-scan
     // candidates — see cp_onepass_find).
     l.set(Ladder::kWalkOn, p.dfa_find_ok() && p.capture_scan_ok());
-    l.set(Ladder::kWalkByte, f == kFamUsDfa);
     break;
   case kFamEgcByte:
   case kFamEgcByteIp:
-    l.set(Ladder::kByte);
     l.set(Ladder::kIpOn, f == kFamEgcByteIp);
     l.set(Ladder::kWalkOn, p.byte_walk_ok());
-    l.set(Ladder::kWalkByte);
     break;
   case kFamUsAssert:
     // Shared byte assert engine (the assert chain resolves the groups), with
     // the walk of a `body$` capture plan ahead of it.
-    l.set(Ladder::kAssert);
-    l.set(Ladder::kByte);
     l.set(Ladder::kBoolFind, p.assert_bool_finds(true));
     l.set(Ladder::kWalkOn, p.capture_scan_ok());
-    l.set(Ladder::kWalkByte);
     break;
   case kFamAssertAscii:
-    l.set(Ladder::kAssert);
     l.set(Ladder::kBoolFind, p.assert_bool_finds(false));
     // `body$` capture patterns: the one-pass candidate drivers serve the
     // find (see onepass_require_end_); a bail reverts to the assert chain.
@@ -17389,8 +17423,6 @@ inline Regex::Ladder Regex::ladder_family(const Plan &p, Family f,
     break;
   case kFamAssertByte:
     // Grapheme: the same engine on a subject assert_byte_path_ok admits.
-    l.set(Ladder::kAssert);
-    l.set(Ladder::kByte);
     l.set(Ladder::kBoolFind, p.assert_bool_finds(true));
     break;
   case kFamilyCount: break;
@@ -17421,8 +17453,18 @@ inline void Regex::ladder_plan(Plan &p) {
     }
     const bool byte_first =
         ascii == kFamilyCount || (p.crlf_fused_lit_ && byte != kFamilyCount);
-    p.match_guesses_[0] = byte_first ? byte : ascii;
-    p.match_guesses_[1] = byte_first ? ascii : byte;
+    p.guesses_[Plan::kGuessMatch][0] = byte_first ? byte : ascii;
+    p.guesses_[Plan::kGuessMatch][1] = byte_first ? ascii : byte;
+    // A CodePoint plan's family does not depend on the subject (only whether
+    // its byte DFAs may run does: us_stray), so a find guesses it. (Neither
+    // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
+    if (p.us_) {
+      for (const bool test : {false, true})
+        p.guesses_[test ? Plan::kGuessTest : Plan::kGuessFind][0] =
+            p.dfa_family_ok(test) ? kFamUsDfa
+            : p.byte_assert_path_ ? kFamUsAssert
+                                  : kFamilyCount;
+    }
   }
   p.fused_ = p.egc_fused_ok()
                  ? (p.prefix_fused() ? Plan::Fused::Prefix
@@ -17442,15 +17484,6 @@ inline void Regex::ladder_plan(Plan &p) {
         ladder_repick(p, fl);
       }
     }
-    // A CodePoint plan's family does not depend on the subject (only whether
-    // its byte DFAs may run does: us_stray), so a find guesses it. (Neither
-    // family: a fresh ladder stands on the Pike. [Tier: Pike/cp])
-    Ladder &us = p.us_ladder_[w];
-    us.want = want;
-    if (p.dfa_family_ok(w != 0))
-      us = p.family_[kFamUsDfa][w];
-    else if (p.byte_assert_path_)
-      us = p.family_[kFamUsAssert][w];
     Ladder &st = p.start_[w];
     st.want = want;
     if (w == 2) st.set(Ladder::kInnerOff); // carried through Rung::Classify
@@ -17474,7 +17507,8 @@ inline void Regex::ladder_plan(Plan &p) {
       // family is the one to take.
       st.rung = st.below = Rung::TextAnchor;
     } else if (p.us_) {
-      st = us;
+      const Family f = p.guesses_[guess_row(st)][0];
+      st = f == kFamilyCount ? pike_ladder(want) : p.family_[f][w];
     } else {
       st.rung = st.below = Rung::Classify; // the subject chooses the family
     }
@@ -17485,12 +17519,12 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
                                             size_t &fna,
                                             Plan::IcaseScan &probe) const {
   const Plan &p = *plan_;
-  const int w = ladder_caller(l);
   if (p.us_) {
     if (fna == kUnclassified) fna = first_nonascii(text);
+    // (Both CodePoint families are sound on the same subjects.)
     if (!family_sound(kFamUsDfa, text, fna))
       return pike_ladder(l.want); // a stray byte: see us_stray
-    return ladder_adopt(p.us_ladder_[w], l);
+    return ladder_guessed(l);
   }
   // [Tier: Dfa/EgcByte] fused literal-prefilter rungs (see egc_fused_ok for
   // the rationale). A cluster they cannot vet downgrades to the Pike from
@@ -17500,6 +17534,7 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
     if (fna < text.size()) {
       l.rung = l.below = p.fused_ == Plan::Fused::Prefix ? Rung::FusedPrefix
                                                          : Rung::FusedSuffix;
+      l.fam = kFamEgcByte; // (the byte programs: nothing else asks)
       return l;
     }
   }
@@ -17511,6 +17546,7 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
   // DFA family.
   if (p.fused_ == Plan::Fused::Collapse) {
     l.rung = l.below = Rung::FusedSuffix;
+    l.fam = kFamEgcByte;
     return l;
   }
   return ladder_gated(text, l, fna, probe);
@@ -17552,7 +17588,7 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
                                       bool below_walk) {
   const bool rows = l.want == Want::Rows;
   const bool walk = l.has(Ladder::kWalkOn) && !below_walk;
-  if (l.has(Ladder::kAssert)) {
+  if (ladder_assert(l)) {
     if (rows) return walk ? Rung::Walk : Rung::AssertChain;
     // A boolean takes its own scan unless the family's find is bounded
     // (Plan::assert_bool_finds). That scan serves either engine in either
@@ -17622,13 +17658,13 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   }
   // A CodePoint scan does not ask first whether its subject has a stray byte
   // (us_stray), which no byte automaton reads: it guesses it reads none, on
-  // its family (Plan::us_ladder_), and the answer stands if what the scan
+  // its family (Plan::guesses_), and the answer stands if what the scan
   // read holds that out (guess_held). Else the Pike answers, from the
   // start. (Not on a rung before Classify: EndAnchor reads from the end, and
   // vets what it read.)
   if (plan_->us_ && rung_classified(l.rung)) {
     if (l.rung == Rung::Classify)
-      l = ladder_adopt(plan_->us_ladder_[ladder_caller(l)], l);
+      l = ladder_guessed(l);
     l.set(Ladder::kSpec);
   }
   bool found;
@@ -17664,8 +17700,9 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     reach = st == Step::Again
                 ? std::max(c.pos, scr.cache->reach(ladder_byte(l)))
                 : c.pos;
-  if (guess_held(l.has(Ladder::kAssert) ? kFamUsAssert : kFamUsDfa, text,
-                 reach))
+  // (Only a CodePoint family guesses here: spelled out, the choice lets
+  // guess_held fold.)
+  if (guess_held(ladder_assert(l) ? kFamUsAssert : kFamUsDfa, text, reach))
     return found;
   return find_pike(text, scr, out);
 }
@@ -17766,10 +17803,10 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
   if constexpr (All) {
     // Rows until the walk stops; e2 says why (it is never a match end).
     e2 = onepass_fill_run(scr.cache, text, *scr.saves, out, c.pos, budget,
-                          l.has(Ladder::kWalkByte));
+                          family_has(kTraitWalkByte, l.fam));
   } else {
     e2 = capture_find_dispatch(scr.cache, text, c.pos, *scr.saves, budget,
-                               l.has(Ladder::kWalkByte));
+                               family_has(kTraitWalkByte, l.fam));
     if (e2 >= 0) {
       walk_yield(out, text, *scr.saves, e2);
       c.pos = e2; // !can_match_empty_ -> progress
@@ -17782,7 +17819,7 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
     // with sparse matches the next one can be far away, and the bare
     // DFA would walk all of the way there.
     chain_once = true;
-  } else if (e2 == LazyDfa::kCap && !l.has(Ladder::kAssert)) {
+  } else if (e2 == LazyDfa::kCap && !ladder_assert(l)) {
     ladder_downgrade(l); // a reverse cap, as on the chain
   } else {
     l.set(Ladder::kWalkOn, false); // kWalkBail (the assert family: or kCap)
@@ -18033,7 +18070,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   case Rung::Bool: {
     int e2;
     const bool byte = ladder_byte(l);
-    if (l.has(Ladder::kAssert)) {
+    if (ladder_assert(l)) {
       // A text-anchored pattern matches at 0 or nowhere: the anchored DFA
       // dies at the first byte no match can take, where the re-seeding one
       // would go on to the end of the subject (as assert_find_span). Else the

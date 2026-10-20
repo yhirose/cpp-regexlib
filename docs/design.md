@@ -555,6 +555,15 @@ family's ladder for each kind of caller (`Plan::family_`; three kinds, see
 `ladder_caller`: a find, a boolean, a boolean over a short subject), and where a scan
 starts (`Plan::start_` — a CodePoint plan's family does not depend on the
 subject at all, so its scan starts on the family's first rung outright).
+A ladder names the family it runs on (`Ladder::fam`); which DFAs its rungs
+read and whether they run the assert engine follow from the family alone
+(`kFamilyTraits`, read through `ladder_byte` and `ladder_assert`), not from
+flags of their own. The families a guess tries are one table too
+(`Plan::guesses_`, below), per guesser: `match()`, a find, a boolean.
+The gates are not such a table: `ladder_gated` writes them as a chain, since
+each family's route has conditions of its own (a probe to choose, a pure-ASCII
+CR-LF exception), and inlined into a Grapheme scan's first step the chain
+folds where a loop over families would not.
 `ladder_family` is the one place a family is defined, `ladder_classify` the
 one place a find reads the subject gates (a guess asks them of what it
 read — see below), and `ladder_pick` the one place the
@@ -712,7 +721,7 @@ They guess now. A family runs as if the subject were one it serves, and its
 answer stands if the subject is one *as far as the scan read*
 (`guess_held`); else the next guess, and at the last the Pike.
 
-- **`match()`** tries the families of `Plan::match_guesses_` (set by
+- **`match()`** tries its families in `Plan::guesses_` (set by
   `ladder_plan`), each anchored at 0 (`match_end`): a CodePoint plan's one; a
   Grapheme plan's ASCII family, then its byte family — the byte family first
   for a pattern with a CR-LF literal, which the ASCII family cannot match
@@ -726,7 +735,8 @@ answer stands if the subject is one *as far as the scan read*
   the first non-ASCII byte (`lazy_inst_matches` matches none), so it is the
   ASCII run before that.
 - **A CodePoint `search()` / `test()`** (`find_rest`) runs the family its
-  plan guesses (`Plan::us_ladder_`) with `Ladder::kSpec` set, and does not
+  plan guesses (its row of `Plan::guesses_`, `ladder_guessed`) with
+  `Ladder::kSpec` set, and does not
   check for a stray byte first. A rung runs many scans, so each forward DFA
   scan raises its DFA's high-water mark instead (`LazyDfa::hi`, a
   start-state skip included), zeroed when the guess starts

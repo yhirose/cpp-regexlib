@@ -346,12 +346,53 @@ struct PlanProbe {
   // u Assert/Byte (CodePoint), b Dfa/EgcByte, i the same with the (?i)
   // probe, a Dfa/Ascii, A Assert/Ascii, B Assert/Byte (Grapheme).
   static constexpr std::string_view kFamilies = "UubiaAB";
-  // The families match() tries, in order.
-  static std::string match_guesses(const Regex &re) {
+  // The families a guesser tries, in order: 'm' match(), 'f' a find, 't' a
+  // boolean (Plan::guesses_).
+  static std::string guesses(const Regex &re, char who) {
     std::string s;
-    for (const auto f : re.plan_->match_guesses_)
+    const auto g = who == 'm'   ? Regex::Plan::kGuessMatch
+                   : who == 'f' ? Regex::Plan::kGuessFind
+                                : Regex::Plan::kGuessTest;
+    for (const auto f : re.plan_->guesses_[g])
       if (f != Regex::kFamilyCount) s += kFamilies[f];
     return s;
+  }
+  static std::string match_guesses(const Regex &re) {
+    return guesses(re, 'm');
+  }
+  // Whether every ladder of `re`'s plan names the family it runs on, and
+  // reads the engine that family's letter says: the assert engine on u A
+  // B, the byte programs' DFAs on u b i B, the walk's byte first-byte sets
+  // on U u b i (Regex::kFamilyTraits). A scan that starts on a family's
+  // rung starts on that family's ladder — for a CodePoint plan, the family
+  // its find / boolean guesses.
+  static bool ladders_name_families(const Regex &re) {
+    const auto &p = *re.plan_;
+    for (int f = 0; f < Regex::kFamilyCount; f++) {
+      const char c = kFamilies[f];
+      for (int w = 0; w < 3; w++) {
+        const Regex::Ladder &l = p.family_[f][w];
+        const auto fam = static_cast<Regex::Family>(f);
+        if (l.fam != fam) return false;
+        if (Regex::ladder_assert(l) != (std::string_view("uAB").find(c) !=
+                                        std::string_view::npos) ||
+            Regex::ladder_byte(l) != (std::string_view("ubiB").find(c) !=
+                                      std::string_view::npos) ||
+            Regex::family_has(Regex::kTraitWalkByte, fam) !=
+                (std::string_view("Uubi").find(c) != std::string_view::npos))
+          return false;
+      }
+    }
+    for (int w = 0; w < 3; w++) {
+      const Regex::Ladder &st = p.start_[w];
+      if (!Regex::rung_on_family(st.rung)) continue;
+      const auto f =
+          p.guesses_[w ? Regex::Plan::kGuessTest : Regex::Plan::kGuessFind][0];
+      if (!p.us_ || f == Regex::kFamilyCount || st.fam != f ||
+          st.flags != p.family_[f][w].flags || st.rung != p.family_[f][w].rung)
+        return false;
+    }
+    return true;
   }
   // Whether the answer of `re`'s family `fam`, which read `s` up to `reach`,
   // holds for `s` (Regex::guess_held).
@@ -1898,7 +1939,7 @@ template <class F> void each_dirty_subject(F agrees) {
 }
 
 // match() does not classify its subject. It tries the plan's families in
-// turn, each anchored at 0 (Plan::match_guesses_), and the first whose
+// turn, each anchored at 0 (Plan::guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
 // (guess_held). So what a family cannot read (kDirt), placed at every
 // offset of the first 48 bytes and further on, over ASCII, accented and
@@ -2075,6 +2116,42 @@ void test_find_guess() {
 // same rungs in the same order. These pin where a scan STARTS (so a fast path
 // cannot quietly stop being taken) and what the rungs that only some callers
 // reach hand back.
+// Every ladder names the family it runs on (Ladder::fam), and what engine
+// it reads follows from that family alone. A CodePoint find guesses its
+// plan's one family, a Grapheme one none yet; match() tries the families of
+// Plan::guesses_ too.
+void test_ladder_family() {
+  const char *pats[] = {"\\w+",        "(\\w+)@(\\w+)", "\\b\\w+\\b",
+                        "^(\\w+)$",    "(?i)holmes",   "x\\w*z",
+                        "a\r\nb",      "foo$",         "(a|b)*c",
+                        "\\bqzx\\w*\\b", "^a+$",         "(?i)\\bfoo\\w*"};
+  for (const char *pat : pats)
+    for (const auto u : {reg::MatchUnit::CodePoint, reg::MatchUnit::Grapheme}) {
+      const Regex re(pat, 0, u);
+      CHECK(PlanProbe::ladders_name_families(re));
+      if (u == reg::MatchUnit::Grapheme) {
+        CHECK(PlanProbe::guesses(re, 'f').empty());
+        CHECK(PlanProbe::guesses(re, 't').empty());
+      }
+    }
+  // CodePoint: the DFA family, else the byte assert one.
+  {
+    const Regex re("\\w+", 0, reg::MatchUnit::CodePoint);
+    CHECK(PlanProbe::guesses(re, 'f') == "U");
+    CHECK(PlanProbe::guesses(re, 't') == "U");
+    CHECK(PlanProbe::guesses(re, 'm') == "U");
+  }
+  {
+    const Regex re("\\b\\w+\\b", 0, reg::MatchUnit::CodePoint);
+    CHECK(PlanProbe::guesses(re, 'f') == "u");
+    CHECK(PlanProbe::guesses(re, 't') == "u");
+  }
+  // Grapheme: match()'s ASCII family first, its byte family first for a
+  // CR-LF literal.
+  CHECK(PlanProbe::guesses(Regex("\\w+"), 'm') == "ab");
+  CHECK(PlanProbe::guesses(Regex("a\r\nb"), 'm') == "ba");
+}
+
 void test_find_ladder() {
   auto rows = [](const Regex &re) { return PlanProbe::start(re, false); };
   auto test = [](const Regex &re) { return PlanProbe::start(re, true); };
@@ -6685,6 +6762,7 @@ int main() {
   test_match_rows();
   test_whole_match_capture();
   test_onewalk_local_bail();
+  test_ladder_family();
   test_find_ladder();
   test_end_anchor();
   test_assert_byte_groups();

@@ -516,6 +516,14 @@ subject 全体を分割する。
 ごとの階段（`Plan::family_`。呼び出し側は 3 種類で、find・真偽値・短い主題への
 真偽値。`ladder_caller` を参照）と、走査の始まる段（`Plan::start_`。CodePoint の
 プランの系統は主題に依らないので、その走査は系統の最初の段からじかに始まる）です。
+ラダーは自分の走る系統を名指します（`Ladder::fam`）。段がどの DFA を読むか、assert の
+エンジンを走らせるかは系統だけで決まり（`kFamilyTraits`。`ladder_byte` と
+`ladder_assert` で読む）、別の旗は持ちません。推測が試す系統も 1 つの表です
+（`Plan::guesses_`。下を参照）。行は推測する側ごとで、`match()`・find・真偽値です。
+ゲートはこの表になっていません。`ladder_gated` はゲートを順に書き並べます。系統ごとの
+経路に固有の条件（選ぶプローブ、純 ASCII の CR-LF の例外）があり、Grapheme の走査の
+最初の一歩にインライン化されると、書き並べたものは畳まれ、系統を回すループは畳まれない
+からです。
 系統を定義する場所は `ladder_family` の 1 か所、find が主題のゲートを読む場所は
 `ladder_classify` の 1 か所（推測は、読んだ範囲についてだけ同じゲートを問います。下を参照）、系統の中の
 段の順序を書く場所は `ladder_pick` の 1 か所です（系統より前の段は系統のものでは
@@ -663,7 +671,7 @@ find は絞り込みのないスキャンで最初からやり直すからです
 *走査が読んだ範囲で*主題がそうであれば、その答えを採ります（`guess_held`）。そうでなければ
 次の推測へ、最後は Pike です。
 
-- **`match()`** は `Plan::match_guesses_`（`ladder_plan` が決める）の系統を順に、位置 0 から
+- **`match()`** は `Plan::guesses_` の自分の行（`ladder_plan` が決める）の系統を順に、位置 0 から
   走らせます（`match_end`）。
   - CodePoint のプランは、その 1 つの系統。
   - Grapheme のプランは、ASCII 系統、次にバイト系統。
@@ -679,7 +687,8 @@ find は絞り込みのないスキャンで最初からやり直すからです
     アンカー付き DFA は最初の非 ASCII バイトで死にます（`lazy_inst_matches` はどれにも
     一致させない）。無駄になるのは、その前の ASCII の部分です。
 - **CodePoint の `search()` / `test()`**（`find_rest`）は、プランが推測する系統
-  （`Plan::us_ladder_`）を `Ladder::kSpec` を立てて走らせ、迷子のバイトを先に調べません。
+  （`Plan::guesses_` の find・真偽値の行。`ladder_guessed`）を `Ladder::kSpec` を立てて
+  走らせ、迷子のバイトを先に調べません。
   - 1 つの段が多くの走査をするので、前向きの DFA の走査がそれぞれ、その DFA の
     最高到達点（`LazyDfa::hi`。開始状態の読み飛ばしを含む）を引き上げます。最高到達点は
     推測の始まりに 0 に戻します（`FindCache::reach_from_zero`）。
