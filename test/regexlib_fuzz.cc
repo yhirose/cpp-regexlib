@@ -399,10 +399,11 @@ void fail(const std::string &why, const std::string &pat,
 
 // The reference the differentials compare against: `pat` on the Pike VM,
 // forced there by a transformation no accelerated tier can see through. An
-// always-true LOOKAHEAD — the next cluster is anything, or the text ends —
-// matches at every position and consumes nothing, so the wrapped pattern has
-// exactly the bare pattern's matches and groups, and a lookaround is a
-// construct neither DFA family compiles.
+// empty LOOKAHEAD `(?=)` matches at every position and consumes nothing, so
+// the wrapped pattern has exactly the bare pattern's matches and groups, and
+// a lookaround is a construct neither DFA family compiles. (Not
+// `(?=[\s\S]|$)`: no class takes a stray byte, so that one fails in front
+// of one.)
 //
 // It used to be `(?:PAT)(?:\b|\B)`, from before the assert tiers existed.
 // They serve `\b` and `\B`, so that wrap had come to run on the assert DFAs
@@ -420,8 +421,7 @@ reg::Regex *pike_reference(const std::string &pat, unsigned flags,
                            reg::MatchUnit unit) {
   reg::Regex *pike = nullptr;
   try {
-    pike = new reg::Regex("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)",
-                          flags, unit);
+    pike = new reg::Regex("(?=)(?:" + pat + ")(?=)", flags, unit);
   } catch (...) {
     return nullptr; // wrapping may hit a limit; the caller skips the compare
   }

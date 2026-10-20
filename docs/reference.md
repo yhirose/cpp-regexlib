@@ -63,7 +63,7 @@ What changes versus the default grapheme unit:
 | `\w` / `\p{L}` on `"e"+◌́` | the whole cluster (base `e` is a letter) | just `"e"` (combining mark stops it) |
 | `\d \w \s [..] \p{…}` | classify a cluster by its base code point | match one code point |
 | match offsets | byte offsets on grapheme boundaries | byte offsets on code-point boundaries |
-| a lone/invalid UTF-8 byte | one fallback element | one code point (the byte value) |
+| a byte that is no UTF-8 (a stray) | a cluster of its own, matched by nothing | an element of its own, matched by nothing |
 | literal text in the pattern | read by clusters: NFD `é+` repeats the `é` | read by code points: NFD `é+` repeats the mark |
 
 Everything else is identical — literals, alternation, quantifiers, groups,
@@ -76,6 +76,14 @@ bytes, and no overlong form, surrogate, or value past U+10FFFF. Any other byte �
 a stray continuation byte, a lead byte whose continuation bytes are missing, the
 bytes of `C0 AF` or `ED A0 80` — is one element of its own (in either unit), and
 the byte after it starts afresh: `"\xE3" "ab"` is three elements, never one.
+Such a byte, a *stray*, matches no atom: no literal, `.` (with or without
+`(?s)`), class or property, negated ones included (`[^a]`, `\W`, `\D`,
+`\P{L}`). It is no word character to `\b`/`\B` and no line break to `(?m)^`/`$`,
+and in the grapheme unit it is a cluster of its own, which a combining mark
+after it does not join. This is how RE2 and Rust's `regex` read it: `.` over
+`"a\xFF" "b"` matches `a` and `b`, and an empty pattern matches at all four
+positions. The pattern itself must be UTF-8; one that is not throws
+`RegexError` with `BadUtf8`.
 
 **Why it exists — no non-ASCII cliff.** In grapheme mode, grapheme breaking is
 stateful, so any non-ASCII byte drops the whole subject off the lazy-DFA fast
@@ -411,7 +419,8 @@ index of the pattern's grapheme cluster it is in) and a caret line. `RegexError:
 `UnbalancedParen`, `BadGroup`, `BadInlineFlags`, `BadUnicodeProperty`,
 `NestingTooDeep`, `NothingToRepeat`, `ProgramTooLarge`, `PatternTooLong`,
 `StepBudgetExceeded`, `Internal`, `BadRepeat` — `{n,m}` with `n` > `m`, or a count past 1000000 —,
-`BadCharRange` — `[z-a]`) for branching without parsing the message.
+`BadCharRange` — `[z-a]` —, `BadUtf8` for a pattern that is not UTF-8) for
+branching without parsing the message.
 
 ## std::regex-compatible API
 
@@ -482,7 +491,9 @@ Read these before porting; they do **not** all fail the same way:
 - **Code-point `.`, not byte `.`.** Over a `std::string`, `std::regex`'s `.`
   matches one *byte* (splitting a multi-byte UTF-8 character); this facade's `.`
   matches one *code point*. On ASCII the two are identical; on UTF-8 this facade
-  is *more* correct, not byte-for-byte identical to `std::regex`.
+  is *more* correct, not byte-for-byte identical to `std::regex`. A byte that is
+  no UTF-8 matches nothing here, and a pattern holding one throws
+  (`error_collate`).
 - **Linear-time, ReDoS-proof — backtracking-only constructs are rejected.**
   Atomic groups `(?>…)` and possessive quantifiers (`a++`, `a*+`) throw
   `regex_error` at construction; a pathological pattern such as `(a+)+$` runs in

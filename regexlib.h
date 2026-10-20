@@ -631,7 +631,7 @@ static const short _dir[] = {
 };
 static const int NLEAF = 131, NSUPER = 19, SB_SHIFT = 5, SB_MASK = 31;
 inline GraphemeBreak get_value(char32_t cp) {
-  if (cp > 0x10FFFF) return D;
+  if (cp > 0x10FFFF) return T::Control;
   unsigned bi = cp >> 7;
   short d = _dir[bi >> SB_SHIFT];
   short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);
@@ -1398,13 +1398,23 @@ inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
   return false;
 }
 
-// Lenient decode: on invalid UTF-8, stand the raw byte in for the code point
-// and consume exactly one byte, so a scan over a malformed subject still makes
-// progress and never straddles the next lead byte. Returns the byte length.
+// What a byte that starts no code point reads as: a stray, one element of
+// its own that no atom matches — no literal, `.` or class, negated ones
+// included — that is no word character and no line break, and that is a
+// grapheme cluster of its own (its Grapheme_Cluster_Break is Control, so
+// GB4/GB5 break on both sides of it). RE2's and Rust's byte automata read
+// such a byte the same way: they match code points, so it is out of their
+// reach. Past U+10FFFF, so no code point is one.
+inline constexpr char32_t kStrayCp = 0x110000;
+inline bool is_stray(char32_t cp) { return cp > 0x10FFFF; }
+
+// Lenient decode: a byte that starts no code point is a stray (kStrayCp), one
+// byte long, so a scan over a malformed subject still makes progress and
+// never straddles the next lead byte. Returns the byte length.
 inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
   size_t bytes;
   if (decode_codepoint(s8, l, bytes, cp)) return bytes;
-  cp = static_cast<unsigned char>(s8[0]);
+  cp = kStrayCp;
   return 1;
 }
 
@@ -1464,16 +1474,16 @@ inline size_t cp_start(const char *s8, size_t at) {
 
 // The element that ENDS at byte `at` (> 0), read as decode_or_byte reads left to
 // right: the code point whose well-formed encoding ends exactly there, else the
-// single byte before `at` standing for itself. (A lead byte always begins an
-// element, so the nearest lead within four bytes is where a code point ending
-// at `at` would start; a longer or shorter sequence from it ends elsewhere.)
-// Returns its byte length.
+// single byte before `at`, a stray. (A lead byte always begins an element, so
+// the nearest lead within four bytes is where a code point ending at `at`
+// would start; a longer or shorter sequence from it ends elsewhere.) Returns
+// its byte length.
 inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
   const size_t j = cp_start(s8, at - 1);
   size_t bytes;
   if (decode_codepoint(s8 + j, at - j, bytes, cp) && j + bytes == at)
     return bytes;
-  cp = static_cast<unsigned char>(s8[at - 1]);
+  cp = kStrayCp;
   return 1;
 }
 
@@ -1636,6 +1646,7 @@ struct RegexError : public std::runtime_error {
     // Values are ABI: a new code goes last.
     BadRepeat,    // a counted repeat whose minimum exceeds its maximum
     BadCharRange, // a class range whose start exceeds its end, e.g. [z-a]
+    BadUtf8,      // the pattern is not UTF-8 (RFC 3629)
   };
 
   RegexError(Code code, const std::string &msg)
@@ -1972,6 +1983,12 @@ inline bool is_line_break(const std::u32string &g) {
   return !g.empty() && is_line_break_cp(g[0]);
 }
 
+// Does `.` take the element that starts with `c` (a code point, or a
+// cluster's first)? Any but a stray and, unless (?s), a line break.
+inline bool dot_takes(char32_t c, bool dotall) {
+  return !unicode::utf8::is_stray(c) && (dotall || !is_line_break_cp(c));
+}
+
 } // namespace detail
 
 //------------------------------------------------------------------------------
@@ -2031,8 +2048,10 @@ struct CharClass {
   // case-fold orbit) is a member: the class is the union of the orbits its
   // members touch, taken before negation, as the byte compiler builds it — so
   // [a-z] holds A-Z, [^a] excludes A, and \p{Lu} holds a. (Not "cp's fold lies
-  // between the folds of a range's ends": fold is not monotonic.)
+  // between the folds of a range's ends": fold is not monotonic.) A stray is
+  // in no class, negated or not (utf8::kStrayCp).
   bool matches_cp(char32_t cp, bool icase) const {
+    if (unicode::utf8::is_stray(cp)) return false;
     bool in = has_member(cp);
     if (!in && icase)
       if (const std::vector<char32_t> *orbit = detail::case_fold_orbit(cp))
@@ -2713,8 +2732,16 @@ struct Parser {
     cps.reserve(pattern.size());
     for (size_t off = 0; off < pattern.size();) {
       char32_t cp;
-      off += unicode::utf8::decode_or_byte(pattern.data() + off,
-                                           pattern.size() - off, cp);
+      size_t bytes;
+      // A byte that starts no code point would be a literal no subject
+      // matches (a stray: utf8::kStrayCp), so the pattern is refused, as
+      // RE2 refuses it — at the cluster it would start.
+      if (!unicode::utf8::decode_codepoint(pattern.data() + off,
+                                           pattern.size() - off, bytes, cp)) {
+        pos = cps.size();
+        error(RegexError::Code::BadUtf8, "not UTF-8");
+      }
+      off += bytes;
       cps += cp;
     }
   }
@@ -4771,7 +4798,7 @@ inline bool cp_inst_matches(const Program &prog, const Inst &in, char32_t cp,
     const std::u32string &lit = prog.lits[in.lit_idx()];
     return lit.size() == 1 && (icase ? fold(lit[0]) == fold(cp) : lit[0] == cp);
   }
-  if (in.op == Op::Any) return dotall || !is_line_break_cp(cp);
+  if (in.op == Op::Any) return dot_takes(cp, dotall);
   return prog.classes[in.cls_idx()].matches_cp(cp, icase);
 }
 
@@ -9971,7 +9998,7 @@ private:
       if (!g) return false;
       switch (in.op) {
       case Op::Char: return lit_match(prog.lits[in.lit_idx()], *g);
-      case Op::Any: return dotall_ || !detail::is_line_break(*g);
+      case Op::Any: return !g->empty() && detail::dot_takes((*g)[0], dotall_);
       case Op::Class: return prog.classes[in.cls_idx()].matches(*g, icase_);
       default: return false;
       }
@@ -12435,8 +12462,8 @@ private:
   };
 
   // The code point that starts at byte `at` (< n). A byte that starts none
-  // stands in for itself, one byte long.
-  static Decoded cp_at(std::string_view text, int at) {
+  // is a stray (utf8::kStrayCp), one byte long.
+  REGEXLIB_ALWAYS_INLINE static Decoded cp_at(std::string_view text, int at) {
     char32_t cp = static_cast<unsigned char>(text[static_cast<size_t>(at)]);
     if (cp < 0x80) return {cp, 1};
     const size_t len = unicode::utf8::decode_or_byte(
@@ -15957,27 +15984,16 @@ private:
         const detail::Inst &in = insts[pc];
         if (in.op == Op::Char || in.op == Op::Any || in.op == Op::Class) {
           if (pos >= hi) break;
-          // ASCII fast path: one byte is one code point.
-          char32_t cp;
-          size_t blen;
-          unsigned char b0 = static_cast<unsigned char>(t[pos]);
-          if (b0 < 0x80) {
-            cp = b0;
-            blen = 1;
-          } else if (!unicode::utf8::decode_codepoint(
-                         t.data() + pos, t.size() - pos, blen, cp)) {
-            cp = b0;
-            blen = 1;
-          }
+          const Decoded d = cp_at(t, pos);
           // A multi-byte code point can extend past `hi` (a backtracking
           // branch may decode at a position whose code point straddles the
           // span end). It is not consumable within [start, hi), and consuming
           // it would index past the gen-stamped visited bitmap. Stop this
           // branch instead.
-          if (pos + static_cast<int>(blen) > hi) break;
-          if (!detail::cp_inst_matches(prog, in, cp, icase, dotall)) break;
+          if (pos + d.len > hi) break;
+          if (!detail::cp_inst_matches(prog, in, d.cp, icase, dotall)) break;
           pc++;
-          pos += static_cast<int>(blen);
+          pos += d.len;
           continue;
         }
         if (in.op == Op::Match) {
@@ -18309,6 +18325,9 @@ private:
     case C::NothingToRepeat: return regex_constants::error_badrepeat;
     case C::BadRepeat: return regex_constants::error_badbrace;
     case C::BadCharRange: return regex_constants::error_range;
+    // std has no encoding error; the nearest is a character the pattern
+    // cannot name.
+    case C::BadUtf8: return regex_constants::error_collate;
     case C::ProgramTooLarge:
     case C::PatternTooLong:
     case C::StepBudgetExceeded: return regex_constants::error_complexity;

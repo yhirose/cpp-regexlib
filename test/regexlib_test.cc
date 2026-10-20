@@ -446,18 +446,19 @@ namespace {
 
 using reg::detail::PlanProbe;
 
-// `pat` on the grapheme Pike, forced there by an always-true lookahead (the
-// next cluster is anything, or the text ends): the same matches and groups,
-// and a lookaround is a construct neither DFA family compiles. The
-// wrap these tests used to use, `(?:PAT)(?:\b|\B)`, predates the assert
-// tiers, which serve it — so it had come to compare a tier with itself. The
-// plan is asked, so a reference cannot drift off the Pike unnoticed again.
+// `pat` on the grapheme Pike, forced there by an empty lookahead `(?=)`,
+// true everywhere (not `(?=[\s\S]|$)`, which no stray byte satisfies): the
+// same matches and groups, and a lookaround is a construct neither DFA
+// family compiles. The wrap these tests used to use, `(?:PAT)(?:\b|\B)`,
+// predates the assert tiers, which serve it — so it had come to compare a
+// tier with itself. The plan is asked, so a reference cannot drift off the
+// Pike unnoticed again.
 // The same lookahead in front keeps the Pike rung's own accelerators off it
 // (a literal prefix, Teddy or first-byte set to skip to): the twin is the
 // VM started at every position, and shares nothing with what it checks.
 inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0,
                             reg::MatchUnit unit = reg::MatchUnit::Grapheme) {
-  reg::Regex re("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)", flags, unit);
+  reg::Regex re("(?=)(?:" + pat + ")(?=)", flags, unit);
   check(PlanProbe::pike_only(re), "pike_twin: reference is Pike-only",
         __LINE__);
   return re;
@@ -809,7 +810,6 @@ void test_assert_us_unified() {
         {"^", "a\rb\nc", {{0, 0}, {2, 2}, {4, 4}}, {{0, 0}, {2, 2}, {4, 4}}},
         {"$", "a\rb\nc", {{1, 1}, {3, 3}, {5, 5}}, {{1, 1}, {3, 3}, {5, 5}}},
     };
-    const std::string la = ")(?=[\\s\\S]|$)";
     for (auto &c : cases) {
       Regex us = make_us(c.pat, reg::Multiline);
       Regex egc = make_egc(c.pat, reg::Multiline);
@@ -817,10 +817,9 @@ void test_assert_us_unified() {
       CHECK(iter_spans(us, c.subj) == c.us);
       CHECK(spans(egc, c.subj) == c.egc);
       CHECK(iter_spans(egc, c.subj) == c.egc);
-      CHECK(spans(make_us("(?:" + std::string(c.pat) + la, reg::Multiline),
+      CHECK(spans(pike_twin(c.pat, reg::Multiline, reg::MatchUnit::CodePoint),
                   c.subj) == c.us);
-      CHECK(spans(make_egc("(?:" + std::string(c.pat) + la, reg::Multiline),
-                  c.subj) == c.egc);
+      CHECK(spans(pike_twin(c.pat, reg::Multiline), c.subj) == c.egc);
       CHECK(us.test(c.subj) == !c.us.empty());
       CHECK(us.search(c.subj).begin() == c.us[0].first);
     }
@@ -3665,12 +3664,11 @@ void test_suffix_prefilter() {
   // US (UnicodeScalar) mode now shares the suffix/ReverseInner literal prefilter
   // (it ran a naked byte-DFA scan before). On a pure-ASCII subject US must equal
   // EGC exactly; the US prefilter result must also match the prefilter-free US
-  // reference (a trailing always-true lookahead makes the pattern assert-tier,
-  // bypassing byte_suffix_/byte_inner_).
+  // reference (its Pike-only twin, which bypasses byte_suffix_/byte_inner_).
   {
     auto ok_us = [](const std::string &subj, const std::string &pat) {
       auto a = make_us(pat).find_all(subj);
-      auto ref = make_us("(?:" + pat + ")(?=[\\s\\S]|$)").find_all(subj);
+      auto ref = pike_twin(pat, 0, reg::MatchUnit::CodePoint).find_all(subj);
       auto eg = make_egc(pat).find_all(subj);
       if (a.size() != ref.size() || a.size() != eg.size()) return false;
       for (size_t i = 0; i < a.size(); i++)
@@ -4058,7 +4056,7 @@ void test_anchor_choice() {
   auto ok_us = [](const std::string &subj, const std::string &pat) {
     Regex us = make_us(pat);
     auto a = us.find_all(subj);
-    auto ref = make_us("(?:" + pat + ")(?=[\\s\\S]|$)").find_all(subj);
+    auto ref = pike_twin(pat, 0, reg::MatchUnit::CodePoint).find_all(subj);
     if (a.size() != ref.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
       if (a[i].begin() != ref[i].begin() || a[i].end() != ref[i].end())
@@ -5817,19 +5815,29 @@ void test_body_dollar() {
   }
   { // Regression: the iterator's byte-assert rung served EGC capture patterns
     // on a non-ASCII subject while search() and find_all() kept them off it,
-    // and the subject check let a stray byte through. A subject ending in a
-    // lone UTF-8 lead byte is where the two engines part: the grapheme engine
-    // gives the invalid byte its own cluster and matches, the byte automaton
-    // wants a continuation byte and does not — so find_iter reported no match
-    // where search() and find_all() reported one.
+    // and the subject check let a stray byte through: on a subject ending in
+    // a lone UTF-8 lead byte, find_iter and search() parted. A stray matches
+    // nothing (utf8::kStrayCp): "ab\xc3" has no match, and with " cd" after
+    // it, the one match is at the end — on every surface (rows).
     // (The groups of the first three span their matches, so they run as
     // capture-free twins; the second three keep real groups.)
-    for (const char *pat : {R"(([^ ]+)$)", R"((\w+)$)", R"((.)$)",
-                            R"(([^ ])([^ ]*)$)", R"((\w)(\w*)$)", R"((.)()$)"}) {
-      Regex re = make_egc(pat);
-      const std::string s = "ab\xc3"; // \xc3 with no continuation byte
-      CHECK(rows(re, s).size() == 1);
-      CHECK(rows(re, std::string(4096, 'q') + " ab\xc3").size() == 1);
+    struct Case {
+      const char *pat;
+      size_t from_end; // the match is the last `from_end` bytes
+      const char *g1;
+    };
+    for (const Case &c : {Case{R"(([^ ]+)$)", 2, "cd"}, Case{R"((\w+)$)", 2, "cd"},
+                          Case{R"((.)$)", 1, "d"}, Case{R"(([^ ])([^ ]*)$)", 2, "c"},
+                          Case{R"((\w)(\w*)$)", 2, "c"}, Case{R"((.)()$)", 1, "d"}}) {
+      Regex re = make_egc(c.pat);
+      for (const std::string &lead : {std::string(), std::string(4096, 'q') + " "}) {
+        CHECK(rows(re, lead + "ab\xc3").empty()); // \xc3: no continuation byte
+        const std::string s = lead + "ab\xc3 cd";
+        CHECK(rows(re, s) ==
+              std::vector<std::string>{std::to_string(s.size() - c.from_end) +
+                                       "," + std::to_string(s.size()) + "=" +
+                                       c.g1});
+      }
     }
   }
   { // Regression: a Multiline anchor binds AT the line terminator, i.e. BETWEEN
@@ -6110,6 +6118,13 @@ void test_invalid_patterns() {
   };
   for (const auto &[pat, code] : errors)
     CHECK(code_of(pat) == code);
+  // The pattern is UTF-8, in either unit: a byte that starts no code point
+  // would be a literal no subject matches (a stray), so it is refused,
+  // escaped or not.
+  for (const char *pat : {"\xE9", "a\xFF" "b", "[\xE9]", "\\\xE9", "\xC3",
+                          "\xC0\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80"})
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+      CHECK(code_of(pat, unit) == C::BadUtf8);
   // The escapes there are: control characters, \0 alone, and [\b].
   CHECK(Regex("^\\a\\e\\cA\\cz\\0$")
             .test(std::string("\x07\x1b\x01\x1a\0", 5)));
@@ -6546,10 +6561,12 @@ void test_out_of_range_utf8() {
                             "\xF7\xBF\xBF\xBF"}) {
       const std::string s = std::string(bad) + "b1";
       CHECK(!make_unit(unit, "^.$", 0).test(bad));
-      CHECK(make_unit(unit, "^.{4}$", 0).test(bad)); // four stray bytes
+      // Four strays: five positions, and `.` takes none of them.
+      CHECK(make_unit(unit, "", 0).find_all(bad).size() == 5);
+      CHECK(!make_unit(unit, ".", 0).test(bad));
       auto m = make_unit(unit, "b\\d", 0).search(s);
       CHECK(m && m.begin() == 4 && m.end() == 6);
-      CHECK(make_unit(unit, "(?<=\\W)b", 0).search(s).begin() == 4);
+      CHECK(make_unit(unit, "(?<!\\w)b", 0).search(s).begin() == 4);
     }
   }
   // U+10FFFF itself is the last code point, and still one.
@@ -6561,6 +6578,7 @@ void test_utf8_decoder_strict() {
   using reg::unicode::utf8::decode_before;
   using reg::unicode::utf8::decode_codepoint;
   using reg::unicode::utf8::decode_or_byte;
+  using reg::unicode::utf8::kStrayCp;
   const auto decodes = [](const std::string &s, char32_t want) {
     size_t bytes = 0;
     char32_t cp = 0;
@@ -6604,11 +6622,12 @@ void test_utf8_decoder_strict() {
   CHECK(rejects_bytes("\xFE"));
   CHECK(rejects_bytes("\xFF"));
   CHECK(rejects_bytes(""));
-  // A bad sequence is a byte of its own, and the next byte starts afresh.
+  // A bad sequence is a byte of its own, a stray, and the next byte starts
+  // afresh.
   {
     const std::string s = "\xE3" "ab";
     char32_t cp;
-    CHECK(decode_or_byte(s.data(), s.size(), cp) == 1 && cp == 0xE3);
+    CHECK(decode_or_byte(s.data(), s.size(), cp) == 1 && cp == kStrayCp);
     CHECK(decode_or_byte(s.data() + 1, s.size() - 1, cp) == 1 && cp == 'a');
   }
   // valid_from is the same test as a decode_codepoint walk: every string of up
@@ -6684,24 +6703,23 @@ void test_utf8_decoder_strict() {
   {
     char32_t cp;
     const std::string a = "x\xD8\x80\xBF"; // U+0600, then a stray BF
-    CHECK(decode_before(a.data(), 4, cp) == 1 && cp == 0xBF);
+    CHECK(decode_before(a.data(), 4, cp) == 1 && cp == kStrayCp);
     CHECK(decode_before(a.data(), 3, cp) == 2 && cp == 0x600);
     const std::string b = "\xC3\xA9\x80"; // é, then a stray continuation
-    CHECK(decode_before(b.data(), 3, cp) == 1 && cp == 0x80);
+    CHECK(decode_before(b.data(), 3, cp) == 1 && cp == kStrayCp);
     CHECK(decode_before(b.data(), 2, cp) == 2 && cp == 0xE9);
     const std::string c = "\xF0\x9F\x98\x80"; // one four-byte code point
     CHECK(decode_before(c.data(), 4, cp) == 4 && cp == 0x1F600);
-    CHECK(decode_before(c.data(), 3, cp) == 1 && cp == 0x98);
+    CHECK(decode_before(c.data(), 3, cp) == 1 && cp == kStrayCp);
     const std::string d = "\xE3\x81"; // a truncated lead
-    CHECK(decode_before(d.data(), 2, cp) == 1 && cp == 0x81);
+    CHECK(decode_before(d.data(), 2, cp) == 1 && cp == kStrayCp);
   }
 }
 
 // A subject that is not UTF-8 reads as the Pike reads it — a stray byte is an
-// element of its own, and the next byte starts afresh — whichever tier a plan
-// would serve a well-formed one with. The byte automata cannot match a stray
-// byte, so every such subject has to reach the Pike; each pattern is checked
-// against its Pike-only twin on every short run of well- and ill-formed pieces.
+// element of its own that no atom matches, and the next byte starts afresh —
+// whichever tier a plan serves it with; each pattern is checked against its
+// Pike-only twin on every short run of well- and ill-formed pieces.
 void test_invalid_utf8_tiers() {
   const char *const pieces[] = {
       "a",          "b",          "x",
@@ -6757,19 +6775,76 @@ void test_invalid_utf8_tiers() {
       }
     }
   }
-  // The cases that showed it: a byte automaton reading a stray byte as
-  // nothing, or a bad sequence as swallowing the byte after it.
+  // The cases that showed it: a stray byte read as a code point, or a bad
+  // sequence as swallowing the byte after it.
   for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
-    CHECK(make_unit(unit, "x[^ ]", 0).test("x\x80\xC3\xA9"));
-    CHECK(make_unit(unit, "^.+$", 0).test("x\xE3x"));
+    CHECK(spans(make_unit(unit, "x[^ ]", 0), "x\x80x\xC3\xA9") ==
+          (std::vector<size_t>{2, 5}));
+    CHECK(spans(make_unit(unit, ".", 0), "x\xE3x") ==
+          (std::vector<size_t>{0, 1, 2, 3}));
+    CHECK(!make_unit(unit, "^.+$", 0).test("x\xE3x"));
     CHECK(make_unit(unit, "a\\b", 0).test("a\x80"));
     CHECK(spans(make_unit(unit, "a", 0), "\xC3" "a" "\xE3" "a") ==
           (std::vector<size_t>{1, 2, 3, 4}));
   }
   // A literal sits on a cluster boundary after a stray byte that follows a
-  // Prepend: U+0600 BF is one cluster, and the `abc` after it starts a new one.
+  // Prepend: the stray breaks as a Control does, so U+0600 and BF are two
+  // clusters, and the `abc` after them starts a third.
   CHECK(spans(Regex("abc"), "abc\xD8\x80\xBF" "abc") ==
         (std::vector<size_t>{0, 3, 6, 9}));
+  CHECK(spans(Regex("."), "\xD8\x80\xBF" "a") ==
+        (std::vector<size_t>{0, 2, 3, 4}));
+}
+
+// A stray byte (one that starts no code point) matches nothing: no literal,
+// `.` or class, negated ones and properties included; it is no word
+// character and no line break; and in the Grapheme unit it is a cluster of
+// its own, which a combining mark after it does not join. Where RE2 and
+// Rust's regex have the construct, these are their answers (`.`, `[^a]`,
+// `\W`, `\D`, `\P{L}`, `\b`, `\p{M}` after a stray). Every surface gives
+// the same one.
+void test_stray_matches_nothing() {
+  struct Case {
+    const char *pat;
+    std::string subj;
+    std::vector<size_t> want;
+  };
+  // (0xFF and 0x80 as the stray: as Latin-1 code points the one is a letter
+  // and the other a control, so each case holds only of a stray.)
+  const std::string afb = "a\xFF" "b", a80b = "a\x80" "b";
+  const Case cases[] = {
+      {".", afb, {0, 1, 2, 3}},
+      {"(?s).", afb, {0, 1, 2, 3}},
+      {"[^a]", afb, {2, 3}},
+      {"\\W", a80b, {}},
+      {"\\D", afb, {0, 1, 2, 3}},
+      {"\\S", afb, {0, 1, 2, 3}},
+      {"\\P{L}", a80b, {}},
+      {"\\p{C}", a80b, {}}, // (which holds the unassigned code points)
+      // No code point either: not ÿ (U+00FF), not é (U+00E9), not NEL
+      // (U+0085, a line break).
+      {"\xC3\xBF", afb, {}},
+      {"(?i)\xC3\xBF", afb, {}},
+      {"\\w+", "x\xE9y", {0, 1, 2, 3}},
+      {"\xC3\xA9", "x\xE9y", {}},
+      {"(?m)^", "a\x85" "b", {0, 0}},
+      {"(?s).", "a\x85" "b", {0, 1, 2, 3}},
+      // An element of its own, no word character.
+      {"\\b", afb, {0, 0, 1, 1, 2, 2, 3, 3}},
+      {"\\B", afb, {}},
+      {"(?<!\\w)b", afb, {2, 3}},
+      {"(?<=\\W)b", a80b, {}},
+      // A combining mark after a stray is a cluster of its own.
+      {".", "\xFF\xCC\x81", {1, 3}},
+      {"\\p{M}", "\xFF\xCC\x81", {1, 3}},
+  };
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const Case &c : cases) {
+      const Regex re = make_unit(unit, c.pat, 0);
+      CHECK(finds_agree(re, c.want, c.subj));
+      CHECK(re.match(c.subj).matched() ==
+            (!c.want.empty() && c.want[0] == 0));
+    }
 }
 
 // Under IgnoreCase a class range holds a code point when ANY of its case
@@ -6955,6 +7030,7 @@ int main() {
   test_out_of_range_utf8();
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();
+  test_stray_matches_nothing();
   test_icase_class_ranges();
   test_error_messages();
 

@@ -287,6 +287,7 @@ void test_error_codes() {
       {R"(\p{Nonesuch})", rc::error_escape}, // unknown unicode property
       {"a{3,1}", rc::error_badbrace},        // repeat count out of order
       {"[z-a]", rc::error_range},            // class range out of order
+      {"a\xFF", rc::error_collate},          // not UTF-8
   };
   for (const Case &c : cases) {
     bool threw = false;

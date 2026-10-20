@@ -122,11 +122,13 @@ def _best_super_shift(codes):
     return best[1]
 
 
-def emit_page_table(out, name, ctype, order, defval, values):
+def emit_page_table(out, name, ctype, order, defval, values, stray=None):
     """Emit `namespace name { ... get_value(char32_t) ... }` for an enum property.
 
     `order`  : ordered list of enum member names (ordinal = index).
-    `values` : list of length MAX_CP+1 of enum-member names (strings)."""
+    `values` : list of length MAX_CP+1 of enum-member names (strings).
+    `stray`  : the member a value past U+10FFFF reads as (utf8::kStrayCp, what
+               a byte that starts no code point decodes to); `defval` if None."""
     ordmap = {n: i for i, n in enumerate(order)}
 
     # leaf level
@@ -191,15 +193,16 @@ def emit_page_table(out, name, ctype, order, defval, values):
 
     out.write("static const int NLEAF = %d, NSUPER = %d, SB_SHIFT = %d, SB_MASK = %d;\n"
               % (nleaf, nsuper, shift, sb - 1))
+    past = "D" if stray is None or stray == defval else "T::" + stray
     out.write(
         "inline %s get_value(char32_t cp) {\n"
-        "  if (cp > 0x10FFFF) return D;\n"
+        "  if (cp > 0x10FFFF) return %s;\n"
         "  unsigned bi = cp >> 7;\n"
         "  short d = _dir[bi >> SB_SHIFT];\n"
         "  short bc = d < NSUPER ? _supers[d][bi & SB_MASK] : (short)(d - NSUPER);\n"
         "  return bc < NLEAF ? _leaves[bc][cp & 127] : (T)(bc - NLEAF);\n"
         "}\n"
-        "}  // namespace %s\n" % (ctype, name)
+        "}  // namespace %s\n" % (ctype, past, name)
     )
 
 
@@ -449,8 +452,9 @@ def build_block(ucd):
     # --- GraphemeBreak (enum value list is version-dependent) ---
     gcb_order, gcb_vals = parse_enum_prop(ucd, "auxiliary/GraphemeBreakProperty.txt")
     emit_enum(out, "GraphemeBreak", gcb_order)
+    # A stray is a cluster of its own: it breaks as a Control does (GB4/GB5).
     emit_page_table(out, "_grapheme_break_properties", "GraphemeBreak",
-                    gcb_order, "Unassigned", gcb_vals)
+                    gcb_order, "Unassigned", gcb_vals, stray="Control")
     out.write("\n")
 
     # --- Emoji (Extended_Pictographic etc., for GB11) ---
