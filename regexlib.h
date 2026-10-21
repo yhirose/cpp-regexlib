@@ -2325,11 +2325,10 @@ inline Node strip_boundary_asserts(const Node &root) {
 // True ⟹ every match of `n` necessarily begins at text offset 0 (start of
 // text) in the given multiline mode — the pattern is left-anchored by a `\A`
 // (always) or `^` (only when NOT multiline) that no alternative can bypass.
-// Used to skip the assert tier's reverse start-scan: when this holds, the
-// forward-located end already implies start == 0, so the (per-call,
-// malloc-heavy) reverse closure walk is pure waste. Conservative — any shape
-// that could let a match begin off zero returns false (the reverse scan still
-// runs, correct but slower).
+// Used to find such a pattern at 0 alone (Rung::TextAnchor: the find from
+// 0 is the whole find, for every caller). Conservative: any shape that
+// could let a match begin off zero returns false (the pattern takes the
+// ordinary ladder, correct but slower).
 inline bool forces_text_begin(const Node &n, bool multiline) {
   using K = Node::Kind;
   switch (n.kind) {
@@ -6044,7 +6043,9 @@ private:
     // A text-anchored pattern matches at 0 or nowhere, so the find from 0
     // is the whole find, for every caller (find_from0): the subject is
     // never classified, and the find reads no further than its walk and
-    // its scans from 0.
+    // its scans from 0. Every scan of such a plan starts and ends here (the
+    // fuzzer checks the start: PlanProbe::text_anchor_starts), so no rung
+    // below knows of a text anchor.
     TextAnchor,
     // An end-anchored pattern matches at the text's end or nowhere: one
     // reverse scan from there, over what the match spans, is the find —
@@ -6847,8 +6848,6 @@ private:
       // WalkDriver and Regex::onepass_driver_find).
       if (!onepass_unbounded_) {
         // WalkDriver::None
-      } else if (onepass_anchored_start_) {
-        walk_driver_ = WalkDriver::AnchoredStart;
       } else if (prefix_.active() && prefix_.ascii && !prefix_.icase) {
         // The grapheme program's prefix.
         walk_driver_ = WalkDriver::Prefix;
@@ -7278,8 +7277,9 @@ private:
         // `^body$` (a leading text-begin anchor too — the validate-and-
         // extract shape, `^(\d{4})-(\d{2})-(\d{2})$`) is the same admission
         // with the single candidate 0: strip_boundary_asserts already
-        // dropped both anchors from the one-pass program, and the drivers
-        // read onepass_anchored_start_. Without it such a pattern pays the
+        // dropped both anchors from the one-pass program, and
+        // onepass_anchored_start_ has the find from 0 take the walk
+        // (family_walks_on). Without it such a pattern pays the
         // assert DFA locate + the bitstate.
         if (cp_onepass_.ok && !icase_ && !can_match_empty_ &&
             root.kind == detail::Node::Kind::Concat && !root.kids.empty() &&
@@ -10024,21 +10024,19 @@ private:
     bool onepass_require_end_ = false;
     // With onepass_require_end_: the pattern ALSO carries a leading text-begin
     // anchor (`^body$`, the validate-and-extract shape), likewise stripped
-    // from the one-pass program. Position 0 is then the only candidate, so
-    // the drivers collapse to one walk from 0 (onepass_driver_find) — no
-    // memmem / position scan, and a find from any later floor is a definitive
-    // no-match.
+    // from the one-pass program. Position 0 is then the only candidate: the
+    // walk is the find from 0's (family_walks, from0_walk), no memmem or
+    // position scan.
     bool onepass_anchored_start_ = false;
     // Where the unbounded one-pass walk takes its candidates from, best
-    // first: position 0 alone, a literal prefix (walk_prefix_ — whichever of
-    // the plan's prefix analyses has one, see the constructor), a
-    // non-absorbing interior literal, or every position (pruned by Teddy
-    // or the first-byte set). Inner is the one driver that reads the
-    // FindCache (its cached reverse(pre) DFA), so a one-step find on any
-    // other runs without fetching it (see Regex::scr_walk).
+    // first: a literal prefix (walk_prefix_ — whichever of the plan's prefix
+    // analyses has one, see the constructor), a non-absorbing interior
+    // literal, or every position (pruned by Teddy or the first-byte set).
+    // Inner is the one driver that reads the FindCache (its cached
+    // reverse(pre) DFA), so a one-step find on any other runs without
+    // fetching it (see Regex::scr_walk).
     enum class WalkDriver : uint8_t {
       None, // no unbounded one-pass table
-      AnchoredStart,
       Prefix,
       Inner,
       Scan,
@@ -10506,9 +10504,9 @@ private:
     AssertPrefilter assert_;
 
     // True ⟹ the pattern is left-anchored at text-begin (`\A`, or `^` when not
-    // multiline) on every alternative, so an assert-tier match necessarily starts
-    // at offset 0. Lets the general find_span path skip the reverse start-scan
-    // (its per-call malloc-heavy closure walk) and set start = 0 directly.
+    // multiline) on every alternative (forces_text_begin), so every match
+    // starts at offset 0: every scan starts on Rung::TextAnchor, the find
+    // from 0 (ladder_plan).
     bool text_anchored_ = false;
     // ... and right-anchored at text-end (`\z`, or `$` when not multiline) on
     // every alternative, and not left-anchored: every match ends at the end
@@ -10639,9 +10637,7 @@ private:
     // such an anchor: its verify walks forward to the leftmost-first end,
     // which can be the end of the line, where the boolean scan stops at the
     // first accept — and skips to that literal itself (LazyDfa::kSkipAssert).
-    // Nor is anything an anchor for a text-anchored pattern, which the
-    // boolean scan decides from 0 (see Rung::Bool), where the find's verify
-    // goes on to the leftmost-first end (`^.*foo\b`). The word scan is
+    // The word scan is
     // bounded too — a walk ends where the word does — and where it is sparse
     // it reads sixteen positions at a time, where the boolean scan steps
     // every byte. ASCII only: the walk
@@ -10651,7 +10647,7 @@ private:
       if (!byte && !assert_ascii_tier()) return false;
       const bool bounded = !assert_.lit.empty() || assert_.word_suffix ||
                            !assert_.suffix.empty();
-      return !text_anchored_ && (bounded || (!byte && word_scan_sparse()));
+      return bounded || (!byte && word_scan_sparse());
     }
 
     // EGC byte path: UTF-8 byte programs (forward + reverse), compiled like
@@ -12246,28 +12242,6 @@ private:
                        bool span) const {
     // What a scan that found nothing answers: nothing, or that it gave up.
     const auto none = [](int r) { return r == LazyDfa::kCap ? r : 0; };
-    // Text-begin-anchored (e.g. the `^...$` validation shape): every match
-    // starts at 0, so a find from a later floor cannot succeed, and from == 0
-    // is answered by the bare ANCHORED DFA (shared with match()) — its state
-    // set dies at the first mismatching byte, where the unanchored lf scan's
-    // `(?s:.)*?` prefix thread would walk the rest of the subject. The
-    // reverse start-scan is provably redundant (the start is 0), and the
-    // literal prefilters below can only postpone the same single anchored
-    // run.
-    if (plan_->text_anchored_) {
-      if (from > 0) return 0;
-      // [Tier: AnchoredOnePass] one deterministic walk decides the whole
-      // find (anchored_onepass_try): sound on any subject — a non-ASCII
-      // byte bails to the DFA below.
-      int e0 = 0;
-      const int r = anchored_onepass_try(text, e0);
-      if (r == 0) return 0;
-      if (r < 0) e0 = look_forward_lf(fc.dfa(*this, byte, kDfaFwda), text, 0);
-      if (e0 < 0) return none(e0);
-      s = 0;
-      e = e0;
-      return 1;
-    }
     if (!plan_->assert_.lit.empty())
       return assert_lit_find(fc, text, from, s, e, byte);
     if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
@@ -15269,17 +15243,12 @@ public:
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
   // A boolean over a short subject gives the interior-literal rung up
-  // before trying it (limits::kBoolSkipBytes; see ladder_caller). A ladder
-  // at Classify (where a shallow rung's bail moves it) keeps its place:
-  // the flag is what makes it the third.
+  // before trying it (limits::kBoolSkipBytes; see ladder_caller): it starts
+  // on the third ladder, the boolean's with that rung given up.
   REGEXLIB_ALWAYS_INLINE Ladder ladder_short_test(std::string_view text,
                                                   Ladder l) const {
-    if (text.size() >= size_t(limits::kBoolSkipBytes)) return l;
-    if (l.rung == Rung::Classify) {
-      l.set(Ladder::kInnerOff);
-      return l;
-    }
-    return plan_->start_[2];
+    return text.size() >= size_t(limits::kBoolSkipBytes) ? l
+                                                         : plan_->start_[2];
   }
   // A Grapheme scan that would classify its subject guesses instead
   // (Plan::find_guess_), and the answer stands if what the scan read holds
@@ -16319,8 +16288,8 @@ private:
   }
 
   // [Tier: AnchoredOnePass] the ONE shared decision for every anchored entry
-  // point (match / find_from0 / assert_find_span — a
-  // text-anchored pattern matches at 0 or nowhere): 1 = match ([0, e_out)),
+  // point (match and find_from0: a text-anchored pattern matches at 0 or
+  // nowhere): 1 = match ([0, e_out)),
   // 0 = definitive no-match (no accept, or `$` unsatisfied — require_end
   // demands the accept land exactly at n), -1 = not decided (table absent,
   // or a non-ASCII byte bailed; the caller falls to its own chain).
@@ -16585,18 +16554,6 @@ private:
     return -1;
   }
 
-  // The unbounded one-pass walk from 0 as the whole find — a text-anchored
-  // plan's one candidate (WalkDriver::AnchoredStart), or the find from 0's
-  // (from0_walk, for match() and from0_rest): the end (groups in `saves`),
-  // -1 when no match starts there, or kWalkLocal on a non-ASCII byte (the
-  // caller's DFA answers). `w` reports how far it read.
-  int onepass_from0(std::string_view t, std::vector<int> &saves,
-                    OnePassWalk &w) const {
-    const int e = cp_onepass_find(t, 0, saves, w);
-    if (e == kWalkLocal) return e;
-    return e >= 0 && onepass_end_ok(e, t) ? e : -1;
-  }
-
   // One front door for the unbounded one-pass capture find: route through
   // the best candidate source (literal prefix > non-absorbing ReverseInner >
   // position scan). Returns the match end (saves filled), -1 (definitive
@@ -16609,15 +16566,6 @@ private:
                           std::vector<int> &saves, WalkBudget &budget,
                           bool byte) const {
     switch (plan_->walk_driver_) {
-    // `^body$`: position 0 is the only candidate (a text-begin anchor), so a
-    // find from any later floor is a definitive no-match and the whole find
-    // is one walk — no scan, no budget (nothing to re-walk). A bail (non-
-    // ASCII byte) falls back to the assert chain as the other drivers do.
-    case Plan::WalkDriver::AnchoredStart: {
-      if (from > 0) return -1;
-      OnePassWalk w;
-      return onepass_from0(t, saves, w); // one candidate: nothing to count
-    }
     case Plan::WalkDriver::Prefix:
       return prefix_onepass_find(t, from, saves, budget,
                                  plan_->walk_prefix_.text,
@@ -16935,9 +16883,9 @@ private:
   // first, which yields the end and the groups in one (a bail falls to the
   // DFA): on Dfa/Ascii (onepass_end_ok keeps the onepass_unbounded_ /
   // onepass_require_end_ pair read together), and `^body$`
-  // (onepass_anchored_start_) on the assert family the find ladder's walk
-  // takes it on. The plan's, so read off it (Plan::walk_families_, from
-  // family_walks_on).
+  // (onepass_anchored_start_) on the families whose program the walk's
+  // table is: a CodePoint plan's, and a Grapheme plan's ASCII one. The
+  // plan's, so read off it (Plan::walk_families_, from family_walks_on).
   bool family_walks(Family f) const {
     return (plan_->walk_families_ >> f) & 1u;
   }
@@ -16953,14 +16901,16 @@ private:
              (p.us_ || !family_has<kTraitByte>(f));
     }
   }
-  // The walk (onepass_from0): its end, or -1, with the groups in `saves`
-  // (`walked`); kWalkLocal hands the find to the family's DFA. It needs no
-  // cache: the save slots only.
+  // The unbounded one-pass walk from 0 as the whole find: its end, or -1
+  // when no match starts there, with the groups in `saves` (`walked`);
+  // kWalkLocal on a non-ASCII byte hands the find to the family's DFA.
+  // `reach`: how far it read. It needs no cache: the save slots only.
   int from0_walk(std::string_view text, std::vector<int> &saves, int &reach,
                  bool &walked) const {
     OnePassWalk w;
-    const int e = onepass_from0(text, saves, w);
+    int e = cp_onepass_find(text, 0, saves, w);
     reach = w.reach(0, static_cast<int>(text.size()));
+    if (e != kWalkLocal && !(e >= 0 && onepass_end_ok(e, text))) e = -1;
     walked = e >= 0;
     return e;
   }
@@ -18118,21 +18068,11 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // From 0: a prefilter rung that bailed here proved nothing the scan can
   // skip, and the scan is one pass.
   case Rung::Bool: {
-    int e2;
-    const bool byte = ladder_byte(l);
-    if (ladder_assert(l)) {
-      // A text-anchored pattern matches at 0 or nowhere: the anchored DFA
-      // dies at the first byte no match can take, where the re-seeding one
-      // would go on to the end of the subject (as assert_find_span). Else the
-      // re-seeding scan, which skips to the assert prefix when the plan has
-      // one (LazyDfa::kSkipAssert).
-      e2 = look_forward_first(p.text_anchored_
-                                  ? scr.cache->dfa(*this, byte, kDfaFwda)
-                                  : scr.cache->dfa(*this, byte, kDfaBool),
-                              text);
-    } else {
-      e2 = dfa_forward_first(scr.cache->dfa(*this, byte, kDfaBool), text, 0);
-    }
+    // The re-seeding scan; with look, it skips to the assert prefix when the
+    // plan has one (LazyDfa::kSkipAssert).
+    LazyDfa &d = scr.cache->dfa(*this, ladder_byte(l), kDfaBool);
+    const int e2 = ladder_assert(l) ? look_forward_first(d, text)
+                                    : dfa_forward_first(d, text, 0);
     if (e2 == LazyDfa::kCap) {
       // The DFA gave up: a regular pattern can still need exponentially
       // many DFA states, and this subject kept asking for new ones. The

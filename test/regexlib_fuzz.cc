@@ -83,6 +83,16 @@ namespace reg {
 namespace detail {
 struct PlanProbe {
   static bool literal_only(const Regex &re) { return re.plan_->literal_only_; }
+  // Whether a text-anchored plan starts every scan on Rung::TextAnchor, the
+  // find from 0, which hands the scan to no other rung: what lets the
+  // family rungs and the walk's drivers know nothing of a text anchor.
+  static bool text_anchor_starts(const Regex &re) {
+    const auto &p = *re.plan_;
+    if (!p.text_anchored_) return true;
+    for (const auto &st : p.start_)
+      if (st.rung != Regex::Rung::TextAnchor) return false;
+    return true;
+  }
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
@@ -872,6 +882,8 @@ void check_pattern(const std::string &pat,
     fail("non-RegexError thrown at construction", pat, "");
     return;
   }
+  if (!reg::detail::PlanProbe::text_anchor_starts(*re))
+    fail("text-anchored plan does not start on Rung::TextAnchor", pat, "");
   // The DFA-vs-Pike reference (see pike_reference): search/find_all take the
   // accelerated tiers for the bare pattern, this takes the Pike for the same
   // matches. Null when the wrap hit a limit; the differential is skipped.
@@ -1087,6 +1099,9 @@ void check_us_vs_pike(const std::string &pat,
   } catch (...) {
     return; // rejected pattern: nothing to compare
   }
+  if (!reg::detail::PlanProbe::text_anchor_starts(*us))
+    fail("text-anchored plan does not start on Rung::TextAnchor (CodePoint)",
+         pat, "");
   pike = pike_reference(pat, 0u, oracle);
   if (!pike) {
     delete us;
