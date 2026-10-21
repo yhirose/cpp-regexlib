@@ -490,9 +490,12 @@ from 628 to 59 ms — the grapheme Pike they ran on segments the whole subject.
 The numbered tiers above say *what engine runs*. Which of them serves a call
 is decided in two places: the find entry points (`test` / `search` /
 `find_all` / `find_iter` / `find_at`) climb one shared ladder (next section),
-and `match` — anchored at 0, where no prefilter applies — takes one rung per
-family of that ladder (`match_end`): the family's DFA anchored at 0 locates
-the end, and `match_located` resolves any groups within it. Which family
+and `match` — anchored at 0, where no prefilter applies — asks the families
+of that ladder in turn, each anchored at 0 (`from0_dfa`, after the capture
+walk where the family has one: `family_walks`): the family's DFA locates the
+end, and `match_located` resolves any groups within it. The find of a
+text-anchored pattern, decided at 0 too, asks the same families the same
+way (`from0_rest`). Which family
 answers is not decided by the gates up front but by trying them in turn (see
 "Guessing the family" below). Every
 branch carries a `[Tier: …]` label in the source, with one canonical name per
@@ -504,7 +507,7 @@ branch carries a `[Tier: …]` label in the source, with one canonical name per
 | `LiteralAlt` | `literal_alt_` non-empty | Teddy multi-literal scan, ordered verify of the literals behind the fingerprint found |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + per-hit boundary & anchor-flag verify; any subject |
 | `EndAnchor` | `end_anchor_ok` (`end_anchored_`, the byte assert programs, and for groups the capture program) | the reverse byte DFA from `n` to the cursor: the leftmost start; groups in `[s, n)`; vets only the bytes it read (`end_region_ok`), else `Classify` |
-| `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — a state is the offset of its row (premultiplied, as the LazyDfa's), so each byte's one load waits on the load before it and nothing else; a row is 129 entries, the state's accept flag and then a column per ASCII byte — the flag is read off the dependency chain, and the odd width keeps one column of many rows out of one cache set (a 128-digit validator over varying subjects: 262 ns with 128-entry rows, 140 so); a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the assert chain) |
+| `AnchoredOnePass` | `aop_.ok` (the `^body$` / `^body` validation shape: an assert-free body with captures stripped, plus — for bare `^body` only — the cut rules; see `onepass_body_ok`) | ONE compact deterministic walk from 0 (`anchored_onepass_try`, shared by search / match / test) — a state is the offset of its row (premultiplied, as the LazyDfa's), so each byte's one load waits on the load before it and nothing else; a row is 129 entries, the state's accept flag and then a column per ASCII byte — the flag is read off the dependency chain, and the odd width keeps one column of many rows out of one cache set (a 128-digit validator over varying subjects: 262 ns with 128-entry rows, 140 so); a trailing `$` is the accept-lands-at-n test (uncut table, so the end is forced and the body may alternate or be lazy: `^(a\|aa)+$`); bare `^body` uses the leftmost-first-cut table, whose last accept is the exact leftmost-first end only under the cut rules. Sound on ANY subject: the walk bails on a non-ASCII byte, and on `\r` when the pattern could split a CR-LF cluster (`onepass_walk_bails_cr`). With captures the walk still decides the span — `test()` and every no-match (`^(a+)+$` on its ReDoS input) — and a match's groups are resolved on it; `+cap` for `^body$` goes further: `onepass_anchored_start_` makes position 0 the sole candidate of the capture one-pass walk, so `^(\d{4})-(\d{2})-(\d{2})$` yields end and groups in one walk (a bail falls to the family's DFA from 0, `from0_dfa`, and the groups are resolved in its span) |
 | WordOnePass | `wop_.ok` (`\b body \b`, capture-free, word-only head/tail atoms; with a trailing `\b`, every accepting state's outgoing bytes must be word bytes; WITHOUT one the table carries the cut, so the body must satisfy the cut rules too — `onepass_body_ok`) | per-candidate compact walk: candidates = non-word-preceded viable start bytes, taken a block at a time (`word_start_block`, see the scan section) behind a short scalar entry ramp; the trailing `\b` is one next-byte test at the last accept (exact via the accepting-state admission: a passed-over accept is always followed by a word byte) |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | byte lazy DFA over `byte_prog_` (suffix/inner prefilters); then, at EVERY capture count (`onepass_unbounded_`), the candidate + unbounded one-pass walk — one walk per match yielding end + groups where there are groups and the span (saves 0/1, which the compiler emits at any `ncap`) where there are none, replacing the located-span chain's two passes. A non-ASCII byte in the walk's way is a *local* bail: the chain serves that one find and the driver resumes with the next (§2, Linearity). A stray byte (not RFC 3629 UTF-8) needs nothing: the byte automaton cannot match one, and in the unit nothing does |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | byte lazy DFA (icase-prefix / suffix / inner prefilters, fused EGC literal scan); the one-pass walk and `+cap` as above, except on a CRLF-collapse plan (`byte_walk_ok`: its byte programs count a CR-LF pair as one element and the walk's table counts two) |
@@ -535,7 +538,7 @@ a rung exists at all of them or at none.
 | Rung | What runs | Needs |
 | --- | --- | --- |
 | `Literal` / `LiteralAlt` / `AssertAnchor` | a plan that is its own locate; never falls | the cursor |
-| `TextAnchor` | a text-anchored pattern matches at 0 or nowhere: the `AnchoredOnePass` walk from 0 is the whole find. For a caller that reads no groups — a capture-free plan, or `test()` | the cursor |
+| `TextAnchor` | a text-anchored pattern matches at 0 or nowhere, so the find from 0 is the whole find, for every caller (`find_from0`): the `AnchoredOnePass` walk (a match it decides has its groups resolved on its span); else, for `^lit$`, the literal at 0; else the families, each anchored at 0 and judged on what it read, as `match()` asks them (a boolean's scans stop at their first accept); else the Pike from 0. The subject is never classified | the cursor; the cache past the walk |
 | `EndAnchor` | an end-anchored pattern matches at the end or nowhere: the reverse DFA from the end is the whole find, over the bytes it vets itself (§2, "The find from the end") | cache |
 | `Classify` | looks at the subject and stands on the family that serves it; where a Grapheme plan starts unless a rung above is the whole plan | the subject's class |
 | `FusedPrefix` / `FusedSuffix` | the fused EGC literal scans (§4) | cache |
@@ -651,11 +654,14 @@ prefix never goes back, and the scan still stops at its first accept, so
 to the end of the line. A dense prefix is stepped through, by the bar the
 DFA tiers leave one to their scan at (`Plan::assert_prefix_skips`): a scan
 restarted at every `e` costs more than one that steps through them. A
-text-anchored pattern's boolean is the anchored DFA's from 0, whatever
-literals it has: the find's verify from 0 goes on to the leftmost-first end
-(`^.*foo\b`). Tested over a megabyte of prose with no match, in either
+text-anchored pattern's boolean is its find from 0 (`Rung::TextAnchor`)
+with the DFA scans stopped at their first accept, whatever literals it has:
+where a find goes on to the leftmost-first end (`^.*foo\b`), the boolean
+has its answer at the first accept. Tested over a
+megabyte of prose with no match, in either
 unit: `\bqzx\w*\b` and `(?m)^qzx.*` went from 1.5-1.9 ms to 41-43 µs, what
-the find takes; `^qzx\b.*` to 12 µs; `\bq[a-z]+e\b` with a `q` every 61
+the find takes; `^qzx\b.*` to 12 µs (now 13-17 ns: the find from 0 reads
+only the first bytes, see "Guessing the family"); `\bq[a-z]+e\b` with a `q` every 61
 bytes to ~0.3 ms. The fuzzer asks every subject of its layer for the
 boolean four ways — with the skip, without it, of `search()` and of the
 Pike — malformed bytes among them.
@@ -700,9 +706,10 @@ Three things keep the shared ladder from costing them anything:
   reached through a pointer, the same ladder cost `search()` ~100
   instructions a call.
 - The rungs that can answer alone are tried before what the others work with
-  exists: the shallow rungs with a cursor and nothing else (`find_once`; the
-  text-anchored walk is inlined there — a validator's whole call is that
-  walk), then the walk (`find_run`: the budget, and thread-local save slots
+  exists: the self-locating rungs, with a cursor and nothing else, and the
+  walk from 0 of a text-anchored find (`find_once`, `find_from0`; the walk
+  is inlined there — a validator's whole call is that walk), then the walk
+  (`find_run`: the budget, and thread-local save slots
   — a walk whose driver reads no DFA runs without the thread's cache, which
   is 35 instructions to fetch, `scr_walk`), then the rest.
 - Nothing about the pattern is decided per call (the plan's ladders, above),
@@ -731,7 +738,7 @@ automata, like the unit, match no stray byte), and its `guess_held` always
 holds.
 
 - **`match()`** tries its families in `Plan::match_guesses_` (set by
-  `ladder_plan`), each anchored at 0 (`match_end`): a CodePoint plan's one; a
+  `ladder_plan`), each anchored at 0 (`from0_dfa`): a CodePoint plan's one; a
   Grapheme plan's ASCII family, then its byte family — the byte family first
   for a pattern with a CR-LF literal, which the ASCII family cannot match
   (`ascii_grapheme_ok`), so that on the subjects where it matters the first
@@ -743,6 +750,21 @@ holds.
   stopped: on a non-ASCII subject the ASCII family's anchored DFA dies at
   the first non-ASCII byte (`lazy_inst_matches` matches none), so it is the
   ASCII run before that.
+- **A text-anchored find** (`search()`, `test()`, `find_iter`, `find_all`,
+  `find_at` of a pattern every match of which starts at 0:
+  `forces_text_begin`) is decided at 0 too, and asks the same families the
+  same way (`Rung::TextAnchor`: the walk from 0, then `from0_rest`); a
+  Grapheme one never reaches `Classify`. It used to: its guess judged a
+  no-match on the whole subject, a pure-ASCII subject was scanned for a
+  non-ASCII byte first, `^lit$` ran its memmem to the end, and the iterator
+  classified the subject whole. Measured on `test()` (Apple clang -O3,
+  best of 3) over the Sherlock corpus (595 KB) and over a megabyte of
+  accented prose: `^qzx\b.*` from 7.9 µs and 346 µs to 46 and 17 ns,
+  `^qzx$` from 15.5 and 28.8 µs to 7 ns (`search()`: 48, 19 and 10 ns). With groups,
+  a no-match the walk settles is settled as `match()` settles it
+  (`^(a+)+$` on its ReDoS input: `search()` 33–54 ns to 23–30). A wrong
+  guess costs what it costs `match()`: `^\w+\b` over "héllo world",
+  `search()` 77 to 100 ns.
 - **A Grapheme `search()` / `test()`** at `Classify` (`find_rest`:
   `guess_begin`, then the scan, `find_run`, then the verdict) finds
   the subject's first non-ASCII byte, a fast pass, and does not check its
@@ -1317,7 +1339,7 @@ gate. Syntax, leftmost-first semantics, linear time, and byte-offset reporting
 are unchanged; only the unit of `.`/classes and the offset boundary change.
 
 It keeps the **two programs** of §3 (`prog_`/byte + `cp_prog_`/code-point).
-`run()`/`run_saves()` are parametrized on the program, so the proven grapheme
+`run_saves()` is parametrized on the program, so the proven grapheme
 Pike runs `cp_prog_` unchanged with code-point semantics and byte offsets;
 subjects feed it via `segment_cp` (plain UTF-8 decode).
 

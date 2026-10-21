@@ -206,7 +206,7 @@ struct PlanProbe {
   // The rung a scan starts on, for a caller that wants matches (`test`
   // false) or only whether there is one. One letter per rung:
   //   L literal   A literal alternation   a assert-literal anchor
-  //   ^ the walk from 0   $ the reverse scan from the end
+  //   ^ the find from 0   $ the reverse scan from the end
   //   ? the subject decides
   //   i (?i) prefix   S suffix   I interior literal   W the walk
   //   C the chain   c the assert chain   B the boolean scan   P the Pike
@@ -2254,6 +2254,91 @@ void test_find_guess_grapheme() {
   CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.search(early).matched()); }));
 }
 
+// A text-anchored pattern matches at 0 or nowhere (forces_text_begin), so
+// its find is decided at 0 as match() is (find_from0): for every caller and
+// in either unit the scan starts on Rung::TextAnchor, where the families,
+// each anchored at 0, are judged on what their scan read (match()'s families are
+// put to kDirt in test_match_guess; these are the shapes new to the find:
+// a boolean's scan that stops at its first accept, groups resolved on the
+// walk's span, a literal anchor at 0, empty matches, a CR-LF literal). So
+// each piece of kDirt at the early offsets and further on, over ASCII,
+// accented and CR-LF text: search() and test() agree with the Pike, groups
+// and all; and so does every find surface (find_all, find_iter, find_at
+// stepped on) and match(), with the piece at 0, 1 or 2.
+// And it reads what its answer needs: over 1 MB of accented prose that ends
+// in a combining mark (which, classified whole, sends a Grapheme scan to
+// the Pike, to segment all of it), no match comes from the first bytes,
+// behind a byte the walk from 0 does not handle, and a match at 0 so comes
+// to a scan that steps on (find_all, find_at), which classified its subject
+// whole.
+void test_text_anchored_find() {
+  const char *pats[] = {"^qzx\\b.*", "^qzx$",       "^\\w+\\b",
+                        "^(\\w+)\\s", "^the\\b(.*)", "^(a+)+$",
+                        "^\\s*",      "^",           "\\b^\\w{2}",
+                        "^\\r\\n",    "^[^\\n]*"};
+  const size_t offsets[] = {0, 1, 2, 3, 4, 6, 9, 14, 21, 32, 48, 100};
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const char *pat : pats) {
+      const Regex re(pat, 0, u), pike = pike_twin(pat, 0, u);
+      CHECK(PlanProbe::start(re, false) == '^' &&
+            PlanProbe::start(re, true) == '^');
+      for (const char *body : kGuessBodies) {
+        std::string base;
+        while (base.size() < 160) base += body;
+        CHECK(all_agree(re, pike, base));
+        for (const char *d : kDirt)
+          for (const size_t at : offsets) {
+            const std::string s = inserted(base, at, d);
+            CHECK(at <= 2 ? all_agree(re, pike, s) : first_agrees(re, pike, s));
+          }
+      }
+    }
+  // No match, behind an `é`: no surface runs the Pike. And where the scan
+  // steps on (find_all, find_at), not for a match at 0 either.
+  const std::string prose = accented_prose(1u << 20) + "\xCC\x81",
+                    behind = "\xC3\xA9" + prose;
+  for (const char *pat : {"^qzx\\b.*", "^(qzx)\\b", "^qzx.*", "^The\\b",
+                          "^(The) (qu\\w+)"}) {
+    const Regex re = make_egc(pat);
+    CHECK(!PlanProbe::pike_ran(
+        re, [&] { CHECK(!re.search(behind).matched()); }));
+    CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(!re.test(behind)); }));
+    CHECK(!PlanProbe::pike_ran(
+        re, [&] { CHECK(re.find_all(behind).empty()); }));
+    CHECK(!PlanProbe::pike_ran(
+        re, [&] { CHECK(!re.find_at(behind, 0).m.matched()); }));
+  }
+  for (const char *pat : {"^The\\b", "^(The) (qu\\w+)", "^\\w+\\b"}) {
+    const Regex re = make_egc(pat);
+    CHECK(!PlanProbe::pike_ran(
+        re, [&] { CHECK(re.find_all(prose).size() == 1); }));
+    CHECK(!PlanProbe::pike_ran(
+        re, [&] { CHECK(re.find_at(prose, 0).m.matched()); }));
+  }
+  // A boolean stops at its first accept, where the find goes on to the
+  // leftmost-first end (the subject has no line break: the end of it).
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const Regex re("^The\\b.*", 0, u);
+    CHECK(re.test(prose));
+    CHECK(PlanProbe::dfa_stats(re).scanned < 64);
+  }
+  // A match the walk from 0 decided has its groups resolved on that span:
+  // no DFA locates it again.
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const Regex re("^(\\w+)\\s", 0, u);
+    CHECK(re.search("hello world").group(1).str() == "hello");
+    CHECK(PlanProbe::dfa_stats(re).built == 0);
+  }
+  // `^body$` with groups: the capture walk from 0 yields the end and the
+  // groups in one, in search() as in match().
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const Regex re("^(\\d{4})-(\\d{2})-(\\d{2})$", 0, u);
+    CHECK(re.search("2026-10-21").group(2).str() == "10");
+    CHECK(re.match("2026-10-21").group(3).str() == "21");
+    CHECK(PlanProbe::dfa_stats(re).built == 0);
+  }
+}
+
 // Every ladder names the family it runs on (Ladder::fam), and what engine
 // it reads follows from that family alone. A CodePoint find runs its
 // plan's one family; a Grapheme one takes its ASCII family on a pure-ASCII
@@ -2333,20 +2418,18 @@ void test_find_ladder() {
       CHECK(rows(re) != 'L' && test(re) != 'L');
   for (const Regex &re : {Regex("fox|dog|cat"), make_us("fox|dog|cat")})
     CHECK(rows(re) == 'A' && test(re) == 'A');
-  // A text-anchored pattern: one walk from 0, before the subject is looked
-  // at or the cache fetched — for test() always, for a find when there are
-  // no groups to hand out (with groups, the capture walk of the family is
-  // the one walk to take).
-  CHECK(rows(Regex("^#[0-9a-fA-F]{6}$")) == '^');
-  CHECK(test(Regex("^#[0-9a-fA-F]{6}$")) == '^');
-  CHECK(rows(make_us("^#[0-9a-fA-F]{6}$")) == '^');
-  CHECK(test(make_us("^(\\d+)-(\\d+)$")) == '^');
-  CHECK(rows(make_us("^(\\d+)-(\\d+)$")) == 'W');
-  CHECK(rows(Regex("^(\\d+)-(\\d+)$")) == '?');
+  // A text-anchored pattern: the find from 0, before the subject is looked
+  // at (and the cache fetched, where its walk answers): for every caller,
+  // in either mode, with groups or without, and ahead of a literal anchor's
+  // memmem (`^qzx$`).
+  for (const char *pat : {"^#[0-9a-fA-F]{6}$", "^(\\d+)-(\\d+)$", "^qzx\\b.*",
+                          "^qzx$", "\\Aqzx", "^a|^b", "\\b^\\w+", "^"})
+    for (const Regex &re : {Regex(pat), make_us(pat)})
+      CHECK(rows(re) == '^' && test(re) == '^');
   // An end-anchored pattern: one reverse scan from the end, before the
   // subject is looked at — for every caller, in either mode, with groups or
   // without (they resolve in the span it locates). Not one anchored at the
-  // start too (the walk from 0, or the families, have it), nor one with a
+  // start too (the find from 0 has it), nor one with a
   // branch that can end elsewhere, nor `\Z` or (?m)'s `$`.
   for (const char *pat :
        {"\\w+$", "(\\w+)$", "foo\\d*\\z", "(?:a|bc)\\z|\\d$", "\\w+\\z\\b"})
@@ -2676,10 +2759,9 @@ void test_find_ladder() {
       CHECK(agree(pat, subj));
 
   // A caller's FindCache shared by two Regexes is re-bound by every step
-  // that can reach a rung reading its DFAs. That includes the step that
-  // starts on the walk from 0 and leaves it for the families: a
-  // text-anchored, capture-free pattern over a subject with a non-ASCII
-  // byte in it. (Bound only once the scan stood past that rung, it ran the
+  // that can reach a rung reading its DFAs. That includes the find from 0
+  // (Rung::TextAnchor), which reads them past its walk: a text-anchored
+  // pattern over a subject with a non-ASCII byte in it. (Bound only once the scan stood past that rung, it ran the
   // other Regex's DFAs — and found nothing.)
   {
     Regex::FindCache cache;
@@ -3363,7 +3445,7 @@ void test_find_at() {
     CHECK(us.m.matched() && us.next_pos == 4);
   }
 
-  // The same rule where the scan is the walk from 0 (Rung::TextAnchor): an
+  // The same rule where the scan is the find from 0 (Rung::TextAnchor): an
   // empty match at 0 in front of a cluster that starts with an ASCII byte,
   // e+◌́ or b+ZWJ, resumes past the cluster, which the walk, stopping at the
   // `e` (`b`) it has no step for, does not read.
@@ -3385,8 +3467,9 @@ void test_find_at() {
   }
   // The step itself, against the unit's segmentation: the end of the element
   // at 0 for each piece of kDirt alone, before an ASCII byte, twice over,
-  // behind an ASCII base and behind a CR. (The walk from 0 asks it only with
-  // an ASCII first byte; the step answers for any.)
+  // behind an ASCII base and behind a CR. (The find from 0 asks it whatever
+  // the first byte: past a walk that bails, the families or the Pike find
+  // the empty match at 0.)
   for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
     const Regex re("^a*", 0, u);
     for (const char *d : kDirt) {
@@ -7039,6 +7122,7 @@ int main() {
   test_match_guess();
   test_find_guess();
   test_find_guess_grapheme();
+  test_text_anchored_find();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

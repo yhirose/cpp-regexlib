@@ -5774,13 +5774,8 @@ public:
     // [Tier: AssertAnchor] gate-free assert-literal anchored at 0 (EGC; US is
     // already gate-free).
     if (plan_->assert_anchor_egc()) {
-      int m = static_cast<int>(plan_->assert_.lit.size());
-      if (static_cast<int>(text.size()) >= m &&
-          std::memcmp(text.data(), plan_->assert_.lit.data(), m) == 0 &&
-          literal_boundary_ok(text, 0, m) &&
-          assert_anchor_verify(text, 0, m, /*byte=*/true))
-        return build_dfa_result(text, 0, m);
-      return MatchResult{};
+      const int m = assert_anchor_at0(text);
+      return m < 0 ? MatchResult{} : build_dfa_result(text, 0, m);
     }
     // [Tier: AnchoredOnePass] `^body$` / `^body` validators: one walk from 0
     // decides match() outright, before even the cache fetch. Mode-independent
@@ -5802,24 +5797,25 @@ public:
     // combining mark past the end of a match is no reason to segment the
     // subject for the Pike, and nor is the length of a clean one a reason to
     // scan it. [Tier: Pike] / [Tier: Pike/cp] when no family holds: a
-    // subject none of them serves.
+    // subject none of them serves. (The find of a text-anchored plan asks
+    // the same of the same families: from0_rest.)
     for (const Family f : plan_->match_guesses_) {
       if (f == kFamilyCount) break;
-      // An ASCII family holds for no subject whose first byte is not: what
-      // it read always includes that byte.
-      if ((f == kFamAscii || f == kFamAssertAscii) && !text.empty() &&
-          static_cast<unsigned char>(text[0]) >= 0x80)
-        continue;
-      int reach = 0;
+      if (family_skipped(f, text)) continue;
+      int reach = 0, e = kWalkLocal;
       bool walked = false;
-      const int e = match_end(f, text, cache, sc, reach, walked);
+      if (family_walks(f)) e = from0_walk(text, sc.saves, reach, walked);
+      if (e == kWalkLocal) e = from0_dfa<false>(f, text, cache, reach);
       if (e == LazyDfa::kCap) continue; // a DFA gave up: the next family
       if (!guess_held(f, text, reach)) continue;
       if (e < 0) return MatchResult{};
       return walked ? build_result_bytes(text, sc.saves)
                     : match_located(text, e, sc);
     }
-    return match_pike(text, sc);
+    MatchResult r;
+    ResultSink out{r};
+    from0_pike(text, sc, out);
+    return r;
   }
 
   // Whether `text` contains a match: the first step of the find ladder
@@ -6045,9 +6041,10 @@ private:
     Literal,      // pure printable-ASCII literal: memmem, no classification
     LiteralAlt,   // pure literal alternation: Teddy + ordered memcmp
     AssertAnchor, // gate-free assert-literal: memmem + boundary + flag verify
-    // A text-anchored pattern matches at 0 or nowhere, so one walk from 0
-    // answers before the subject is even classified. For a caller that
-    // reads no groups (a capture-free plan, or Want::Test).
+    // A text-anchored pattern matches at 0 or nowhere, so the find from 0
+    // is the whole find, for every caller (find_from0): the subject is
+    // never classified, and the find reads no further than its walk and
+    // its scans from 0.
     TextAnchor,
     // An end-anchored pattern matches at the text's end or nowhere: one
     // reverse scan from there, over what the match spans, is the find —
@@ -6073,14 +6070,12 @@ private:
     Pike
   };
   // The groups of rungs (by their order above):
-  //   self-locating — the plan is its own find, needing no cache;
-  //   shallow — those, and TextAnchor: ladder_shallow's, needing nothing of
-  //     a scan but its cursor;
+  //   self-locating — the plan is its own find, needing nothing of a scan
+  //     but its cursor (ladder_shallow's);
   //   on a family — the family rungs, from FusedPrefix to Bool.
   static constexpr bool rung_self_locates(Rung r) {
     return r < Rung::TextAnchor;
   }
-  static constexpr bool rung_shallow(Rung r) { return r <= Rung::TextAnchor; }
   static constexpr bool rung_on_family(Rung r) {
     return r > Rung::Classify && r != Rung::Pike;
   }
@@ -10052,8 +10047,9 @@ private:
     // The ladders, per caller ([0] Want::Rows, [1] Want::Test, [2] Want::Test
     // over a short subject — see Regex::ladder_caller); see
     // Regex::ladder_plan.
-    //   start_: where a scan starts — a plan that is its own locate, a
-    //     walk from 0, a CodePoint plan's family, or Rung::Classify.
+    //   start_: where a scan starts — a plan that is its own locate, the
+    //     find from 0 of a text-anchored plan, a CodePoint plan's family,
+    //     or Rung::Classify.
     //   family_: each family's ladder, for the subject to choose among.
     //   fused_: which fused EGC scan the plan has (egc_fused_ok /
     //     egc_fused_collapse_ok, asked once).
@@ -10062,7 +10058,8 @@ private:
     // (Regex::guess_held); one that does not hold is the Pike's answer
     // (match()) or the subject's classified whole (a find). (A CodePoint
     // plan's family serves every subject: its guess always holds.)
-    //   match_guesses_: match()'s, tried in turn.
+    //   match_guesses_: match()'s and a text-anchored find's (from0_rest),
+    //     tried in turn.
     //   find_guess_: a find's and a boolean's (Row: Regex::guess_row) — a
     //     CodePoint plan's one family, which its scans start on; a Grapheme
     //     plan's byte family, guessed on a subject that is not pure ASCII.
@@ -10076,6 +10073,9 @@ private:
     Family match_guesses_[2] = {kFamilyCount, kFamilyCount};
     Family find_guess_[2] = {kFamilyCount, kFamilyCount};
     Family ascii_route_[2] = {kFamilyCount, kFamilyCount};
+    // The families whose find from 0 takes the capture walk first, a bit per
+    // family (Regex::family_walks; worked out by ladder_plan).
+    uint8_t walk_families_ = 0;
     // [Tier: AnchoredOnePass] the `^body$` / `^body` validation shape with a
     // greedy-only, assert-free body: ONE deterministic walk from 0 answers
     // the whole find (see plan_anchored_onepass). The table is the body's
@@ -13446,8 +13446,9 @@ private:
     return false;
   }
 
-  // A guess (match(), find_rest: Plan::match_guesses_, find_guess_): family
-  // `f` has answered for `text` from 0, and its scans read nothing at or
+  // A guess (match() and from0_rest: Plan::match_guesses_; find_rest:
+  // find_guess_): family `f` has answered for `text` from 0, and its scans
+  // read nothing at or
   // past `reach`: one past the furthest byte its DFA scans and walks
   // examined or skipped over (a skip is a claim about the bytes it passes:
   // no match starts there), at least the match's end. Its answer is the
@@ -14331,11 +14332,15 @@ private:
     return d.skip == LazyDfa::kSkipAssert ? look_forward_skip(d, text)
                                           : look_forward_all(d, text);
   }
-  REGEXLIB_NOINLINE int look_forward_all(LazyDfa &d,
-                                         std::string_view text) const {
+  // (`reach_out`: how far it read, for the guess of the find from 0, which
+  // has no skip to take.)
+  REGEXLIB_NOINLINE int look_forward_all(LazyDfa &d, std::string_view text,
+                                         int *reach_out = nullptr) const {
     int reach = 0;
-    return dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(d, text, 0,
-                                                               reach);
+    const int e = dfa_forward_lf_scan</*First=*/true, /*Look=*/true>(
+        d, text, 0, reach);
+    if (reach_out) *reach_out = reach;
+    return e;
   }
   // The skip: every match begins with the prefix, so the scan starts at its
   // next occurrence, and when it stands in a start state again — nothing in
@@ -14689,7 +14694,8 @@ private:
     Saves saves;
   };
 
-  // Total ε-closure work for the current top-level match (reset by run()).
+  // Total ε-closure work for the current top-level match (reset by
+  // run_saves()).
   // Drives the match-time step budget. Per-thread, so concurrent matching on
   // one Regex stays safe.
   static long &match_steps() {
@@ -15117,8 +15123,9 @@ public:
     return n;
   }
   // Rung::Classify: which engine family serves this subject (a scan on `l`,
-  // past its literal and text-anchor rungs). `fna` caches the subject's
-  // first non-ASCII byte once something computes it; `probe` receives the
+  // past its literal rungs; a text-anchored plan never comes here). `fna`
+  // caches the subject's first non-ASCII byte once something computes it;
+  // `probe` receives the
   // (?i) prefix scan if the family has that rung. Inlined, with
   // ladder_gated: a Grapheme scan passes through here on its first step,
   // where two calls handing a Ladder back and forth through memory weigh
@@ -15219,14 +15226,11 @@ public:
   // rung changed it, or set chain_once).
   enum class Step : uint8_t { Again, Yield, Over };
   // The rungs that need nothing of a scan but its cursor: a plan that is
-  // its own locate, and the walk from 0. Again when the walk from 0 met a
-  // byte it does not handle — the ladder is then on Rung::Classify, and
-  // nothing else has changed. `InlineWalk` inlines that walk: for a
-  // one-step find, which tries these rungs before anything the others work
-  // with exists, and drops the cursor after (find_once).
-  template <bool All, bool InlineWalk, class Out>
-  REGEXLIB_ALWAYS_INLINE Step ladder_shallow(std::string_view text, Ladder &l,
-                                             Cursor &c, Out &out) const;
+  // its own locate (rung_self_locates). They never say Again.
+  template <bool All, class Out>
+  REGEXLIB_ALWAYS_INLINE Step ladder_shallow(std::string_view text,
+                                             const Ladder &l, Cursor &c,
+                                             Out &out) const;
   // Rung::Walk (ladder_walk), and the deep rungs (ladder_deep, one dispatch
   // of rung `r`).
   template <bool All, class Out>
@@ -15254,12 +15258,13 @@ public:
   // the engine delays it — the set-up of a whole scan was most of a short
   // search() or test() — so each part is set up only once the rungs before
   // it could not answer: find_once tries the shallow rungs with a cursor
-  // alone; find_run tries the walk (its budget, its save slots), and only
-  // then fetches the cache for the rest.
+  // alone, and a text-anchored plan's find from 0 (find_from0: its walk,
+  // then the cache for the rest); find_run tries the walk (its budget, its
+  // save slots), and only then fetches the cache for the rest.
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool find_once(std::string_view text, Out &out) const;
-  // The step past the shallow rungs: the scan on its ladder (find_run), and
-  // a guess's verdict on what that scan read.
+  // The step past the shallow rungs and the find from 0: the scan on its
+  // ladder (find_run), and a guess's verdict on what that scan read.
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
@@ -15379,8 +15384,10 @@ public:
     // user-supplied FindCache may be shared across Regexes (or across
     // interleaved iterators), and its DFAs are only valid for the Regex
     // they were built for; a step that starts on a rung reading none (the
-    // walk from 0, the Pike) can leave it for one that does, so no rung is
-    // excepted. `sc`: the caller's scratch, null for the cache's own.
+    // Pike) can leave it for one that does, and the find from 0 reads it
+    // past its walk, where from0_rest would otherwise fetch this thread's
+    // own, so no rung is excepted. `sc`: the caller's scratch, null for the
+    // cache's own.
     Scr scratch(Scratch *sc) {
       Scr scr;
       if (rung_self_locates(l_.rung)) return scr;
@@ -15762,9 +15769,9 @@ private:
   // Pike VM match loop: finds the leftmost-first match at or after `start`. On
   // success returns true and moves the capture saves (grapheme/code-point
   // indices) into `out_saves`; the byte-offset/string result is built
-  // separately. Shared by run() (-> MatchResult) and the columnar fills (->
-  // byte-offset rows). `prog` is the grapheme program (EGC) or the code-point
-  // program (UnicodeScalar), with `seg` segmented to match (one grapheme / one
+  // separately: handed to a sink (from0_pike, pike_step) or turned into byte
+  // offsets (capture_saves_bytes). `prog` is the grapheme program (EGC) or
+  // the code-point program (UnicodeScalar), with `seg` segmented to match (one grapheme / one
   // code point per entry) — the loop body is identical either way.
   bool run_saves(const detail::Program &prog, const detail::Segmented &seg,
                  int start, bool anchored, Scratch &sc,
@@ -15835,13 +15842,6 @@ private:
     if (!have) return false;
     out_saves = std::move(matched);
     return true;
-  }
-
-  MatchResult run(const detail::Program &prog, const detail::Segmented &seg,
-                  int start, bool anchored, Scratch &sc) const {
-    std::vector<int> saves;
-    if (!run_saves(prog, seg, start, anchored, sc, saves)) return MatchResult{};
-    return build_result(seg, saves);
   }
 
   // Bounded-backtracking capture engine (RE2 "BitState" / Rust
@@ -16319,7 +16319,7 @@ private:
   }
 
   // [Tier: AnchoredOnePass] the ONE shared decision for every anchored entry
-  // point (assert_find_span / match / test — a
+  // point (match / find_from0 / assert_find_span — a
   // text-anchored pattern matches at 0 or nowhere): 1 = match ([0, e_out)),
   // 0 = definitive no-match (no accept, or `$` unsatisfied — require_end
   // demands the accept land exactly at n), -1 = not decided (table absent,
@@ -16586,9 +16586,10 @@ private:
   }
 
   // The unbounded one-pass walk from 0 as the whole find — a text-anchored
-  // plan's one candidate (WalkDriver::AnchoredStart), or match()'s: the end
-  // (groups in `saves`), -1 when no match starts there, or kWalkLocal on a
-  // non-ASCII byte (the caller's DFA answers). `w` reports how far it read.
+  // plan's one candidate (WalkDriver::AnchoredStart), or the find from 0's
+  // (from0_walk, for match() and from0_rest): the end (groups in `saves`),
+  // -1 when no match starts there, or kWalkLocal on a non-ASCII byte (the
+  // caller's DFA answers). `w` reports how far it read.
   int onepass_from0(std::string_view t, std::vector<int> &saves,
                     OnePassWalk &w) const {
     const int e = cp_onepass_find(t, 0, saves, w);
@@ -16904,59 +16905,106 @@ private:
     return -1;
   }
 
-  // match()'s locate on family `f`, anchored at 0 (its rung of match()):
-  // the end, -1 when no match starts there, or LazyDfa::kCap when a DFA
-  // gave up. `reach` is how far it read — at least the end (see
-  // guess_held); `walked`, that a one-pass walk resolved the groups too, in
-  // sc.saves. The family's DFA locates the end — with captures, the one-pass
-  // walk from 0 first where it can serve (a bail falls to the DFA):
-  // unbounded on Dfa/Ascii (onepass_end_ok keeps the
-  // onepass_unbounded_ / onepass_require_end_ pair read together), `^body$`
+  // The find from 0, in parts. match() and the find of a text-anchored
+  // plan (find_from0) ask the same question (what matches at 0) and share
+  // the parts that answer it; each builds its answer its own way.
+  //
+  // [Tier: AssertAnchor] gate-free assert-literal anchored at 0 (EGC; US is
+  // already gate-free): its end, or -1.
+  int assert_anchor_at0(std::string_view text) const {
+    const int m = static_cast<int>(plan_->assert_.lit.size());
+    if (static_cast<int>(text.size()) >= m &&
+        std::memcmp(text.data(), plan_->assert_.lit.data(), m) == 0 &&
+        literal_boundary_ok(text, 0, m) &&
+        assert_anchor_verify(text, 0, m, /*byte=*/true))
+      return m;
+    return -1;
+  }
+  // The families from 0 (Plan::match_guesses_), each anchored at 0, are
+  // asked in turn by match() and by the find of a text-anchored plan
+  // (from0_rest), the first whose answer holds for the subject as far as
+  // its scan read (guess_held) answering. The parts of a family's answer:
+  //
+  // Whether family `f` is passed over: an ASCII family holds for no subject
+  // whose first byte is not, as what it read always includes that byte.
+  static bool family_skipped(Family f, std::string_view text) {
+    return (f == kFamAscii || f == kFamAssertAscii) && !text.empty() &&
+           static_cast<unsigned char>(text[0]) >= 0x80;
+  }
+  // Whether family `f` takes the unbounded one-pass capture walk from 0
+  // first, which yields the end and the groups in one (a bail falls to the
+  // DFA): on Dfa/Ascii (onepass_end_ok keeps the onepass_unbounded_ /
+  // onepass_require_end_ pair read together), and `^body$`
   // (onepass_anchored_start_) on the assert family the find ladder's walk
-  // takes it on.
-  REGEXLIB_ALWAYS_INLINE int match_end(Family f, std::string_view text,
-                                       FindCache &cache, Scratch &sc,
-                                       int &reach, bool &walked) const {
-    const Plan &p = *plan_;
+  // takes it on. The plan's, so read off it (Plan::walk_families_, from
+  // family_walks_on).
+  bool family_walks(Family f) const {
+    return (plan_->walk_families_ >> f) & 1u;
+  }
+  static bool family_walks_on(const Plan &p, Family f) {
+    if (p.ncap_ == 0) return false;
     switch (f) {
-    // [Tier: Dfa/US | Dfa/EgcByte] the leftmost-first byte DFA.
+    case kFamAscii: return p.onepass_unbounded_;
     case kFamUsDfa:
-      return dfa_forward_lf(cache.dfa(*this, false, kDfaFwda), text, 0, &reach);
     case kFamEgcByte:
-    case kFamEgcByteIp:
-      return dfa_forward_lf(cache.dfa(*this, true, kDfaFwda), text, 0, &reach);
-    // [Tier: Dfa/Ascii] the ordered+cut DFA over the grapheme program.
-    case kFamAscii:
-      if (p.ncap_ > 0 && p.onepass_unbounded_) {
-        const int e = match_walk(text, sc, reach, walked);
-        if (e != kWalkLocal) return e;
-      }
-      return dfa_forward_lf(cache.dfa(*this, false, kDfaFwda), text, 0, &reach);
-    // [Tier: Assert/Ascii | Assert/Byte] the anchored lf assert DFA over the
-    // grapheme programs, or over the byte ones (either unit) — after, for
-    // `^body$` with captures, [Tier: AnchoredOnePass+cap]: the walk from the
-    // single candidate 0 yields the end AND the groups (see
-    // onepass_anchored_start_), on the family the find ladder's walk takes it
-    // on.
-    default: {
-      const bool byte = family_has<kTraitByte>(f);
-      if (p.onepass_anchored_start_ && (p.us_ || !byte)) {
-        const int e = match_walk(text, sc, reach, walked);
-        if (e != kWalkLocal) return e;
-      }
-      return look_forward_lf(cache.dfa(*this, byte, kDfaFwda), text, 0, &reach);
-    }
+    case kFamEgcByteIp: return false;
+    default: // [Tier: AnchoredOnePass+cap]
+      return p.onepass_anchored_start_ &&
+             (p.us_ || !family_has<kTraitByte>(f));
     }
   }
-  // match_end's walk (onepass_from0): its end, or -1, with the groups in
-  // sc.saves (`walked`); kWalkLocal hands the find to the family's DFA.
-  int match_walk(std::string_view text, Scratch &sc, int &reach,
+  // The walk (onepass_from0): its end, or -1, with the groups in `saves`
+  // (`walked`); kWalkLocal hands the find to the family's DFA. It needs no
+  // cache: the save slots only.
+  int from0_walk(std::string_view text, std::vector<int> &saves, int &reach,
                  bool &walked) const {
     OnePassWalk w;
-    const int e = onepass_from0(text, sc.saves, w);
+    const int e = onepass_from0(text, saves, w);
     reach = w.reach(0, static_cast<int>(text.size()));
     walked = e >= 0;
     return e;
+  }
+  // The family's DFA: the end, -1 when no match starts at 0, or
+  // LazyDfa::kCap when it gave up; `reach` is how far it read, at least the
+  // end (see guess_held). `First`: the end of the first accept (as
+  // Rung::Bool's scan), for a caller that asks only whether, where the
+  // leftmost-first end can be the end of the line (`^qzx\b.*`).
+  template <bool First>
+  REGEXLIB_ALWAYS_INLINE int from0_dfa(Family f, std::string_view text,
+                                       FindCache &cache, int &reach) const {
+    switch (f) {
+    // [Tier: Dfa/US | Dfa/EgcByte] the leftmost-first byte DFA; [Tier:
+    // Dfa/Ascii] the ordered+cut DFA over the grapheme program.
+    case kFamUsDfa:
+    case kFamAscii:
+      return dfa_forward_end(cache.dfa(*this, false, kDfaFwda), text, 0,
+                             /*span=*/!First, &reach);
+    case kFamEgcByte:
+    case kFamEgcByteIp:
+      return dfa_forward_end(cache.dfa(*this, true, kDfaFwda), text, 0,
+                             /*span=*/!First, &reach);
+    // [Tier: Assert/Ascii | Assert/Byte] the anchored lf assert DFA over the
+    // grapheme programs, or over the byte ones (either unit).
+    default: {
+      LazyDfa &d = cache.dfa(*this, family_has<kTraitByte>(f), kDfaFwda);
+      return First ? look_forward_all(d, text, &reach)
+                   : look_forward_lf(d, text, 0, &reach);
+    }
+    }
+  }
+  // [Tier: Pike] / [Tier: Pike/cp] the unit's Pike VM anchored at 0, for a
+  // subject no family serves: its end, or -1, the match handed to `out`.
+  template <class Out>
+  REGEXLIB_NOINLINE int from0_pike(std::string_view text, Scratch &sc,
+                                   Out &out) const {
+    const bool cp = plan_->us_;
+    const detail::Segmented seg =
+        cp ? detail::segment_cp(text) : detail::segment(text);
+    if (!run_saves(cp ? plan_->cp_prog_ : plan_->prog_, seg, 0,
+                   /*anchored=*/true, sc, sc.saves))
+      return -1;
+    out.groups(*this, seg, sc.saves);
+    return static_cast<int>(seg.byte_begin[static_cast<size_t>(sc.saves[1])]);
   }
 
   // match()'s result for the span [0, e) a DFA located, the groups resolved
@@ -16969,15 +17017,85 @@ private:
     if (!capture_saves_bytes(t, 0, e, sc, sc.saves)) return MatchResult{};
     return build_result_bytes(t, sc.saves);
   }
-  // match()'s baseline, the unit's anchored Pike VM: [Tier: Pike] over the
-  // grapheme program, [Tier: Pike/cp] over the code-point one.
-  MatchResult match_pike(std::string_view t, Scratch &sc) const {
-    if (plan_->us_) {
-      auto seg = detail::segment_cp(t);
-      return run(plan_->cp_prog_, seg, 0, /*anchored=*/true, sc);
+
+  // The find of a text-anchored plan (Rung::TextAnchor): every match
+  // starts at 0, so the first one from 0 is the leftmost-first one and none
+  // follows it. The match goes to `out`; returns its end (where a DFA's
+  // first accept ended, for a caller that asks only whether: see
+  // from0_dfa), or -1 for none. `scr` is filled by the first part that
+  // needs it. [Tier:
+  // AnchoredOnePass] `^body$` / `^body` validators: one walk from 0
+  // decides, before even the cache fetch, and is all a validator's call
+  // is: inlined for a one-step find (`InlineWalk`: find_once), the rest
+  // out of line (from0_rest). With groups to resolve, the walk still
+  // settles every no-match (`^(a+)+$` on its ReDoS input, the common
+  // validator miss), and a match's groups are resolved on the span it
+  // decided; but `^body$`'s capture walk (family_walks) yields the end and
+  // the groups in one.
+  template <bool InlineWalk, class Out>
+  REGEXLIB_ALWAYS_INLINE int find_from0(std::string_view text, Scr &scr,
+                                        Out &out) const {
+    const bool groups = Out::kGroups && plan_->ncap_ > 0;
+    int walk_end = -1;
+    if (plan_->aop_.ok && !(groups && plan_->onepass_anchored_start_)) {
+      const int r = InlineWalk ? anchored_onepass_once(text, walk_end)
+                               : anchored_onepass_try(text, walk_end);
+      if (r == 0) return -1;
+      if (r > 0 && !groups) {
+        out.span(*this, text, 0, walk_end);
+        return walk_end;
+      }
     }
-    auto seg = detail::segment(t);
-    return run(plan_->prog_, seg, 0, /*anchored=*/true, sc);
+    return from0_rest(text, walk_end, scr, out);
+  }
+  // find_from0 past the walk from 0 (`walk_end`: the end of the match it
+  // decided, whose groups are to be resolved; else -1): `^lit$` at 0, else
+  // the families from 0, else the Pike from 0.
+  template <class Out>
+  REGEXLIB_NOINLINE int from0_rest(std::string_view text, int walk_end,
+                                   Scr &scr, Out &out) const {
+    if (plan_->assert_anchor_egc()) {
+      const int m = assert_anchor_at0(text);
+      if (m >= 0) out.span(*this, text, 0, m);
+      return m;
+    }
+    if (walk_end >= 0) { // the groups, resolved on the walk's span
+      if (!scr.cache) scr_fetch(scr);
+      return emit_located(text, 0, walk_end, *scr.sc, *scr.saves, out)
+                 ? walk_end
+                 : -1;
+    }
+    // The families from 0, as match() asks them (see family_skipped): the
+    // walk before the cache, which it does not need; a caller that asks only
+    // whether stops each DFA at its first accept, and has no groups for a
+    // walk to resolve.
+    for (const Family f : plan_->match_guesses_) {
+      if (f == kFamilyCount) break;
+      if (family_skipped(f, text)) continue;
+      int reach = 0, e = kWalkLocal;
+      bool walked = false;
+      if (Out::kGroups && family_walks(f)) {
+        if (!scr.saves) scr.saves = &walk_saves();
+        e = from0_walk(text, *scr.saves, reach, walked);
+      }
+      if (e == kWalkLocal) {
+        if (!scr.cache) scr_fetch(scr);
+        e = from0_dfa<!Out::kGroups>(f, text, *scr.cache, reach);
+      }
+      if (e == LazyDfa::kCap) continue; // a DFA gave up: the next family
+      if (!guess_held(f, text, reach)) continue;
+      if (e < 0) return -1;
+      if (walked) {
+        out.groups(*this, text, *scr.saves);
+        return e;
+      }
+      // The groups, if any, resolved within the span — bounded by the
+      // leftmost-first end, as the capture engines need (see
+      // cp_onepass_saves).
+      return emit_located(text, 0, e, *scr.sc, *scr.saves, out) ? e : -1;
+    }
+    if (!scr.cache) scr_fetch(scr);
+    return from0_pike(text, *scr.sc, out);
   }
 
   // Byte-offset saves (from the byte backtracker) -> MatchResult; offsets are
@@ -17168,12 +17286,6 @@ private:
 
   // --- Result materialization & bulk fill ---
 
-  MatchResult build_result(const detail::Segmented &seg,
-                           const std::vector<int> &saves) const {
-    MatchResult r;
-    set_result(r, seg, saves);
-    return r;
-  }
   void set_result(MatchResult &r, const detail::Segmented &seg,
                   const std::vector<int> &saves) const {
     auto byte_of = [&](int gi) -> size_t {
@@ -17207,7 +17319,7 @@ private:
     return Match(subj, base, spans, ngroups, names, g);
   }
 
-  // Columnar sibling of build_result: convert the Pike saves (grapheme indices)
+  // Columnar sibling of set_result: convert the Pike saves (grapheme indices)
   // to byte offsets and append one match's row of 2*(ncap_+1) values to `spans`
   // (g0.begin,g0.end, g1..., with kSpanNone for an unmatched group). No
   // strings.
@@ -17410,8 +17522,9 @@ inline void Regex::ladder_plan(Plan &p) {
                                      : Plan::Fused::Suffix)
                  : p.egc_fused_collapse_ok() ? Plan::Fused::Collapse
                                              : Plan::Fused::None;
-  // The families a scan takes without classifying. match()'s, each anchored
-  // at 0: a CodePoint plan's one; a Grapheme plan's ASCII family first —
+  // The families a scan takes without classifying. match()'s and a
+  // text-anchored find's (from0_rest), each anchored at 0: a CodePoint
+  // plan's one; a Grapheme plan's ASCII family first —
   // the subject a scan most often meets, and the cheaper engine there —
   // then its byte family. The byte family first for a CR-LF literal, which
   // the ASCII family refuses on a CR-LF subject (Plan::crlf_fused_lit_).
@@ -17453,6 +17566,10 @@ inline void Regex::ladder_plan(Plan &p) {
     p.match_guesses_[0] = byte_first ? byte : ascii;
     p.match_guesses_[1] = byte_first ? ascii : byte;
   }
+  static_assert(kFamilyCount <= 8, "a bit per family in walk_families_");
+  for (int f = 0; f < kFamilyCount; f++)
+    if (family_walks_on(p, static_cast<Family>(f)))
+      p.walk_families_ |= static_cast<uint8_t>(1u << f);
   // Three kinds of caller (see ladder_caller): a find, a boolean, and a
   // boolean over a short subject — the boolean's ladders with the
   // interior-literal rung given up (limits::kBoolSkipBytes).
@@ -17469,10 +17586,15 @@ inline void Regex::ladder_plan(Plan &p) {
     Ladder &st = p.start_[w];
     st.want = want;
     if (w == 2) st.set(Ladder::kInnerOff); // carried through Rung::Classify
-    // Pure printable-ASCII literal: memmem each match, no subject
-    // classification — the RE2/rure literal scan. Sound on any UTF-8; see
-    // literal_locate.
-    if (p.literal_only_) {
+    if (p.text_anchored_) {
+      // Every match starts at 0 (forces_text_begin): the first from 0 is
+      // the leftmost-first one, and none follows it. Ahead of the literal
+      // anchor's memmem (`^foo$`), which would read the whole subject.
+      st.rung = st.below = Rung::TextAnchor;
+    } else if (p.literal_only_) {
+      // Pure printable-ASCII literal: memmem each match, no subject
+      // classification — the RE2/rure literal scan. Sound on any UTF-8;
+      // see literal_locate.
       st.rung = st.below = Rung::Literal;
     } else if (p.literal_alt_ok()) {
       st.rung = st.below = Rung::LiteralAlt;
@@ -17482,12 +17604,6 @@ inline void Regex::ladder_plan(Plan &p) {
       st.rung = st.below = Rung::EndAnchor;
     } else if (p.assert_anchor_egc()) {
       st.rung = st.below = Rung::AssertAnchor;
-    } else if (p.aop_.ok && (w || p.ncap_ == 0)) {
-      // The walk from 0 needs neither the subject's class nor the cache; a
-      // bail classifies (see ladder_shallow). With groups to resolve it would
-      // be a second walk on every match, and the capture walk of the assert
-      // family is the one to take.
-      st.rung = st.below = Rung::TextAnchor;
     } else if (p.us_) {
       st = find_guess_ladder(p, st);
     } else {
@@ -17599,18 +17715,21 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
 template <class Out>
 inline bool Regex::find_once(std::string_view text, Out &out) const {
   Ladder l = plan_->start_[Out::kGroups ? 0 : 1];
-  if (rung_shallow(l.rung)) {
+  if (rung_self_locates(l.rung) || l.rung == Rung::TextAnchor) {
+    if (l.rung == Rung::TextAnchor) {
+      Scr scr; // filled by the part that needs it
+      return find_from0<true>(text, scr, out) >= 0;
+    }
     Cursor c;
-    const Step st = ladder_shallow<false, true>(text, l, c, out);
-    if (st != Step::Again) return st == Step::Yield;
+    return ladder_shallow<false>(text, l, c, out) == Step::Yield;
   }
   return find_rest(text, l, out);
 }
 
 template <class Out>
 inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
-  // (The short boolean's ladder, past the shallow rungs: they have no
-  // interior-literal rung to give up.)
+  // (The short boolean's ladder, past the shallow rungs and the find from
+  // 0: they have no interior-literal rung to give up.)
   if constexpr (!Out::kGroups) l = ladder_short_test(text, l);
   guess_begin(text, l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
@@ -17662,51 +17781,24 @@ inline bool Regex::find_run(std::string_view text, Scr &scr, Ladder &l,
 }
 
 
-template <bool All, bool InlineWalk, class Out>
-inline Regex::Step Regex::ladder_shallow(std::string_view text, Ladder &l,
-                                         Cursor &c, Out &out) const {
-  switch (l.rung) {
+template <bool All, class Out>
+inline Regex::Step Regex::ladder_shallow(std::string_view text,
+                                         const Ladder &l, Cursor &c,
+                                         Out &out) const {
   // The three literal-ish rungs differ only in which locate they call; all
   // three needles are non-nullable, so e2 > s2 and `pos = e2` always makes
   // progress. They never fall.
-  case Rung::Literal:
-  case Rung::LiteralAlt:
-  case Rung::AssertAnchor:
-    for (;;) {
-      int s2, e2;
-      bool found = l.rung == Rung::Literal
-                       ? literal_locate(text, c.pos, s2, e2)
-                       : l.rung == Rung::LiteralAlt
-                             ? literal_alt_locate(text, c.pos, s2, e2)
-                             : assert_anchor_locate(text, c.pos, s2, e2);
-      if (!found) return Step::Over;
-      out.span(*this, text, s2, e2);
-      c.pos = e2;
-      if (!All) return Step::Yield;
-    }
-  // A text-anchored pattern matches at 0 or nowhere: one walk from 0 is the
-  // whole find.
-  default: { // Rung::TextAnchor
-    if (c.pos > 0) return Step::Over;
-    int e0 = 0;
-    int t = InlineWalk ? anchored_onepass_once(text, e0)
-                       : anchored_onepass_try(text, e0);
-    if (t < 0) {
-      // A byte the walk does not handle: the families answer.
-      l.rung = l.below = Rung::Classify;
-      return Step::Again;
-    }
-    if (t > 0) {
-      out.span(*this, text, 0, e0);
-      // Past 0, where a next step finds nothing; past the element at 0
-      // after an empty match (find_at's next_pos), for a scan that reads
-      // its cursor again (a one-step find drops it, and under All the scan
-      // ends here).
-      c.pos = e0 > 0 ? e0 : All || InlineWalk ? 1 : step_past_empty0(text);
-      if (!All) return Step::Yield;
-    }
-    return Step::Over;
-  }
+  for (;;) {
+    int s2, e2;
+    bool found = l.rung == Rung::Literal
+                     ? literal_locate(text, c.pos, s2, e2)
+                     : l.rung == Rung::LiteralAlt
+                           ? literal_alt_locate(text, c.pos, s2, e2)
+                           : assert_anchor_locate(text, c.pos, s2, e2);
+    if (!found) return Step::Over;
+    out.span(*this, text, s2, e2);
+    c.pos = e2;
+    if (!All) return Step::Yield;
   }
 }
 
@@ -17726,8 +17818,8 @@ inline bool Regex::ladder_step(std::string_view text, Scr &scr, Ladder &l,
     const Rung r = chain_once ? l.below : l.rung;
     if (r != Rung::Pike && c.pos > n) return false;
     const Step st =
-        rung_shallow(r)
-            ? ladder_shallow<All, false>(text, l, c, out)
+        rung_self_locates(r)
+            ? ladder_shallow<All>(text, l, c, out)
             : r == Rung::Walk
                   ? ladder_walk<All>(text, scr, l, c, budget, chain_once, out)
                   : ladder_deep<All>(r, text, scr, l, c, budget, d,
@@ -17782,6 +17874,17 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   const Plan &p = *plan_;
   const int n = static_cast<int>(text.size());
   switch (r) {
+  // A text-anchored plan: the find from 0 is the whole find.
+  case Rung::TextAnchor: {
+    if (c.pos > 0) return Step::Over;
+    const int e = find_from0<false>(text, scr, out);
+    if (e < 0) return Step::Over;
+    // Past 0, where a next step finds nothing: past the element at 0 after
+    // an empty match (find_at's next_pos), for a scan that reads its cursor
+    // again (under All the scan ends here).
+    c.pos = e > 0 ? e : All ? 1 : step_past_empty0(text);
+    return All ? Step::Over : Step::Yield;
+  }
   case Rung::Classify:
     l = ladder_reclassify(text, l, d.fna, d.probe);
     break;
@@ -18055,7 +18158,7 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       if (!All) return Step::Yield;
     }
   }
-  default: break; // the shallow rungs and the walk: not dispatched here
+  default: break; // the self-locating rungs and the walk: not here
   }
   return Step::Again;
 }
@@ -18079,7 +18182,7 @@ inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos,
 
 // One step of the scan find_iter() takes, from `pos`: the same Finder, so
 // the ladder and the empty-match resume rule (Pike: one grapheme /
-// code-point index; the walk from 0: step_past_empty0; the other byte
+// code-point index; the find from 0: step_past_empty0; the other byte
 // rungs: us_step_byte) have exactly one home — this
 // cannot drift from what iteration does. The result is built in place, as
 // search() builds its own. `cache` null: this thread's.

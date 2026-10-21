@@ -1649,13 +1649,12 @@ void invariant_fuzz_egc_onewalk(int iters) {
 //     long, with the literal absent, or present once, or present in the
 //     other case, or only at the very end. The long subjects above are drawn
 //     from the pattern's own letters, which rarely lack anything.
-//   - TextAnchored: Rung::TextAnchor — a text-anchored pattern whose caller
-//     reads no groups: one walk from 0 is the whole find. It was test()'s
-//     and match()'s rung; it is now search()'s and the iterator's as well,
-//     for a capture-free plan. There a second step has to find nothing, an
-//     empty match at 0 must not come back, and a byte the walk has no
-//     transition for hands the find to the families (which then must not
-//     have lost the groups of a pattern that has them).
+//   - TextAnchored: Rung::TextAnchor, a text-anchored pattern's find from 0
+//     (find_from0), for every caller, with groups or without: the walk from
+//     0, then the families from 0 or the Pike. There a second step has to
+//     find nothing, an empty match at 0 must not come back, and a byte the
+//     walk has no transition for hands the find to the families (which then
+//     must not have lost the groups of a pattern that has them).
 //   - LookBack: the interior-literal rung's look-back as a boolean takes it:
 //     32 bytes (limits::kBoolFloorBytes) and, with the part before the
 //     literal still alive there, the scan instead. A pre-part that needs

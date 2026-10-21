@@ -287,9 +287,10 @@ int main() {
       // in front of a trailing one, with the word scan before or behind it.
       {"e[a-z]{3,}q", 0},
       {"e[a-z]{3,}q", kUS},
-      // The walk from 0: a text-anchored, capture-free pattern is one walk
-      // and nothing after it, whether the ladder is stepped or run to its
-      // end — including an empty match at 0, which must not come back.
+      // The find from 0: a text-anchored pattern, with groups or without,
+      // is one find from 0 and nothing after it, whether the ladder is
+      // stepped or run to its end — including an empty match at 0, which
+      // must not come back.
       {"^[a-z]+", 0},
       {"^[a-z]+", kUS},
       {"^[a-z]*", 0},
