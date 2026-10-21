@@ -1723,8 +1723,8 @@ void test_whole_match_capture() {
 // Subjects where a byte engine and the grapheme engine can part: up to ten
 // pieces each — ASCII, CR-LF, a lone CR, NEL, stray bytes, combining marks,
 // ZWJ emoji, flags, Hangul jamo, an Indic conjunct (GB9c), a Prepend — and
-// among them the clean ones (one code point to a cluster) a byte engine
-// answers for.
+// among them the clean ones (one code point, or a stray, to a cluster) a
+// byte engine answers for.
 std::vector<std::string> cluster_subjects() {
   const char *pieces[] = {
       "a", "b", "1", " ", "\n", "\r\n", "\r", "x", ".", "@",
@@ -1784,10 +1784,11 @@ std::string accented_prose(size_t bytes) {
 // pattern ends at the text's end, so the reverse DFA run from there finds
 // the leftmost-first one, reading what it spans and no more — the subject
 // before it is never looked at, so the bytes it read must answer for it:
-// valid UTF-8 (CodePoint), clusters of one code point read from a boundary
-// nothing joins (Grapheme). Every surface agrees with the Pike over tails of
-// stray bytes, combining marks, ZWJ emoji, flags, Hangul jamo, an Indic
-// conjunct (GB9c), a Prepend, CR-LF and NEL, where the scan gives way.
+// any (CodePoint); clusters of one code point or a stray, read from a
+// boundary nothing joins (Grapheme). Every surface agrees with the Pike over
+// tails of combining marks, ZWJ emoji, flags, Hangul jamo, an Indic conjunct
+// (GB9c), a Prepend, CR-LF and NEL, where the scan gives way, and of stray
+// bytes, where it does not.
 void test_end_anchor() {
   const char *pats[] = {"\\w+$", "(\\w+)$", "(\\w)(\\w*)\\z", "[a-z]+$",
                         "foo\\d*$", "(?:\\w+|\\d+)$", "\\w*$", "\\s\\w+$",
@@ -1807,13 +1808,16 @@ void test_end_anchor() {
   // From the end, the find reads what it finds: over 1 MB that ends in the
   // match, the reverse DFA is the one stepped, and over little more than
   // the match — after a stray byte, a combining mark or a CR-LF the scan
-  // never reads, in either mode. A boolean reads less still: up to its first
-  // accept, though the match is the whole text.
-  const std::string body = accented_prose(1u << 20) + "end";
-  for (const char *head : {"", "\xFF", "e\xCC\x81", "\r\n"}) {
-    const std::string s = head + body;
+  // never reads, and after a stray just before where it stops (a cluster
+  // of its own, which nothing joins), in either mode. A boolean reads less
+  // still: up to its first accept, though the match is the whole text.
+  const std::string prose = accented_prose(1u << 20);
+  for (const std::string &s :
+       {prose + "end", "\xFF" + prose + "end", "e\xCC\x81" + prose + "end",
+        "\r\n" + prose + "end", prose + "\xFF end"}) {
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
       const Regex re("(\\w+)$", 0, unit);
+      CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.search(s).matched()); }));
       Regex::FindCache fc;
       const auto all = re.find_all(s, fc);
       CHECK(all.size() == 1 && all[0].begin() == s.size() - 3 &&
@@ -1832,9 +1836,9 @@ void test_end_anchor() {
 // code-point program reads the elements the grapheme engine does, so the
 // groups it finds in the span the byte assert DFA located are the grapheme
 // engine's. match() and every find surface agree with the Pike — over
-// subjects ending in a lone UTF-8 lead byte among the rest, which held
-// Grapheme groups off this tier while its subject check let a stray byte
-// through (`([^ ]+)$` over "ab\xC3" had two answers). Every group here is
+// subjects with stray bytes among the rest: a stray is a cluster of its own
+// that neither engine matches, so the subject check lets it through
+// (`([^ ]+)$` over "ab\xC3": no match in either). Every group here is
 // real: one that spans the whole match is no work for the capture engine
 // (see test_whole_match_capture).
 void test_assert_byte_groups() {
@@ -1920,10 +1924,11 @@ void test_crlf_interior_anchors() {
     CHECK(!PlanProbe::crlf_byte_safe(Regex(pat)));
 }
 
-// What an engine family can part from the unit's engine on, a piece each:
-// stray bytes, a combining mark (alone and on a base), a ZWJ, a flag, a
-// Prepend, Hangul jamo, an Indic conjunct (GB9c), a CR-LF, a lone CR and LF,
-// a NEL, a ZWJ sequence.
+// What an engine family can part from the unit's engine on, a piece each: a
+// combining mark (alone and on a base), a ZWJ, a flag, a Prepend, Hangul
+// jamo, an Indic conjunct (GB9c), a CR-LF, a lone CR and LF, a NEL, a ZWJ
+// sequence; and stray bytes, which a family has to read as the unit does:
+// a cluster of its own that nothing matches.
 const char *const kDirt[] = {
     "\xFF", "\x80", "\xC3", "\xE6\xBC", "\xCC\x81", "e\xCC\x81", "\xE2\x80\x8D",
     "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", "\xD8\x80",
@@ -1954,12 +1959,12 @@ template <class F> void each_dirty_subject(F agrees) {
 // match() does not classify its subject. It tries the plan's families in
 // turn, each anchored at 0 (Plan::match_guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
-// (guess_held). So what a family cannot read (kDirt), placed at every
-// offset of the first 48 bytes and further on, over ASCII, accented and
-// CR-LF text: match() agrees with the Pike, groups and all, in both units. And it reads what its answer needs: over 1 MB of prose that
-// ends in a stray byte, a family answers from the first few bytes, where
-// the subject's class sent match() to the Pike, which segmented the whole
-// of it.
+// (guess_held). So each piece of kDirt, placed at every offset of the first
+// 48 bytes and further on, over ASCII, accented and CR-LF text: match()
+// agrees with the Pike, groups and all, in both units. And it reads what its
+// answer needs: over 1 MB of prose that ends in a combining mark (which, the
+// subject classified whole, sends a Grapheme match() to the Pike, to segment
+// all of it), a family answers from the first few bytes.
 void test_match_guess() {
   const char *pats[] = {
       "\\w+", ".", "\\w", "[a-z]+ing", ".*fox", "[^ ]+ [^ ]+", "x\\w*z",
@@ -2019,7 +2024,7 @@ void test_match_guess() {
     CHECK(PlanProbe::match_guesses(make_us(o.pat)) == o.us);
   }
 
-  const std::string prose = accented_prose(1u << 20) + "\xFF";
+  const std::string prose = accented_prose(1u << 20) + "\xCC\x81";
   for (const char *head : {"", "\xC3\xA9t\xC3\xA9 "})
     for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
       for (const char *pat : {"\\w+", "\\b\\w+\\b"}) {
@@ -2148,14 +2153,13 @@ void test_find_guess() {
 // (Plan::ascii_route_, find_guess_): a pure-ASCII subject takes the ASCII
 // family outright, any other guesses the byte family, judged on what it
 // read; a guess that does not hold classifies the subject whole, as
-// before. So over ASCII, accented and CR-LF text with what a family cannot
-// read at every early offset (kDirt: marks, ZWJ, flags, CR-LF, lone CR /
-// LF, strays), the first
-// match and the boolean are the grapheme Pike's — on patterns the plan
-// guesses for and patterns it does not (a CR-LF read part-way: the pairs
-// below, which a guess would answer wrongly), and with the cluster that
-// begins where the scan stopped (`[a-z]+ing` over "...abxing" + a mark: the
-// mark makes "g" + U+0301 no `g`).
+// before. So over ASCII, accented and CR-LF text with each piece of kDirt
+// at every early offset (marks, ZWJ, flags, CR-LF, lone CR / LF, strays),
+// the first match and the boolean are the grapheme Pike's — on patterns the
+// plan guesses for and patterns it does not (a CR-LF read part-way: the
+// pairs below, which a guess would answer wrongly), and with the cluster
+// that begins where the scan stopped (`[a-z]+ing` over "...abxing" + a mark:
+// the mark makes "g" + U+0301 no `g`).
 void test_find_guess_grapheme() {
   const char *pats[] = {
       "\\w+", "(\\w+) (\\w+)", "[a-z]+ing", "\\w+@\\w+", "x\\w*z",
@@ -2182,9 +2186,10 @@ void test_find_guess_grapheme() {
     CHECK(first_agrees(re, pike, subj));
   }
   // It reads what its answer needs: over 1 MB of accented prose that ends
-  // in a stray byte, the ASCII family answers from the first bytes, where
-  // the subject's class sent the find to the Pike, which segmented it all.
-  const std::string prose = accented_prose(1u << 20) + "\xFF";
+  // in a combining mark (on the last space: a cluster of two code points),
+  // the byte family answers from the first bytes, where the subject's class
+  // sends the find to the Pike, which segments it all.
+  const std::string prose = accented_prose(1u << 20) + "\xCC\x81";
   // (Not `(\\w+)\\s(\\w+)`: `\\s` takes a CR or an LF alone, so it is no
   // guess.)
   for (const char *pat : {"\\w+", "\\b\\w+\\b", "(\\w+) (\\w+)"}) {
@@ -2193,6 +2198,29 @@ void test_find_guess_grapheme() {
     CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
     CHECK(m.matched() && m.begin() < 64);
     CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(prose)); }));
+  }
+  // A stray among what the scan read is a cluster no engine matches, as its
+  // byte automaton matches no stray: no reason for the Pike. On each gate's
+  // way to the byte family: the clusters checked with CR-LF pairs allowed
+  // (`\w+`, the cluster walk) or not (`\w*`, which can match empty:
+  // simple_from), the cluster just after a match of the fused prefix and
+  // suffix scans (`quick \w+`, `\w+ fox`), the bytes the end anchor read
+  // (`\w+$` on a stray at the end: no match).
+  const std::string body = accented_prose(1u << 20) + "end";
+  for (const char *pat :
+       {"\\w+", "\\b\\w+\\b", "(\\w+) (\\w+)", "\\w*", "\\w*x", "[^ ]*s",
+        "quick \\w+", "\\w+ fox", "\\w+$", "(\\w+)$"}) {
+    const Regex re = make_egc(pat);
+    for (const std::string &s :
+         {"The\xFF " + body, "quick brown\xFF " + body, "brown fox\xFF " + body,
+          body + "\xFF the end", body + "\xFF"}) {
+      const bool want =
+          s.back() != '\xFF' || std::string_view(pat).back() != '$';
+      reg::MatchResult m;
+      CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(s); }));
+      CHECK(m.matched() == want);
+      CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(s) == want); }));
+    }
   }
   // Where a DFA of the guess gives up, the guess ends (the Pike, or the
   // subject classified whole): on caches too small, over letters that take

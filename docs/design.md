@@ -261,7 +261,8 @@ the code point before, whose kind the boundary there asks:
 - **CodePoint**: nothing to vet. A stray byte, which no byte DFA matches,
   is matched by nothing in the unit either.
 - **Grapheme**: every cluster among them is one code point — or a CR-LF, to a
-  pattern that cannot split one — checked forward (`egc_simple_from`) from a
+  pattern that cannot split one, or a stray byte, a cluster of its own that
+  nothing matches — checked forward (`egc_simple_from`) from a
   boundary that nothing before it can join: back past any pair that fuses,
   and past a left side that is `Extend` or `ZWJ`, the two rules (GB9c, GB11)
   that look further back. Then the byte program, and the code-point program
@@ -475,12 +476,11 @@ that span.
 an EGC plan every cluster is one code point — or a CR-LF pair that a
 `crlf_byte_safe_` pattern cannot split, with a group boundary or otherwise
 (`crlf_run_ends`) — so the groups it finds in the located span are the grapheme
-engine's: the argument the `Dfa/EgcByte` tier's groups rest on. EGC groups were held off
-this tier while the subject check let a stray byte through: a subject ending in
-a lone UTF-8 lead byte gave `([^ ]+)$` two answers (the grapheme engine gives
-the invalid byte its own cluster and matches; the byte automaton wants a
-continuation byte and does not). `simple_from` and the cluster walk refuse a
-stray byte now, so the subject alone decides. On 4 MB of
+engine's: the argument the `Dfa/EgcByte` tier's groups rest on. A stray
+byte is a cluster of its own (it breaks as a Control) that neither engine
+matches, so `simple_from` and the cluster walk let it through and the two
+still agree: `([^ ]+)$` over a subject ending in a lone UTF-8 lead byte has
+no match in either. On 4 MB of
 non-ASCII prose (Grapheme), `(\w+)$`'s `match()` went from 207 to 2.1 ms,
 `(\w+)@(\w+)\b`'s `search()` from 512 to 11 ms and `\b(\w+)\b`'s `find_all`
 from 628 to 59 ms — the grapheme Pike they ran on segments the whole subject.

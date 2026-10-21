@@ -5799,10 +5799,10 @@ public:
     // The plan's families in turn (Plan::match_guesses_), each anchored at
     // 0: the first whose answer holds for the subject as far as it read
     // (guess_held) answers. The subject is never classified as a whole — a
-    // stray byte or a combining mark past the end of a match is no reason
-    // to segment the subject for the Pike, and nor is the length of a clean
-    // one a reason to scan it. [Tier: Pike] / [Tier: Pike/cp] when no family
-    // holds: a subject none of them serves.
+    // combining mark past the end of a match is no reason to segment the
+    // subject for the Pike, and nor is the length of a clean one a reason to
+    // scan it. [Tier: Pike] / [Tier: Pike/cp] when no family holds: a
+    // subject none of them serves.
     for (const Family f : plan_->match_guesses_) {
       if (f == kFamilyCount) break;
       // An ASCII family holds for no subject whose first byte is not: what
@@ -12324,8 +12324,8 @@ private:
   // Groups included: on such a subject the code-point program the bitstate
   // runs (cp_prog_) reads the elements the grapheme engine does, so the
   // groups it finds in the located span are the grapheme engine's — as for
-  // the Dfa/EgcByte tier's. That rests on egc_simple_from refusing a stray
-  // byte (`([^ ]+)$` over "ab\xC3").
+  // the Dfa/EgcByte tier's. A stray, a cluster of its own that neither
+  // matches, changes nothing there (`([^ ]+)$` over "ab\xC3": no match).
   bool assert_byte_path_ok(std::string_view text, size_t fna) const {
     if (!plan_->byte_assert_path_) return false;
     if (fna == text.size())
@@ -13125,10 +13125,17 @@ private:
       }
       char32_t cp;
       size_t bytes;
-      // Not UTF-8: the byte automaton cannot match the stray byte the Pike
-      // gives its own cluster, so the subject is not eligible.
-      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp))
-        return false;
+      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp)) {
+        // A stray: a cluster of its own, which nothing matches, as nothing
+        // in the byte automaton does. It breaks as a Control, so it joins
+        // nothing on either side (GB4, GB5). (A branch of its own: folded
+        // into the step above, the loop runs slower over CJK text.)
+        off++;
+        lp = unicode::_grapheme_break_properties::get_value(
+            unicode::utf8::kStrayCp);
+        have_prev = true;
+        continue;
+      }
       off += bytes;
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       if (have_prev && gb_fuses(lp, rp)) return false;
@@ -13171,10 +13178,11 @@ private:
         off = skip_to_nonascii(p, n, off); // jump the ASCII run (incl. \r\n)
         if (off >= n) break;
       }
-      // off is at a non-ASCII lead byte, and its left neighbor (the code point
-      // ending at off) is ASCII or absent: either we just skipped an ASCII run,
-      // or off == start, the caller's first-non-ASCII index. That is exactly
-      // egc_cluster_walk's precondition, so it does the cluster walk.
+      // off is at a non-ASCII byte that starts an element (a lead byte, or a
+      // stray), and its left neighbor (the element ending at off) is ASCII
+      // or absent: either we just skipped an ASCII run, or off == start, the
+      // caller's first-non-ASCII index. That is exactly egc_cluster_walk's
+      // precondition, so it does the cluster walk.
       bool bad = false;
       off = egc_cluster_walk(s8, off, bad);
       if (bad) return false;
@@ -13215,10 +13223,8 @@ private:
         prev_pos = off - 1;
         continue;
       }
-      char32_t cp;
-      size_t bytes;
-      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp))
-        return false; // a stray byte: see simple_from
+      char32_t cp; // (a stray: see simple_from)
+      const size_t bytes = unicode::utf8::decode_or_byte(d + off, n - off, cp);
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       bool fuse =
           have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF);
@@ -13235,14 +13241,15 @@ private:
   }
 
   // Walk the non-ASCII cluster neighborhood starting at `off` (a non-ASCII
-  // lead byte), rejecting any non-CR-LF multi-code-point cluster. Returns the
-  // resume offset (the next ASCII byte after the clusters close) or sets `bad`
-  // and returns SIZE_MAX when a disqualifying cluster is found. This is the
-  // one cluster walk: simple_from_crlf_ok's eligibility pass and the fused EGC
-  // scans all run it. The left neighbor is ASCII whenever the scan resumed from
-  // an ASCII run; at a call start it may be a match end whose left byte is a
-  // UTF-8 continuation byte — start fresh there (the preceding match's
-  // end-fusion was already vetted by egc_match_clean).
+  // byte that starts an element: a lead byte, or a stray), rejecting any
+  // non-CR-LF multi-code-point cluster. Returns the resume offset (the next
+  // ASCII byte after the clusters close) or sets `bad` and returns SIZE_MAX
+  // when a disqualifying cluster is found. This is the one cluster walk:
+  // simple_from_crlf_ok's eligibility pass and the fused EGC scans all run
+  // it. The left neighbor is ASCII whenever the scan resumed from an ASCII
+  // run; at a call start it may be a match end whose left byte is a UTF-8
+  // continuation byte — start fresh there (the preceding match's end-fusion
+  // was already vetted by egc_match_clean).
   static size_t egc_cluster_walk(std::string_view text, size_t off,
                                  bool &bad) {
     using GB = unicode::GraphemeBreak;
@@ -13254,13 +13261,8 @@ private:
                 ? unicode::_grapheme_break_properties::get_value(p[off - 1])
                 : GB::Unassigned;
     while (off < n) {
-      char32_t cp;
-      size_t bytes;
-      if (!unicode::utf8::decode_codepoint(d + off, n - off, bytes, cp)) {
-        bad = true; // a stray byte: see simple_from
-        return SIZE_MAX;
-      }
-      off += bytes;
+      char32_t cp; // (a stray: see simple_from)
+      off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       if (have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF)) {
         bad = true;
@@ -16789,16 +16791,15 @@ private:
 
   // Whether the bytes [q, n) a reverse scan from the end read can answer for
   // the subject without a look at the rest of it: any (CodePoint); clusters
-  // of one code point, or a CR-LF to a pattern that cannot split one, from a
-  // boundary nothing before `q` can join (Grapheme).
+  // of one code point, a stray, or a CR-LF to a pattern that cannot split
+  // one, from a boundary nothing before `q` can join (Grapheme).
   bool end_region_ok(std::string_view text, size_t q) const {
     if (plan_->us_) return true;
     // Back past pairs that fuse, and past an Extend or ZWJ left side (GB9c
-    // and GB11 look further back from those). A stray byte is no code point.
+    // and GB11 look further back from those). (A stray, a Control, stops it.)
     using GB = unicode::GraphemeBreak;
     while (q > 0 && q < text.size()) {
       const Decoded l = cp_before(text, static_cast<int>(q));
-      if (l.len == 1 && l.cp >= 0x80) return false;
       const GB lp = unicode::_grapheme_break_properties::get_value(l.cp);
       if (lp != GB::Extend && lp != GB::ZWJ &&
           !gb_fuses(lp, unicode::_grapheme_break_properties::get_value(
