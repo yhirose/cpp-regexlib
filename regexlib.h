@@ -1418,50 +1418,6 @@ inline size_t decode_or_byte(const char *s8, size_t l, char32_t &cp) {
   return 1;
 }
 
-// Is s8[from..n) well-formed UTF-8 (`from` a code-point boundary)? The same
-// RFC 3629 test as decode_codepoint, written out for speed: eight ASCII bytes
-// at a time, then the lead byte picks the check. A byte automaton matches code
-// points, so a stray byte is out of its reach; the engines serve a subject
-// that is not valid with the Pike, which reads each such byte as an element of
-// its own (decode_or_byte).
-inline bool valid_from(const char *s8, size_t n, size_t from = 0) {
-  const unsigned char *p = reinterpret_cast<const unsigned char *>(s8);
-  const auto cont = [&](size_t i) { return (p[i] & 0xC0) == 0x80; };
-  for (size_t off = from; off < n;) {
-    uint64_t w;
-    while (off + 8 <= n) {
-      std::memcpy(&w, p + off, 8);
-      if (w & 0x8080808080808080ull) break;
-      off += 8;
-    }
-    if (off >= n) break;
-    const unsigned c = p[off];
-    if (c < 0x80) {
-      off++;
-    } else if (c < 0xC2) { // a continuation byte alone, or an overlong C0/C1
-      return false;
-    } else if (c < 0xE0) {
-      if (off + 2 > n || !cont(off + 1)) return false;
-      off += 2;
-    } else if (c < 0xF0) {
-      if (off + 3 > n || !cont(off + 1) || !cont(off + 2)) return false;
-      const unsigned b1 = p[off + 1];
-      if ((c == 0xE0 && b1 < 0xA0) || (c == 0xED && b1 > 0x9F))
-        return false; // overlong, surrogate
-      off += 3;
-    } else {
-      if (c > 0xF4 || off + 4 > n || !cont(off + 1) || !cont(off + 2) ||
-          !cont(off + 3))
-        return false;
-      const unsigned b1 = p[off + 1];
-      if ((c == 0xF0 && b1 < 0x90) || (c == 0xF4 && b1 > 0x8F))
-        return false; // overlong, past U+10FFFF
-      off += 4;
-    }
-  }
-  return true;
-}
-
 // Where the code point that holds byte `at` would start: back over at most
 // three continuation bytes, to the nearest lead (or as far as they go).
 inline size_t cp_start(const char *s8, size_t at) {
@@ -1485,6 +1441,21 @@ inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
     return bytes;
   cp = kStrayCp;
   return 1;
+}
+
+// Is boundary `at` of s8[0, n) inside a code point — between two bytes of
+// one well-formed encoding? Every other boundary is one a left-to-right
+// decode (decode_or_byte) lands on, the ones around a stray among them.
+// (A code point holding the byte at `at` starts at the nearest lead within
+// three bytes before it, if anywhere: see decode_before.)
+inline bool inside(const char *s8, size_t n, size_t at) {
+  if (at == 0 || at >= n ||
+      (static_cast<unsigned char>(s8[at]) & 0xC0) != 0x80)
+    return false;
+  const size_t j = cp_start(s8, at); // < at: s8[at] continues
+  size_t bytes;
+  char32_t cp;
+  return decode_codepoint(s8 + j, n - j, bytes, cp) && j + bytes > at;
 }
 
 } // namespace utf8
@@ -1577,12 +1548,9 @@ inline size_t decode_before(const char *s8, size_t at, char32_t &cp) {
 #if defined(__GNUC__) || defined(__clang__)
 #define REGEXLIB_ALWAYS_INLINE __attribute__((always_inline))
 #define REGEXLIB_NOINLINE __attribute__((noinline))
-// ... and out of line with everything it calls inlined into it.
-#define REGEXLIB_NOINLINE_FLAT __attribute__((noinline, flatten))
 #else
 #define REGEXLIB_ALWAYS_INLINE
 #define REGEXLIB_NOINLINE
-#define REGEXLIB_NOINLINE_FLAT
 #endif
 
 // A value the optimizer is not to see through: what went into it stays one
@@ -3608,32 +3576,6 @@ struct Program {
 using ByteRange = std::pair<unsigned char, unsigned char>;
 using ByteSeq = std::vector<ByteRange>;
 
-// Unlike unicode::utf8::encode_codepoint this also encodes surrogates (as the
-// 3-byte form): a class range may be written to include them, and the range
-// splitter needs a byte pattern for every code point it is handed.
-inline int utf8_encode_cp(char32_t cp, unsigned char b[4]) {
-  if (cp <= 0x7F) {
-    b[0] = static_cast<unsigned char>(cp);
-    return 1;
-  }
-  if (cp <= 0x7FF) {
-    b[0] = static_cast<unsigned char>(0xC0 | (cp >> 6));
-    b[1] = static_cast<unsigned char>(0x80 | (cp & 0x3F));
-    return 2;
-  }
-  if (cp <= 0xFFFF) {
-    b[0] = static_cast<unsigned char>(0xE0 | (cp >> 12));
-    b[1] = static_cast<unsigned char>(0x80 | ((cp >> 6) & 0x3F));
-    b[2] = static_cast<unsigned char>(0x80 | (cp & 0x3F));
-    return 3;
-  }
-  b[0] = static_cast<unsigned char>(0xF0 | (cp >> 18));
-  b[1] = static_cast<unsigned char>(0x80 | ((cp >> 12) & 0x3F));
-  b[2] = static_cast<unsigned char>(0x80 | ((cp >> 6) & 0x3F));
-  b[3] = static_cast<unsigned char>(0x80 | (cp & 0x3F));
-  return 4;
-}
-
 // Recurse over byte positions [i, n): `lo`/`hi` are the per-position byte
 // bounds, `cur` the sequence accumulated for [0, i). Continuation bytes span
 // [0x80, 0xBF].
@@ -3691,19 +3633,29 @@ inline void utf8_seq_rec(std::array<unsigned char, 4> lo,
 
 inline void utf8_ranges_same_len(char32_t lo, char32_t hi,
                                  std::vector<ByteSeq> &out) {
-  unsigned char lb[4], hb[4];
-  int n = utf8_encode_cp(lo, lb);
-  utf8_encode_cp(hi, hb);
+  // (No surrogate gets here: utf8_ranges splits them out.)
+  char lb[4], hb[4];
+  const int n = static_cast<int>(unicode::utf8::encode_codepoint(lo, lb));
+  unicode::utf8::encode_codepoint(hi, hb);
   std::array<unsigned char, 4> la{}, ha{};
   for (int k = 0; k < n; k++) {
-    la[k] = lb[k];
-    ha[k] = hb[k];
+    la[k] = static_cast<unsigned char>(lb[k]);
+    ha[k] = static_cast<unsigned char>(hb[k]);
   }
   utf8_seq_rec(la, ha, n, 0, {}, out);
 }
 
-// Append the UTF-8 byte-range sequences for code-point range [lo, hi].
+// Append the UTF-8 byte-range sequences for the scalar values in code-point
+// range [lo, hi]. A class range may be written across the surrogates, but
+// they have no UTF-8 form: the three bytes of one are three strays to the
+// decoder (decode_codepoint), and no automaton may take them for a code
+// point.
 inline void utf8_ranges(char32_t lo, char32_t hi, std::vector<ByteSeq> &out) {
+  if (lo <= 0xDFFF && hi >= 0xD800) {
+    if (lo < 0xD800) utf8_ranges(lo, 0xD7FF, out);
+    if (hi > 0xDFFF) utf8_ranges(0xE000, hi, out);
+    return;
+  }
   static const char32_t bound[] = {0x7F, 0x7FF, 0xFFFF, 0x10FFFF};
   char32_t s = lo;
   for (char32_t b : bound) {
@@ -6124,16 +6076,11 @@ private:
   //   self-locating — the plan is its own find, needing no cache;
   //   shallow — those, and TextAnchor: ladder_shallow's, needing nothing of
   //     a scan but its cursor;
-  //   classified — Classify and what follows it (before it, no rung reads
-  //     the subject's class; EndAnchor vets what it reads);
   //   on a family — the family rungs, from FusedPrefix to Bool.
   static constexpr bool rung_self_locates(Rung r) {
     return r < Rung::TextAnchor;
   }
   static constexpr bool rung_shallow(Rung r) { return r <= Rung::TextAnchor; }
-  static constexpr bool rung_classified(Rung r) {
-    return r >= Rung::Classify;
-  }
   static constexpr bool rung_on_family(Rung r) {
     return r > Rung::Classify && r != Rung::Pike;
   }
@@ -10113,12 +10060,12 @@ private:
     // The families a scan takes without classifying its subject,
     // kFamilyCount where none. A guess is judged on what it read
     // (Regex::guess_held); one that does not hold is the Pike's answer
-    // (match(), a CodePoint find) or the subject's classified whole (a
-    // Grapheme find).
+    // (match()) or the subject's classified whole (a find). (A CodePoint
+    // plan's family serves every subject: its guess always holds.)
     //   match_guesses_: match()'s, tried in turn.
     //   find_guess_: a find's and a boolean's (Row: Regex::guess_row) — a
-    //     CodePoint plan's one family; a Grapheme plan's
-    //     byte family, on a subject that is not pure ASCII.
+    //     CodePoint plan's one family, which its scans start on; a Grapheme
+    //     plan's byte family, guessed on a subject that is not pure ASCII.
     //   ascii_route_: a Grapheme find's or boolean's family on a pure-ASCII
     //     subject, taken outright: it is sound there, so no guess.
     enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
@@ -11957,13 +11904,13 @@ private:
     return f;
   }
 
-  // Code-point-aware empty-width flags at byte boundary `sp`: the code point
-  // ending at sp against the one starting there. A byte interior to a
-  // multi-byte code point (a UTF-8 continuation byte) is no boundary, so no
-  // assertion fires there (return 0).
+  // Code-point-aware empty-width flags at byte boundary `sp`: the element
+  // ending at sp against the one starting there. A boundary inside a code
+  // point is none, so no assertion fires there (return 0); the ones around a
+  // stray are.
   int empty_flags_cp(std::string_view t, int sp, int n) const {
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
-    if (sp > 0 && sp < n && (p[sp] & 0xC0) == 0x80) return 0; // mid-code-point
+    if (unicode::utf8::inside(t.data(), t.size(), static_cast<size_t>(sp)))
+      return 0;
     const bool has_prev = sp > 0, has_next = sp < n;
     const char32_t prev = has_prev ? cp_before(t, sp).cp : 0;
     const char32_t next = has_next ? cp_at(t, sp).cp : 0;
@@ -12194,22 +12141,19 @@ private:
       if (!h) return false;
       int ls = static_cast<int>(h - p);
       int e = ls + m;
-      // Walk left over word code points to the start of the maximal \w-run.
-      int ws = ls;
+      // Walk left over word code points to the start of the maximal \w-run,
+      // an element at a time (a stray is no word character), counting them:
+      // the pre-literal `\w{rmin,rmax}` must cover exactly [ws, ls).
+      int ws = ls, wlen = 0;
       while (ws > 0) {
-        int j = ws - 1; // step back to the lead byte of the preceding code point
-        while (j > 0 && (static_cast<unsigned char>(text[j]) & 0xC0) == 0x80)
-          j--;
-        if (!word_cp_at(text, j, n)) break;
-        ws = j;
+        const Decoded d = cp_before(text, ws);
+        if (!(d.cp < 0x80
+                  ? detail::ascii_word_byte(static_cast<unsigned char>(d.cp))
+                  : detail::is_word_cp(d.cp)))
+          break;
+        ws -= d.len;
+        wlen++;
       }
-      // The pre-literal `\w{rmin,rmax}` must cover exactly [ws, ls) by count.
-      // The walk above only extended the run over code points word_cp_at
-      // decoded successfully, so [ws, ls) is a clean sequence of complete code
-      // points — counting them is counting the non-continuation bytes.
-      int wlen = 0;
-      for (int k = ws; k < ls; k++)
-        wlen += (static_cast<unsigned char>(text[k]) & 0xC0) != 0x80;
       if (wlen >= plan_->assert_.ws_rmin &&
           (plan_->assert_.ws_rmax < 0 || wlen <= plan_->assert_.ws_rmax)) {
         s_out = ws;
@@ -12375,8 +12319,7 @@ private:
   // gate matches the regular byte path (a CR-LF interior carries no match
   // boundary when the pattern is CRLF-byte-safe and non-empty). `fna` is the
   // subject's first non-ASCII byte. (A CodePoint plan's byte assert DFA
-  // reproduces code-point matching on any well-formed UTF-8, which is all the
-  // unit's own check asks: us_stray.)
+  // reproduces code-point matching on any subject.)
   //
   // Groups included: on such a subject the code-point program the bitstate
   // runs (cp_prog_) reads the elements the grapheme engine does, so the
@@ -13446,20 +13389,6 @@ private:
     return l;
   }
 
-  // `l` for a scan over `text` — or the Pike, for a CodePoint subject with a
-  // stray byte (us_stray), which no byte automaton reads, where `l` stands
-  // on a family's rung. (A rung ahead of Classify reads no subject class, or
-  // vets what it reads; Classify checks for itself.)
-  Ladder unstray(std::string_view text, Ladder l) const {
-    return rung_on_family(l.rung) && us_stray(text)
-               ? pike_ladder(l.want)
-               : l;
-  }
-  // Is this a CodePoint plan's subject with a stray byte in it?
-  bool us_stray(std::string_view text) const {
-    return plan_->us_ && !family_sound(kFamUsDfa, text, first_nonascii(text));
-  }
-
   // Whether the EGC byte family serves this subject (`i` its first non-ASCII
   // byte, shared with ascii_grapheme_ok at the dispatch site so the subject
   // is classified once): one the byte programs answer for (byte_sound), and
@@ -13498,13 +13427,13 @@ private:
   // and whether a cheaper one takes a pure-ASCII subject: see ladder_gated).
   // `i`: no byte before it is non-ASCII — the first non-ASCII byte of
   // `text`, or its start (the ASCII family asks for the first exactly, and
-  // refuses anything else). A CodePoint family's: no stray byte, which no
-  // byte automaton reads.
+  // refuses anything else). A CodePoint family's: every subject — its byte
+  // automata, like the unit, match no stray byte (utf8::kStrayCp).
   REGEXLIB_ALWAYS_INLINE bool family_sound(Family f, std::string_view text,
                                            size_t i) const {
     switch (f) {
     case kFamUsDfa:
-    case kFamUsAssert: return utf8_from(text, i);
+    case kFamUsAssert: return true;
     case kFamAscii:
     case kFamAssertAscii: return ascii_grapheme_ok(text, i);
     case kFamEgcByte:
@@ -13515,17 +13444,6 @@ private:
     return false;
   }
 
-  // ... a CodePoint family's: `text` from `i` is RFC 3629 UTF-8. (The pass
-  // from a non-ASCII byte on is out of line: inlined, its loop crowds the
-  // code of the scan it joins.)
-  static bool utf8_from(std::string_view text, size_t i) {
-    return i >= text.size() || utf8_valid_rest(text.data(), text.size(), i);
-  }
-  REGEXLIB_NOINLINE_FLAT static bool utf8_valid_rest(const char *s, size_t n,
-                                                     size_t i) {
-    return unicode::utf8::valid_from(s, n, i);
-  }
-
   // A guess (match(), find_rest: Plan::match_guesses_, find_guess_): family
   // `f` has answered for `text` from 0, and its scans read nothing at or
   // past `reach`: one past the furthest byte its DFA scans and walks
@@ -13534,31 +13452,28 @@ private:
   // unit's when the family is sound (family_sound) for the prefix R its
   // answer depended on (guess_end). What follows does not matter: nothing
   // read it. A gate that holds for the whole subject holds for R, so a
-  // subject no guess holds for is one no family served either.
+  // subject no guess holds for is one no family served either. (A
+  // CodePoint family's holds for every subject: family_sound.)
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach) const {
+    if (!family_has<kTraitGrapheme>(f)) return true;
     // (Not substr: guess_end is within `text`, and GCC calls substr here.)
-    const std::string_view r(text.data(), guess_end(text, reach, f));
+    const std::string_view r(text.data(), guess_end(text, reach));
     return family_sound(f, r, first_nonascii(r));
   }
-  // ... R's end: [0, reach) completed to a code point, and closed by the
-  // family's own rules past what its scans read. The code point at `reach`
-  // too, where the answer can depend on it without a scan reporting it: an
-  // assert engine's look reads it as context (its literal-led verifies
-  // decode it without a DFA), and a Grapheme family's stop means what it
-  // does only if that code point does not join the one before. And for a
-  // Grapheme family an LF after a CR there, so that no pair is split (to a
-  // CodePoint one each is a code point of its own).
+  // ... R's end (a Grapheme family's): [0, reach) and the code point at
+  // `reach`, completed — the stop means what it does only if that code point
+  // does not join the one before, and an assert engine's look reads it as
+  // context (its literal-led verifies decode it without a DFA) — and an LF
+  // after a CR there, so that no pair is split.
   REGEXLIB_ALWAYS_INLINE static size_t guess_end(std::string_view text,
-                                                 int reach, Family f) {
-    const bool pair = family_has<kTraitGrapheme>(f);
-    const bool next = family_has<kTraitGrapheme | kTraitAssert>(f);
+                                                 int reach) {
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
     size_t end = static_cast<size_t>(reach);
-    if (next && end < n) end++;
+    if (end < n) end++;
     while (end < n && (p[end] & 0xC0) == 0x80) end++;
-    if (pair && end < n && p[end] == '\n' && end > 0 && p[end - 1] == '\r')
+    if (end < n && p[end] == '\n' && end > 0 && p[end - 1] == '\r')
       end++;
     return end;
   }
@@ -13629,16 +13544,13 @@ private:
     return !pending_cr; // a trailing CR has no LF
   }
 
-  // Advance past an empty match in UnicodeScalar mode: step by one whole code
-  // point (its UTF-8 length), not one byte, so empty matches land only on code-
-  // point boundaries (one per code point, matching grapheme positions on
-  // single-code-point input). A stray continuation byte counts as one byte.
+  // Advance past an empty match in UnicodeScalar mode: step by one whole
+  // element (a code point's UTF-8 length, a stray's one byte), not one byte,
+  // so empty matches land only on element boundaries (one per code point,
+  // matching grapheme positions on single-code-point input).
   static int us_step_byte(std::string_view t, int pos) {
     if (pos < 0 || pos >= static_cast<int>(t.size())) return pos + 1;
-    unsigned char c = static_cast<unsigned char>(t[pos]);
-    int len =
-        c < 0x80 ? 1 : (c < 0xC0 ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4)));
-    return pos + len;
+    return pos + cp_at(t, pos).len;
   }
 
   // The prefilter skips, folded into the DFA scans. Both are only ever called
@@ -14820,19 +14732,19 @@ public:
     friend struct detail::PlanProbe;
 
     // How far forward the scans of a guess read (LazyDfa::hi): from 0, and
-    // the furthest — over the forward DFAs of one program set, the byte
-    // programs' (`byte`) or the others: a family's rungs run those alone
+    // the furthest — over the forward DFAs of the byte programs: a guess is
+    // a byte family's (Plan::find_guess_), whose rungs run those alone
     // (Regex::ladder_byte). (The reverse DFAs read within what a forward one
     // did. Spelled out: as a loop, the two cost a short test() 19
     // instructions more.)
-    void reach_from_zero(bool byte) {
-      std::optional<LazyDfa> *d = set(byte);
+    void reach_from_zero() {
+      std::optional<LazyDfa> *d = set(true);
       if (d[kDfaBool]) d[kDfaBool]->hi = 0;
       if (d[kDfaFwd]) d[kDfaFwd]->hi = 0;
       if (d[kDfaFwda]) d[kDfaFwda]->hi = 0;
     }
-    int reach(bool byte) const {
-      const std::optional<LazyDfa> *d = set(byte);
+    int reach() const {
+      const std::optional<LazyDfa> *d = set(true);
       int hi = d[kDfaBool] ? d[kDfaBool]->hi : 0;
       if (d[kDfaFwd] && d[kDfaFwd]->hi > hi) hi = d[kDfaFwd]->hi;
       if (d[kDfaFwda] && d[kDfaFwda]->hi > hi) hi = d[kDfaFwda]->hi;
@@ -15150,8 +15062,9 @@ public:
   static Plan::Row guess_row(const Ladder &l) {
     return l.want == Want::Rows ? Plan::kFindRow : Plan::kTestRow;
   }
-  // The ladder of the family a scan on `l` guesses (the Pike with none):
-  // a CodePoint plan's, where a scan starts (ladder_plan) and at Classify.
+  // The ladder of the plan's find_guess_ family for a scan on `l` (the Pike
+  // with none): a CodePoint plan's, where a scan starts (ladder_plan) and at
+  // Classify.
   static Ladder find_guess_ladder(const Plan &p, const Ladder &l) {
     const Family f = p.find_guess_[guess_row(l)];
     return f == kFamilyCount ? pike_ladder(l.want)
@@ -15334,36 +15247,28 @@ public:
     }
     return plan_->start_[2];
   }
-  // A scan that would classify its subject guesses instead
+  // A Grapheme scan that would classify its subject guesses instead
   // (Plan::find_guess_), and the answer stands if what the scan read holds
-  // it out (guess_held).
-  // A CodePoint scan does not ask first whether its subject has a stray
-  // byte (us_stray), which no byte automaton reads: it guesses it reads
-  // none, on its family. (Not on a rung before Classify: EndAnchor reads
-  // from the end, and vets what it read.) A Grapheme one, at Classify,
-  // finds the subject's first non-ASCII byte, a fast pass, but does not
-  // check its clusters, which is the slow one: a pure-ASCII subject takes
-  // the plan's ASCII family outright (no guess: it is sound there), any
-  // other guesses the byte family — where the plan has them (see
-  // ladder_plan).
+  // it out (guess_held). At Classify it finds the subject's first non-ASCII
+  // byte, a fast pass, but does not check its clusters, which is the slow
+  // one: a pure-ASCII subject takes the plan's ASCII family outright (no
+  // guess: it is sound there), any other guesses the byte family — where
+  // the plan has them (see ladder_plan). (A CodePoint scan has nothing to
+  // guess: its family serves every subject.)
   REGEXLIB_ALWAYS_INLINE void guess_begin(std::string_view text,
                                           Ladder &l) const {
-    if (plan_->us_) {
-      if (!rung_classified(l.rung)) return;
-      if (l.rung == Rung::Classify) l = ladder_guessed(l);
-    } else {
-      const Plan::Row row = guess_row(l);
-      const Family route = plan_->ascii_route_[row],
-                   guess = plan_->find_guess_[row];
-      if (l.rung != Rung::Classify ||
-          (route == kFamilyCount && guess == kFamilyCount))
-        return;
-      const bool ascii = first_nonascii(text) == text.size();
-      const Family f = ascii ? route : guess;
-      if (f == kFamilyCount) return;
-      l = ladder_on(f, l);
-      if (ascii) return; // sound: no guess
-    }
+    if (plan_->us_) return;
+    const Plan::Row row = guess_row(l);
+    const Family route = plan_->ascii_route_[row],
+                 guess = plan_->find_guess_[row];
+    if (l.rung != Rung::Classify ||
+        (route == kFamilyCount && guess == kFamilyCount))
+      return;
+    const bool ascii = first_nonascii(text) == text.size();
+    const Family f = ascii ? route : guess;
+    if (f == kFamilyCount) return;
+    l = ladder_on(f, l);
+    if (ascii) return; // sound: no guess
     l.set(Ladder::kSpec);
   }
   // A one-step scan on `l` from 0, to its first answer: the walk first,
@@ -15390,9 +15295,7 @@ public:
     // `cache` null: this thread's, fetched by the first step that needs one.
     Finder(const Regex &re, std::string_view text, FindCache *cache)
         : re_(&re), text_(text), cache_(cache), l_(re.plan_->start_[0]),
-          budget_(text.size()) {
-      l_ = re.unstray(text, l_);
-    }
+          budget_(text.size()) {}
 
     // The next match, handed to `out`; false when none remains. Over the
     // caller's scratch (the iterator's own, which lives as long as the scan
@@ -16885,11 +16788,11 @@ private:
   }
 
   // Whether the bytes [q, n) a reverse scan from the end read can answer for
-  // the subject without a look at the rest of it: well-formed UTF-8
-  // (CodePoint); clusters of one code point, or a CR-LF to a pattern that
-  // cannot split one, from a boundary nothing before `q` can join (Grapheme).
+  // the subject without a look at the rest of it: any (CodePoint); clusters
+  // of one code point, or a CR-LF to a pattern that cannot split one, from a
+  // boundary nothing before `q` can join (Grapheme).
   bool end_region_ok(std::string_view text, size_t q) const {
-    if (plan_->us_) return family_sound(kFamUsAssert, text.substr(q), 0);
+    if (plan_->us_) return true;
     // Back past pairs that fuse, and past an Extend or ZWJ left side (GB9c
     // and GB11 look further back from those). A stray byte is no code point.
     using GB = unicode::GraphemeBreak;
@@ -17487,11 +17390,10 @@ inline void Regex::ladder_plan(Plan &p) {
   {
     Family ascii = kFamilyCount, byte = kFamilyCount;
     if (p.us_) {
-      // A CodePoint plan's family does not depend on the subject (only
-      // whether its byte DFAs may run does: us_stray), so a find guesses it
-      // too — the DFA family if it can serve the caller (dfa_family_ok),
-      // else the assert one. (Neither: a fresh ladder stands on the Pike.
-      // [Tier: Pike/cp])
+      // A CodePoint plan's family does not depend on the subject, so a
+      // find starts on it — the DFA family if it can serve the caller
+      // (dfa_family_ok), else the assert one. (Neither: a fresh ladder
+      // stands on the Pike. [Tier: Pike/cp])
       const Family as = p.byte_assert_path_ ? kFamUsAssert : kFamilyCount;
       byte = p.dfa_family_ok(true) ? kFamUsDfa : as;
       p.find_guess_[Plan::kTestRow] = byte;
@@ -17570,13 +17472,8 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
                                             size_t &fna,
                                             Plan::IcaseScan &probe) const {
   const Plan &p = *plan_;
-  if (p.us_) {
-    if (fna == kUnclassified) fna = first_nonascii(text);
-    // (Both CodePoint families are sound on the same subjects.)
-    if (!family_sound(kFamUsDfa, text, fna))
-      return pike_ladder(l.want); // a stray byte: see us_stray
-    return ladder_guessed(l);
-  }
+  // A CodePoint plan's family serves every subject.
+  if (p.us_) return ladder_guessed(l);
   // [Tier: Dfa/EgcByte] fused literal-prefilter rungs (see egc_fused_ok for
   // the rationale). A cluster they cannot vet downgrades to the Pike from
   // the cursor.
@@ -17696,26 +17593,17 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     if (!guess_open(l)) return found;
     // How far the guess's scans read: a match's end, or past it as far as
     // a DFA scan did, the whole subject when there is no match. A walk
-    // reads past its end only ASCII bytes: no stray (CodePoint), and no
-    // byte whose cluster could change what the walk saw (Grapheme: the
-    // plan guesses only where a CR-LF reads as the grapheme engine reads
-    // it — see ladder_plan).
+    // reads past its end only ASCII bytes: none whose cluster could change
+    // what the walk saw (the plan guesses only where a CR-LF reads as the
+    // grapheme engine reads it — see ladder_plan).
     int reach = static_cast<int>(text.size());
     if (found)
       reach = walked ? c.pos
-                     : std::max(c.pos, scr.cache->reach(ladder_byte(l)));
+                     : std::max(c.pos, scr.cache->reach());
+    if (guess_held(l.fam, text, reach)) return found;
     // A guess that does not hold: the scan again from the start, into a
-    // fresh sink — on the Pike (CodePoint), or classified whole (Grapheme).
-    if (plan_->us_) {
-      // (Each CodePoint family spelled out, so that guess_held folds.)
-      if (l.fam == kFamUsAssert ? guess_held(kFamUsAssert, text, reach)
-                                : guess_held(kFamUsDfa, text, reach))
-        return found;
-      l = pike_ladder(l.want);
-    } else {
-      if (guess_held(l.fam, text, reach)) return found;
-      l = ladder_unguessed(l);
-    }
+    // fresh sink, the subject classified whole.
+    l = ladder_unguessed(l);
     out.clear();
   }
 }
@@ -17737,7 +17625,7 @@ inline bool Regex::find_run(std::string_view text, Scr &scr, Ladder &l,
   // once and reused across calls, where rebuilding them was the dominant
   // per-call cost.
   if (!scr.cache) scr_fetch(scr);
-  if (l.has(Ladder::kSpec)) scr.cache->reach_from_zero(ladder_byte(l));
+  if (l.has(Ladder::kSpec)) scr.cache->reach_from_zero();
   Deep d;
   // (Classified here rather than by the step's own case: one trip through
   // the dispatch less on a Grapheme scan's way to its engine.)

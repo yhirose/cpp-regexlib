@@ -380,7 +380,7 @@ struct PlanProbe {
   // on U u b i, the Grapheme unit on b i a A B (Regex::kFamilyTraits) —
   // carried in its flags. A scan that starts on a family's rung starts on
   // that family's ladder — for a CodePoint plan, the family its find /
-  // boolean guesses.
+  // boolean runs on (Plan::find_guess_).
   static bool ladders_name_families(const Regex &re) {
     const auto &p = *re.plan_;
     for (int f = 0; f < Regex::kFamilyCount; f++) {
@@ -1991,18 +1991,16 @@ void test_match_guess() {
   // joins the one before (a combining mark after `a`), or reach is inside it
   // — and the LF of a CR there, so that the pair is not split (a lone CR
   // would refuse the collapsed byte programs of `[^x]{2}`). A CodePoint
-  // family's, the bytes it read, to a code point's end: the one at reach
-  // only where a look read it (the assert family).
+  // family's holds for every subject: its byte automata, like the unit,
+  // match no stray byte.
   const Regex word("\\w"), pair("[^x]{2}"), us_word = make_us("\\w");
   CHECK(PlanProbe::guess_held(word, 'a', "ab", 1));
   CHECK(!PlanProbe::guess_held(word, 'a', "a\xCC\x81", 1));
   CHECK(PlanProbe::guess_held(word, 'b', "\xC3\xA9" "a", 1));
   CHECK(!PlanProbe::guess_held(word, 'b', "a\xCC\x81", 1));
-  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 1));
-  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 2));
-  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 3));
-  CHECK(!PlanProbe::guess_held(us_word, 'u', "\xC3\xA9\xFF", 2));
-  CHECK(!PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xE6\xBC", 3));
+  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xFF", 3));
+  CHECK(PlanProbe::guess_held(us_word, 'u', "\xC3\xA9\xFF", 2));
+  CHECK(PlanProbe::guess_held(us_word, 'U', "\xC3\xA9\xE6\xBC", 3));
   CHECK(PlanProbe::guess_held(pair, 'b', "\xC3\xA9\r\nab", 2));
   CHECK(!PlanProbe::guess_held(pair, 'b', "\xC3\xA9\rab", 2));
 
@@ -2038,19 +2036,14 @@ void test_match_guess() {
       }
 }
 
-// A CodePoint find does not ask first whether its subject holds a stray
-// byte (us_stray). Its scan guesses it reads none, on the plan's family, and
-// keeps its answer when what it read holds none (find_rest, guess_held);
-// else the Pike answers, from the start. So the pieces a byte automaton
-// cannot read, or that a grapheme engine would join, placed at every offset
-// of the first 48 bytes and further on, change no answer of search() or
-// test() from the Pike's — on every rung, and where a DFA reads past the
-// match (`a.*b`, which a stray stops) or there is none to find
-// (`[^\x00-\x7f]`, which the stray is to the Pike). And over 1 MB of prose
-// that ends in a stray byte the first match is found without the Pike, which
-// segmented the whole subject — from what this call read: after a scan to
-// the end of another, a boolean that answers in the first words is not
-// judged on the bytes the other read.
+// A CodePoint find runs the plan's family on any subject: its byte
+// automata, like the unit, match no stray byte. So the pieces a byte
+// automaton cannot read, or that a grapheme engine would join, placed at
+// every offset of the first 48 bytes and further on, change no answer of
+// search() or test() from the Pike's — on every rung, and where a DFA reads
+// past the match (`a.*b`, which a stray stops) or there is none to find
+// (`[^\x00-\x7f]`, which no stray is). And over 1 MB of prose with a stray
+// byte at either end the first match is found without the Pike.
 // Letters that take many DFA states, clean and with each piece of `dirt` at
 // the edges and inside.
 std::vector<std::string>
@@ -2098,14 +2091,9 @@ void test_find_guess() {
         [&](std::string_view s) { return first_agrees(re, pike, s); });
   }
 
-  // What a guess's answer depends on, past what its scans consumed: the code
-  // point an assert engine reads as context at the match's end (a stray
-  // byte there is a word character to the Pike: U+00FF), and the bytes a
-  // skip passes over (a stray 0xE9 is U+00E9 to the Pike, which the
-  // literal's or the first-byte set's skip passes). (The cases of a stray
-  // 0xE9 / 0xFF hold with or without LazyDfa::hi counting skips: no scan
-  // that finds a match ends on a skip. They pin the answer for one that
-  // does.)
+  // A stray where an assert engine reads its context at the match's end (no
+  // word character), and where a literal's or the first-byte set's skip
+  // passes over it (no `é` and no `ÿ`, which 0xE9 and 0xFF are in Latin-1).
   for (const auto &[pat, subj] : std::initializer_list<
            std::pair<const char *, const char *>>{
            {"\\b\\w{1,5}ing\\b", "doing\xFF"},
@@ -2128,27 +2116,21 @@ void test_find_guess() {
     CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
     CHECK(m.matched() && m.begin() < 64);
     CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(prose)); }));
-    // (A stray among what the scan read: the Pike.)
-    CHECK(PlanProbe::pike_ran(re, [&] { m = re.search("The\xFF" + prose); }));
+    CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search("The\xFF" + prose); }));
+    CHECK(m.matched() && m.begin() < 64);
   }
-  const Regex re = make_us("\\w+ \\d+");
-  std::string words, early = "one 1 ";
+  std::string words;
   while (words.size() < (1u << 20)) words += "the quick brown fox ";
-  early += "\xFF" + words;
-  CHECK(!re.test(words));
-  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(early)); }));
-  // (A scan from the end does not guess: it vets what it read.)
   const Regex end = make_us("\\w+$");
   CHECK(!PlanProbe::pike_ran(
       end, [&] { CHECK(end.search("\xFF" + words + "end").matched()); }));
 
-  // Where a DFA of the guess gives up, the guess ends: at the Pike, which
-  // answers from the start, or — the boolean's DFA, which the find's rungs
-  // take over from — where the subject is classified whole. Over letters
-  // that take many DFA states, clean and with a stray byte, a lone lead byte
-  // or an accent at the edges and inside: on caches too small for them
-  // (built afresh for each call), and with only the boolean's DFA given up,
-  // which on clean text leaves the find's own rungs to answer, not the Pike.
+  // Where a DFA gives up: the Pike, which answers from the start, or — the
+  // boolean's DFA, which the find's rungs take over from — those rungs. Over
+  // letters that take many DFA states, clean and with a stray byte, a lone
+  // lead byte or an accent at the edges and inside: on caches too small for
+  // them (built afresh for each call), and with only the boolean's DFA given
+  // up, which leaves the find's own rungs to answer, not the Pike.
   const std::vector<std::string> hard =
       hard_subjects({"\xFF", "\xC3", "\xC3\xA9"});
   for (const char *pat :
@@ -2221,13 +2203,26 @@ void test_find_guess_grapheme() {
        {"b[a-d]{7}c|a[a-d]{7}d", "(?:[ab]|[bc])[a-e ]{14}[a-d]",
         "(a)[a-d]{8}(d)", "\\b[ab]*a[ab]{9}\\b"})
     check_squeezed(make_egc(pat), pike_twin(pat), hard);
+  // From what this call read: after a scan to the end of another subject, a
+  // boolean or a find that answers in the first words is not judged on what
+  // the other read (FindCache::reach_from_zero) — the mark past this one's
+  // match would send it to the Pike.
+  const Regex re = make_egc("\\w+ \\d+");
+  std::string words;
+  while (words.size() < (1u << 20)) words += "the quick brown fox ";
+  const std::string far = "\xC3\xA9 " + words,
+                    early = "one 1 a\xCC\x81 " + words;
+  CHECK(!re.test(far));
+  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(early)); }));
+  CHECK(!re.search(far).matched());
+  CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.search(early).matched()); }));
 }
 
 // Every ladder names the family it runs on (Ladder::fam), and what engine
-// it reads follows from that family alone. A CodePoint find guesses its
-// plan's one family, a Grapheme one its ASCII family on a pure-ASCII
-// subject and its byte family on any other; match() tries the families of
-// Plan::match_guesses_.
+// it reads follows from that family alone. A CodePoint find runs its
+// plan's one family; a Grapheme one takes its ASCII family on a pure-ASCII
+// subject and guesses its byte family on any other; match() tries the
+// families of Plan::match_guesses_.
 void test_ladder_family() {
   const char *pats[] = {"\\w+",        "(\\w+)@(\\w+)", "\\b\\w+\\b",
                         "^(\\w+)$",    "(?i)holmes",   "x\\w*z",
@@ -6630,24 +6625,15 @@ void test_utf8_decoder_strict() {
     CHECK(decode_or_byte(s.data(), s.size(), cp) == 1 && cp == kStrayCp);
     CHECK(decode_or_byte(s.data() + 1, s.size() - 1, cp) == 1 && cp == 'a');
   }
-  // valid_from is the same test as a decode_codepoint walk: every string of up
-  // to three bytes drawn from the bytes where the rules change, and long random
-  // ones around every length boundary.
+  // A left-to-right decode (decode_or_byte), over every string of up to
+  // four bytes drawn from the bytes where the rules change and over long
+  // random ones around every length boundary: a step and the read back
+  // behind it take the same element; a step lands on every byte that
+  // continues no code point (what the assert boolean's skip, restarted at an
+  // occurrence, is told stands behind it: Regex::look_forward_skip); and
+  // the boundaries it does not land on are the ones `inside` a code point.
   {
-    const auto walk = [](const std::string &s) {
-      for (size_t off = 0; off < s.size();) {
-        size_t bytes;
-        char32_t cp;
-        if (!decode_codepoint(s.data() + off, s.size() - off, bytes, cp))
-          return false;
-        off += bytes;
-      }
-      return true;
-    };
-    // ... and a step and the read back behind it take the same element, and
-    // a step lands on every byte that continues no code point: what the
-    // assert boolean's skip, restarted at an occurrence, is told stands
-    // behind it (Regex::look_forward_skip).
+    using reg::unicode::utf8::inside;
     const auto reads_back = [](const std::string &s) {
       std::vector<bool> lands(s.size());
       for (size_t i = 0; i < s.size();) {
@@ -6657,10 +6643,12 @@ void test_utf8_decoder_strict() {
         i += len;
         if (decode_before(s.data(), i, b) != len || b != a) return false;
       }
-      for (size_t j = 0; j < s.size(); j++)
+      for (size_t j = 0; j < s.size(); j++) {
         if ((static_cast<unsigned char>(s[j]) & 0xC0) != 0x80 && !lands[j])
           return false;
-      return true;
+        if (inside(s.data(), s.size(), j) == (j == 0 || lands[j])) return false;
+      }
+      return !inside(s.data(), s.size(), s.size());
     };
     const unsigned char edge[] = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F,
                                   0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0,
@@ -6671,7 +6659,6 @@ void test_utf8_decoder_strict() {
     const auto each = [&](auto &&self, size_t depth) -> void {
       if (!s.empty() || depth == 0) {
         strings++;
-        CHECK(reg::unicode::utf8::valid_from(s.data(), s.size()) == walk(s));
         CHECK(reads_back(s));
       }
       if (depth == 0) return;
@@ -6691,13 +6678,12 @@ void test_utf8_decoder_strict() {
         c = (x >> 24) % 4 ? static_cast<char>('a' + (x >> 16) % 26)
                           : static_cast<char>(edge[(x >> 8) % sizeof edge]);
       }
-      CHECK(reg::unicode::utf8::valid_from(r.data(), r.size()) == walk(r));
       CHECK(reads_back(r));
     }
-    // From a code-point boundary part-way in.
+    // Inside é, not in front of the stray after it nor behind that.
     const std::string t = "ab\xC3\xA9\xFF" "cd";
-    CHECK(!reg::unicode::utf8::valid_from(t.data(), t.size(), 2));
-    CHECK(reg::unicode::utf8::valid_from(t.data(), t.size(), 5));
+    CHECK(inside(t.data(), t.size(), 3));
+    CHECK(!inside(t.data(), t.size(), 4) && !inside(t.data(), t.size(), 5));
   }
   // The element ending at a byte, read as a left-to-right scan reads it.
   {

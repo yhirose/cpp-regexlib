@@ -242,8 +242,8 @@ Rust・Go と同じくテキストの末尾だけです。PCRE2・Python・Java 
 コードポイントの途中で止まったならそのコードポイント全体、下限より上で止まった
 のでなければその前のコードポイント（そこでの境界が尋ねる種類）も含めます：
 
-- **CodePoint**：UTF-8 として正しいこと（バイト DFA は迷子のバイトを扱えず、Pike は
-  それを 1 要素として読む）。
+- **CodePoint**：確かめることはありません。どのバイトDFAもマッチしない迷子のバイトは、
+  単位の中でも何にもマッチしないからです。
 - **Grapheme**：その中の書記素がすべて 1 コードポイント——CR-LF は、それを分け得ない
   パターンなら可——であることを、前に何が来ても繋がらない境界から前向きに確かめる
   （`egc_simple_from`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
@@ -433,7 +433,7 @@ look なしの実体化は元のコードのままです。
 コピーを得ない：US の `^ $ \b` パターン（capture 有無問わず）は**任意**の UTF-8 subject で
 `assert_find_span` / `assert_prefix_find` を再利用し、同じ
 prefilter・同じ `cp_prog_` bitstate capture 解決を使う。単位によるのはゲートだけで、CodePoint のプランは
-単位自身の UTF-8 検査（`us_stray`）を通った任意の subject で、Grapheme のプランは非ASCII かつ複数CP
+任意のsubjectで、Grapheme のプランは非ASCII かつ複数CP
 クラスタ無しの subject で（`assert_byte_path_ok`）この tier を使う。ASCII の subject では、EGC のプランは書記素プログラムのほうを歩く。span が
 bitstate を溢れる場合は、その span の上でコードポイント Pike へフォールバック。
 
@@ -471,11 +471,11 @@ subject 全体を分割する。
 | `EndAnchor` | `end_anchor_ok`（`end_anchored_`、バイト assert プログラム、グループには capture プログラム） | `n` からカーソルまでの逆バイト DFA：最も左の開始。グループは `[s, n)` で解決。読んだバイトだけを検査（`end_region_ok`）、通らなければ `Classify` |
 | `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——状態は自分の行のオフセットで表す（LazyDfa と同じ前掛け。1 バイトごとのロードは前のロードだけを待つ）。1 行は 129 エントリで、状態の accept フラグのあとに ASCII の 1 バイトにつき 1 列が続く。フラグは依存チェーンの外で読む。幅を 2 のべきにしないのは、多くの行の同じ列が 1 つのキャッシュセットに集まらないようにするため（主題を変えながら 128 桁を検証する場合：128 エントリの行で 262 ns、129 エントリで 140 ns）。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bail は assert チェーンへ） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。候補は短いスカラーの入口ランプのあと、ブロック単位で取る（`word_start_block`。スキャンの節を参照）。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
-| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る（§2「線形性」）。迷子のバイト（RFC 3629 の UTF-8 でないバイト）を含む subject はコードポイント Pike が受け持つ（バイトオートマトンはコードポイントでないバイトに一致できず、Pike はそれを 1 要素として読む）。呼び出しより長く生きる走査は最初から Pike で始まり（`us_stray`）、1 回だけの find は読んだバイトにそれがあったときに Pike へ回る（「系統を推測し、走査が読んだ範囲で判定する」） |
+| `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る（§2「線形性」）。迷子のバイト（RFC 3629のUTF-8でないバイト）には何も要らない。バイトオートマトンはそれにマッチできず、単位の中でも何もそれにマッチしない |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；one-pass 歩行と `+cap` は同上。ただし CRLF collapse プランは除く（`byte_walk_ok`：そのバイトプログラムは CR-LF の対を 1 要素と数え、歩行の表は 2 要素と数える） |
 | `Dfa/Ascii` | EGC ∧ `dfa_ok_` ∧ ASCII subject | 書記素プログラム上の lazy DFA（バイト == 書記素）；`+cap` 同上 |
 | `Assert/Ascii` | `dfa_assert_ok_` ∧ ASCII subject | 書記素プログラム上の LazyDfa を look つきで（前向きと、開始を求める逆向き）+ assert literal/prefix/suffix/word prefilter；`+cap`: assert 対応 bitstate |
-| `Assert/Byte` | US: 任意の UTF-8 subject（`us_stray`）；EGC: `assert_byte_path_ok(text)`（非ASCII simple） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap`: assert 対応 bitstate、両モード（上記参照） |
+| `Assert/Byte` | US: 任意の subject；EGC: `assert_byte_path_ok(text)`（非ASCII simple） | バイトプログラム上の LazyDfa を look つきで；同じ prefilter；`+cap`: assert 対応 bitstate、両モード（上記参照） |
 | `Pike` / `Pike/cp` | 常時（フォールバック） | `prog_` 上の書記素 Pike VM；US: `cp_prog_` 上のコードポイント Pike |
 
 どちらの階段も適格な tier を上から試し、DFA がキャッシュを断念したら次へフォールスルーする。
@@ -530,7 +530,7 @@ Grapheme の find と真偽値が純 ASCII の対象でそのまま取る系統�
 からです。
 系統を定義する場所は `ladder_family` の 1 か所、find が主題に系統を選ぶ場所は
 `ladder_gated`（`ladder_classify` が呼びます）の 1 か所、系統が主題を受け持てるかの判定は
-`family_sound` の 1 か所（問うのはゲート、読んだ範囲についての推測〔下を参照〕、`unstray`、
+`family_sound` の 1 か所（問うのはゲート、読んだ範囲についての推測〔下を参照〕、
 `end_region_ok` です）、系統の中の
 段の順序を書く場所は `ladder_pick` の 1 か所です（系統より前の段は系統のものでは
 ありません。それ自体で位置が決まるプランやテキスト先頭固定のプランは `ladder_plan` が
@@ -668,14 +668,15 @@ find は絞り込みのないスキャンで最初からやり直すからです
 - `match()` は位置 0 に固定されています。検証パターンや行頭のトークンなら、答えは数バイトで決まります。
 - `search()` と `test()` は、最初のマッチで答えが決まります。
 
-それでも以前は、まず主題の全体を見ていました。系統を選ぶゲート（`first_nonascii`、
-続いて `simple_from` か `contains_crlf`。CodePoint では `valid_from`、`us_stray`）は、
-どれも主題全体を読みます。どこかに迷子のバイトや結合文字が 1 つあれば、Pike に回って
-主題全体を分割していました。
+それでも以前は、まず主題の全体を見ていました。Graphemeの系統を選ぶゲート
+（`first_nonascii`、続いて`simple_from`か`contains_crlf`）は、どれも主題全体を読みます。
+どこかに迷子のバイトや結合文字が1つあれば、Pikeに回って主題全体を分割していました。
 
 今は推測します。ある系統を、主題がその系統の受け持つものであるかのように走らせます。
 *走査が読んだ範囲で*主題がそうであれば、その答えを採ります（`guess_held`）。そうでなければ
-次の推測へ、最後は Pike です。
+次の推測へ、最後は Pike です。CodePointのプランには推測することがありません。その系統は
+どの主題も受け持ちます（バイトオートマトンも単位と同じく迷子のバイトにマッチしません）。
+`guess_held`は常に成り立ちます。
 
 - **`match()`** は `Plan::match_guesses_`（`ladder_plan` が決める）の系統を順に、位置 0 から
   走らせます（`match_end`）。
@@ -692,32 +693,25 @@ find は絞り込みのないスキャンで最初からやり直すからです
   - 外れた推測の費用は、止まるまでの走査です。非 ASCII の主題では、ASCII 系統の
     アンカー付き DFA は最初の非 ASCII バイトで死にます（`lazy_inst_matches` はどれにも
     一致させない）。無駄になるのは、その前の ASCII の部分です。
-- **CodePoint の `search()` / `test()`**（`find_rest`。`guess_begin`、走査の `find_run`、
-  そして判定）は、プランが推測する系統
-  （`Plan::find_guess_`。`ladder_guessed`）を `Ladder::kSpec` を立てて
-  走らせ、迷子のバイトを先に調べません。
-  - 1 つの段が多くの走査をするので、前向きの DFA の走査がそれぞれ、その DFA の
-    最高到達点（`LazyDfa::hi`。開始状態の読み飛ばしを含む）を引き上げます。最高到達点は
-    推測の始まりに 0 に戻します（`FindCache::reach_from_zero`）。
-  - 歩行は報告しなくて構いません。歩行（一方向の歩行、スカラーの chain、suffix の
-    スカラー検証）は非 ASCII バイトで手を引き、その先は DFA が読みます。だから歩行が
-    終端の先で読むバイトに迷子は混ざりません。迷子は CodePoint の主題が成り立たなく
-    なる唯一の理由です。
-  - 答えが成り立たなければ、新しい sink・カーソル・予算で、最初から Pike が答えます
-    （`find_rest` が Pike のラダーで `find_run` をもう一度走らせます）。
-  - 走査が系統の段を離れたら、推測はそこで終わります。離れるのは DFA が諦めたときだけです。
-    - `Classify`（真偽値の走査が find の段に引き継ぐ所）では、以前と同じく主題全体を
-      分類します。
-    - Pike では、その答えがそのまま残ります。1 回の find はカーソルを一致を返すときに
-      しか動かさないので、Pike は 0 から始まります。
-- **Grapheme の `search()` / `test()`** は、`Classify` で（`guess_begin`）検索対象の
-  最初の非 ASCII バイトを求めます（速いパス）。まとまりの検査（遅いパス：
-  `egc_simple_from` は 1 バイトあたり約 5 命令、`first_nonascii` は 0.25 命令）はしません。
+- **Grapheme の `search()` / `test()`** は、`Classify` で（`find_rest`。`guess_begin`、
+  走査の`find_run`、そして判定）検索対象の最初の非 ASCII バイトを求めます（速いパス）。
+  まとまりの検査（遅いパス：`egc_simple_from` は 1 バイトあたり約 5 命令、
+  `first_nonascii` は 0.25 命令）はしません。
   - 純 ASCII の対象は、プランの ASCII 系統（`Plan::ascii_route_`）へそのまま進みます。
     推測ではありません（そこでは健全です）。
-  - それ以外は、バイト系統（`Plan::find_guess_`）を推測し、読んだ範囲で判定します（`guess_held`）。成り立たな
-    ければ、以前と同じく最初から対象全体を分類します。
-  - どちらも、CR-LF が書記素のエンジンと同じに読まれるパターン（`crlf_byte_safe_`、
+  - それ以外は、バイト系統（`Plan::find_guess_`。`ladder_on`）を`Ladder::kSpec`を立てて
+    推測します。
+  - 1つの段が多くの走査をするので、前向きのDFAの走査がそれぞれ、そのDFAの最高到達点
+    （`LazyDfa::hi`。開始状態の読み飛ばしを含む）を引き上げます。最高到達点は推測の
+    始まりに0に戻します（`FindCache::reach_from_zero`）。
+  - 答えは読んだ範囲で判定します（`guess_held`）。成り立たなければ、新しいsink・
+    カーソル・予算で、以前と同じく最初から対象全体を分類します（`find_rest`が
+    `find_run`をもう一度走らせます）。
+  - 走査が系統の段を離れたら、推測はそこで終わります。離れるのはDFAが諦めたときだけです。
+    `Classify`（真偽値の走査がfindの段に引き継ぐ所）では主題全体を分類します。Pikeでは、
+    その答えがそのまま残ります。1回のfindはカーソルを一致を返すときにしか動かさないので、
+    Pikeは0から始まります。
+  - ASCII系統への直行もバイト系統の推測も、CR-LF が書記素のエンジンと同じに読まれるパターン（`crlf_byte_safe_`、
     空に一致しない、融合した CR-LF リテラルがない）だけです。そうであれば、走査が報告した
     先で歩行が読むのは ASCII で、まとまりがその意味を変えることはありません（一致した
     ASCII のバイトの先は読みに行き、非 ASCII で手を引きます。一致しなかったバイトは、
@@ -729,14 +723,13 @@ find は絞り込みのないスキャンで最初からやり直すからです
     バイトを越えます）。バイト系統を先に推測すると、行ごとの検索の大半を占める ASCII の
     対象で遅いエンジンが走ります。
 
-両者に共通の規則：
+規則：
 
 - **走査が読んだ範囲**（`reach`）：系統の DFA の走査と歩行が調べたか読み飛ばしたバイトの
   うち、最も先のものの 1 つ先。少なくともマッチの終端以上で、マッチがなければ主題全体です
   （リテラルのプレフィルタは DFA を通らずに末尾まで読みます）。
   - 読み飛ばしも数えます。読み飛ばしは「そこで一致は始まらない」という、飛び越えた
-    バイトについての主張だからです。その中の迷子のバイトは、Pike にとってはコードポイント
-    です（0xE9 は U+00E9）。
+    バイトについての主張で、その中のまとまりがそれを誤りにし得るからです。
   - 作る側はみな同じ定義です。アンカー付きの走査の `reach_out`（読み飛ばさない）と、
     `LazyDfa::hi`（`FindCache::reach_from_zero` 以来、前向きの走査が止まった最も先）。
 - **成り立つべきこと**：系統自身のゲートを、`reach` の位置のコードポイントで終わる
@@ -751,15 +744,8 @@ find は絞り込みのないスキャンで最初からやり直すからです
     純 ASCII の主題を速い ASCII 系統へ送ること（`egc_byte_path`）。健全性は、バイト
     プログラムがその主題に答えられるかどうか（`byte_sound`）です。健全性の判定は
     `Regex::family_sound` の 1 つで、ゲート・推測・末尾アンカーの検査
-    （`end_region_ok`）がどれもこれを呼びます。
-  - CodePoint の系統の健全性が成り立たなくなるのは迷子のバイトだけで、コードポイント
-    どうしは結びつきません。だから接頭辞は、走査が読んだバイトを、止まったコードポイントの
-    終わりまで伸ばしたものです。`reach` の位置のコードポイントを含めるのは、look が文脈
-    として読むときだけです（assert の系統。リテラルを先頭にする検証は DFA の走査を通らずに
-    それを読むので、どの走査も報告しません）。CR の後の LF は迷子ではないので、含めても
-    変わりません。
-  - この 2 つの閉じ方は、走査が報告するものではなく系統の性質です（`guess_end`：
-    `kTraitAssert`、`kTraitGrapheme`）。
+    （`end_region_ok`）がどれもこれを呼びます（CodePointの系統はどの主題でも成り立ちます）。
+  - 閉じ方は、走査が報告するものではなくGrapheme単位の性質です（`guess_end`）。
 - **Pike でよい理由**：Pike が基準のエンジンだからです。
   - 以前より Pike になることも増えません。主題全体で成り立つゲートは、そのどの接頭辞
     でも成り立ちます。どの推測も成り立たない主題は、以前もどの系統も受け持たなかった
@@ -774,16 +760,6 @@ find は絞り込みのないスキャンで最初からやり直すからです
   非 ASCII バイトがある主題への `.*fox` で、1.50 倍（+57 ns）。外れた推測の走査の分です。
 - 走査が末尾まで読むパターン（改行のない主題への `.*fox`）は、以前と同じ費用です（命令数の差は 0.5% 以内）。
 
-計測（CodePoint の `search()` / `test()`、最初の数語に一致がある 4 MB の散文）：
-
-- `\w+`、`(\w+) (\w+)`、`[a-z]+ing`、`(\w+)@(\w+)`、`\b\w+\b`、`\w+ \d+` は
-  0.14–1.4 ms から 0.04–0.33 µs になりました。
-- 位置 100 か末尾に迷子のバイトがある場合も、98–121 ms から同じ程度になりました。
-- 一致のない find は末尾まで読み、以前と同じ費用です（命令数の差は 0.001% 以内）。
-- 約 60 バイトの主題では、1 回の呼び出しの命令数が 209 少ない〜1 多い（361–1341 命令の
-  うち。主題が ASCII でないほど少ない）。一致が主題の末尾近くにあるか一致がないときは
-  9 少ない〜29 多い（2.2% 以内）。走査が以前の検査とほぼ同じだけ読むためです。
-
 計測（Grapheme の `search()` / `test()`、命令数、GCC -O2）：
 
 - 最初の数語に一致がある 1 MB の対象で、`\w+`、`\b\w+\b`、`(\w+) (\w+)` は、アクセント
@@ -793,7 +769,6 @@ find は絞り込みのないスキャンで最初からやり直すからです
   CSV）に、そうした文書を検索する種類のパターン 12 個で：行ごとに 4〜12% 少なく、文書
   ごとに 17% 少ない〜0.7% 多い（1 つのパターンと文書の組で最悪 11% 多い）。
 - 約 60 バイトの対象で 10%（ASCII）、7%（アクセント入り）、2%（CJK で始まる）少ない。
-  CodePoint の find は、推測のループを 1 回回す分 4〜14 多い。
 
 ### 線形性（O(n²) の罠）
 
