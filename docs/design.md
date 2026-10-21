@@ -712,8 +712,10 @@ Three things keep the shared ladder from costing them anything:
   walk from 0 of a text-anchored find (`find_once`, `find_from0`; the walk
   is inlined there — a validator's whole call is that walk), then the walk
   (`find_run`: the budget, and thread-local save slots
-  — a walk whose driver reads no DFA runs without the thread's cache, which
-  is 35 instructions to fetch, `scr_walk`), then the rest.
+  — a walk whose first engine reads no DFA runs without the thread's cache,
+  which is 35 instructions to fetch, `walk_fetches_`; a scalar chain in
+  front of the one driver that reads it fetches nothing, and that driver
+  fetches it when the chain hands over, `walk_cache`), then the rest.
 - Nothing about the pattern is decided per call (the plan's ladders, above),
   and a Grapheme scan's one look at its subject (`ladder_classify`) is
   inlined into the one-step find — as two calls handing the ladder back and

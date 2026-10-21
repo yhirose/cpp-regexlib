@@ -6879,6 +6879,7 @@ private:
       } else {
         walk_driver_ = WalkDriver::Scan;
       }
+      walk_fetches_ = walk_driver_ == WalkDriver::Inner && !chain_.ok;
       // The lazy DFAs' start skips and the walk's scan, now that every
       // searcher behind them is planned.
       // (A CodePoint plan's programs are byte programs: it has the one.)
@@ -10034,8 +10035,8 @@ private:
     // analyses has one, see the constructor), a non-absorbing interior
     // literal, or every position (pruned by Teddy or the first-byte set).
     // Inner is the one driver that reads the FindCache (its cached
-    // reverse(pre) DFA), so a one-step find on any other runs without
-    // fetching it (see Regex::scr_walk).
+    // reverse(pre) DFA), and a one-step find fetches it only when that
+    // driver runs (see Regex::walk_cache).
     enum class WalkDriver : uint8_t {
       None, // no unbounded one-pass table
       Prefix,
@@ -10043,6 +10044,11 @@ private:
       Scan,
     };
     WalkDriver walk_driver_ = WalkDriver::None;
+    // Whether the walk's FIRST engine reads the FindCache: the inner driver
+    // with no scalar chain in front of it. A one-step find then fetches the
+    // cache before the walk, where it costs less than inside it; behind a
+    // chain only a hand-over reaches the driver, which fetches it then.
+    bool walk_fetches_ = false;
     // The ladders, per caller ([0] Want::Rows, [1] Want::Test, [2] Want::Test
     // over a short subject — see Regex::ladder_caller); see
     // Regex::ladder_plan.
@@ -15180,14 +15186,21 @@ public:
     return v;
   }
   // What the walk works with, for a find that came without it (find_once):
-  // the save slots alone when its driver reads no DFA, else this thread's
-  // cache. Fetching that cache is not free on a short call, and it sits in
-  // front of the engine: hence on demand.
+  // this thread's cache when the walk's first engine reads it
+  // (Plan::walk_fetches_), else the save slots alone; behind a scalar chain
+  // the one driver that reads the cache fetches it on a hand-over
+  // (walk_cache). Fetching it is not free on a short call: hence on demand.
   REGEXLIB_ALWAYS_INLINE void scr_walk(Scr &scr) const {
-    if (plan_->walk_driver_ == Plan::WalkDriver::Inner)
+    if (plan_->walk_fetches_)
       scr_fetch(scr);
     else
       scr.saves = &walk_saves();
+  }
+  // The cache, for the one walk driver that reads it (WalkDriver::Inner),
+  // fetched into `scr` the first time it runs.
+  REGEXLIB_ALWAYS_INLINE FindCache &walk_cache(Scr &scr) const {
+    if (!scr.cache) scr_fetch(scr);
+    return *scr.cache;
   }
   // What only the rungs past the walk read: the deep part of a scan.
   struct Deep {
@@ -16586,7 +16599,7 @@ private:
   // (kWalkLocal) or for the rest of their loop. Rung::Walk's engine, in
   // every family.
   REGEXLIB_ALWAYS_INLINE
-  int onepass_driver_find(FindCache *fc, std::string_view t, int from,
+  int onepass_driver_find(Scr &scr, std::string_view t, int from,
                           std::vector<int> &saves, WalkBudget &budget,
                           bool byte) const {
     switch (plan_->walk_driver_) {
@@ -16596,7 +16609,8 @@ private:
                                  plan_->walk_prefix_.probe,
                                  plan_->walk_prefix_.probe2);
     case Plan::WalkDriver::Inner:
-      return inner_find_onepass(fc->inrev(*this), t, from, saves, budget);
+      return inner_find_onepass(walk_cache(scr).inrev(*this), t, from, saves,
+                                budget);
     case Plan::WalkDriver::Scan:
     case Plan::WalkDriver::None: // (not reached: capture_find_dispatch)
       break;
@@ -16608,10 +16622,12 @@ private:
   // the whole pattern is a forced chain (no automaton at all; see
   // chain_capture_find), else the candidate-driven one-pass walk.
   //
-  // `fc` is read by ONE driver — the inner one, for its cached reverse(pre)
-  // DFA — and may be null for a plan that never reaches it
-  // (Plan::walk_driver_): a one-step find then skips fetching the
-  // thread's cache altogether (see scr_walk).
+  // The cache in `scr` is read by ONE driver, the inner one, for its cached
+  // reverse(pre) DFA, and fetched by it if it is not there yet (see
+  // walk_cache): a one-step find whose walk never reaches that driver, as
+  // when the chain answers first, does not fetch the thread's cache. The
+  // walk writes `saves`, the slots it was handed, even after that fetch
+  // points `scr`'s at the cache's.
   //
   // capture_find_inline is the body, and it and everything down to the
   // drivers are always inlined: once into capture_find_dispatch, the call
@@ -16620,7 +16636,7 @@ private:
   // that depends on how many callers there are: one more instantiated step
   // gives the loop a call per match.
   REGEXLIB_ALWAYS_INLINE int
-  capture_find_inline(FindCache *fc, std::string_view t, int from,
+  capture_find_inline(Scr &scr, std::string_view t, int from,
                       std::vector<int> &saves, WalkBudget &budget,
                       bool byte) const {
     if (plan_->chain_.ok) {
@@ -16634,13 +16650,13 @@ private:
     }
     if (!plan_->onepass_unbounded_)
       return kWalkBail; // neither engine planned: the located-span chain serves
-    return onepass_driver_find(fc, t, from, saves, budget, byte);
+    return onepass_driver_find(scr, t, from, saves, budget, byte);
   }
   REGEXLIB_NOINLINE int
-  capture_find_dispatch(FindCache *fc, std::string_view t, int from,
+  capture_find_dispatch(Scr &scr, std::string_view t, int from,
                         std::vector<int> &saves, WalkBudget &budget,
                         bool byte) const {
-    return capture_find_inline(fc, t, from, saves, budget, byte);
+    return capture_find_inline(scr, t, from, saves, budget, byte);
   }
 
   // Anchored scalar-chain capture find (see Plan::ChainCapture): locate the
@@ -16742,11 +16758,11 @@ private:
   // them and goes on from `from`. Its own function, NOT inlined: inside the
   // step this loop would make its own inlining decision about the dispatch
   // below and take a call per match; the one shared loop does not.
-  REGEXLIB_NOINLINE int onepass_fill_run(FindCache *fc, std::string_view bytes,
+  REGEXLIB_NOINLINE int onepass_fill_run(Scr &scr, std::string_view bytes,
                        std::vector<int> &saves, RowSink &out, int &from,
                        WalkBudget &budget, bool byte) const {
     for (;;) {
-      int e = capture_find_inline(fc, bytes, from, saves, budget, byte);
+      int e = capture_find_inline(scr, bytes, from, saves, budget, byte);
       if (e < 0) return e;
       walk_yield(out, bytes, saves, e);
       from = e; // !can_match_empty_ -> progress
@@ -17815,16 +17831,19 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
                                Cursor &c, WalkBudget &budget,
                                bool &chain_once, Out &out) const {
   if (!scr.saves) scr_walk(scr);
+  // The match is read from the slots the walk was handed: a driver that
+  // fetches the cache later (walk_cache) points scr.saves at the cache's.
+  std::vector<int> &saves = *scr.saves;
   int e2;
   if constexpr (All) {
     // Rows until the walk stops; e2 says why (it is never a match end).
-    e2 = onepass_fill_run(scr.cache, text, *scr.saves, out, c.pos, budget,
+    e2 = onepass_fill_run(scr, text, saves, out, c.pos, budget,
                           ladder_walk_byte(l));
   } else {
-    e2 = capture_find_dispatch(scr.cache, text, c.pos, *scr.saves, budget,
+    e2 = capture_find_dispatch(scr, text, c.pos, saves, budget,
                                ladder_walk_byte(l));
     if (e2 >= 0) {
-      walk_yield(out, text, *scr.saves, e2);
+      walk_yield(out, text, saves, e2);
       c.pos = e2; // !can_match_empty_ -> progress
       return Step::Yield;
     }

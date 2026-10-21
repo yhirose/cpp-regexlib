@@ -433,10 +433,23 @@ struct PlanProbe {
   // Whether `f` — calls of `re` that draw on this thread's cache — ran the
   // Pike: it prepares the cache's scratch, which is emptied first.
   template <class F> static bool pike_ran(const Regex &re, F f) {
+    return scratch_after(re, f).clist.capacity() > 0;
+  }
+  // Whether `f`, calls of `re` whose walk answers, walked on the save slots
+  // of this thread's cache, which are emptied first: whether a one-step find
+  // fetched the cache before its walk (Plan::walk_fetches_). A fetch inside
+  // the walk (Regex::walk_cache) leaves them empty: the walk keeps the slots
+  // it started on.
+  template <class F> static bool walk_on_cache(const Regex &re, F f) {
+    return scratch_after(re, f).saves.capacity() > 0;
+  }
+  // The calling thread's cache scratch of `re` after `f`, emptied first.
+  template <class F>
+  static const Regex::Scratch &scratch_after(const Regex &re, F f) {
     Regex::Scratch &sc = re.thread_cache().sc_;
     sc = Regex::Scratch{};
     f();
-    return sc.clist.capacity() > 0;
+    return sc;
   }
   // For each lazy DFA with look that the calling thread's cache of `re` has
   // built: whether it steps a byte at a time (LazyDfa::bytewise), and
@@ -2483,6 +2496,26 @@ void test_find_ladder() {
   CHECK(test(make_us("e[a-z]{3,}q")) == 'S');
   CHECK(test(make_us("[a-z]+@[a-z]+")) == 'I');
   CHECK(test(make_us("(\\w+)=(\\w+)")) == 'I'); // its find walks ('W' above)
+  // A one-step find fetches the thread's cache before its walk only when
+  // the walk's first engine reads it (Plan::walk_fetches_), in either unit:
+  // not for the scalar chain in front of the interior-literal driver, which
+  // answers "key=value" alone; at once for that driver with no chain in
+  // front. A chain that hands over (a non-ASCII byte by its anchor) has the
+  // driver fetch it then, and the match is read from the slots the walk
+  // started on: "→key=value" (the walk answers), "café=crème" (it falls to
+  // the rung below).
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const Regex chain("(\\w+)=(\\w+)", 0, u), driver("(\\w+)=(.+)", 0, u);
+    CHECK(!PlanProbe::walk_on_cache(
+        chain, [&] { CHECK(chain.search("key=value").matched()); }));
+    CHECK(PlanProbe::walk_on_cache(
+        driver, [&] { CHECK(driver.search("key=value").matched()); }));
+    reg::MatchResult m = chain.search("\xE2\x86\x92key=value");
+    CHECK(m.group(1).str() == "key" && m.group(2).str() == "value");
+    m = chain.search("caf\xC3\xA9=cr\xC3\xA8me");
+    CHECK(m.group(1).str() == "caf\xC3\xA9" &&
+          m.group(2).str() == "cr\xC3\xA8me");
+  }
   // So does an assert pattern's, on either engine and in either unit, with
   // groups or without, where no literal bounds what follows a hit: where
   // the find chains to the end of a long match, the boolean stops at the
