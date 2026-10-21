@@ -2477,11 +2477,12 @@ void test_find_ladder() {
   // Grapheme: the subject chooses the family.
   CHECK(rows(Regex("\\w+")) == '?' && test(Regex("\\w+")) == '?');
   // A boolean takes the find's prefilter rungs (each stops at the first
-  // accepting state it reaches) and, where the find would walk or chain,
+  // accepting state it reaches), the interior literal's too where a find
+  // with groups walks first; and where the find would only walk or chain,
   // the boolean scan.
   CHECK(test(make_us("e[a-z]{3,}q")) == 'S');
   CHECK(test(make_us("[a-z]+@[a-z]+")) == 'I');
-  CHECK(test(make_us("(\\w+)=(\\w+)")) == 'B');
+  CHECK(test(make_us("(\\w+)=(\\w+)")) == 'I'); // its find walks ('W' above)
   // So does an assert pattern's, on either engine and in either unit, with
   // groups or without, where no literal bounds what follows a hit: where
   // the find chains to the end of a long match, the boolean stops at the
@@ -3985,43 +3986,49 @@ void test_inner_prefilter() {
 void test_anchor_choice() {
   auto anchor = [](const char *pat) { return PlanProbe::anchor(Regex(pat)); };
 
-  // --- DFA tiers: prefix vs suffix ---
-  // A common letter in front of a rare suffix: the suffix drives.
-  CHECK(anchor("e[a-z]{3,}q") == 'S');
-  CHECK(anchor("a.{16}z") == 'S');
-  CHECK(anchor("a[^.]*\\!") == 'S');
-  CHECK(anchor("s[a-z]*\\?") == 'S');
-  CHECK(anchor("t[a-z]+ing") == 'S');
-  CHECK(anchor("the\\s+\\w+ly") == 'S');
-  // A rare prefix keeps the find, whatever follows.
-  CHECK(anchor("Sherlock\\s+Holmes") == 'P');
-  CHECK(anchor("S[a-z]+\\.") == 'P'); // `.` is five times as common as `S`
-  CHECK(anchor("H[a-z]+s") == 'P');
-  CHECK(anchor("z[a-z]+e") == 'P');
-  CHECK(anchor("T[a-z]+k") == 'P'); // both sparse: the incumbent stays
-  // Both dense: no anchor is worth a verify per occurrence.
-  CHECK(anchor("e[a-z]+s") == '-');
-  CHECK(anchor("a[a-z]*e") == '-');
-  // --- class-led: suffix / interior literal vs the start set ---
-  CHECK(anchor("[a-q][^u-z]{13}x") == 'S');
-  CHECK(anchor("[a-zA-Z]+ing") == 'S');
-  CHECK(anchor("[a-z]+e") == 'S');      // dense, but so is the start set
-  CHECK(anchor("[A-Z]\\w+ the") == 'S');
-  CHECK(anchor("[A-Z][a-z]+s") == '-'); // a capital is rarer than an `s`
-  CHECK(anchor("\\w+ Holmes \\w+") == 'I');
-  CHECK(anchor("\\w+@\\w+") == 'I');
-  // --- the interior literal against the other two ---
-  CHECK(anchor("a\\w+@\\w+") == 'I');  // behind a dense prefix
-  CHECK(anchor("\\w+@\\w+e") == 'I');  // in front of a dense suffix
-  CHECK(anchor("\\w+e\\w+@") == 'S');  // ... and behind a rare one
-  CHECK(anchor("Mr\\w+e\\w+") == 'P'); // a rare prefix beats a dense interior
-  // --- captures keep the order the capture drivers assume ---
-  CHECK(anchor("e(\\w+)q") == 'P');
-  CHECK(anchor("(\\w+)=(\\S+)") == 'I');
-  // --- CodePoint mode chooses the same way ---
-  CHECK(PlanProbe::anchor(make_us("e[a-z]{3,}q")) == 'S');
-  CHECK(PlanProbe::anchor(make_us("Sherlock\\s+Holmes")) == 'P');
-  CHECK(PlanProbe::anchor(make_us("a\\w+@\\w+")) == 'I');
+  // --- DFA tiers, in either unit: a CodePoint plan chooses as a Grapheme
+  // one does, with groups or without ---
+  const std::pair<const char *, char> dfa_choices[] = {
+      // A common letter in front of a rare suffix: the suffix drives.
+      {"e[a-z]{3,}q", 'S'},
+      {"a.{16}z", 'S'},
+      {"a[^.]*\\!", 'S'},
+      {"s[a-z]*\\?", 'S'},
+      {"t[a-z]+ing", 'S'},
+      {"the\\s+\\w+ly", 'S'},
+      // A rare prefix keeps the find, whatever follows.
+      {"Sherlock\\s+Holmes", 'P'},
+      {"S[a-z]+\\.", 'P'}, // `.` is five times as common as `S`
+      {"H[a-z]+s", 'P'},
+      {"z[a-z]+e", 'P'},
+      {"T[a-z]+k", 'P'}, // both sparse: the incumbent stays
+      // Both dense: no anchor is worth a verify per occurrence.
+      {"e[a-z]+s", '-'},
+      {"a[a-z]*e", '-'},
+      // --- class-led: suffix / interior literal vs the start set ---
+      {"[a-q][^u-z]{13}x", 'S'},
+      {"[a-zA-Z]+ing", 'S'},
+      {"[a-z]+e", 'S'}, // dense, but so is the start set
+      {"[A-Z]\\w+ the", 'S'},
+      {"[A-Z][a-z]+s", '-'}, // a capital is rarer than an `s`
+      {"\\w+ Holmes \\w+", 'I'},
+      {"\\w+@\\w+", 'I'},
+      // --- the interior literal against the other two ---
+      {"a\\w+@\\w+", 'I'},  // behind a dense prefix
+      {"\\w+@\\w+e", 'I'},  // in front of a dense suffix
+      {"\\w+e\\w+@", 'S'},  // ... and behind a rare one
+      {"Mr\\w+e\\w+", 'P'}, // a rare prefix beats a dense interior
+      // --- captures keep the order the capture drivers assume ---
+      {"e(\\w+)q", 'P'},
+      {"(\\w+)=(\\S+)", 'I'},
+      // (The lexer's string literal: its prefix is all it offers, and a
+      // plan with groups takes it in either unit.)
+      {R"~("(\\.|[^"\\])*")~", 'P'},
+  };
+  for (const auto &[pat, want] : dfa_choices) {
+    CHECK(anchor(pat) == want);
+    CHECK(PlanProbe::anchor(make_us(pat)) == want);
+  }
   // --- assert tiers: leading vs trailing literal ---
   CHECK(anchor("Sherlock [a-z]+e\\b") == 'P');
   CHECK(anchor("H[a-z]+s\\b") == 'P');

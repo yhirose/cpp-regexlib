@@ -1768,7 +1768,10 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
 
   `suffix_` / `inner_` stay set only for the anchor chosen, so the ladder's
   rungs read the choice without knowing there was one; the record keeps each
-  anchor's cost, and the tests pin choices through it (`PlanProbe`). The
+  anchor's cost, and the tests pin choices through it (`PlanProbe`), the
+  same in either unit. (A CodePoint plan with groups used to choose none, so
+  `(\w+)=(\S+)`'s boolean stepped a megabyte with no `=` in it in 1.78 ms;
+  it now looks for the `=`, 16 µs.) The
   **assert tiers** choose the same way between their leading and trailing
   literal (`plan_assert_anchor`; there the order used to be suffix-first, so
   `Sherlock [a-z]+e\b` scanned for `e`: ~0.35 → ~30 GB/s), and order the word

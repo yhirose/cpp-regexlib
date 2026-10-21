@@ -6838,7 +6838,15 @@ private:
       plan_reverse_and_lf(root);
       plan_egc_captures(root);
       plan_egc_byte_path(root);
-      plan_us_prefilters(root);
+      // Which literal drives the find (plan_anchor: the required prefix, the
+      // required suffix or an interior literal), for the same patterns in
+      // either unit. Its rungs run on the byte programs, a CodePoint plan's
+      // own, where a literal's memmem lands on code-point boundaries only
+      // (UTF-8 is self-delimiting); a Grapheme plan stands on them only for
+      // a subject its gates admit (egc_byte_path, the ASCII families). With
+      // groups too: pick_anchor keeps the capture drivers' order, and a rung
+      // that locates a span resolves the groups on it.
+      if (dfa_find_ok()) plan_anchor(root);
       plan_literal(root);
       plan_assert_tiers(root);
       plan_capture_onepass(root);
@@ -6907,7 +6915,6 @@ private:
              : (test ? dfa_assert_ok_ : assert_ascii_tier()) ? kFamAssertAscii
                                                              : kFamilyCount;
     }
-    bool dfa_find_free() const { return dfa_find_ok() && ncap_ == 0; }
     // [Tier: LiteralAlt]
     bool literal_alt_ok() const { return !literal_alt_.empty(); }
     // [Tier: AssertAnchor] on the EGC ladders (a US ladder needs no
@@ -7143,28 +7150,8 @@ private:
         compile_byte_trio(fwd, lf, byte_lf_prog_);
         byte_path_ = true;
         analyze_byte_prefilter(byte_prog_.prog); // byte-level dead-skip (any UTF-8)
-        plan_anchor(root); // prefix / suffix / interior literal: which one drives
         analyze_byte_icase_prefix(); // (?i) clean-prefix rare-byte prefilter
       }
-    }
-
-    void plan_us_prefilters(const detail::Node &root) {
-      // US (UnicodeScalar) rare-literal prefilters. US runs the SAME UTF-8 byte
-      // automaton as the EGC byte path (prog_/rev_prog_/lf_prog_ are us=true
-      // compiles), but the suffix / ReverseInner analyses live in the !us_
-      // block above, so a class-led, class-tailed US pattern (e.g.
-      // `[a-q][^u-z]{13}x`) would have NO usable prefilter and scan the whole
-      // subject with the DFA, where EGC has a prefilter. Compute them
-      // here from `root`; the rare trailing/interior literal then drives a
-      // memmem-skip + reverse-DFA verify (suffix_find / inner_find) over US's
-      // own DFAs (kDfaFwda / kDfaRev / kDfaFwd, and inrev).
-      // Soundness is simpler than EGC: US matches code points, ASCII/UTF-8
-      // literals memmem only at code-point boundaries (UTF-8 self-delimiting),
-      // and there is no grapheme cluster to gate on — so the prefilter applies
-      // to ANY subject. Which anchor drives — the literal prefix
-      // (analyze_byte_prefilter has set byte_prefix_ for US above), the
-      // suffix or an interior literal — is plan_anchor's choice, as on EGC.
-      if (us_ && dfa_find_free()) plan_anchor(root);
     }
 
     // Assertion tiers: the byte assert programs + assert prefilters, then the
