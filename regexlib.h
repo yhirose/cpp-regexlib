@@ -5636,6 +5636,10 @@ class Regex {
     static constexpr int kMinScan = 2048;
     static constexpr int kCandWalk = 10; // half chain-bytes per walk call
     static constexpr int kCandChain = 3; // ... per candidate of the chain's
+    // What a verify's step costs, in half chain-bytes: a step of the walk's
+    // table, and one of an anchored DFA (the chain's own step).
+    static constexpr int kWalkStep = 1;
+    static constexpr int kDfaStep = 2;
     explicit WalkBudget(size_t subject_len)
         : left_(static_cast<int>(subject_len)) {}
     bool spend(int walked) {
@@ -5659,19 +5663,24 @@ class Regex {
     //
     // The yardstick here is what the chain would have done on the SAME
     // candidates, and both sides are counted per candidate, in half
-    // chain-bytes: a call's fixed cost (kCandWalk for the walk, kCandChain
+    // chain-bytes: a call's fixed cost (kCandWalk for the driver, kCandChain
     // for the chain, back at its start state, into the skip), plus the
-    // bytes: half a chain-byte each for the walk, one for the chain on a
-    // failure and two on a match (forward for the end, reverse for the
-    // start). A run that ends in failure is a chain-byte more.
-    bool spend_at_candidate(const OnePassWalk &w) {
-      cand_charge_ += kCandWalk + w.walked + 2 * w.runs;
-      cand_chain_ += kCandChain + 2 * static_cast<int64_t>(w.walked);
-      return spend(w.walked) &&
+    // bytes: a `step` each for the driver (kWalkStep, half a chain-byte, for
+    // the walk; kDfaStep, a whole one, for Rung::Prefix's anchored DFA), one
+    // chain-byte for the chain on a failure and two on a match (forward for
+    // the end, reverse for the start). A run that ends in failure is a
+    // chain-byte more.
+    bool spend_at_candidate(int walked, int runs, int step) {
+      cand_charge_ += kCandWalk + step * static_cast<int64_t>(walked) + 2 * runs;
+      cand_chain_ += kCandChain + 2 * static_cast<int64_t>(walked);
+      return spend(walked) &&
              cand_charge_ <= std::max<int64_t>(2 * kMinScan, cand_chain_);
     }
-    void matched_at_candidate(int len) {
-      cand_charge_ += kCandWalk + len;
+    bool spend_at_candidate(const OnePassWalk &w) {
+      return spend_at_candidate(w.walked, w.runs, kWalkStep);
+    }
+    void matched_at_candidate(int len, int step = kWalkStep) {
+      cand_charge_ += kCandWalk + step * static_cast<int64_t>(len);
       cand_chain_ += kCandChain + 4 * static_cast<int64_t>(len);
     }
     // A LOCAL bail (kWalkLocal): the walk met a byte its table has no
@@ -6060,6 +6069,7 @@ private:
     FusedPrefix, // EGC, non-ASCII subject: literal prefix scan that vets
     FusedSuffix, // the clusters it passes (no upfront classification)
     IcasePrefix, // (?i) literal prefix: pair probe + anchored verify
+    Prefix,      // rare literal prefix + anchored verify
     Suffix,      // rare trailing literal + reverse verify
     Inner,       // rare interior literal + reverse(pre) floor
     Walk,        // candidate + one-pass walk: end and groups in one pass
@@ -6167,7 +6177,8 @@ private:
       // Rungs the scan has given up, whatever family it lands on next.
       kSuffixOff = 1 << 6,
       kInnerOff = 1 << 7,
-      kGivenUp = kSuffixOff | kInnerOff,
+      kPrefixOff = 1 << 10,
+      kGivenUp = kSuffixOff | kInnerOff | kPrefixOff,
       // A guess (find_rest): the family is assumed to serve the subject and
       // judged on what its scan read.
       kSpec = 1 << 8,
@@ -6943,6 +6954,24 @@ private:
     // (plan_anchor) and the fused scan can take it (all ASCII, no CR/LF).
     bool prefix_fused() const {
       return anchor_.kind == AnchorChoice::Kind::Prefix && byte_prefix_.ascii;
+    }
+    // Whether a DFA over the byte programs (`byte`) or over the others skips
+    // from its start state with the byte programs' literals
+    // (byte_start_skip_) rather than the grapheme program's (start_skip_):
+    // a CodePoint plan's programs are byte programs too. FindCache::make
+    // gives a DFA its skip by it, and Rung::Prefix takes its candidates by
+    // it, so the two scan for the same needle.
+    bool start_skips_byte(bool byte) const { return byte || us_; }
+    // [Tier: Dfa/*] the prefix anchor's own rung, on a family that has no
+    // fused one for the subject (Rung::Prefix): the prefix chosen and
+    // sparse (a dense one is the scan's: plan_anchor), case-sensitive (the
+    // (?i) one is IcasePrefix's), and the needle the family's start skip
+    // scans for (`byte_skip`: start_skips_byte). Its candidates are then
+    // where the chain's forward scan would start.
+    bool prefix_rung_ok(bool byte_skip) const {
+      return anchor_.kind == AnchorChoice::Kind::Prefix &&
+             !anchor_.prefix_dense() && !icase_ &&
+             (byte_skip ? byte_start_skip_ : start_skip_) == StartSkip::Prefix;
     }
     // [Tier: Dfa/EgcByte] fused-collapse tier: the CRLF-collapse analogue of
     // egc_fused_ok. The collapsed byte programs reproduce the grapheme engine
@@ -14249,6 +14278,42 @@ private:
     return -1;
   }
 
+  // Literal-prefix find (Rung::Prefix; the case-sensitive twin of
+  // icase_prefix_find): the leftmost-first match with start >= `from`. Every
+  // match begins with the prefix, so its occurrences, in order, are the
+  // candidate starts (the family's start skip finds them, as the chain's
+  // forward scan would: `byte_skip`, Plan::start_skips_byte), and the first
+  // one the anchored DFA `a` verifies is the leftmost start, the scan's end
+  // its leftmost-first end. Returns the end (start in s_out), -1, LazyDfa::kCap,
+  // or kWalkBail once the verifies stop paying, or have walked the budget
+  // (WalkBudget::spend_at_candidate: the chain is led to the same
+  // candidates): the caller falls to the chain from s_out, past the
+  // candidates that failed.
+  int prefix_find(LazyDfa &a, std::string_view text, int from, bool byte_skip,
+                  int &s_out, WalkBudget &budget, bool span) const {
+    const unsigned char *p =
+        reinterpret_cast<const unsigned char *>(text.data());
+    const int n = static_cast<int>(text.size());
+    for (int i = from;;) {
+      const int s = byte_skip ? byte_prefilter_skip(p, n, i)
+                              : plan_prefilter_skip(p, n, i);
+      if (s >= n) return -1; // (no match is empty: each holds the prefix)
+      int reach = 0;
+      const int e = dfa_forward_end(a, text, s, span, &reach);
+      if (e == LazyDfa::kCap) return LazyDfa::kCap;
+      if (e > s) {
+        budget.matched_at_candidate(e - s, WalkBudget::kDfaStep);
+        s_out = s;
+        return e;
+      }
+      if (!budget.spend_at_candidate(reach - s, 0, WalkBudget::kDfaStep)) {
+        s_out = s + 1;
+        return kWalkBail;
+      }
+      i = s + 1;
+    }
+  }
+
   // --- Leftmost-first DFA find (no longest-safe predicate) ---
 
   // Forward scan over an ordered+cut DFA `d` from byte `from`: returns the
@@ -14498,7 +14563,7 @@ private:
   // plan or a caller that reads no groups, else the groups resolved within
   // it (group 0 == [s, e)). False when the capture engine declines the span
   // — a definitive end of the scan. What the located-span rungs (Chain,
-  // AssertChain, Inner) do with what they locate.
+  // AssertChain, Inner, Prefix) do with what they locate.
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool emit_located(std::string_view text, int s, int e,
                                            Scratch &sc,
@@ -14847,7 +14912,7 @@ public:
       } else if (d->look) {
         if (role == kDfaBool && p.assert_prefix_skips())
           d->skip = S::kSkipAssert;
-      } else if (!byte && !p.us_) {
+      } else if (!p.start_skips_byte(byte)) {
         if (p.start_skip_ != Plan::StartSkip::None) d->skip = S::kSkipPlan;
       } else if (p.byte_skips()) {
         d->skip = byte || role == kDfaFwd ? S::kSkipByte : S::kSkipByteLong;
@@ -15069,7 +15134,7 @@ public:
     const uint16_t off = old.flags & Ladder::kGivenUp & ~n.flags;
     if (off) {
       n.flags |= off;
-      ladder_repick(*plan_, n);
+      n = ladder_repicked(n);
     }
     return n;
   }
@@ -15298,8 +15363,8 @@ public:
                                        Out &out) const;
   // Whether the scan on `l` is still a guess: it ends where the scan leaves
   // the family's rungs — Classify classifies the subject whole
-  // (ladder_adopt drops kSpec), and the Pike, which a one-step find enters
-  // at 0 (its cursor moves only at a yield), is the reference.
+  // (ladder_adopt drops kSpec), and the Pike, which a guess's scan enters
+  // at 0 whatever its cursor (Rung::Pike), is the reference.
   static bool guess_open(const Ladder &l) {
     return l.has(Ladder::kSpec) && l.rung != Rung::Pike;
   }
@@ -17702,6 +17767,12 @@ inline Regex::Rung Regex::ladder_pick(const Plan &p, const Ladder &l,
   if (!rows) return Rung::Bool;
   if (walk) return Rung::Walk;
   if (inner) return Rung::Inner;
+  // The literal prefix, where the walk does not take it as its candidates
+  // or has bailed locally on one: the chain's start without its reverse
+  // scan.
+  if (p.prefix_rung_ok(p.start_skips_byte(ladder_byte(l))) &&
+      !l.has(Ladder::kPrefixOff))
+    return Rung::Prefix;
   return Rung::Chain;
 }
 
@@ -17994,6 +18065,40 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
     }
     break;
   }
+  // Literal-prefix prefilter (prefix_find): each occurrence a candidate
+  // start, the anchored forward DFA its verify. The chain finds the same
+  // match with its forward scan and then a reverse one back to the start,
+  // which the occurrence already is. Below the walk too: one match, then
+  // back to it.
+  case Rung::Prefix: {
+    LazyDfa &a = scr.cache->dfa(*this, ladder_byte(l), kDfaFwda);
+    for (;;) {
+      int s2 = -1;
+      const int e2 =
+          prefix_find(a, text, c.pos, p.start_skips_byte(ladder_byte(l)), s2,
+                      budget, /*span=*/Out::kGroups);
+      if (e2 == kWalkBail) {
+        // Unprofitable or the budget hit -> the rungs below, from past the
+        // candidates that failed (no match starts before them).
+        c.pos = s2;
+        l.set(Ladder::kPrefixOff);
+        l = ladder_repicked(l);
+        break;
+      }
+      if (e2 == LazyDfa::kCap) {
+        ladder_downgrade(l);
+        break;
+      }
+      if (e2 < 0) return Step::Over;
+      if (!emit_located(text, s2, e2, *scr.sc, *scr.saves, out))
+        return Step::Over;
+      c.pos = e2; // non-nullable (the prefix) -> e2 > s2
+      const bool back = ladder_served(chain_once, budget, c.pos);
+      if (!All) return Step::Yield;
+      if (back) break;
+    }
+    break;
+  }
   // Required-suffix prefilter: memmem the rare trailing literal + reverse-DFA
   // verify, instead of walking the forward DFA to the next match end. Same
   // leftmost-first matches; the variable-length case re-expands forward from
@@ -18130,10 +18235,14 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
     }
     return e2 < 0 ? Step::Over : Step::Yield;
   }
-  // The proven baseline (see pike_step).
+  // The proven baseline (see pike_step). A guess's scan enters it at 0: what
+  // the guessed family passed over is not the Pike's to trust (a rung can
+  // move the cursor past candidates it failed, as Rung::Prefix does on a
+  // bail), and guess_open takes the Pike's answer as the reference.
   case Rung::Pike: {
     if (!d.seg)
-      c.gpos = ladder_segment(d.seg, text, c.pos);
+      c.gpos = ladder_segment(d.seg, text,
+                              l.has(Ladder::kSpec) ? 0 : c.pos);
     const detail::Segmented &sg = *d.seg;
     const int gn = static_cast<int>(sg.graphemes.size());
     for (;;) {

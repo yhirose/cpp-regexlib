@@ -213,12 +213,17 @@ struct PlanProbe {
   //   L literal   A literal alternation   a assert-literal anchor
   //   ^ the find from 0   $ the reverse scan from the end
   //   ? the subject decides
-  //   i (?i) prefix   S suffix   I interior literal   W the walk
-  //   C the chain   c the assert chain   B the boolean scan   P the Pike
+  //   i (?i) prefix   p literal prefix   S suffix   I interior literal
+  //   W the walk   C the chain   c the assert chain   B the boolean scan
+  //   P the Pike
   //   F / f the fused prefix / suffix scans (never a start: the subject
   //   has to be looked at first)
   static char start(const Regex &re, bool test) {
     return rung(re.plan_->start_[test ? 1 : 0].rung);
+  }
+  // The rung family `fam` (a letter of kFamilies) leads a find with.
+  static char family_find(const Regex &re, char fam) {
+    return rung(re.plan_->family_[kFamilies.find(fam)][0].rung);
   }
   // ... and the one a boolean stands on in the ASCII assert family, over a
   // subject of limits::kBoolSkipBytes or more (`short_subject` false) or
@@ -239,6 +244,7 @@ struct PlanProbe {
     case R::FusedPrefix: return 'F';
     case R::FusedSuffix: return 'f';
     case R::IcasePrefix: return 'i';
+    case R::Prefix: return 'p';
     case R::Suffix: return 'S';
     case R::Inner: return 'I';
     case R::Walk: return 'W';
@@ -351,6 +357,14 @@ struct PlanProbe {
   }
   static DfaStats dfa_stats(const Regex &re) {
     return dfa_stats(re.thread_cache());
+  }
+  // The subject bytes stepped since a clear by the calling thread's DFA of
+  // `re` in `role` (kFwd, the chain's forward one; kFwda, the anchored one)
+  // over the byte programs or the others; 0 where it has none.
+  static constexpr int kFwd = Regex::kDfaFwd, kFwda = Regex::kDfaFwda;
+  static uint64_t scanned(const Regex &re, bool byte, int role) {
+    const auto &d = re.thread_cache().dfas_[byte ? 1 : 0][role];
+    return d ? d->scanned : 0;
   }
   // The engine families, a letter each, in Regex::Family order: U Dfa/US,
   // u Assert/Byte (CodePoint), b Dfa/EgcByte, i the same with the (?i)
@@ -1968,18 +1982,26 @@ const char *const kGuessBodies[] = {
     ("the qu\xC3\xA9" "ck brown f\xC3\xB6x jumps over "),
     "\xC3\xA9t\xC3\xA9 the quick brown f\xC3\xB6x ",
     "the quick brown fox\r\njumps over the dog\r\n"};
-// `agrees` over each of kGuessBodies (repeated to 160 bytes), and over each
-// with a piece of kDirt at each of the offsets 0-48 and at 100.
-template <class F> void each_dirty_subject(F agrees) {
-  for (const char *body : kGuessBodies) {
+// `agrees` over each of `bodies` (repeated to 160 bytes), and over each with
+// a piece of kDirt at each of `offsets`.
+template <class F, class Bodies, class Offsets>
+void each_dirty_subject(F agrees, const Bodies &bodies,
+                        const Offsets &offsets) {
+  for (const char *body : bodies) {
     std::string base;
     while (base.size() < 160) base += body;
     CHECK(agrees(base));
-    for (const char *d : kDirt) {
-      for (size_t at = 0; at <= 48; at++) CHECK(agrees(inserted(base, at, d)));
-      CHECK(agrees(inserted(base, 100, d)));
-    }
+    for (const char *d : kDirt)
+      for (const size_t at : offsets) CHECK(agrees(inserted(base, at, d)));
   }
+}
+// ... over kGuessBodies, with the piece at each of the offsets 0-48 and at
+// 100.
+template <class F> void each_dirty_subject(F agrees) {
+  std::vector<size_t> offsets;
+  for (size_t at = 0; at <= 48; at++) offsets.push_back(at);
+  offsets.push_back(100);
+  each_dirty_subject(agrees, kGuessBodies, offsets);
 }
 
 // match() does not classify its subject. It tries the plan's families in
@@ -2380,6 +2402,44 @@ void test_text_anchored_find() {
   }
 }
 
+// A sparse literal prefix the walk does not take has a rung of its own
+// (Rung::Prefix): its occurrences in order, each verified with the anchored
+// forward DFA, the first that matches the leftmost start. So over text the
+// prefixes occur in (comments, string literals with escapes, an HTTP status
+// line, occurrences that overlap: `xx` in "xxxw", where the first fails and
+// the second matches; or that fail and come again), with each piece of
+// kDirt at the early offsets and further on: every find surface and match()
+// agree with the Pike, groups and all, in both units.
+void test_prefix_rung() {
+  const char *pats[] = {"/\\*.*?\\*/",
+                        R"~("(\\.|[^"\\])*")~",
+                        R"~("(?:\\.|[^"\\])*")~",
+                        "(HTTP/1\\.[01]) (\\d{3})(?: (.*?))?\\r\\n",
+                        "xx(?:y|z)*?w",
+                        "ab(c|d)*?e"};
+  const char *bodies[] = {
+      "x = 1; /* a */ s = \"he\\\"y\" + \"\"; /*/* b */ ",
+      "HTTP/1.1 200 OK\r\nHTTP/1.0 404\r\n xxxw xxyzw abce abd ",
+      "\"\\\\\" /* x \"q\" */ ab abde \"unterminated /* "};
+  const size_t offsets[] = {0, 1, 2, 3, 5, 8, 13, 21, 34, 100};
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const char *pat : pats) {
+      const Regex re(pat, 0, u), pike = pike_twin(pat, 0, u);
+      each_dirty_subject(
+          [&](std::string_view s) { return all_agree(re, pike, s); }, bodies,
+          offsets);
+    }
+  // A Grapheme search guesses the byte family, whose verify fails "xxé w"
+  // (its `[^a\r\n]` meets the mark, where the Pike's takes the cluster);
+  // the candidates fail until the rung gives up, past them, to the chain,
+  // and a squeezed chain to the Pike. The Pike, under the guess, starts at
+  // 0: the leftmost match is the one the byte family failed.
+  const char *pat = "xx(?:(y|z)*?[^a\\r\\n]w|[ab]*a[ab]{10}c)";
+  check_squeezed(Regex(pat), pike_twin(pat),
+                 {"xxe\xCC\x81w " + std::string(300, 'x') + " xx" +
+                  noise(100, "ab", 7) + " xxyw"});
+}
+
 // Every ladder names the family it runs on (Ladder::fam), and what engine
 // it reads follows from that family alone. A CodePoint find runs its
 // plan's one family; a Grapheme one takes its ASCII family on a pure-ASCII
@@ -2486,6 +2546,28 @@ void test_find_ladder() {
   CHECK(rows(make_us("(\\w+)=(\\w+)")) == 'W');
   CHECK(rows(make_us("e[a-z]{3,}q")) == 'S');
   CHECK(rows(make_us("[a-z]+@[a-z]+")) == 'I');
+  // A sparse literal prefix the walk does not take (an alternation, a lazy
+  // repeat): its occurrences, each verified forward (Rung::Prefix), on a
+  // CodePoint plan and on a Grapheme one's ASCII and byte families. Not a
+  // dense prefix (the chain's one scan is faster), nor one the walk takes.
+  // And a find of a match at 0 runs no reverse scan to find its start.
+  const char *prefix_led[][2] = {
+      {"/\\*.*?\\*/", "/* a doc comment */"},
+      {R"~("(\\.|[^"\\])*")~", "\"hello world\""},
+      {"(HTTP/1\\.[01]) (\\d{3})(?: (.*?))?\\r\\n", "HTTP/1.1 200 OK\r\n"},
+      {"xx(?:y|z)*?w", "xxyzw"}};
+  for (const auto &[pat, subj] : prefix_led) {
+    CHECK(rows(make_us(pat)) == 'p');
+    CHECK(PlanProbe::family_find(Regex(pat), 'a') == 'p' &&
+          PlanProbe::family_find(Regex(pat), 'b') == 'p');
+    for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, u);
+      CHECK(re.search(subj).begin() == 0);
+      CHECK(PlanProbe::dfa_stats(re).rev_entries == 0);
+    }
+  }
+  CHECK(rows(make_us("e(a|b)*?x")) == 'C');
+  CHECK(rows(make_us("//[^\\n]*")) == 'W');
   CHECK(rows(make_us("(?=a)\\w")) == 'P');
   // Grapheme: the subject chooses the family.
   CHECK(rows(Regex("\\w+")) == '?' && test(Regex("\\w+")) == '?');
@@ -5330,6 +5412,27 @@ void test_walk_budget_linearity() {
   { // unbounded one-pass prefix driver (captures)
     cases.push_back({"onepass-prefix", "a([a-z]+)0", std::string(200000, 'a'), 0});
   }
+  { // the literal prefix's own rung (Rung::Prefix): every `/*` a candidate,
+    // every verify a walk to the end, where no `*/` follows; and failing
+    // candidates that use the budget up before the match
+    std::string s, t;
+    for (int i = 0; i < 100000; i++)
+      s += "/* ";
+    for (int i = 0; i < 100000; i++)
+      t += "ab";
+    CHECK(PlanProbe::family_find(Regex("ab(?:c|d)*?e"), 'a') == 'p');
+    cases.push_back({"prefix-rung", R"(/\*.*?\*/)", s, 0});
+    cases.push_back({"prefix-rung-bail-match", "ab(?:c|d)*?e", t + "abce", 1});
+    // ... and one that stops paying (WalkBudget::spend_at_candidate): over a
+    // megabyte of `x`, every byte a candidate of `x(?:y|z)*?w` that fails at
+    // once, the anchored verifies cover a few KB before the chain takes the
+    // find, and the chain starts past them, not again from the start.
+    const std::string xs(1u << 20, 'x');
+    const Regex re = make_us("x(?:y|z)*?w");
+    CHECK(re.find_all(xs).empty());
+    CHECK(PlanProbe::scanned(re, false, PlanProbe::kFwda) < (64u << 10));
+    CHECK(PlanProbe::scanned(re, false, PlanProbe::kFwd) < xs.size());
+  }
   { // budget exhaustion mid-subject must still find the later real match via
     // the linear fallback (correctness through the bail path)
     std::string s(100000, 'Z');
@@ -7191,6 +7294,7 @@ int main() {
   test_find_guess();
   test_find_guess_grapheme();
   test_text_anchored_find();
+  test_prefix_rung();
   test_unicode_scalar();
   test_named_groups();
   test_named_groups_introspection();

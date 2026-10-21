@@ -542,7 +542,7 @@ a rung exists at all of them or at none.
 | `EndAnchor` | an end-anchored pattern matches at the end or nowhere: the reverse DFA from the end is the whole find, over the bytes it vets itself (§2, "The find from the end") | cache |
 | `Classify` | looks at the subject and stands on the family that serves it; where a Grapheme plan starts unless a rung above is the whole plan | the subject's class |
 | `FusedPrefix` / `FusedSuffix` | the fused EGC literal scans (§4) | cache |
-| `IcasePrefix` / `Suffix` / `Inner` | the candidate + verify prefilters (§7) | cache, budget |
+| `IcasePrefix` / `Prefix` / `Suffix` / `Inner` | the candidate + verify prefilters (§7) | cache, budget |
 | `Walk` | candidate + unbounded one-pass walk: end and groups in one pass | budget, save slots |
 | `Chain` / `AssertChain` | the located-span chain: forward to the end, reverse to the start, groups | cache |
 | `Bool` | `test()` only: the boolean forward scan, which stops at the first accepting state | cache |
@@ -587,6 +587,7 @@ puts a Grapheme scan whose subject is not ASCII). Within a family:
   profitability rule gives it up);
 - the walk; then, with captures, the interior literal (it needs a capture
   pass per match, the walk yields the groups in its one pass);
+- the literal prefix (`Rung::Prefix`), where the walk does not take it;
 - the chain. On the assert families: the walk, then the assert chain.
 
 **Bails.** A rung that cannot go on says why (§2, Linearity). *Locally* — a
@@ -785,8 +786,10 @@ holds.
   `find_run` again), as before. The guess ends where the scan leaves the
   family's rungs, which only a DFA that gave up makes it do: at
   `Classify`, where a boolean hands over to the find's rungs, the subject
-  is classified whole; at the Pike, which a one-step find enters at 0 (its
-  cursor moves only at a yield), the answer stands. The route and the
+  is classified whole; at the Pike, which a guess's scan enters at 0
+  whatever its cursor (a rung can move it past candidates it failed, which
+  a guess vouches for no more than for anything else it read), the answer
+  stands. The route and the
   guess are both taken only where a CR-LF reads as the grapheme engine
   reads it (`crlf_byte_safe_`,
   non-empty, no fused CR-LF literal): then a walk that reads past what the
@@ -916,7 +919,8 @@ That bail is **global** — the driver is done for the rest of the scan
 a different code, `kWalkLocal`: the one-pass table has no transition for the
 byte, which says nothing about the bytes after it. So it is **local**: the
 rung below the walk serves that ONE find (`dfa_chain_step` /
-`assert_chain_step`, or the interior-literal rung of a capture plan) and the
+`assert_chain_step`, the interior-literal rung of a capture plan, or the
+literal-prefix rung) and the
 walk is asked again for the next. It used to be one code, so a single `é`
 handed the rest of the subject to the chain: `\w+` in CodePoint mode over 512 KB of ASCII words with one `é` in the
 middle ran at ~270 MB/s against ~410 without it, and runs at ~410 now (with an
@@ -1526,6 +1530,29 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   The pair distance is capped (48) so the extra readahead keeps the vector
   loops, and the partner is picked **at plan time** (`pair_probe` → the
   `probe2` fields), not per call — a per-find recomputation costs per match.
+- **Literal-prefix rung (`Rung::Prefix`, `prefix_find`)** — where the prefix
+  is the anchor chosen, sparse and case-sensitive (`prefix_rung_ok`; the
+  `(?i)` one is `IcasePrefix`'s) and the walk does not take it as its
+  candidates (an alternation or a lazy repeat keeps the pattern off the
+  one-pass walk), its occurrences, in order, are the candidate starts: the
+  first the anchored forward DFA verifies is the leftmost start, and that
+  scan's end the leftmost-first end. The chain finds the same match with its
+  forward scan, which skips to the same occurrences, and then a reverse scan
+  back to the start the occurrence already is. The candidates come from the
+  start skip of the family's own DFAs (`start_skips_byte`: the byte
+  programs' for a CodePoint plan and the EGC byte family, the grapheme
+  program's for the ASCII one), so they are where the chain would start.
+  Each verify is counted against what the chain would have done on the same
+  candidate (`spend_at_candidate`, as for the walk's prefix driver, at a
+  whole chain-byte a DFA step, `kDfaStep`): where the candidates mostly fail
+  (`x(?:y|z)*?w` over a run of `x`, which would cost 7.7x the chain) the
+  rung gives the scan up after a few KB to the chain, from past the
+  candidates that failed (`kPrefixOff`). It serves below the walk too, for
+  the one match of a local bail. Per `search()` call, CodePoint (Apple clang
+  -O3, best of three interleaved runs of 25 x 2000): the lexer's block
+  comment `/\*.*?\*/` 102 → 65 ns, string literal `"(\\.|[^"\\])*"` 117 → 77
+  (73 → 46 without the group), the HTTP status line 142 → 96; Grapheme 107
+  → 69 for the comment.
 - **Short (?i) literal → case-orbit alternation (`decase_ascii_literal`)** — a
   pure printable-ASCII `(?i)` literal whose every character is *clean* (its
   only fold pre-images are its own ASCII cases, per the live fold table) and
