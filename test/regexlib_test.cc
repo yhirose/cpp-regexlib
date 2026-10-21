@@ -75,6 +75,10 @@ struct PlanProbe {
   // How many groups the plan reports as the whole match, run as its
   // capture-free twin (detail::peel_root_groups); 0 when its groups are real.
   static int alias_groups(const Regex &re) { return re.plan_->alias_groups_; }
+  // Where a scan resumes past an empty match at 0 (Regex::step_past_empty0).
+  static int step_past_empty0(const Regex &re, std::string_view s) {
+    return re.step_past_empty0(s);
+  }
   // Whether the byte tiers may serve a CR-LF subject (see crlf_byte_safe).
   static bool crlf_byte_safe(const Regex &re) {
     return re.plan_->crlf_byte_safe_;
@@ -3357,6 +3361,45 @@ void test_find_at() {
     CHECK(r.m.matched() && r.next_pos == 8);
     auto us = make_us("q*").find_at(flag, 0);
     CHECK(us.m.matched() && us.next_pos == 4);
+  }
+
+  // The same rule where the scan is the walk from 0 (Rung::TextAnchor): an
+  // empty match at 0 in front of a cluster that starts with an ASCII byte,
+  // e+◌́ or b+ZWJ, resumes past the cluster, which the walk, stopping at the
+  // `e` (`b`) it has no step for, does not read.
+  {
+    const char *pats[] = {"^a*", "^\\s*", "^(a*)", "\\A(?:ab)*"};
+    const std::pair<std::string, size_t> subs[] = {
+        {"e\xCC\x81x", 3}, {"b\xE2\x80\x8D" "x", 4}};
+    for (const char *p : pats) {
+      const Regex egc = make_egc(p), us = make_us(p);
+      CHECK(PlanProbe::start(egc, false) == '^' &&
+            PlanProbe::start(us, false) == '^');
+      for (const auto &[s, cluster] : subs) {
+        auto r = egc.find_at(s, 0);
+        CHECK(r.m.matched() && r.m.end() == 0 && r.next_pos == cluster);
+        r = us.find_at(s, 0);
+        CHECK(r.m.matched() && r.m.end() == 0 && r.next_pos == 1);
+      }
+    }
+  }
+  // The step itself, against the unit's segmentation: the end of the element
+  // at 0 for each piece of kDirt alone, before an ASCII byte, twice over,
+  // behind an ASCII base and behind a CR. (The walk from 0 asks it only with
+  // an ASCII first byte; the step answers for any.)
+  for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+    const Regex re("^a*", 0, u);
+    for (const char *d : kDirt) {
+      const std::string p = d;
+      for (const std::string &s : {p, p + "x", p + p, "e" + p, "\r" + p}) {
+        const auto seg = u == reg::MatchUnit::Grapheme
+                             ? reg::detail::segment(s)
+                             : reg::detail::segment_cp(s);
+        CHECK(PlanProbe::step_past_empty0(re, s) ==
+              static_cast<int>(seg.byte_begin[1]));
+      }
+    }
+    CHECK(PlanProbe::step_past_empty0(re, "") == 1);
   }
 
   // find_at is a positioned scan of the full subject, not a search of the

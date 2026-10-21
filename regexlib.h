@@ -13554,6 +13554,33 @@ private:
     if (pos < 0 || pos >= static_cast<int>(t.size())) return pos + 1;
     return pos + cp_at(t, pos).len;
   }
+  // ... and past an empty match at 0 in either unit: one element on, a code
+  // point or a grapheme cluster (find_at's next_pos never lands inside
+  // one). is_grapheme_boundary(s, l, i) reads s[0, i + 1), the code points
+  // before the boundary and the one after it, so the decode stops at the
+  // code point that opens the next cluster, not at the subject's end. (From
+  // 0 only, where there is no left context: elsewhere GB9c, GB11 and
+  // GB12/13 read back past the cluster's start.)
+  int step_past_empty0(std::string_view t) const {
+    const size_t n = t.size();
+    if (plan_->us_ || n == 0) return us_step_byte(t, 0);
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
+    // Two ASCII bytes are two clusters, but for a CR-LF.
+    if (p[0] < 0x80 && (n == 1 || p[1] < 0x80))
+      return n > 1 && p[0] == '\r' && p[1] == '\n' ? 2 : 1;
+    std::u32string cps;
+    size_t off = 0;
+    while (off < n) {
+      char32_t cp;
+      const size_t len = unicode::utf8::decode_or_byte(t.data() + off, n - off, cp);
+      cps.push_back(cp);
+      if (cps.size() > 1 && unicode::is_grapheme_boundary(
+                                cps.data(), cps.size(), cps.size() - 1))
+        break;
+      off += len;
+    }
+    return static_cast<int>(off);
+  }
 
   // The prefilter skips, folded into the DFA scans. Both are only ever called
   // from the start state (no match in progress), where every match must begin
@@ -15196,7 +15223,7 @@ public:
   // byte it does not handle — the ladder is then on Rung::Classify, and
   // nothing else has changed. `InlineWalk` inlines that walk: for a
   // one-step find, which tries these rungs before anything the others work
-  // with exists (find_once).
+  // with exists, and drops the cursor after (find_once).
   template <bool All, bool InlineWalk, class Out>
   REGEXLIB_ALWAYS_INLINE Step ladder_shallow(std::string_view text, Ladder &l,
                                              Cursor &c, Out &out) const;
@@ -17671,7 +17698,11 @@ inline Regex::Step Regex::ladder_shallow(std::string_view text, Ladder &l,
     }
     if (t > 0) {
       out.span(*this, text, 0, e0);
-      c.pos = e0 > 0 ? e0 : 1; // past 0: a next step finds nothing
+      // Past 0, where a next step finds nothing; past the element at 0
+      // after an empty match (find_at's next_pos), for a scan that reads
+      // its cursor again (a one-step find drops it, and under All the scan
+      // ends here).
+      c.pos = e0 > 0 ? e0 : All || InlineWalk ? 1 : step_past_empty0(text);
       if (!All) return Step::Yield;
     }
     return Step::Over;
@@ -18048,7 +18079,8 @@ inline Regex::FindAt Regex::find_at(std::string_view text, size_t pos,
 
 // One step of the scan find_iter() takes, from `pos`: the same Finder, so
 // the ladder and the empty-match resume rule (Pike: one grapheme /
-// code-point index; byte rungs: us_step_byte) have exactly one home — this
+// code-point index; the walk from 0: step_past_empty0; the other byte
+// rungs: us_step_byte) have exactly one home — this
 // cannot drift from what iteration does. The result is built in place, as
 // search() builds its own. `cache` null: this thread's.
 inline Regex::FindAt Regex::find_at_step(std::string_view text, size_t pos,
