@@ -471,7 +471,7 @@ subject 全体を分割する。
 | `LiteralAlt` | `literal_alt_` 非空 | Teddy 複数リテラルスキャン、見つかった fingerprint で始まるリテラルの順序付き verify |
 | `AssertAnchor` | `assert_.anchor_gatefree` | memmem + ヒットごとの境界 & アンカーフラグ verify；任意 subject |
 | `EndAnchor` | `end_anchor_ok`（`end_anchored_`、バイト assert プログラム、グループには capture プログラム） | `n` からカーソルまでの逆バイト DFA：最も左の開始。グループは `[s, n)` で解決。読んだバイトだけを検査（`end_region_ok`）、通らなければ `Classify` |
-| `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——状態は自分の行のオフセットで表す（LazyDfa と同じ前掛け。1 バイトごとのロードは前のロードだけを待つ）。1 行は 129 エントリで、状態の accept フラグのあとに ASCII の 1 バイトにつき 1 列が続く。フラグは依存チェーンの外で読む。幅を 2 のべきにしないのは、多くの行の同じ列が 1 つのキャッシュセットに集まらないようにするため（主題を変えながら 128 桁を検証する場合：128 エントリの行で 262 ns、129 エントリで 140 ns）。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bailは系統の位置0からのDFA（`from0_dfa`）へ。グループはその範囲で解決） |
+| `AnchoredOnePass` | `aop_.ok`（`^body$` / `^body` の検証形：assert なしの body を capture 剥がしで判定。素の `^body` のみ追加で cut 規則も要求——`onepass_body_ok`） | 位置 0 からの**1 回**のコンパクト決定的歩行（`anchored_onepass_try`、search / match / test で共有）——状態は自分の行のオフセットで表す（LazyDfa と同じ前掛け。1 バイトごとのロードは前のロードだけを待つ）。1 行は 129 エントリで、状態の accept フラグのあとに ASCII の 1 バイトにつき 1 列が続く。フラグは依存チェーンの外で読む。幅を 2 のべきにしないのは、多くの行の同じ列が 1 つのキャッシュセットに集まらないようにするため（主題を変えながら 128 桁を検証する場合：128 エントリの行で 262 ns、129 エントリで 140 ns）。末尾 `$` は「accept==n」比較（uncut テーブル。終端が確定するので body は alternation でも lazy でもよい：`^(a\|aa)+$`）。素の `^body` は leftmost-first cut テーブルを使い、cut 規則を満たす限り最終 accept が leftmost-first 終端そのもの。**任意 subject で健全**：歩行は非 ASCII バイトで、また CR-LF クラスタを分割し得るパターンでは `\r` でも bail する（`onepass_walk_bails_cr`）。真偽値の歩行は、表が受理の先へ進める場合、最初の受理で止まる。止まるのは、最後の受理の次のバイトと同じく、受理の次のバイトがbailの検査を通った所（`aop_.stop_first`、プランで1回求める。進めない表では最初の受理がもともと歩行の終わりで、`^body$`はnでの受理が要る）。capture 付きでも歩行がスパンを決める——`test()` と全ての不一致（ReDoS 入力に対する `^(a+)+$`）はこれで決着し、一致時のグループはそのスパン上で解決する。`^body$` の `+cap` はさらに先へ：`onepass_anchored_start_` により capture one-pass 歩行の候補が位置 0 のみになり、`^(\d{4})-(\d{2})-(\d{2})$` は 1 回の歩行で終端とグループを得る（bailは系統の位置0からのDFA（`from0_dfa`）へ。グループはその範囲で解決） |
 | WordOnePass | `wop_.ok`（`\b body \b`、capture なし、先頭/末尾 atom が語のみ。末尾 `\b` 付きはさらに全 accepting 状態の出バイトが語バイトであること。末尾 `\b` **なし**はテーブルが cut 付きになるので body に cut 規則も要求——`onepass_body_ok`） | 候補ごとのコンパクト歩行：候補=非単語が先行する開始可能バイト。候補は短いスカラーの入口ランプのあと、ブロック単位で取る（`word_start_block`。スキャンの節を参照）。末尾 `\b` は最終 accept での次バイト 1 判定（accepting 状態 admission により厳密：通過した accept の直後は必ず語バイト） |
 | `Dfa/US` | `us_ ∧ dfa_ok_` | `byte_prog_` 上のバイト lazy DFA（suffix/inner prefilter）；続いて **capture の有無を問わず**（`onepass_unbounded_`）候補＋unbounded one-pass 歩行——1 マッチ 1 歩行で、capture があれば終端とグループを、無ければスパンを得る（slot 0/1 は ncap に関係なくコンパイラが出す）。located-span chain の 2 走査を置き換える。歩行の途中にある非ASCII バイトは**局所的な** bail：chain がその 1 件だけを処理し、ドライバは次の find から戻る（§2「線形性」）。迷子のバイト（RFC 3629のUTF-8でないバイト）には何も要らない。バイトオートマトンはそれにマッチできず、単位の中でも何もそれにマッチしない |
 | `Dfa/EgcByte` | EGC ∧ `egc_byte_path(text)` | バイト lazy DFA（icase-prefix / suffix / inner prefilter、融合 EGC リテラルスキャン）；one-pass 歩行と `+cap` は同上。ただし CRLF collapse プランは除く（`byte_walk_ok`：そのバイトプログラムは CR-LF の対を 1 要素と数え、歩行の表は 2 要素と数える） |
@@ -500,7 +500,7 @@ subject 全体を分割する。
 | 段 | 走るもの | 必要なもの |
 | --- | --- | --- |
 | `Literal` / `LiteralAlt` / `AssertAnchor` | プランそのものが位置特定になっているもの。下へ落ちない | カーソル |
-| `TextAnchor` | テキスト先頭に固定されたパターンは0でマッチするか、どこでもしない。だから位置0からのfindがfindの全部（`find_from0`）。どの呼び出し側でも：`AnchoredOnePass`の歩行（歩行が決めたマッチのグループはその範囲で解決）、だめなら`^lit$`は位置0のリテラル、それ以外は各系統を位置0から、`match()`と同じく読んだ範囲で判定して（真偽値の走査は最初の受理で止まる）、それもだめなら位置0からのPike。主題を分類しない | カーソル。歩行で決まらなければキャッシュ |
+| `TextAnchor` | テキスト先頭に固定されたパターンは0でマッチするか、どこでもしない。だから位置0からのfindがfindの全部（`find_from0`）。どの呼び出し側でも：`AnchoredOnePass`の歩行（真偽値の歩行は`^body$`を除き最初の受理で止まる。歩行が決めたマッチのグループはその範囲で解決）、だめなら`^lit$`は位置0のリテラル、それ以外は各系統を位置0から、`match()`と同じく読んだ範囲で判定して（真偽値の走査は最初の受理で止まる）、それもだめなら位置0からのPike。主題を分類しない | カーソル。歩行で決まらなければキャッシュ |
 | `EndAnchor` | 末尾に固定されたパターンは末尾でマッチするか、どこでもしない：末尾からの逆 DFA が find の全部。読んだバイトは自分で検査する（§2「末尾からの find」） | キャッシュ |
 | `Classify` | 主題を見て、それを受け持つ系統の段に立つ。上の段がプランの全部でない限り、Grapheme のプランはここから始まる | 主題の分類 |
 | `FusedPrefix` / `FusedSuffix` | 融合 EGC リテラルスキャン（§4） | キャッシュ |
@@ -606,12 +606,13 @@ leftmost-first の終端まで歩く。上述）、look 付きで歩く DFA に�
 密なリテラルをスキャンに任せるときと同じです（`Plan::assert_prefix_skips`）。`e` の
 たびに始め直すスキャンは、全部を歩くスキャンより高くつくからです。テキスト先頭に
 固定されたパターンの真偽値は、リテラルを持っていても、位置0からのfind
-（`Rung::TextAnchor`）のDFAの走査を最初の受理で止めたものです。findは
+（`Rung::TextAnchor`）の歩行とDFAの走査を最初の受理で止めたものです。findは
 leftmost-firstの終端まで歩きますが（`^.*foo\b`）、真偽値の答えは最初の受理で出ます。
 一致のない 1 MB の文章への真偽値は、どちらの単位でも、`\bqzx\w*\b` と `(?m)^qzx.*` が
 1.5〜1.9 ms から 41〜43 µs（find と同じ）に、`^qzx\b.*` が 12 µs に（今は13〜17ns。
 位置0からのfindは先頭のバイトだけを読みます。「系統を推測し、走査が読んだ範囲で
-判定する」を参照）、61 バイトごとに
+判定する」を参照）、位置0からの歩行が決める`^the.*`は、改行の無い1MBのASCIIで
+1.37msから5〜7nsに、61 バイトごとに
 `q` がある文章への `\bq[a-z]+e\b` が ~0.3 ms になりました。fuzz はこの層の主題すべてに
 ついて、真偽値を 4 通り（読み飛ばしあり、なし、`search()`、Pike）で尋ねます（不正な
 バイトも含めて）。

@@ -7430,6 +7430,11 @@ private:
       uint32_t start = 0; // the start state's row
       bool ok = false;
       bool require_end = false;
+      // A boolean's walk stops at its first accept (onepass_walk_impl's
+      // First): for a bare `^body` whose walk can go past an accept. Where
+      // none can, the first accept is the walk's end anyway; `^body$` needs
+      // the accept at n.
+      bool stop_first = false;
       static constexpr uint32_t kDeadState = 0xFFFFFFFFu;
       static constexpr size_t kStride = 1 + 128;
       // A state's row, as the walk carries it: the offset of its first byte's
@@ -7444,6 +7449,17 @@ private:
       bool accepts(size_t state) const { return row(state)[-1] != 0; }
       const uint32_t *start_row() const {
         return next.data() + start / sizeof(uint32_t);
+      }
+      // Whether the walk can go on from an accepting state on a byte `pred`
+      // holds for (an admission's question, asked once).
+      template <class Pred> bool leaves_accept(Pred pred) const {
+        for (size_t i = 0; i < states(); i++) {
+          if (!accepts(i)) continue;
+          for (int b = 0; b < 128; b++)
+            if (row(i)[b] != kDeadState && pred(static_cast<unsigned char>(b)))
+              return true;
+        }
+        return false;
       }
     };
 
@@ -7497,6 +7513,8 @@ private:
       if (!onepass_body_ok(body, /*cut=*/!require_end)) return;
       if (!compact_onepass_table(body, aop_, /*cut=*/!require_end)) return;
       aop_.require_end = require_end;
+      aop_.stop_first = !require_end &&
+                        aop_.leaves_accept([](unsigned char) { return true; });
       aop_.ok = true;
     }
 
@@ -7633,13 +7651,9 @@ private:
         // Bodies that can resume on a non-word byte after a complete match —
         // \b(?:a\.)+a\b, \b\d+\.?\d+\b — are rejected here and stay on the
         // assert-DFA chain, which evaluates `\b` at every accept boundary.
-        for (size_t i = 0; i < wop_.states(); i++) {
-          if (!wop_.accepts(i)) continue;
-          for (int b = 0; b < 128; b++)
-            if (wop_.row(i)[b] != AnchoredOnePass::kDeadState &&
-                !is_word_byte(static_cast<unsigned char>(b)))
-              return;
-        }
+        if (wop_.leaves_accept(
+                [](unsigned char b) { return !is_word_byte(b); }))
+          return;
       }
       wop_trail_wb_ = trail;
       wop_.ok = true;
@@ -16212,7 +16226,13 @@ private:
   // byte (the callers' kWalkBail). One table load per byte, of the row the
   // next one is read from; the accept flag is read off the dependency chain.
   // Straight-line and static, so it inlines into both call sites.
-  template <bool BailCr>
+  //
+  // `First` returns the first accept instead, for a caller that asks only
+  // whether (a boolean: a `.*` tail would read on to the end of the line).
+  // It stops once the byte after the accept has passed the bail test, as
+  // the byte after the last accept has: a mark there would put the accept
+  // inside a cluster.
+  template <bool BailCr, bool First>
   static int onepass_walk_impl(const Plan::AnchoredOnePass &a,
                                const unsigned char *p, int n, int start,
                                int &end_pos, bool &bail) {
@@ -16230,13 +16250,16 @@ private:
     int acc = -1, pos = start;
     bail = false;
     for (;; pos++) {
-      if (entry(tb + st - sizeof(uint32_t))) acc = pos; // in front of the row
+      // (The state's accept flag, in front of its row.)
+      const bool accepts = entry(tb + st - sizeof(uint32_t)) != 0;
+      if (accepts) acc = pos;
       if (pos == n) break;
       unsigned char b = p[pos];
       if (b >= 128 || (BailCr && b == '\r')) {
         bail = true;
         break;
       }
+      if (First && accepts) break;
       // The row is all that one load hands the next (see REGEXLIB_OPAQUE).
       const unsigned char *col =
           detail::walk_column(tb, sizeof(uint32_t) * b);
@@ -16250,11 +16273,13 @@ private:
   // `bail_cr` is a plan constant (onepass_walk_bails_cr), so the branch is
   // hoisted out of the per-byte loop via the template — CR-LF-safe patterns
   // (the common validators) keep the original two-test loop body.
+  template <bool First = false>
   static int onepass_walk(const Plan::AnchoredOnePass &a,
                           const unsigned char *p, int n, int start,
                           int &end_pos, bool &bail, bool bail_cr) {
-    return bail_cr ? onepass_walk_impl<true>(a, p, n, start, end_pos, bail)
-                   : onepass_walk_impl<false>(a, p, n, start, end_pos, bail);
+    return bail_cr
+               ? onepass_walk_impl<true, First>(a, p, n, start, end_pos, bail)
+               : onepass_walk_impl<false, First>(a, p, n, start, end_pos, bail);
   }
 
   // EGC fuses the ASCII pair CR-LF into ONE grapheme, so a byte-wise walk is
@@ -16278,12 +16303,21 @@ private:
   // the last accept of `^body…` (leftmost-first end for the cut-built no-`$`
   // table; longest accept for the uncut `^body$` table, where the caller
   // demands accept == n), -1 if no accept, kWalkBail on a non-ASCII byte.
+  // `First`: for a caller that asks only whether; the walk then stops at
+  // its first accept if the plan's does (Plan::AnchoredOnePass::stop_first).
+  template <bool First>
   int anchored_onepass_walk(std::string_view t) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
+    const int n = static_cast<int>(t.size());
+    const bool bail_cr = onepass_walk_bails_cr();
     int end_pos;
     bool bail;
-    int acc = onepass_walk(plan_->aop_, p, static_cast<int>(t.size()),
-                           /*start=*/0, end_pos, bail, onepass_walk_bails_cr());
+    // (stop_first is the plan's, as bail_cr is: the walk is picked once.)
+    int acc = First && plan_->aop_.stop_first
+                  ? onepass_walk<true>(plan_->aop_, p, n, /*start=*/0, end_pos,
+                                       bail, bail_cr)
+                  : onepass_walk<false>(plan_->aop_, p, n, /*start=*/0, end_pos,
+                                        bail, bail_cr);
     return bail ? kWalkBail : acc;
   }
 
@@ -16302,11 +16336,14 @@ private:
     return anchored_onepass_once(text, e_out);
   }
   // The same, inlined: for the one-step find, where a validator's whole call
-  // is this walk, and a call is a real share of it.
+  // is this walk, and a call is a real share of it. `First`: for a caller
+  // that asks only whether, whose `e_out` is where an accept ended, not the
+  // match (see anchored_onepass_walk).
+  template <bool First = false>
   REGEXLIB_ALWAYS_INLINE int anchored_onepass_once(std::string_view text,
                                                    int &e_out) const {
     if (!plan_->aop_.ok) return -1;
-    int e0 = anchored_onepass_walk(text);
+    int e0 = anchored_onepass_walk<First>(text);
     if (e0 == kWalkBail) return -1;
     if (e0 < 0 ||
         (plan_->aop_.require_end && e0 != static_cast<int>(text.size())))
@@ -16970,10 +17007,10 @@ private:
 
   // The find of a text-anchored plan (Rung::TextAnchor): every match
   // starts at 0, so the first one from 0 is the leftmost-first one and none
-  // follows it. The match goes to `out`; returns its end (where a DFA's
-  // first accept ended, for a caller that asks only whether: see
-  // from0_dfa), or -1 for none. `scr` is filled by the first part that
-  // needs it. [Tier:
+  // follows it. The match goes to `out`; returns its end (where the walk's
+  // or a DFA's first accept ended, for a caller that asks only whether: see
+  // anchored_onepass_walk, from0_dfa), or -1 for none. `scr` is filled by
+  // the first part that needs it. [Tier:
   // AnchoredOnePass] `^body$` / `^body` validators: one walk from 0
   // decides, before even the cache fetch, and is all a validator's call
   // is: inlined for a one-step find (`InlineWalk`: find_once), the rest
@@ -16988,8 +17025,11 @@ private:
     const bool groups = Out::kGroups && plan_->ncap_ > 0;
     int walk_end = -1;
     if (plan_->aop_.ok && !(groups && plan_->onepass_anchored_start_)) {
-      const int r = InlineWalk ? anchored_onepass_once(text, walk_end)
-                               : anchored_onepass_try(text, walk_end);
+      // (A boolean's walk stops at its first accept; it comes inlined, from
+      // find_once.)
+      const int r = InlineWalk
+                        ? anchored_onepass_once<!Out::kGroups>(text, walk_end)
+                        : anchored_onepass_try(text, walk_end);
       if (r == 0) return -1;
       if (r > 0 && !groups) {
         out.span(*this, text, 0, walk_end);

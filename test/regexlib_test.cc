@@ -165,6 +165,11 @@ struct PlanProbe {
     const auto &a = word ? re.plan_->wop_ : re.plan_->aop_;
     return a.ok ? a.states() : 0;
   }
+  // Whether a boolean's walk of the `^body` tier stops at its first accept
+  // (Plan::AnchoredOnePass::stop_first).
+  static bool walk_stops_first(const Regex &re) {
+    return re.plan_->aop_.ok && re.plan_->aop_.stop_first;
+  }
   static std::vector<size_t> word_starts(std::string_view s, size_t off,
                                          const NibbleSet &starts, bool walk) {
     const auto *p = reinterpret_cast<const unsigned char *>(s.data());
@@ -2259,8 +2264,10 @@ void test_find_guess_grapheme() {
 // in either unit the scan starts on Rung::TextAnchor, where the families,
 // each anchored at 0, are judged on what their scan read (match()'s families are
 // put to kDirt in test_match_guess; these are the shapes new to the find:
-// a boolean's scan that stops at its first accept, groups resolved on the
-// walk's span, a literal anchor at 0, empty matches, a CR-LF literal). So
+// a boolean's scan or walk that stops at its first accept (the walk once it
+// has read the byte after it: a mark there undoes the accept), groups
+// resolved on the walk's span, a literal anchor at 0, empty matches, a
+// CR-LF literal). So
 // each piece of kDirt at the early offsets and further on, over ASCII,
 // accented and CR-LF text: search() and test() agree with the Pike, groups
 // and all; and so does every find surface (find_all, find_iter, find_at
@@ -2275,7 +2282,8 @@ void test_text_anchored_find() {
   const char *pats[] = {"^qzx\\b.*", "^qzx$",       "^\\w+\\b",
                         "^(\\w+)\\s", "^the\\b(.*)", "^(a+)+$",
                         "^\\s*",      "^",           "\\b^\\w{2}",
-                        "^\\r\\n",    "^[^\\n]*"};
+                        "^\\r\\n",    "^[^\\n]*",    "^the.*",
+                        "^th[a-z]*"};
   const size_t offsets[] = {0, 1, 2, 3, 4, 6, 9, 14, 21, 32, 48, 100};
   for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
     for (const char *pat : pats) {
@@ -2317,10 +2325,30 @@ void test_text_anchored_find() {
   }
   // A boolean stops at its first accept, where the find goes on to the
   // leftmost-first end (the subject has no line break: the end of it).
+  // And so does the walk from 0: over a megabyte of ASCII that ends in an
+  // `é`, it does not read on to the `é`, which would bail it to a DFA.
+  std::string ascii = "the";
+  while (ascii.size() < (1u << 20)) ascii += " quick brown fox";
+  ascii += "\xC3\xA9";
   for (const auto u : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
     const Regex re("^The\\b.*", 0, u);
     CHECK(re.test(prose));
     CHECK(PlanProbe::dfa_stats(re).scanned < 64);
+    for (const char *pat : {"^the.*", "^the[^\\n]*", "(?s)^the.*"}) {
+      const Regex walk(pat, 0, u);
+      CHECK(walk.test(ascii));
+      CHECK(PlanProbe::dfa_stats(walk).built == 0);
+    }
+  }
+  // ... where it can go past an accept. One whose every accept ends it, or
+  // whose accept has to be at n, walks as the find does.
+  for (const char *pat : {"^the.*", "^th[a-z]*", "^[a-z]+"})
+    CHECK(PlanProbe::walk_stops_first(Regex(pat)));
+  for (const char *pat :
+       {"^#[0-9a-f]{6}", "^(\\w+)\\s", "^\\s*#", "^[a-z]+$"}) {
+    const Regex re(pat);
+    CHECK(PlanProbe::walk_states(re, false) > 0);
+    CHECK(!PlanProbe::walk_stops_first(re));
   }
   // A match the walk from 0 decided has its groups resolved on that span:
   // no DFA locates it again.
