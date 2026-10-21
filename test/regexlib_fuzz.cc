@@ -86,6 +86,7 @@ struct PlanProbe {
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
+           !p.text_anchored_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
@@ -417,11 +418,16 @@ void fail(const std::string &why, const std::string &pat,
 // set) — at every entry point, since they share one ladder. A reference
 // that took those would share them with any pattern the Pike serves; behind
 // a lookahead none of them is planned, and the VM starts at every position.
+// The front one in a group of its own: a pattern every match of which
+// starts at 0 (text_anchored_, `^a`) is found from 0 alone, and the
+// analysis that says so looks past a bare lookahead in front — through the
+// group it does not. The reference is then the VM started everywhere, and
+// it checks that analysis too.
 reg::Regex *pike_reference(const std::string &pat, unsigned flags,
                            reg::MatchUnit unit) {
   reg::Regex *pike = nullptr;
   try {
-    pike = new reg::Regex("(?=)(?:" + pat + ")(?=)", flags, unit);
+    pike = new reg::Regex("(?:(?=))(?:" + pat + ")(?=)", flags, unit);
   } catch (...) {
     return nullptr; // wrapping may hit a limit; the caller skips the compare
   }

@@ -193,6 +193,7 @@ struct PlanProbe {
   static bool pike_only(const Regex &re) {
     const auto &p = *re.plan_;
     return !p.literal_only_ && p.literal_alt_.empty() && !p.dfa_ok_ &&
+           !p.text_anchored_ &&
            !p.dfa_assert_ok_ && !p.byte_path_ && !p.byte_assert_path_ &&
            !p.lf_prog_.ok() && !p.assert_.anchor_gatefree &&
            !p.aop_.ok && !p.wop_.ok && !p.prefix_.active() && !p.teddy_.ok &&
@@ -456,9 +457,12 @@ using reg::detail::PlanProbe;
 // The same lookahead in front keeps the Pike rung's own accelerators off it
 // (a literal prefix, Teddy or first-byte set to skip to): the twin is the
 // VM started at every position, and shares nothing with what it checks.
+// The front one goes in a group of its own, which the text-anchor analysis
+// does not look through (a bare lookahead it does): `^a`'s twin is not
+// found from 0 alone, as `^a` is.
 inline reg::Regex pike_twin(const std::string &pat, unsigned flags = 0,
                             reg::MatchUnit unit = reg::MatchUnit::Grapheme) {
-  reg::Regex re("(?=)(?:" + pat + ")(?=)", flags, unit);
+  reg::Regex re("(?:(?=))(?:" + pat + ")(?=)", flags, unit);
   check(PlanProbe::pike_only(re), "pike_twin: reference is Pike-only",
         __LINE__);
   return re;

@@ -1944,11 +1944,12 @@ ASan/UBSan) is layered. (Sanitizers multiply the run time — ASan about 7×, UB
   **forced** by a transformation the accelerator cannot see through:
 
   ```cpp
-  pike = Regex("(?=[\\s\\S]|$)(?:" + pat + ")(?=[\\s\\S]|$)");
+  pike = Regex("(?:(?=))(?:" + pat + ")(?=)");
   ```
 
-  The always-true lookahead — the next cluster is anything, or the text ends —
-  matches at every position and consumes nothing, and a lookaround is a
+  The empty lookahead matches at every position and consumes nothing (not
+  `(?=[\s\S]|$)`: no class takes a stray byte, so that one fails in front
+  of one), and a lookaround is a
   construct neither DFA family compiles (`dfa_ok_`/`dfa_assert_ok_` bow out),
   so this `Regex` runs the Pike — while matching the exact same whole spans.
   It stands in front as well as behind because the Pike rung is not the bare
@@ -1956,7 +1957,11 @@ ASan/UBSan) is layered. (Sanitizers multiply the run time — ASan about 7×, UB
   set) and tries the bounded backtracker there — at every entry point, since
   they share one ladder. A reference that took those would share them with
   every pattern the Pike serves; behind a lookahead none is planned, and the
-  VM starts at every position.
+  VM starts at every position. The front one sits in a group of its own:
+  the text-anchor analysis (`forces_text_begin`, whose plans are found from
+  0 alone) looks past a bare lookahead to a `^` behind it, and not through a
+  group, so the reference of `^a` is the VM started everywhere, and it
+  checks that analysis too.
   The scan's full sequence is compared span-for-span **and
   capture-for-capture** against the forced-Pike result. This is the check
   that caught the CRLF soundness bugs: `gen_subject` deliberately emits `\r`
