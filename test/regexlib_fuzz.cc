@@ -777,6 +777,11 @@ void check_reach(const reg::Regex &re, const std::string &subj,
           static_cast<size_t>(draw(0, static_cast<int>(subj.size()) - 1)),
           static_cast<size_t>(draw(1, 8)));
     const std::string cut = std::string(sound.substr(0, e)) + kOn[on] + piece;
+    // (Not a piece that goes on with the code point at the reach, or with
+    // its CR-LF: a continuation byte after a lead byte the subject cut
+    // short, an LF after its CR. guess_end takes those in, so no text has
+    // one past it.)
+    if (P::guess_end(cut, a.reach) != e) return;
     const P::Step b = P::family_step(re, fam, test, short_test, cut, pos);
     if (!b.on_family) return;
     // (Positions in the text the step read: behind the newlines if padded.)
