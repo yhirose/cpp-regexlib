@@ -182,6 +182,61 @@ struct PlanProbe {
   static bool word_scan_sparse(const Regex &re) {
     return re.plan_->word_scan_sparse();
   }
+  // The families a Grapheme scan of `re` (a find's, or a boolean's: `test`)
+  // can stand on, as ladder_gated chooses them, but the one with a (?i)
+  // probe chosen for its subject (kFamEgcByteIp, which find_run is not
+  // handed): the byte family, the ASCII one, the byte assert one.
+  static std::vector<int> step_families(const Regex &re, bool test) {
+    const auto &p = *re.plan_;
+    std::vector<int> f;
+    if (p.us_) return f;
+    if (p.byte_path_) f.push_back(Regex::kFamEgcByte);
+    if (p.ascii_family(test) != Regex::kFamilyCount)
+      f.push_back(p.ascii_family(test));
+    if (p.byte_assert_path_) f.push_back(Regex::kFamAssertByte);
+    return f;
+  }
+  // Where `text`, read from its start, stops being one family `fam`
+  // answers for (Regex::family_unsound_at).
+  static size_t unsound_at(const Regex &re, int fam, std::string_view text) {
+    return re.family_unsound_at(static_cast<Regex::Family>(fam), text,
+                                Regex::first_nonascii(text));
+  }
+  static size_t guess_end(std::string_view text, int reach) {
+    return Regex::guess_end(text, reach);
+  }
+  // One step of family `fam`'s ladder (a find's, or a boolean's: `test`;
+  // `short_test` the boolean's over a short subject) from byte `pos`, taken
+  // as find_rest takes a guess's (find_run): whether it found a match (`r`
+  // holds it for a find), how far it read (Regex::step_reach), and whether
+  // it stayed on the family — not on the Pike, the reference, nor on a
+  // family the subject chose.
+  struct Step {
+    bool found = false;
+    MatchResult r;
+    int reach = 0;
+    bool on_family = false;
+  };
+  static Step family_step(const Regex &re, int fam, bool test, bool short_test,
+                          std::string_view text, int pos) {
+    Step st;
+    Regex::Ladder l = re.plan_->family_[fam][test ? (short_test ? 2 : 1) : 0];
+    l.set(Regex::Ladder::kSpec);
+    Regex::Scr scr;
+    Regex::Cursor c;
+    c.pos = pos;
+    bool walked = false;
+    if (test) {
+      Regex::NoSink out;
+      st.found = re.find_run(text, scr, l, c, walked, out);
+    } else {
+      Regex::ResultSink out{st.r};
+      st.found = re.find_run(text, scr, l, c, walked, out);
+    }
+    st.on_family = Regex::guess_open(l);
+    st.reach = Regex::step_reach(text, scr, l, c, walked, st.found);
+    return st;
+  }
 };
 } // namespace detail
 } // namespace reg
@@ -664,6 +719,84 @@ void check_scan(const reg::Regex &re, const std::string &subj,
     fail("split() pieces do not reconstruct subject", pat, subj);
 }
 
+// A step's answer depends on nothing past its reach (Regex::step_reach):
+// on no byte at or past guess_end(reach), the end of the code point there.
+// What a guess and a cut text (docs/design.md) both stand on. One family
+// of the plan, drawn at random, steps (a find from 0 or from a resume
+// position, a boolean from 0) over the part of the subject it answers for
+// — where a cut text would end — a find behind 4 KB of newlines or none (a
+// walk's budget is seeded with the subject's length: a short one runs out
+// in two failed walks). Past guess_end the text is then cut off, or goes on with
+// a cluster no family answers for, a CR-LF or an ASCII byte, and maybe a
+// piece of the subject: the step answers as before, and for a find with
+// the same match and groups. (A step that left the family — for the Pike,
+// the reference, or for a family the subject chose — is not compared.)
+// Its draws come from the pattern and the subject, not from the stream the
+// other checks draw on, which is then what it was without this one. On
+// half the subjects: on all, it was 7% of the fuzzer's run.
+void check_reach(const reg::Regex &re, const std::string &subj,
+                 const std::vector<reg::MatchResult> &all,
+                 const std::string &pat) {
+  using P = reg::detail::PlanProbe;
+  std::mt19937 own(static_cast<uint32_t>(std::hash<std::string>{}(pat) * 31 +
+                                         std::hash<std::string>{}(subj)));
+  auto draw = [&own](int lo, int hi) {
+    return std::uniform_int_distribution<int>(lo, hi)(own);
+  };
+  if (draw(0, 1)) return;
+  const bool test = draw(0, 1) != 0;
+  const std::vector<int> fams = P::step_families(re, test);
+  if (fams.empty()) return;
+  const int fam =
+      fams[static_cast<size_t>(draw(0, static_cast<int>(fams.size()) - 1))];
+  const bool short_test = draw(0, 1) != 0;
+  // (A find's: a boolean scans from 0, and would read the newlines too.)
+  const int pad = !test && draw(0, 1) ? 4096 : 0;
+  const std::string text = std::string(static_cast<size_t>(pad), '\n') + subj;
+  const std::string_view sound(text.data(), P::unsound_at(re, fam, text));
+  // (A boolean scans from 0: test() takes no other step.)
+  int pos = test ? 0 : pad;
+  if (!test && !all.empty() && draw(0, 1))
+    pos += static_cast<int>(
+        all[static_cast<size_t>(draw(0, static_cast<int>(all.size()) - 1))]
+            .end());
+  if (pos > static_cast<int>(sound.size())) return;
+  static const char *const kOn[] = {
+      "", "", "\xE2\x9D\xA4\xEF\xB8\x8F", "e\xCC\x81", "\r\n", "a", " ", "_"};
+  try {
+    const P::Step a = P::family_step(re, fam, test, short_test, sound, pos);
+    if (!a.on_family || !a.found) return;
+    const size_t e = P::guess_end(sound, a.reach);
+    if (e >= sound.size()) return;
+    const int on = draw(0, 7);
+    // ... and half the time a piece of the subject: what completes a
+    // candidate the step failed for want of more text.
+    std::string piece;
+    if (!subj.empty() && draw(0, 1))
+      piece = subj.substr(
+          static_cast<size_t>(draw(0, static_cast<int>(subj.size()) - 1)),
+          static_cast<size_t>(draw(1, 8)));
+    const std::string cut = std::string(sound.substr(0, e)) + kOn[on] + piece;
+    const P::Step b = P::family_step(re, fam, test, short_test, cut, pos);
+    if (!b.on_family) return;
+    // (Positions in the text the step read: behind the newlines if padded.)
+    const std::string what =
+        "step past its reach (family " + std::to_string(fam) +
+        (test ? short_test ? ", short test" : ", test" : "") + ", from " +
+        std::to_string(pos) + ", reach " + std::to_string(a.reach) +
+        ", cut at " + std::to_string(e) + " + kOn[" + std::to_string(on) +
+        "] + \"" + piece + "\"" + (pad ? ", behind 4096 newlines" : "") +
+        ")";
+    const std::string shown(sound.substr(static_cast<size_t>(pad)));
+    if (b.found != a.found)
+      fail(what + ": found differs", pat, shown);
+    else if (!test)
+      compare_groups(b.r, a.r, what.c_str(), pat, shown);
+  } catch (...) {
+    fail("family step threw", pat, subj);
+  }
+}
+
 // --- Unicode / grapheme-cluster fuzzing (the engine's differentiator) ---
 // A mix of: ASCII, a precomposed accent, a base+combining grapheme, CJK, a
 // single emoji, a ZWJ family cluster (many code points, one grapheme), and a
@@ -955,6 +1088,7 @@ void check_pattern(const std::string &pat,
     }
     check_cache(*re, subj, all, cache, pat);
     check_scan(*re, subj, all, pat);
+    check_reach(*re, subj, all, pat);
   }
   delete re;
   delete pike;

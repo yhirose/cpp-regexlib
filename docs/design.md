@@ -825,13 +825,14 @@ holds.
   is classified whole; at the Pike, which a guess's scan enters at 0
   whatever its cursor (a rung can move it past candidates it failed, which
   a guess vouches for no more than for anything else it read), the answer
-  stands. The route and the
-  guess are both taken only where a CR-LF reads as the grapheme engine
-  reads it (`crlf_byte_safe_`,
-  non-empty, no fused CR-LF literal): then a walk that reads past what the
-  scans report reads ASCII, which no cluster changes the meaning of (past
-  an ASCII byte it matched it reads on, and gives up at a non-ASCII one;
-  a byte it did not match, a cluster on it does not match either). No byte
+  stands. The route is taken only where a CR-LF reads as the grapheme
+  engine reads it (`crlf_byte_safe_`, non-empty, no fused CR-LF literal),
+  which makes the ASCII family sound on every pure-ASCII subject, and the
+  guess with it. The guess leaned on that while a walk's reach was taken
+  to be its match's end (past it a walk reads ASCII, which no cluster
+  changes the meaning of); a walk reports how far it read now (see the
+  rules), so it no longer does, though the guess is still taken only
+  there. No byte
   guess where the plan has a faster way over a non-ASCII subject that needs
   no classifying (the fused rungs; the (?i) prefix probe, chosen over the
   whole subject). The other orders were measured and dropped: guessing the
@@ -847,9 +848,37 @@ The rules:
   whole subject when it found none (a literal prefilter reads to the end
   without a DFA). A skip counts: it is a claim about the bytes it passes
   (no match starts there), which a cluster among them can make wrong. One
-  definition for every producer: the
-  anchored scans' `reach_out` (they never skip) and `LazyDfa::hi` (the
-  furthest any forward scan stopped since `FindCache::reach_from_zero`).
+  definition for every producer, and one function for a find's step
+  (`Regex::step_reach`). The readers, and how each reports:
+  - the forward DFA scans: `LazyDfa::hi`, the furthest any of them stopped
+    since `FindCache::reach_from_zero`, over the program set of the family
+    the step stands on (the byte programs' or the grapheme ones'); the
+    anchored scans of `match()`: their `reach_out` (they never skip). The
+    reverse scans read within what a forward one did;
+  - the walk (`Rung::Walk`: the prefix, scan, inner and scalar-chain
+    drivers) and the assert family's word walk (WordOnePass): each walk's
+    `OnePassWalk::reach`, the failed ones' included, into `Cursor::reach`
+    (`ReadTo`). A candidate that failed on the bytes past a later match
+    decides that match: `(?:b[^c]*c)?(a)\d` over "b a1 xyz" is `a1` only
+    because no `c` follows the `b`, which the walk from 0 read to the end.
+    The scan driver's two-byte reject is passed by the next walk, which
+    starts after it and reads its own first byte. Only a guess's step
+    counts (`Ladder::kSpec`); every other step, and the find_all loops,
+    take the copy that counts nothing (`ReadNone`);
+  - the suffix rung's scalar verifier (`suffix_scalar_verify`): where the
+    last class absorbs the literal (`[^q]{3,}\.`), the end is the last
+    occurrence in the class's run, so it reads to the byte that ends the
+    run; raised into `Cursor::reach` the same way;
+  - the literal prefilters (memmem, Teddy, the first-byte skips): to a
+    candidate, which is no later than the match's start, or to the end;
+  - the reads of the code point past a match (the literal-led assert
+    verifies, the word scan, a walk's trailing `\b`): covered by the code
+    point at `reach` (below).
+  Not guessed, so not counted: the fused rungs, the (?i) probe's family,
+  and the Pike, which is the reference. The fuzzer checks the definition
+  for every family (`check_reach`): a step over the part of a subject its
+  family answers for answers the same when the text past the code point at
+  its reach is cut off, or goes on with a cluster no family answers for.
 - **What must hold**: the family's own gate, over the prefix of the subject
   that ends with the code point at `reach`. That code point is where the scan
   stopped, and whether it joins the one before it is what the stop meant:

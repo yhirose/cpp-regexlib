@@ -452,6 +452,26 @@ struct PlanProbe {
                            size_t i) {
     return re.family_sound(family(fam), s, i);
   }
+  // One step of `re`'s family `fam` (a find's, or a boolean's: `test`)
+  // over `s`, from 0, taken as a guess takes it (find_run): how far it read
+  // (Regex::step_reach), -1 if it left the family; a find's match in `m`.
+  static int step_reach(const Regex &re, char fam, bool test,
+                        std::string_view s, MatchResult &m) {
+    Regex::Ladder l = re.plan_->family_[family(fam)][test ? 1 : 0];
+    l.set(Regex::Ladder::kSpec);
+    Regex::Scr scr;
+    Regex::Cursor c;
+    bool walked = false, found;
+    if (test) {
+      Regex::NoSink out;
+      found = re.find_run(s, scr, l, c, walked, out);
+    } else {
+      Regex::ResultSink out{m};
+      found = re.find_run(s, scr, l, c, walked, out);
+    }
+    return Regex::guess_open(l) ? Regex::step_reach(s, scr, l, c, walked, found)
+                                : -1;
+  }
   // The pieces those are made of: where the first multi-code-point cluster
   // starts (any, or any but a CR-LF pair), the first lone CR or LF, the
   // first CR-LF pair.
@@ -2232,6 +2252,53 @@ void test_lazy_segmentation() {
     CHECK(!hit);
     CHECK(reg::detail::Segmented::made() < 1024);
   }
+}
+
+// How far a step read (Regex::step_reach) is how far the bytes its answer
+// depends on go: what a guess (guess_held) and a cut text stand on, and
+// what the fuzzer's check_reach checks of every family. The readers that
+// no lazy DFA counts for report it themselves. The walk (Rung::Walk) reads
+// past its match to the byte that ended it: `[^b]*\s+` over "2B2 cba b" to
+// the b at 5. A walk that failed reads on too, and decides the match: over
+// "b a1 xyz", `(?:b[^c]*c)?(a)\d` is a1 only because no c follows the b,
+// which the failed walk from 0 read to the end — with "ca2" there, the
+// match starts at 0. The assert family's word walk (WordOnePass) reads to
+// the end for the last e of `\bt[^\n]{3,}[^q]?e`. The suffix rung's scalar
+// verifier ends `[^q]{3,}\.` at the last `.` of the run its class makes, so
+// it reads to the q that ends the run. And a DFA's reach is the furthest
+// of its family's programs' DFAs: the grapheme ones for the ASCII family,
+// a boolean's and a find's chain.
+void test_step_reach() {
+  reg::MatchResult m;
+  const Regex past("[^b]*\\s+");
+  CHECK(PlanProbe::family_find(past, 'b') == 'W');
+  CHECK(PlanProbe::step_reach(past, 'b', false, "2B2 cba b", m) == 6);
+  CHECK(m.matched() && m.begin() == 0 && m.end() == 4);
+  const Regex fails("(?:b[^c]*c)?(a)\\d");
+  for (const char fam : {'a', 'b'}) {
+    CHECK(PlanProbe::family_find(fails, fam) == 'W');
+    CHECK(PlanProbe::step_reach(fails, fam, false, "b a1 xyz", m) == 8);
+    CHECK(m.matched() && m.begin() == 2 && m.end() == 4);
+    CHECK(PlanProbe::step_reach(fails, fam, false, "b a1 xyzca2", m) == 11);
+    CHECK(m.matched() && m.begin() == 0 && m.end() == 11);
+  }
+  const Regex word("\\bt[^\\n]{3,}[^q]?e");
+  CHECK(PlanProbe::word_onepass(word) &&
+        PlanProbe::family_find(word, 'A') == 'c');
+  CHECK(PlanProbe::step_reach(word, 'A', false,
+                              "se,?t,gnn?i!n?ag=\"t??eineen?", m) == 28);
+  CHECK(m.matched() && m.begin() == 4 && m.end() == 26);
+  const Regex suffix("[^q]{3,}\\.");
+  CHECK(PlanProbe::family_find(suffix, 'b') == 'S');
+  CHECK(PlanProbe::step_reach(suffix, 'b', false, "e,,t. q,bg.q.x", m) == 7);
+  CHECK(m.matched() && m.begin() == 0 && m.end() == 5);
+  CHECK(PlanProbe::step_reach(suffix, 'b', false, "e,,t.  g.q.x", m) == 10);
+  CHECK(m.matched() && m.begin() == 0 && m.end() == 9);
+  CHECK(PlanProbe::step_reach(Regex("\\d"), 'a', true, "ab 5 c", m) == 4);
+  const Regex chain("\\d+|q\\w");
+  CHECK(PlanProbe::family_find(chain, 'a') == 'C');
+  CHECK(PlanProbe::step_reach(chain, 'a', false, "ab 55 c", m) == 6);
+  CHECK(m.matched() && m.begin() == 3 && m.end() == 5);
 }
 
 // match() does not classify its subject. It tries the plan's families in
@@ -7522,6 +7589,7 @@ int main() {
   test_crlf_interior_anchors();
   test_unsound_positions();
   test_lazy_segmentation();
+  test_step_reach();
   test_match_guess();
   test_find_guess();
   test_find_guess_grapheme();

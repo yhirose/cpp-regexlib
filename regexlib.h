@@ -5699,6 +5699,16 @@ class Regex {
     // match() answer depends on no byte past it — see guess_held).
     int reach(int s, int n) const { return s + walked < n ? s + walked + 1 : n; }
   };
+  // Where a find's walks report how far they read (see step_reach), the
+  // way a sink takes its match: ReadTo keeps the furthest, ReadNone — a
+  // loop that reads no reach, find_all's — nothing, at no cost.
+  struct ReadTo {
+    int at = 0;
+    void operator()(int r) { at = std::max(at, r); }
+  };
+  struct ReadNone {
+    void operator()(int) {}
+  };
   class WalkBudget {
     int left_;
     int bail_at_ = -1;
@@ -12368,9 +12378,13 @@ private:
   // start — and [s, e) is then no match's span. (A run-time argument:
   // as a template one, the boolean's copy of this function changed what GCC
   // inlined into test(), and cost two to four instructions of every call.)
+  // `read`, unless null, is raised to how far its walk read (see
+  // word_onepass_read); the rest read through DFAs (LazyDfa::hi), or no
+  // further than the code point past the end (the literal-led verifies, the
+  // word scan: see guess_end).
   int assert_find_span(FindCache &fc, std::string_view text, int from, int &s,
-                       int &e, bool byte, WalkBudget &budget,
-                       bool span) const {
+                       int &e, bool byte, WalkBudget &budget, bool span,
+                       int *read) const {
     // What a scan that found nothing answers: nothing, or that it gave up.
     const auto none = [](int r) { return r == LazyDfa::kCap ? r : 0; };
     if (!plan_->assert_.lit.empty())
@@ -12383,7 +12397,7 @@ private:
     // budget bail falls to.
     const bool wop = plan_->wop_.ok && !byte;
     if (wop && !plan_->wop_after_anchor_) {
-      int r = word_onepass_find(text, from, s, e, budget);
+      int r = word_onepass_read(text, from, s, e, budget, read);
       if (r != kWalkBail) return r > 0;
       // budget / non-ASCII -> the assert chain below
     }
@@ -12396,7 +12410,7 @@ private:
       if (r != kWalkBail) return r;
     }
     if (wop && plan_->wop_after_anchor_) {
-      int r = word_onepass_find(text, from, s, e, budget);
+      int r = word_onepass_read(text, from, s, e, budget, read);
       if (r != kWalkBail) return r > 0;
     }
     if (!span) {
@@ -13961,10 +13975,14 @@ private:
   // scan resume point (past the whole analyzed run in the absorb case, so a
   // run full of failing occurrences is analyzed once, keeping the tier
   // linear) — or -1 when a non-ASCII byte is met (the caller falls back to
-  // the DFA verify for this candidate; the table only covers ASCII).
+  // the DFA verify for this candidate; the table only covers ASCII). On a
+  // match `read_out` is one past the furthest byte it read: the end, or in
+  // the absorb case past the byte that ended the run (the end is the last
+  // occurrence in it, so what follows the run decides it).
   int suffix_scalar_verify(std::string_view text, int occ, int floor,
                            bool collapse, int &s_out, int &e_out,
-                           int &next_out, int &walk_out) const {
+                           int &next_out, int &walk_out,
+                           int &read_out) const {
     const auto &sf = plan_->suffix_;
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -13983,6 +14001,7 @@ private:
     walk_out = 0;    // bytes this candidate examined (the caller's budget)
     int i = occ;     // left cursor: start of what remains to be matched
     int e = occ + m; // match end (replaced in the absorb case)
+    read_out = e;
     size_t j = sf.chain.size();
     if (sf.absorb_last) {
       // `[a-zA-Z]+ing` family: the greedy end is the LAST suffix occurrence
@@ -14007,6 +14026,7 @@ private:
         if (!el.in[b]) break;
         re++;
       }
+      read_out = re < n ? re + 1 : n;
       // The walks above plus the in-run occurrence rescan below are this
       // candidate's examined extent.
       walk_out = (occ - i) + 2 * (re - (occ + m));
@@ -14058,7 +14078,8 @@ private:
   // plan allows it (falling back to the DFA per candidate on non-ASCII),
   // otherwise the reverse DFA scan plus — for a variable pre-suffix — the
   // greedy forward re-expansion. Returns 1 with [s_out, e_out) and reach_out
-  // (the rightmost byte examined, for the EGC cleanliness check), 0 if no
+  // (one past the rightmost byte examined: the window of the EGC
+  // cleanliness check, and what the step read past a DFA), 0 if no
   // match ends at this occurrence (next_out = scan resume point),
   // LazyDfa::kCap, or kWalkBail when `budget` is exhausted. The budget is the
   // linearity guard: a FAILED candidate charges every byte its walks
@@ -14077,13 +14098,13 @@ private:
     next_out = occ + 1;
     int spent = 0; // this candidate's examined bytes (charged on failure)
     if (sf.verify == Plan::SuffixPrefilter::Verify::Scalar) {
-      int walked = 0;
+      int walked = 0, read = 0;
       int r = suffix_scalar_verify(text, occ, from, collapse, s_out, e_out,
-                                   next_out, walked);
+                                   next_out, walked, read);
       if (r == 0)
         return budget.spend(walked) ? 0 : kWalkBail;
       if (r > 0) {
-        reach_out = e_out;
+        reach_out = read;
         return 1;
       }
       // r < 0: non-ASCII / CR-LF neighborhood — the DFA verify takes over.
@@ -14128,9 +14149,12 @@ private:
     return 1;
   }
 
+  // `read`, unless null, is raised to the match's reach_out (see
+  // suffix_candidate). A candidate that failed is read past by the one that
+  // matches: the next occurrence is looked for past what it read.
   int suffix_find(LazyDfa &fwd, LazyDfa &rv, std::string_view text, int from,
-                  int &s_out, WalkBudget &budget, bool collapse,
-                  bool span) const {
+                  int &s_out, WalkBudget &budget, bool collapse, bool span,
+                  int *read) const {
     const auto &sf = plan_->suffix_;
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
@@ -14161,6 +14185,7 @@ private:
       if (r == LazyDfa::kCap || r == kWalkBail) return r;
       if (r == 1) {
         s_out = s;
+        if (read) *read = std::max(*read, reach);
         return e;
       }
       scan = next; // no match ends here; the floor (`from`) is unchanged
@@ -14979,20 +15004,20 @@ public:
     friend class MatchIter;
     friend struct detail::PlanProbe;
 
-    // How far forward the scans of a guess read (LazyDfa::hi): from 0, and
-    // the furthest — over the forward DFAs of the byte programs: a guess is
-    // a byte family's (Plan::find_guess_), whose rungs run those alone
-    // (Regex::ladder_byte). (The reverse DFAs read within what a forward one
-    // did. Spelled out: as a loop, the two cost a short test() 19
-    // instructions more.)
-    void reach_from_zero() {
-      std::optional<LazyDfa> *d = set(true);
+    // How far forward the scans of a step read (LazyDfa::hi): from 0, and
+    // the furthest — over the forward DFAs of one program set, the byte
+    // programs' or the grapheme ones' (`byte`): a step stands on one
+    // family, whose rungs run that set alone (Regex::ladder_byte). (The
+    // reverse DFAs read within what a forward one did. Spelled out: as a
+    // loop, the two cost a short test() 19 instructions more.)
+    void reach_from_zero(bool byte) {
+      std::optional<LazyDfa> *d = set(byte);
       if (d[kDfaBool]) d[kDfaBool]->hi = 0;
       if (d[kDfaFwd]) d[kDfaFwd]->hi = 0;
       if (d[kDfaFwda]) d[kDfaFwda]->hi = 0;
     }
-    int reach() const {
-      const std::optional<LazyDfa> *d = set(true);
+    int reach(bool byte) const {
+      const std::optional<LazyDfa> *d = set(byte);
       int hi = d[kDfaBool] ? d[kDfaBool]->hi : 0;
       if (d[kDfaFwd] && d[kDfaFwd]->hi > hi) hi = d[kDfaFwd]->hi;
       if (d[kDfaFwda] && d[kDfaFwda]->hi > hi) hi = d[kDfaFwda]->hi;
@@ -15240,6 +15265,11 @@ public:
   struct Cursor {
     int pos = 0;        // byte cursor (every rung but the Pike)
     int gpos = 0;       // grapheme/code-point cursor (Pike)
+    // How far the readers read that a lazy DFA does not keep the count of
+    // (LazyDfa::hi): the walk's for its last match; raised by the assert
+    // family's word walk and the suffix rung's scalar verifier (see
+    // step_reach).
+    int reach = 0;
   };
   // The cache and scratch a step works with. A one-step find fetches them
   // only when the rung it lands on reads them (see find_once).
@@ -15569,6 +15599,22 @@ public:
   // at 0 whatever its cursor (Rung::Pike), is the reference.
   static bool guess_open(const Ladder &l) {
     return l.has(Ladder::kSpec) && l.rung != Rung::Pike;
+  }
+  // How far a guess's step (find_run's, `found` and `walked` its answers)
+  // read — the answer depends on no byte past the code point there (see
+  // guess_held): the whole subject when there is no match; the walk's own
+  // report when the walk answered (Cursor::reach: its failed candidates
+  // included, and it reads no DFA — a cache the inner driver fetched holds
+  // no reach of this step); else the match's end, or past it as far as the
+  // readers Cursor::reach counts or a DFA scan of the family's programs
+  // read.
+  static int step_reach(std::string_view text, const Scr &scr,
+                        const Ladder &l, const Cursor &c, bool walked,
+                        bool found) {
+    if (!found) return static_cast<int>(text.size());
+    return walked ? c.reach
+                  : std::max(std::max(c.pos, c.reach),
+                             scr.cache->reach(l.trait(kTraitByte)));
   }
 
   // A scan that outlives the call that started it (find_iter, find_all,
@@ -16663,10 +16709,29 @@ private:
   // loop shares the caller's registers with every other rung. And in two
   // parts: with the block scan's call in it, the ramp's loop keeps its
   // operands on the stack.
+  //
+  // `read` hears past the byte each walk stopped at (OnePassWalk::reach in
+  // this walk's terms), the failed ones' too (see prefix_onepass_find).
+  // word_onepass_read raises `*read` with it, a null `read` (a find_all
+  // loop's) nothing: a copy of the scan each way, so that the candidate
+  // loop carries no test for it.
+  int word_onepass_read(std::string_view t, int from, int &s_out, int &e_out,
+                        WalkBudget &budget, int *read) const {
+    if (!read) {
+      ReadNone none;
+      return word_onepass_find(t, from, s_out, e_out, budget, none);
+    }
+    ReadTo to{*read};
+    const int r = word_onepass_find(t, from, s_out, e_out, budget, to);
+    *read = to.at;
+    return r;
+  }
   static constexpr int kWordStartRamp = 4;
+  template <class Read>
   REGEXLIB_NOINLINE int word_onepass_find(std::string_view t, int from,
                                           int &s_out, int &e_out,
-                                          WalkBudget &budget) const {
+                                          WalkBudget &budget,
+                                          Read &read) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const int n = static_cast<int>(t.size());
     // (The start set off the walk's own start row: a compare with what one
@@ -16683,16 +16748,18 @@ private:
       if (c < 128 && (start_row[c] == Plan::AnchoredOnePass::kDeadState ||
                       (cand > 0 && detail::ascii_word_byte(p[cand - 1]))))
         continue; // not a candidate (a non-ASCII byte is the walk's to bail on)
-      int r = word_onepass_at(t, cand, s_out, e_out, budget, bail_cr);
+      int r = word_onepass_at(t, cand, s_out, e_out, budget, bail_cr, read);
       if (r != 0) return r;
     }
-    return word_onepass_scan(t, cand, s_out, e_out, budget);
+    return word_onepass_scan(t, cand, s_out, e_out, budget, read);
   }
 
   // ... and past the ramp.
+  template <class Read>
   REGEXLIB_NOINLINE int word_onepass_scan(std::string_view t, int from,
                                           int &s_out, int &e_out,
-                                          WalkBudget &budget) const {
+                                          WalkBudget &budget,
+                                          Read &read) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const size_t n = t.size();
     const uint8_t *starts = plan_->wop_start_.data();
@@ -16702,7 +16769,7 @@ private:
       off = ws.at + 16; // (a block short of 16 positions ends the subject)
       for (; ws.mask; ws.pop()) {
         int r = word_onepass_at(t, static_cast<int>(ws.first()), s_out, e_out,
-                                budget, bail_cr);
+                                budget, bail_cr, read);
         if (r != 0) return r;
       }
     }
@@ -16712,16 +16779,18 @@ private:
   // One candidate of word_onepass_find: the walk from `cand` — which bails
   // on a non-ASCII byte, the first included — and the trailing `\b` at its
   // last accept. 1 (a match, s/e set), 0 (none starts here) or kWalkBail.
+  template <class Read>
   REGEXLIB_ALWAYS_INLINE int word_onepass_at(std::string_view t, int cand,
                                              int &s_out, int &e_out,
-                                             WalkBudget &budget,
-                                             bool bail_cr) const {
+                                             WalkBudget &budget, bool bail_cr,
+                                             Read &read) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const int n = static_cast<int>(t.size());
     int end_pos;
     bool bail;
     int acc = onepass_walk(plan_->wop_, p, n, cand, end_pos, bail, bail_cr);
     if (bail) return kWalkBail; // non-ASCII -> assert chain
+    read(end_pos < n ? end_pos + 1 : n);
     // (The byte at the accept is ASCII: the walk read it.)
     if (acc > cand &&
         (!plan_->wop_trail_wb_ || acc == n ||
@@ -16756,10 +16825,16 @@ private:
   // its own prefix byte (`a([a-z]+)0` over "aaaa…") would re-walk overlapping
   // tails from every candidate — O(n²). Successful walks advance the caller's
   // cursor past their end, so they cannot overlap and stay outside the budget.
-  REGEXLIB_ALWAYS_INLINE
-  int prefix_onepass_find(std::string_view t, int from, std::vector<int> &saves,
-                          WalkBudget &budget, const std::string &lit,
-                          size_t probe, size_t probe2) const {
+  //
+  // `read` hears how far each walk read (OnePassWalk::reach), the failed
+  // ones' too: a candidate that failed on the bytes past a later match can
+  // decide that match (`(?:b[^c]*c)?a\d` over "b a1 x" is a1 only because
+  // no c follows) — so do the other drivers' (see ReadTo).
+  template <class Read>
+  REGEXLIB_ALWAYS_INLINE int
+  prefix_onepass_find(std::string_view t, int from, std::vector<int> &saves,
+                      WalkBudget &budget, const std::string &lit, size_t probe,
+                      size_t probe2, Read &read) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const unsigned char *np =
         reinterpret_cast<const unsigned char *>(lit.data());
@@ -16774,6 +16849,7 @@ private:
       OnePassWalk w;
       int e = cp_onepass_find(t, s, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, s);
+      read(w.reach(s, n));
       if (e > s && onepass_end_ok(e, t)) {
         budget.matched_at_candidate(e - s);
         return e;
@@ -16799,9 +16875,10 @@ private:
   // to the located-span chain. Returns the match end (saves filled), -1 when
   // none remain, kWalkLocal (a non-ASCII byte: this find goes to the chain)
   // or kWalkBail.
-  REGEXLIB_ALWAYS_INLINE
-  int scan_onepass_find(std::string_view t, int from, std::vector<int> &saves,
-                        WalkBudget &budget, bool byte) const {
+  template <class Read>
+  REGEXLIB_ALWAYS_INLINE int
+  scan_onepass_find(std::string_view t, int from, std::vector<int> &saves,
+                    WalkBudget &budget, bool byte, Read &read) const {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     int n = static_cast<int>(t.size());
     // What prunes the positions, decided with the plan (Plan::StartSkip):
@@ -16839,7 +16916,9 @@ private:
       // starts here; dead on byte 1 means none unless the first transition
       // already accepted (a one-byte match), which is left to the walk. A
       // non-ASCII byte reads dead too and must bail exactly as the walk
-      // would.
+      // would. (What a reject reads, a later walk reads past: it starts
+      // after the rejected start, and reads its own first byte. So `read`
+      // hears the walks alone.)
       {
         const detail::CpOnePass &op = plan_->cp_onepass_;
         const unsigned char b0 = p[pos];
@@ -16860,6 +16939,7 @@ private:
       OnePassWalk w;
       int e = cp_onepass_find(t, pos, saves, w);
       if (e == kWalkLocal) return local_bail(budget, w, pos);
+      read(w.reach(pos, n));
       // (A pruned scan's candidates are the chain's too: its start state
       // is left on the same bytes, and jumps to them with the same searcher
       // unless they are a set too common to. See spend_at_candidate.)
@@ -16886,24 +16966,25 @@ private:
   // their located-span chain on the last three, for this one find
   // (kWalkLocal) or for the rest of their loop. Rung::Walk's engine, in
   // every family.
-  REGEXLIB_ALWAYS_INLINE
-  int onepass_driver_find(Scr &scr, std::string_view t, int from,
-                          std::vector<int> &saves, WalkBudget &budget,
-                          bool byte) const {
+  template <class Read>
+  REGEXLIB_ALWAYS_INLINE int
+  onepass_driver_find(Scr &scr, std::string_view t, int from,
+                      std::vector<int> &saves, WalkBudget &budget, bool byte,
+                      Read &read) const {
     switch (plan_->walk_driver_) {
     case Plan::WalkDriver::Prefix:
       return prefix_onepass_find(t, from, saves, budget,
                                  plan_->walk_prefix_.text,
                                  plan_->walk_prefix_.probe,
-                                 plan_->walk_prefix_.probe2);
+                                 plan_->walk_prefix_.probe2, read);
     case Plan::WalkDriver::Inner:
       return inner_find_onepass(walk_cache(scr).inrev(*this), t, from, saves,
-                                budget);
+                                budget, read);
     case Plan::WalkDriver::Scan:
     case Plan::WalkDriver::None: // (not reached: capture_find_dispatch)
       break;
     }
-    return scan_onepass_find(t, from, saves, budget, byte);
+    return scan_onepass_find(t, from, saves, budget, byte, read);
   }
 
   // Dispatch head shared by the onepass driver users: the scalar chain when
@@ -16923,12 +17004,17 @@ private:
   // (onepass_fill_run), whose per-match path it is. Left to the compiler,
   // that depends on how many callers there are: one more instantiated step
   // gives the loop a call per match.
+  //
+  // `read` hears how far the walks read (see prefix_onepass_find): a
+  // guess's step keeps it (ReadTo), every other step and the loop do not
+  // (ReadNone), and pay nothing for it.
+  template <class Read>
   REGEXLIB_ALWAYS_INLINE int
   capture_find_inline(Scr &scr, std::string_view t, int from,
-                      std::vector<int> &saves, WalkBudget &budget,
-                      bool byte) const {
+                      std::vector<int> &saves, WalkBudget &budget, bool byte,
+                      Read &read) const {
     if (plan_->chain_.ok) {
-      int e = chain_capture_find(t, from, saves, budget);
+      int e = chain_capture_find(t, from, saves, budget, read);
       if (e != kWalkBail && e != kWalkLocal) return e;
       // non-ASCII neighborhood / budget exhaustion: the automaton drivers
       // (with their own budget discipline) take over from here. A chain-only
@@ -16938,13 +17024,14 @@ private:
     }
     if (!plan_->onepass_unbounded_)
       return kWalkBail; // neither engine planned: the located-span chain serves
-    return onepass_driver_find(scr, t, from, saves, budget, byte);
+    return onepass_driver_find(scr, t, from, saves, budget, byte, read);
   }
+  template <class Read>
   REGEXLIB_NOINLINE int
   capture_find_dispatch(Scr &scr, std::string_view t, int from,
-                        std::vector<int> &saves, WalkBudget &budget,
-                        bool byte) const {
-    return capture_find_inline(scr, t, from, saves, budget, byte);
+                        std::vector<int> &saves, WalkBudget &budget, bool byte,
+                        Read &read) const {
+    return capture_find_inline(scr, t, from, saves, budget, byte, read);
   }
 
   // Anchored scalar-chain capture find (see Plan::ChainCapture): locate the
@@ -16957,9 +17044,12 @@ private:
   // walks are bounded
   // by its adjacent class runs, which non-absorption keeps disjoint across
   // candidates, and failures on the open side die within an element's min.
-  REGEXLIB_ALWAYS_INLINE
-  int chain_capture_find(std::string_view t, int from, std::vector<int> &saves,
-                         WalkBudget &budget) const {
+  // `read` hears past the byte each right-side walk stopped at (see
+  // prefix_onepass_find); the left side reads back from the anchor.
+  template <class Read>
+  REGEXLIB_ALWAYS_INLINE int
+  chain_capture_find(std::string_view t, int from, std::vector<int> &saves,
+                     WalkBudget &budget, Read &read) const {
     const auto &ch = plan_->chain_;
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     const unsigned char *ap =
@@ -17020,6 +17110,7 @@ private:
             saves[2 * el.cap + 1] = r;
           }
         }
+        read(r < n ? r + 1 : n);
         if (ok) {
           saves[0] = i;
           saves[1] = r;
@@ -17049,8 +17140,9 @@ private:
   REGEXLIB_NOINLINE int onepass_fill_run(Scr &scr, std::string_view bytes,
                        std::vector<int> &saves, RowSink &out, int &from,
                        WalkBudget &budget, bool byte) const {
+    ReadNone read;
     for (;;) {
-      int e = capture_find_inline(scr, bytes, from, saves, budget, byte);
+      int e = capture_find_inline(scr, bytes, from, saves, budget, byte, read);
       if (e < 0) return e;
       walk_yield(out, bytes, saves, e);
       from = e; // !can_match_empty_ -> progress
@@ -17120,18 +17212,18 @@ private:
   // engine resolves the groups, if any. Returns the position to continue
   // from, -1 when no match remains, or LazyDfa::kCap. `wbudget` is the
   // caller's loop-wide budget for the assert prefilters (see
-  // assert_find_span).
+  // assert_find_span), `read` the reach its walk raises (null: none).
   template <class Out>
   REGEXLIB_ALWAYS_INLINE int assert_chain_step(FindCache &fc,
                                                std::string_view text, int from,
                                                bool byte, WalkBudget &wbudget,
                                                Scratch &sc,
                                                std::vector<int> &saves,
-                                               Out &out) const {
+                                               Out &out, int *read) const {
     if (from > static_cast<int>(text.size())) return -1;
     int s = 0, e = 0;
     const int r = assert_find_span(fc, text, from, s, e, byte, wbudget,
-                                   /*span=*/Out::kGroups);
+                                   /*span=*/Out::kGroups, read);
     if (r <= 0) return r == LazyDfa::kCap ? r : -1;
     if (!emit_located(text, s, e, sc, saves, out)) return -1;
     if (plan_->ncap_ > 0 && Out::kGroups) { // the span as the groups have it
@@ -17150,9 +17242,13 @@ private:
   // match remains, LazyDfa::kCap when the reverse DFA gives up, kWalkLocal on a
   // non-ASCII byte, or kWalkBail when the failed-walk budget runs out (see
   // prefix_onepass_find).
-  REGEXLIB_ALWAYS_INLINE
-  int inner_find_onepass(LazyDfa &pre_rev, std::string_view text, int from,
-                         std::vector<int> &saves, WalkBudget &budget) const {
+  // `read` hears each walk (see prefix_onepass_find); an occurrence that
+  // anchors nothing a later match reads past, as a match holds its literal.
+  template <class Read>
+  REGEXLIB_ALWAYS_INLINE int
+  inner_find_onepass(LazyDfa &pre_rev, std::string_view text, int from,
+                     std::vector<int> &saves, WalkBudget &budget,
+                     Read &read) const {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(text.data());
     const unsigned char *lit =
@@ -17172,6 +17268,7 @@ private:
         OnePassWalk w;
         int e = cp_onepass_find(text, s_floor, saves, w);
         if (e == kWalkLocal) return local_bail(budget, w, ls);
+        read(w.reach(s_floor, n));
         if (e > s_floor && onepass_end_ok(e, text)) return e;
         if (!budget.spend_profitable(w, ls))
           return kWalkBail; // quadratic guard / unprofitable
@@ -17826,8 +17923,10 @@ inline void Regex::ladder_plan(Plan &p) {
                                    : kFamilyCount;
       // A find's families (guess_begin), where a CR-LF reads as the
       // grapheme engine reads it (crlf_byte_safe_, non-empty, no fused
-      // CR-LF literal), so that no byte a walk reads past what the scans
-      // report changes the answer (docs/design.md, "They guess now").
+      // CR-LF literal): the route, which takes no guess, is sound there on
+      // every pure-ASCII subject. (The guess leaned on it too while a
+      // walk's reach was its match's end; see docs/design.md, "They guess
+      // now".)
       // No byte guess where the plan has a faster way over a non-ASCII
       // subject that needs no classifying: the fused rungs, and the (?i)
       // prefix probe.
@@ -18022,16 +18121,8 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
     bool walked = false;
     const bool found = find_run(text, scr, l, c, walked, out);
     if (!guess_open(l)) return found;
-    // How far the guess's scans read: a match's end, or past it as far as
-    // a DFA scan did, the whole subject when there is no match. A walk
-    // reads past its end only ASCII bytes: none whose cluster could change
-    // what the walk saw (the plan guesses only where a CR-LF reads as the
-    // grapheme engine reads it — see ladder_plan).
-    int reach = static_cast<int>(text.size());
-    if (found)
-      reach = walked ? c.pos
-                     : std::max(c.pos, scr.cache->reach());
-    if (guess_held(l.fam, text, reach)) return found;
+    if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found)))
+      return found;
     // A guess that does not hold: the scan again from the start, into a
     // fresh sink, the subject classified whole.
     l = ladder_unguessed(l);
@@ -18056,7 +18147,8 @@ inline bool Regex::find_run(std::string_view text, Scr &scr, Ladder &l,
   // once and reused across calls, where rebuilding them was the dominant
   // per-call cost.
   if (!scr.cache) scr_fetch(scr);
-  if (l.has(Ladder::kSpec)) scr.cache->reach_from_zero();
+  if (l.has(Ladder::kSpec))
+    scr.cache->reach_from_zero(l.trait(kTraitByte));
   Deep d;
   // (Classified here rather than by the step's own case: one trip through
   // the dispatch less on a Grapheme scan's way to its engine.)
@@ -18131,11 +18223,20 @@ inline Regex::Step Regex::ladder_walk(std::string_view text, Scr &scr,
     e2 = onepass_fill_run(scr, text, saves, out, c.pos, budget,
                           ladder_walk_byte(l));
   } else {
-    e2 = capture_find_dispatch(scr, text, c.pos, saves, budget,
-                               ladder_walk_byte(l));
+    // A guess's step counts how far its walks read (step_reach), the one
+    // step that reads it; any other takes the copy that counts nothing.
+    ReadTo read{c.pos};
+    ReadNone none;
+    const bool byte = ladder_walk_byte(l);
+    e2 = l.has(Ladder::kSpec)
+             ? capture_find_dispatch(scr, text, c.pos, saves, budget, byte,
+                                     read)
+             : capture_find_dispatch(scr, text, c.pos, saves, budget, byte,
+                                     none);
     if (e2 >= 0) {
       walk_yield(out, text, saves, e2);
       c.pos = e2; // !can_match_empty_ -> progress
+      c.reach = read.at;
       return Step::Yield;
     }
   }
@@ -18330,8 +18431,12 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
     const bool collapse = ladder_byte(l) && p.byte_crlf_collapse_;
     for (;;) {
       int s2 = -1;
+      // (Counted as the assert chain counts.)
+      int read = c.reach;
       int e2 = suffix_find(a, rv, text, c.pos, s2, budget, collapse,
-                           /*span=*/Out::kGroups);
+                           /*span=*/Out::kGroups,
+                           !All && l.has(Ladder::kSpec) ? &read : nullptr);
+      c.reach = read;
       if (e2 == kWalkBail) {
         l.set(Ladder::kSuffixOff); // budget hit -> the rungs below
         l = ladder_repicked(l);
@@ -18420,9 +18525,14 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // that gives up downgrades.
   case Rung::AssertChain:
     for (;;) {
-      int nx = assert_chain_step(*scr.cache, text, c.pos,
-                                 ladder_byte(l), budget, *scr.sc,
-                                 *scr.saves, out);
+      // (Its own: the cursor's address taken would keep the cursor out of
+      // registers. Counted for a guess's step alone, as the walk's.)
+      int read = c.reach;
+      int nx = assert_chain_step(
+          *scr.cache, text, c.pos, ladder_byte(l), budget, *scr.sc,
+          *scr.saves, out,
+          !All && l.has(Ladder::kSpec) ? &read : nullptr);
+      c.reach = read;
       if (nx == LazyDfa::kCap) {
         ladder_downgrade(l);
         break;
