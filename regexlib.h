@@ -15497,14 +15497,6 @@ public:
   REGEXLIB_ALWAYS_INLINE Ladder ladder_on(Family f, Ladder l) const {
     return ladder_adopt(plan_->family_[f][ladder_caller(l)], l);
   }
-  // A scan on `l` back at Classify, from the start (a guess that did not
-  // hold): only the rungs it gave up stay given up.
-  static Ladder ladder_unguessed(const Ladder &l) {
-    Ladder n = pike_ladder(l.want);
-    n.flags = l.flags & Ladder::kGivenUp;
-    n.rung = n.below = Rung::Classify;
-    return n;
-  }
   // Rung::Classify: which engine family serves this subject (a scan on `l`,
   // past its literal rungs; a text-anchored plan never comes here). `fna`
   // caches the subject's first non-ASCII byte once something computes it;
@@ -15723,6 +15715,10 @@ public:
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
+  template <class Out>
+  REGEXLIB_NOINLINE bool find_unguessed(std::string_view text,
+                                        FindCache *cache, Family fam,
+                                        bool found, Out &out) const;
   // A boolean over a short subject gives the interior-literal rung up
   // before trying it (limits::kBoolSkipBytes; see ladder_caller): it starts
   // on the third ladder, the boolean's with that rung given up.
@@ -15868,6 +15864,25 @@ public:
       Scr scr = scratch(nullptr);
       return step<false>(scr, out);
     }
+    // The first step of a one-step call whose guess did not hold
+    // (find_unguessed): the guess's step — family `fam`'s from 0 over the
+    // whole subject, its match in `out` if `found` — stands for the cut
+    // texts' first, where the scan classifies onto that family. Whatever it
+    // read past the cut, read_to_cut weighs it as any step's: its match
+    // stands if it starts before the earliest match under way at the cut.
+    // Else, out cleared, a step as next()'s.
+    bool next_after_guess(ResultSink &out, Family fam, bool found) {
+      Scr scr = scratch(nullptr);
+      if (cut_ == kToClassify) begin_cut(scr);
+      if (cut_ > 0 && l_.fam == fam) {
+        if (found) c_.pos = out.span_since(0).second;
+        const Step st = read_to_cut(scr, out, 0, 0, found);
+        if (st != Step::Again) return st == Step::Yield;
+      } else {
+        out.clear();
+      }
+      return step<false>(scr, out);
+    }
 
     // Every remaining match, one row each: what next() would yield until it
     // says no. The same step, told not to come back between matches — a
@@ -15914,20 +15929,22 @@ public:
     // ahead).
     template <bool All, class Out>
     REGEXLIB_NOINLINE Step cut_steps(Scr &scr, Out &out) {
-      if (cut_ == kToClassify) {
-        classify();
-        if (cut_ != kNoCut) {
-          read_afresh(scr);
-          spent_ = {c_.pos, 0, scr.cache->aside(l_.trait(kTraitByte))};
-          pike_only_ = false;
-        }
-      }
+      if (cut_ == kToClassify) begin_cut(scr);
       while (cut_ != kNoCut) {
         const Step st = cut_step(scr, out);
         if (st == Step::Again) continue; // (the loop's test tells which)
         if (st != Step::Yield || !All) return st;
       }
       return Step::Again;
+    }
+    // The first step's classifying, and the counts the cut texts begin with
+    // if it cut.
+    void begin_cut(Scr &scr) {
+      classify();
+      if (cut_ == kNoCut) return;
+      read_afresh(scr);
+      spent_ = {c_.pos, 0, scr.cache->aside(l_.trait(kTraitByte))};
+      pike_only_ = false;
     }
     // The scan's Classify (ladder_reclassify's), with a cut where no family
     // serves the subject whole.
@@ -18736,17 +18753,36 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   if constexpr (!Out::kGroups) l = ladder_short_test(text, l);
   guess_begin(text, l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
-  for (;;) {
-    Cursor c;
-    bool walked = false;
-    const bool found = find_run(text, scr, l, c, walked, out);
-    if (!guess_open(l)) return found;
-    if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found)))
-      return found;
-    // A guess that does not hold: the scan again from the start, into a
-    // fresh sink, the subject classified whole.
-    l = ladder_unguessed(l);
-    out.clear();
+  Cursor c;
+  bool walked = false;
+  const bool found = find_run(text, scr, l, c, walked, out);
+  if (!guess_open(l)) return found;
+  if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found)))
+    return found;
+  return find_unguessed(text, scr.cache, l.fam, found, out);
+}
+
+// A guess that does not hold: the first step of the scan a Finder takes —
+// the family over the stretches it serves, the Pike around the clusters it
+// does not (cut texts), where classifying the subject whole sent all of it
+// to the Pike — with the guess's step (family `fam`'s, `found` and in
+// `out`) for its family's first (Finder::next_after_guess): the subject is
+// not read again up to the cut. Through a ResultSink, the Finder find_at
+// steps: a boolean's match, whose place the guess did not keep, is found
+// again, built and dropped. Out of line: search() and test() inline
+// find_rest, and keep their code.
+template <class Out>
+REGEXLIB_NOINLINE bool Regex::find_unguessed(std::string_view text,
+                                             FindCache *cache, Family fam,
+                                             bool found, Out &out) const {
+  Finder f(*this, text, cache);
+  if constexpr (std::is_same_v<Out, ResultSink>) {
+    return f.next_after_guess(out, fam, found);
+  } else {
+    static_assert(std::is_same_v<Out, NoSink>, "search()'s or test()'s");
+    MatchResult m;
+    ResultSink built{m};
+    return found ? f.next(built) : f.next_after_guess(built, fam, false);
   }
 }
 

@@ -2436,6 +2436,29 @@ void test_cut_text() {
       CHECK(reg::detail::Segmented::made() < 1024);
     }
   }
+  // A one-step call whose guess does not hold takes the Finder's first step
+  // (Regex::find_rest): no match over the 8 KB around the heart, and a match
+  // past it, segment around the heart alone — and agree with the Pike. (A
+  // plan a literal leads, `nine\d`, steps on its literal rungs, which do not
+  // classify the subject: a gap of their own.)
+  for (const char *pat : {"\\bqzx\\w*\\b", "(?i)qzx", "\\bq[a-z]x\\b"}) {
+    const Regex re(pat);
+    reg::detail::Segmented::made() = 0;
+    CHECK(!re.test(around));
+    CHECK(!re.search(around).matched());
+    CHECK(reg::detail::Segmented::made() < 1024);
+  }
+  {
+    const std::string past = prose(", ", 3, 4096) + heart + "x qzx";
+    const Regex re("\\bqzx\\b");
+    const reg::MatchResult w = pike_twin("\\bqzx\\b").search(past);
+    reg::detail::Segmented::made() = 0;
+    CHECK(re.test(past));
+    const reg::MatchResult m = re.search(past);
+    CHECK(reg::detail::Segmented::made() < 1024);
+    CHECK(m.matched() && w.matched() && m.begin() == w.begin() &&
+          m.end() == w.end());
+  }
   // Every Grapheme family of plans for each way a family's soundness is
   // decided (see test_unsound_positions), the assert ones among them.
   const Regex plans[] = {Regex("\\w+"), Regex("\\w*"), Regex("[^c-za]a?"),

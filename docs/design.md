@@ -1067,8 +1067,14 @@ no earlier than that step's to where every thread it answers for is gone,
 which a thread alive there read too; `place`, `cut_for`'s stretch and the
 segmentation only move forward.
 
-Not cut: the one-step calls (`search`, `test`, `match`: their guess, when it
-does not hold, still takes the Pike over the subject), a `Classify` that a
+The one-step calls cut too: a `search` or `test` whose guess does not hold
+takes the first step of the scan a Finder takes (`Regex::find_rest`; a
+`test` through a ResultSink, the match built and dropped, the Finder
+`find_at` steps), where classifying the subject whole sent all of it to the
+Pike: `\bqzx\w*\b` with no match over 4 KB, a heart and 4 KB segments 250
+clusters, not 8196. (`match` anchors at 0, and its guesses are local.)
+
+Not cut: a `Classify` that a
 step comes back to midway (an end anchor's DFA that gave up, the fused
 rungs' `ladder_unfused`: `ladder_reclassify` and `ladder_unfused` pass no
 cut), and the fused
@@ -1097,8 +1103,8 @@ The limits, over subjects made of a few sentences repeated: Devanagari
 `\s+` takes 15% more instructions than the whole subject's Pike, `\w+`
 9–10%, Thai `\s+` 8% (the Pike reads nearly all of it, and the cut texts'
 bookkeeping is on top: the budget weighs the family's DFA, not that); and a
-one-step call (`search`, `test`) whose guess does not hold still has the
-Pike read the subject.
+plan a literal leads (`nine\d`, `[q]zx`) steps on its literal rungs, which
+do not classify the subject, so it never cuts.
 
 ### Linearity (the O(n²) trap)
 
