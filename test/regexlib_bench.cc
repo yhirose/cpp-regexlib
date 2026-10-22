@@ -248,6 +248,30 @@ static string make_words_one_nonascii(size_t target_bytes) {
   return s;
 }
 
+// ~target_bytes of Thai prose: sentences of words written without spaces
+// between them, a space between phrases, a newline now and then. Nearly
+// every syllable is a multi-code-point grapheme cluster (a consonant with
+// its vowel or tone mark).
+static string make_thai(size_t target_bytes) {
+  static const char *const kSentences[] = {
+      "ภาษาไทยเป็นภาษาราชการของประเทศไทย",
+      "กรุงเทพมหานครเป็นเมืองหลวงของประเทศไทย",
+      "วันนี้อากาศดีมาก",
+      "ฉันชอบอ่านหนังสือในวันหยุด",
+      "เขาเดินทางไปเชียงใหม่เมื่อสัปดาห์ที่แล้ว",
+      "ร้านอาหารนี้มีชื่อเสียงเรื่องต้มยำกุ้ง",
+  };
+  mt19937 rng(0x7A1);
+  uniform_int_distribution<int> pick(0, 5), sep(0, 4);
+  string out;
+  out.reserve(target_bytes + 128);
+  while (out.size() < target_bytes) {
+    out += kSentences[pick(rng)];
+    out += sep(rng) == 0 ? '\n' : ' ';
+  }
+  return out;
+}
+
 // ~target_bytes of "key=value" pairs separated by spaces (key/value are 2..8
 // lowercase letters). Drives multi-group captures like (\w+)=(\w+), where each
 // group is a distinct span — the case the code-point one-pass engine targets.
@@ -840,6 +864,40 @@ static void run_sherlock_bench(int iters) {
       {"word scan, dense start, \\b", "\\b[a-z]+\\d\\b", false, {ascii}},
   };
   for (auto &c : ascii_cases)
+    run_case(c, iters);
+
+  // The first section's corpus with ONE multi-code-point grapheme cluster
+  // appended: a heart with its emoji presentation selector (U+2764 U+FE0F),
+  // as a chat message, a review or a mail signature carries. A skin tone, a
+  // flag, a ZWJ sequence or an NFD accent is the same case. Compare each row
+  // to its twin in the first section: the cluster is the only difference.
+  // One row per way a scan is taken: the (?i) prefix probe, the byte DFA,
+  // its captures, the assert engine, and a boolean with no match. (A pure
+  // literal's scan never looks at clusters: no row.)
+  string heart = text + "\xE2\x9D\xA4\xEF\xB8\x8F";
+  cout << "\n\nSherlock benchmark — one multi-code-point cluster at the end\n"
+       << string(72, '=') << endl;
+  vector<Case> heart_cases = {
+      {"+1 cluster: name: Sherlock (nocase)", "(?i)Sherlock", false, {heart}},
+      {"+1 cluster: words \\w+", "\\w+", false, {heart}},
+      {"+1 cluster: words (\\w+) capture", "(\\w+)", false, {heart}},
+      {"+1 cluster: word ending n", "\\b\\w+n\\b", false, {heart}},
+      {"+1 cluster: test: leading literal, \\b", "\\bqzx\\w*\\b", true,
+       {heart}},
+  };
+  for (auto &c : heart_cases)
+    run_case(c, iters);
+
+  // A script whose every few code points form a multi-code-point cluster
+  // (Thai: vowel and tone marks over and under the consonants), so no
+  // stretch of the subject is free of them.
+  string thai = make_thai(text.size());
+  cout << "\n\nThai prose  (" << (thai.size() / 1024) << " KB)\n"
+       << string(72, '=') << endl;
+  vector<Case> thai_cases = {
+      {"Thai: words \\w+", "\\w+", false, {thai}},
+  };
+  for (auto &c : thai_cases)
     run_case(c, iters);
 }
 
