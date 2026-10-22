@@ -17,6 +17,7 @@
 #include <memory>
 #include <memory_resource>
 #include <optional>
+#include <random>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -387,6 +388,10 @@ struct PlanProbe {
   static std::string name(Regex::Family f) {
     return f == Regex::kFamilyCount ? "" : std::string(1, kFamilies[f]);
   }
+  // ... and the family a letter names.
+  static Regex::Family family(char fam) {
+    return static_cast<Regex::Family>(kFamilies.find(fam));
+  }
   static Regex::Plan::Row row(char who) {
     return who == 't' ? Regex::Plan::kTestRow : Regex::Plan::kFindRow;
   }
@@ -436,8 +441,43 @@ struct PlanProbe {
   // holds for `s` (Regex::guess_held).
   static bool guess_held(const Regex &re, char fam, std::string_view s,
                          int reach) {
-    return re.guess_held(static_cast<Regex::Family>(kFamilies.find(fam)), s,
-                         reach);
+    return re.guess_held(family(fam), s, reach);
+  }
+  // Where `s`, read from its start, stops being a subject `re`'s family
+  // `fam` answers for (Regex::family_unsound_at), and whether it is one
+  // (Regex::family_sound); `i` its first non-ASCII byte.
+  static size_t family_unsound_at(const Regex &re, char fam,
+                                  std::string_view s, size_t i) {
+    return re.family_unsound_at(family(fam), s, i);
+  }
+  static bool family_sound(const Regex &re, char fam, std::string_view s,
+                           size_t i) {
+    return re.family_sound(family(fam), s, i);
+  }
+  // The pieces those are made of: where the first multi-code-point cluster
+  // starts (any, or any but a CR-LF pair), the first lone CR or LF, the
+  // first CR-LF pair.
+  static size_t fused_from(std::string_view s, size_t i) {
+    return Regex::fused_from(s, i);
+  }
+  static size_t fused_from_crlf_ok(std::string_view s, size_t i) {
+    return Regex::fused_from_crlf_ok(s, i);
+  }
+  static size_t lone_crlf_at(std::string_view s) {
+    return Regex::lone_crlf_at(s);
+  }
+  static size_t crlf_at(std::string_view s) { return Regex::crlf_at(s); }
+  // What the soundness of `re`'s families turns on: CR-LF pairs read as the
+  // grapheme engine reads them (the ASCII family also needs no fused CR-LF
+  // literal), and the CR-LF collapse.
+  static bool crlf_pairs_ok(const Regex &re) {
+    return re.plan_->crlf_byte_safe_ && !re.plan_->can_match_empty_;
+  }
+  static bool crlf_fused_lit(const Regex &re) {
+    return re.plan_->crlf_fused_lit_;
+  }
+  static bool crlf_collapse(const Regex &re) {
+    return re.plan_->byte_crlf_collapse_;
   }
   // The calling thread's unanchored forward DFA of `re`, given up: the
   // boolean's (Rung::Bool) on the DFA family.
@@ -2004,6 +2044,82 @@ template <class F> void each_dirty_subject(F agrees) {
   each_dirty_subject(agrees, kGuessBodies, offsets);
 }
 
+// Where a subject, read from its start, stops being one a family answers
+// for (Regex::family_unsound_at), against a reference that shares no code
+// with the pairwise scans it checks: the clusters of detail::segment(), the
+// Pike's own segmentation.
+void test_unsound_positions() {
+  // ASCII, CR, LF, a CR-LF pair, a precomposed and an NFD accent, an emoji
+  // with and without its presentation selector, a skin tone, a flag, a ZWJ
+  // family, a Thai syllable (consonant and vowel mark), Hangul L V, a Prepend
+  // (U+0600) and the letter it joins, an invalid byte (0xFF) and a stray
+  // continuation byte.
+  static const char *const kUnits[] = {
+      "a", "b", " ", "-", "\r", "\n", "\r\n", "\xC3\xA9", "e\xCC\x81",
+      "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x8D\xA3",
+      "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5",
+      "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7",
+      "\xE0\xB8\x81\xE0\xB8\xB8", "\xE1\x84\x80\xE1\x85\xA1",
+      ("\xD8\x80"
+       "a"),
+      "\xFF", "\x80"};
+  constexpr size_t kN = sizeof(kUnits) / sizeof(kUnits[0]);
+  // A plan for each way a family's soundness is decided: CR-LF pairs read
+  // as the grapheme engine reads them, a nullable pattern (they are not),
+  // the CR-LF collapse, a fused CR-LF literal.
+  const Regex pats[] = {Regex("\\w+"), Regex("\\w*"), Regex("[^c-za]a?"),
+                        Regex("x\r\ny")};
+  CHECK(PlanProbe::crlf_pairs_ok(pats[0]) && !PlanProbe::crlf_pairs_ok(pats[1]));
+  CHECK(PlanProbe::crlf_collapse(pats[2]) && PlanProbe::crlf_fused_lit(pats[3]));
+  std::mt19937 rng(0x5EED);
+  for (int it = 0; it < 3000; it++) {
+    // Runs of ASCII between the units, so pairs straddle the 16-byte blocks
+    // of the lone CR/LF scan and the printable-ASCII skip has runs to take.
+    std::string s;
+    for (int u = static_cast<int>(rng() % 40); u > 0; u--)
+      s += rng() % 2 ? std::string(rng() % 24, 'x') : kUnits[rng() % kN];
+    const size_t n = s.size();
+    const auto seg = reg::detail::segment(s);
+    // The reference: the first cluster of each kind, n if none.
+    size_t multi = n, multi_not_crlf = n, lone = n, crlf = n, non_ascii = n;
+    for (size_t g = 0; g < seg.graphemes.size(); g++) {
+      const std::u32string &c = seg.graphemes[g];
+      const size_t b = seg.byte_begin[g], e = seg.byte_begin[g + 1];
+      const bool pair = c == U"\r\n";
+      if (c.size() > 1) multi = std::min(multi, b);
+      if (c.size() > 1 && !pair) multi_not_crlf = std::min(multi_not_crlf, b);
+      if (c == U"\r" || c == U"\n") lone = std::min(lone, b);
+      if (pair) crlf = std::min(crlf, b);
+      for (size_t k = b; k < e; k++)
+        if (static_cast<unsigned char>(s[k]) >= 0x80)
+          non_ascii = std::min(non_ascii, b);
+    }
+    size_t fna = 0;
+    while (fna < n && static_cast<unsigned char>(s[fna]) < 0x80) fna++;
+    CHECK(PlanProbe::fused_from(s, fna) == multi);
+    CHECK(PlanProbe::fused_from_crlf_ok(s, fna) == multi_not_crlf);
+    CHECK(PlanProbe::lone_crlf_at(s) == lone);
+    CHECK(PlanProbe::crlf_at(s) == crlf);
+    for (const Regex &re : pats) {
+      const bool pairs_ok = PlanProbe::crlf_pairs_ok(re);
+      const size_t egc = pairs_ok ? multi_not_crlf : multi;
+      const size_t byte = PlanProbe::crlf_collapse(re)
+                              ? std::min(multi_not_crlf, lone)
+                              : egc;
+      const size_t ascii = pairs_ok && !PlanProbe::crlf_fused_lit(re)
+                               ? non_ascii
+                               : std::min(non_ascii, crlf);
+      const size_t want[] = {n, n, byte, byte, ascii, ascii, egc};
+      for (size_t f = 0; f < PlanProbe::kFamilies.size(); f++) {
+        const char fam = PlanProbe::kFamilies[f];
+        const size_t at = PlanProbe::family_unsound_at(re, fam, s, fna);
+        CHECK(at == want[f]);
+        CHECK(PlanProbe::family_sound(re, fam, s, fna) == (at == n));
+      }
+    }
+  }
+}
+
 // match() does not classify its subject. It tries the plan's families in
 // turn, each anchored at 0 (Plan::match_guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
@@ -2251,7 +2367,7 @@ void test_find_guess_grapheme() {
   // byte automaton matches no stray: no reason for the Pike. On each gate's
   // way to the byte family: the clusters checked with CR-LF pairs allowed
   // (`\w+`, the cluster walk) or not (`\w*`, which can match empty:
-  // simple_from), the cluster just after a match of the fused prefix and
+  // fused_from), the cluster just after a match of the fused prefix and
   // suffix scans (`quick \w+`, `\w+ fox`), the bytes the end anchor read
   // (`\w+$` on a stray at the end: no match).
   const std::string body = accented_prose(1u << 20) + "end";
@@ -7290,6 +7406,7 @@ int main() {
   test_end_anchor();
   test_assert_byte_groups();
   test_crlf_interior_anchors();
+  test_unsound_positions();
   test_match_guess();
   test_find_guess();
   test_find_guess_grapheme();

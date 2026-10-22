@@ -262,7 +262,7 @@ the code point before, whose kind the boundary there asks:
   is matched by nothing in the unit either.
 - **Grapheme**: every cluster among them is one code point — or a CR-LF, to a
   pattern that cannot split one, or a stray byte, a cluster of its own that
-  nothing matches — checked forward (`egc_simple_from`) from a
+  nothing matches — checked forward (`egc_fused_from`) from a
   boundary that nothing before it can join: back past any pair that fuses,
   and past a left side that is `Extend` or `ZWJ`, the two rules (GB9c, GB11)
   that look further back. Then the byte program, and the code-point program
@@ -478,7 +478,7 @@ an EGC plan every cluster is one code point — or a CR-LF pair that a
 (`crlf_run_ends`) — so the groups it finds in the located span are the grapheme
 engine's: the argument the `Dfa/EgcByte` tier's groups rest on. A stray
 byte is a cluster of its own (it breaks as a Control) that neither engine
-matches, so `simple_from` and the cluster walk let it through and the two
+matches, so `fused_from` and the cluster walk let it through and the two
 still agree: `([^ ]+)$` over a subject ending in a lone UTF-8 lead byte has
 no match in either. On 4 MB of
 non-ASCII prose (Grapheme), `(\w+)$`'s `match()` went from 207 to 2.1 ms,
@@ -573,9 +573,11 @@ CR-LF exception), and inlined into a Grapheme scan's first step the chain
 folds where a loop over families would not.
 `ladder_family` is the one place a family is defined, `ladder_gated`
 (through `ladder_classify`) the one place a find picks a family for its
-subject, `family_sound` the one test of whether a family serves a subject
-(asked by the gates, by each guess of what it read — see below — and by
-`end_region_ok`), and `ladder_pick` the one place the
+subject, `family_unsound_at` the one definition of where a subject, read
+from its start, stops being one a family serves (`family_sound` asks
+whether that is the end of the text it is given, and is asked by the gates,
+by each guess of what it read — see below — and by `end_region_ok`), and
+`ladder_pick` the one place the
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts
 there by `ladder_plan`, and the fused scans are where `ladder_classify`
@@ -731,7 +733,7 @@ A one-step call is often answered by the head of its subject: `match()`,
 anchored at 0, from a few bytes for a validator or the token that starts a
 line; `search()` and `test()` at the first match. They used to look at all of
 the subject first anyway. The gates a Grapheme family is chosen by
-(`first_nonascii`, then `simple_from` or `contains_crlf`) are passes over the
+(`first_nonascii`, then `fused_from` or `contains_crlf`) are passes over the
 whole of it, and a stray byte or a combining mark anywhere sent the call to
 the Pike, which segmented all of it.
 
@@ -773,7 +775,7 @@ holds.
 - **A Grapheme `search()` / `test()`** at `Classify` (`find_rest`:
   `guess_begin`, then the scan, `find_run`, then the verdict) finds
   the subject's first non-ASCII byte, a fast pass, and does not check its
-  clusters, the slow one (`egc_simple_from`, some 5 instructions a byte
+  clusters, the slow one (`egc_fused_from`, some 5 instructions a byte
   where `first_nonascii` is a quarter of one). A pure-ASCII subject takes
   the plan's ASCII family outright (`Plan::ascii_route_`): no guess, it is
   sound there. Any other guesses the byte family (`Plan::find_guess_`,
@@ -823,10 +825,12 @@ The rules:
   a cluster that starts at `reach` is judged by its first code point. The
   gates are split into the route and the soundness — `egc_byte_path` sends a
   pure-ASCII subject to the ASCII family, which is faster there, and
-  `byte_sound` is whether the byte programs answer for it at all — and only
-  the soundness is asked: `Regex::family_sound`, the one test of it, which
-  the gates, the guesses and the end anchor's check (`end_region_ok`) all
-  call (a CodePoint family's holds for every subject). The closure is the
+  `byte_unsound_at` is where the byte programs stop answering for it — and
+  only the soundness is asked: `Regex::family_sound`, the one test of it
+  (whether `family_unsound_at` puts the first cluster the family cannot
+  serve at the end), which the gates, the guesses and the end anchor's
+  check (`end_region_ok`) all call (a CodePoint family's holds for every
+  subject). The closure is the
   Grapheme unit's (`guess_end`), not something a scan reports.
 - **Why the Pike may answer**: it is the reference. And it is no more often
   the Pike than before: a gate that holds for the whole subject holds for
@@ -1171,22 +1175,26 @@ produces exactly the grapheme engine's result without segmenting. For a regular
 ordered+cut byte DFA is leftmost-first for any `dfa_ok_` pattern — no
 longest-safe predicate, exactly as on ASCII.
 
-### `simple_from` — the per-subject gate
+### `fused_from` — the per-subject gate
 
 `egc_byte_path(text)` decides per subject. It scans (vectorized) to the first
 non-ASCII byte; a pure-ASCII subject bails to the cheaper ASCII tiers, a non-ASCII
-one pays a check only over the remainder. `simple_from(s8, start)` returns true
-iff the subject has **no multi-code-point cluster** (so code-point ≡ grapheme,
-and the byte DFA's answer equals the grapheme engine's). It is one forward pass:
-check the ASCII prefix for a `CR×LF` fusion; from `start`, decode and reject the
-moment two adjacent code points fuse (`gb_fuses`); **SIMD-skip printable-ASCII
-runs** (a printable-ASCII run cannot hold a multi-code-point cluster). Any fusion
-→ fall back to the grapheme Pike. (`match()` asks the same of the prefix its
-scan read, not of the whole subject: see §2, "Guessing the family".)
+one pays a check only over the remainder. `fused_from(s8, start)` returns
+where the subject's first **multi-code-point cluster** starts, or its size if
+it has none — and a subject with none is one where code-point ≡ grapheme, and
+the byte DFA's answer equals the grapheme engine's. It is one forward
+pass: check the ASCII prefix for a `CR×LF` fusion; from `start`, decode and stop
+the moment two adjacent code points fuse (`gb_fuses`; the left one begins the
+cluster); **SIMD-skip printable-ASCII runs** (a printable-ASCII run cannot hold
+a multi-code-point cluster). Any fusion → fall back to the grapheme Pike.
+(`match()` asks the same of the prefix its scan read, not of the whole subject:
+see §2, "Guessing the family".) The other gates answer the same way, with a
+position: `fused_from_crlf_ok`, `lone_crlf_at`, `crlf_at`, and per family
+`family_unsound_at`.
 
 ### CRLF — the cliff, and `crlf_byte_safe`
 
-`simple_from` rejects every `\r\n`, so CRLF prose never took the byte path. But a
+`fused_from` stops at every `\r\n`, so CRLF prose never took the byte path. But a
 CR-LF cluster only matters if the *pattern* can tell a one-cluster CR-LF from a
 two-byte `\r``\n`. Most can't. `crlf_byte_safe(node)` is a structural predicate —
 a pattern is safe if no element observes the difference:
@@ -1218,7 +1226,7 @@ a pattern is safe if no element observes the difference:
 admission (an empty match could land on the LF interior to a cluster — a position
 that exists in byte mode but not grapheme).
 
-`simple_from_crlf_ok` is then `simple_from` plus "a CR×LF cluster is permitted",
+`fused_from_crlf_ok` is then `fused_from` plus "a CR×LF cluster is permitted",
 SIMD-skipping whole ASCII runs (including the `\r\n` breaks) to the next
 non-ASCII byte.
 
@@ -1277,7 +1285,7 @@ on the grapheme Pike. This took `["'][^"']{0,30}[?!.]["']` from ~15 to ~740 MB/s
 residual gap is the `.{13}` DFA-state blow-up, not the cliff.
 
 For a collapse pattern with a **required suffix anchor**, the per-call gates
-(`simple_from_crlf_ok` + `no_lone_crlf`, two O(n) passes before the suffix
+(`fused_from_crlf_ok` + `no_lone_crlf`, two O(n) passes before the suffix
 prefilter's own pass) are folded into the suffix scan itself
 (`egc_fused_collapse_ok` → `egc_literal_fused_find` with `collapse=true`). The
 cluster condition rides the scan's non-ASCII stop. The lone-CR/LF condition is
@@ -1317,7 +1325,7 @@ the exception is keyed on the unit (`bflags`).
 
 A subject that genuinely contains a multi-code-point cluster — combining marks,
 ZWJ emoji, Hangul jamo, regional-indicator flags, a `Prepend` run — fails
-`simple_from` and runs on the grapheme Pike, where breaking is stateful and
+`fused_from` and runs on the grapheme Pike, where breaking is stateful and
 correct. That residual cliff is inherent (no byte automaton for a stateful
 grapheme `.`); §5 is the escape hatch.
 
@@ -2091,8 +2099,8 @@ assumption; a self-consistency check is not a substitute.
   longest-safe predicate, so no class of pattern silently gets a non-Perl answer.
 - **Grapheme semantics are the contract** — a class is decided by the cluster's
   base code point; `.` is one cluster; offsets land on cluster boundaries. The
-  EGC byte path is a pure accelerator, gated by `simple_from` /
-  `simple_from_crlf_ok`, falling back to the grapheme Pike otherwise.
+  EGC byte path is a pure accelerator, gated by `fused_from` /
+  `fused_from_crlf_ok`, falling back to the grapheme Pike otherwise.
 - **Every accelerator == the forced baseline**, held by the differential fuzzer
   at all times (DFA, byte path, capture engines, prefilters, both view
   containers), checking spans **and** captures, with CR/LF and case pairs in the

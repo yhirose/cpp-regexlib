@@ -6939,7 +6939,7 @@ private:
     // capture-free, crlf-byte-safe, non-nullable, case-sensitive byte-path
     // pattern with a fixed ASCII prefix or suffix to scan for. The literal
     // scan and the EGC eligibility check are folded into ONE pass
-    // (egc_literal_fused_find) instead of the upfront simple_from_crlf_ok
+    // (egc_literal_fused_find) instead of the upfront fused_from_crlf_ok
     // gate — a per-call O(n) pass that dominates low-match-count patterns
     // like `Sherlock\s+Holmes`. Optimistic: an ineligible subject (a
     // non-CR-LF multi-code-point cluster) bails to the gated tiers / Pike.
@@ -6976,7 +6976,7 @@ private:
     // [Tier: Dfa/EgcByte] fused-collapse tier: the CRLF-collapse analogue of
     // egc_fused_ok. The collapsed byte programs reproduce the grapheme engine
     // on subjects whose only multi-code-point cluster is a PAIRED CR-LF, so
-    // the upfront eligibility is simple_from_crlf_ok PLUS no_lone_crlf — two
+    // the upfront eligibility is fused_from_crlf_ok PLUS no_lone_crlf — two
     // O(n) passes before the suffix prefilter's own pass. The fused scan folds
     // all three into one (egc_literal_fused_find with collapse=true).
     // Suffix-prefilter, fixed-length-pre patterns only: the var_pre forward
@@ -10500,7 +10500,7 @@ private:
       // Gate-free assert-literal path: when the anchors are line/text-only (no \b
       // \B) and the literal is printable ASCII, a memmem hit needs only a per-match
       // grapheme-boundary check (literal_boundary_ok) plus the flag verify — no
-      // upfront simple_from_crlf_ok eligibility scan, on ANY subject (the
+      // upfront fused_from_crlf_ok eligibility scan, on ANY subject (the
       // literal_only_ model). Sound because a line-break code point is always its
       // own grapheme cluster (GB4/GB5), so empty_flags_cp's code-point line/text
       // anchors equal the grapheme engine's even on a multi-code-point-cluster
@@ -10745,7 +10745,7 @@ private:
     // !icase): every match is the exact literal bytes — as standalone
     // graphemes, in Grapheme mode — so a memmem + O(1) boundary check finds
     // it in ONE pass — no subject-classification pass (first_nonascii /
-    // simple_from), the way RE2 / rure scan a literal. See plan_literal /
+    // fused_from), the way RE2 / rure scan a literal. See plan_literal /
     // literal_locate.
     bool literal_only_ = false;
     // Pure literal alternation (>= 2 fixed printable-ASCII alternatives):
@@ -11583,7 +11583,7 @@ private:
   }
 
   // First index in [off, n) whose byte is NOT printable ASCII (i.e. not in
-  // [0x20, 0x7e]), or n. The grapheme-cluster gate (simple_from / _crlf_ok)
+  // [0x20, 0x7e]), or n. The grapheme-cluster gate (fused_from / _crlf_ok)
   // only needs to inspect such bytes: every printable-ASCII code point is
   // GraphemeBreak::Other, and two Others never fuse (and CR-LF is the only
   // ASCII fusion, with CR < 0x20), so a printable-ASCII run holds no
@@ -13038,11 +13038,11 @@ private:
 
   // --- Subject classification: ASCII / simple-grapheme / CRLF gates ---
 
-  // True if the subject contains a CR-LF pair — on an ASCII subject the only
-  // multi-code-point grapheme cluster (GB3), hence the only thing that makes the
-  // byte/code-point fast paths (which count units, not clusters) diverge from
-  // the grapheme engine.
-  static bool contains_crlf(std::string_view text) {
+  // Where the subject's first CR-LF pair starts, or its size if it has none —
+  // on an ASCII subject the only multi-code-point grapheme cluster (GB3),
+  // hence the only thing that makes the byte/code-point fast paths (which
+  // count units, not clusters) diverge from the grapheme engine.
+  static size_t crlf_at(std::string_view text) {
     // `q != end` first: memchr's pointer argument must be non-null even for
     // a zero length, and an empty string_view's data() may be null.
     const char *d = text.data();
@@ -13050,8 +13050,11 @@ private:
          q != end &&
          (q = static_cast<const char *>(memchr(q, '\r', end - q))) != nullptr;
          ++q)
-      if (q + 1 < end && q[1] == '\n') return true;
-    return false;
+      if (q + 1 < end && q[1] == '\n') return static_cast<size_t>(q - d);
+    return text.size();
+  }
+  static bool contains_crlf(std::string_view text) {
+    return crlf_at(text) != text.size();
   }
 
   // True when an ASCII subject may take the byte/code-point fast paths and still
@@ -13063,11 +13066,31 @@ private:
   // The first-non-ASCII index is precomputed by the caller (is_ascii ⟺ fna ==
   // size) and shared with egc_byte_path at the dispatch site. Stricter than
   // the byte path by !crlf_fused_lit_ (Plan::crlf_fused_lit_).
+  // (ascii_unsound_at(text, fna) == text.size(), and a non-ASCII byte answers
+  // it without the decode: the cluster it is in starts before the end.)
   bool ascii_grapheme_ok(std::string_view text, size_t fna) const {
-    return fna == text.size() &&
-           ((plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
-             !plan_->crlf_fused_lit_) ||
-            !contains_crlf(text));
+    return fna == text.size() && ascii_unsound_at(text, fna) == text.size();
+  }
+  // ... and where, read from its start, the subject stops being one: the
+  // first cluster that holds a non-ASCII code point (the one at `fna`, or an
+  // ASCII base it fuses with), or a CR-LF before it that the ASCII programs
+  // cannot read as the grapheme engine does (a pattern that could split it,
+  // or a fused CR-LF literal their DFAs cannot consume: Plan::crlf_fused_lit_).
+  // Inline: ascii_grapheme_ok's callers, match() on a short subject among
+  // them, then fold the decode away.
+  REGEXLIB_ALWAYS_INLINE size_t ascii_unsound_at(std::string_view text,
+                                                 size_t fna) const {
+    size_t k = fna;
+    if (fna < text.size() && fna > 0 &&
+        gb_fuses(unicode::_grapheme_break_properties::get_value(
+                     static_cast<unsigned char>(text[fna - 1])),
+                 unicode::_grapheme_break_properties::get_value(
+                     cp_at(text, static_cast<int>(fna)).cp)))
+      k = fna - 1; // an ASCII base and its mark
+    if (plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
+        !plan_->crlf_fused_lit_)
+      return k;
+    return crlf_at(text.substr(0, k));
   }
 
   // True when the grapheme rules forbid a break between two adjacent code
@@ -13098,28 +13121,29 @@ private:
     return false;  // GB999
   }
 
-  // Verify `text` has no multi-code-point grapheme cluster, given the prefix
-  // [0, start) is already known to be pure ASCII (start = index of the first
-  // non-ASCII byte). On that premise the only multi-code-point cluster the
-  // ASCII prefix can hold is a CR immediately followed by LF, found with a
-  // vectorized memchr rather than a decode pass; the non-ASCII remainder
-  // [start, n) is decoded and each adjacent code-point pair tested for fusion
-  // (bailing at the first fuse). One allocation-free pass over the remainder —
+  // Where `s8`'s first multi-code-point grapheme cluster starts, or its size
+  // if it has none, given the prefix [0, start) is already known to be pure
+  // ASCII (start = index of the first non-ASCII byte). On that premise the
+  // only multi-code-point cluster the ASCII prefix can hold is a CR
+  // immediately followed by LF, found with a vectorized memchr rather than a
+  // decode pass; the non-ASCII remainder [start, n) is decoded and each
+  // adjacent code-point pair tested for fusion (stopping at the first fuse,
+  // whose left code point begins the cluster — before `start` when that is an
+  // ASCII base and its mark). One allocation-free pass over the remainder —
   // the ASCII prefix is never decoded.
-  static bool simple_from(std::string_view s8, size_t start) {
+  static size_t fused_from(std::string_view s8, size_t start) {
     using GB = unicode::GraphemeBreak;
     const char *d = s8.data();
-    for (const char *q = d, *end = d + start;
-         (q = static_cast<const char *>(memchr(q, '\r', end - q))) != nullptr;
-         ++q)
-      if (q + 1 < end && q[1] == '\n')
-        return false; // CR×LF in the ASCII prefix
+    // (Not substr: GCC calls substr here.)
+    const size_t crlf = crlf_at(std::string_view(d, start));
+    if (crlf != start) return crlf; // CR×LF in the ASCII prefix
     const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
     size_t n = s8.size(), off = start;
     bool have_prev = start > 0;
     GB lp = start > 0
                 ? unicode::_grapheme_break_properties::get_value(p[start - 1])
                 : GB::Unassigned;
+    size_t lp_at = start > 0 ? start - 1 : 0; // where lp's code point starts
     while (off < n) {
       // Printable-ASCII fast skip: GraphemeBreak::Unassigned never fuses with a
       // preceding Unassigned, so a run cannot hold a multi-code-point cluster.
@@ -13127,10 +13151,12 @@ private:
       // as the right side (lp == Prepend, GB9b) still takes the full check
       // below. SIMD-jump over the whole printable-ASCII run (the bulk of
       // prose); lp stays Unassigned (every skipped byte is
-      // GraphemeBreak::Other), have_prev stays.
+      // GraphemeBreak::Other), have_prev stays, and the run's last byte is
+      // lp's code point.
       if (p[off] >= 0x20 && p[off] < 0x7f && have_prev &&
           lp == GB::Unassigned) {
         off = skip_printable_ascii(p, n, off + 1);
+        lp_at = off - 1;
         continue;
       }
       char32_t cp;
@@ -13140,26 +13166,38 @@ private:
         // in the byte automaton does. It breaks as a Control, so it joins
         // nothing on either side (GB4, GB5). (A branch of its own: folded
         // into the step above, the loop runs slower over CJK text.)
-        off++;
+        lp_at = off++;
         lp = unicode::_grapheme_break_properties::get_value(
             unicode::utf8::kStrayCp);
         have_prev = true;
         continue;
       }
-      off += bytes;
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
-      if (have_prev && gb_fuses(lp, rp)) return false;
+      if (have_prev && gb_fuses(lp, rp)) return lp_at;
       lp = rp;
+      lp_at = off;
+      off += bytes;
       have_prev = true;
     }
-    return true;
+    return n;
   }
 
-  // Like simple_from, but a CR×LF cluster (GB3) is permitted — any *other*
-  // fusion still disqualifies the subject. Used only when the pattern is
-  // CRLF-byte-safe and non-empty (crlf_byte_safe_ && !can_match_empty_), where
-  // a CR-LF cluster cannot change the byte DFA's match set vs the grapheme
-  // engine.
+  // Where the first multi-code-point cluster of `s8` starts that is not a
+  // CR-LF pair a pattern unable to split one may meet, or its size if there
+  // is none — what lets a byte program answer for a Grapheme subject. No byte
+  // before `i` is non-ASCII (a subject's first non-ASCII byte, or a slice's
+  // start); the cluster found may start before `i` (an ASCII base of a mark
+  // at `i`, or a CR-LF in the ASCII prefix).
+  size_t egc_fused_from(std::string_view s8, size_t i) const {
+    return plan_->crlf_byte_safe_ && !plan_->can_match_empty_
+               ? fused_from_crlf_ok(s8, i)
+               : fused_from(s8, i);
+  }
+
+  // Like fused_from, but a CR×LF cluster (GB3) is permitted — only any
+  // *other* fusion is found. Used only when the pattern is CRLF-byte-safe and
+  // non-empty (crlf_byte_safe_ && !can_match_empty_), where a CR-LF cluster
+  // cannot change the byte DFA's match set vs the grapheme engine.
   //
   // In this mode every ASCII byte is safe: CR-LF is permitted and is the only
   // way two ASCII code points fuse (any other fusion — Extend/ZWJ/SpacingMark,
@@ -13169,17 +13207,7 @@ private:
   // non-ASCII byte, and only there decode and grapheme-break-check the
   // neighborhood: the ASCII left-neighbor (for an ASCII base + non-ASCII
   // combining mark, GB9) and any following code points that keep fusing.
-  // Is `s8` from `i` on free of every multi-code-point cluster but the
-  // CR-LF pairs a pattern that cannot split one may meet — what lets a byte
-  // program answer for a Grapheme subject? `i` starts a cluster, its left
-  // neighbor ASCII or absent (a subject's first non-ASCII byte, or a
-  // slice's start).
-  bool egc_simple_from(std::string_view s8, size_t i) const {
-    return plan_->crlf_byte_safe_ && !plan_->can_match_empty_
-               ? simple_from_crlf_ok(s8, i)
-               : simple_from(s8, i);
-  }
-  static bool simple_from_crlf_ok(std::string_view s8, size_t start) {
+  static size_t fused_from_crlf_ok(std::string_view s8, size_t start) {
     const unsigned char *p =
         reinterpret_cast<const unsigned char *>(s8.data());
     size_t n = s8.size(), off = start;
@@ -13193,15 +13221,15 @@ private:
       // or absent: either we just skipped an ASCII run, or off == start, the
       // caller's first-non-ASCII index. That is exactly egc_cluster_walk's
       // precondition, so it does the cluster walk.
-      bool bad = false;
-      off = egc_cluster_walk(s8, off, bad);
-      if (bad) return false;
+      size_t fused = SIZE_MAX;
+      off = egc_cluster_walk(s8, off, fused);
+      if (fused != SIZE_MAX) return fused;
     }
-    return true;
+    return n;
   }
 
   // Is the byte range [lo, hi) free of any non-CR-LF multi-code-point grapheme
-  // cluster? A bounded simple_from_crlf_ok used to verify a byte-DFA match's
+  // cluster? A bounded fused_from_crlf_ok used to verify a byte-DFA match's
   // INTERIOR (the gap scans in egc_literal_fused_find cover the regions between
   // matches and the start/end fusion at match boundaries; this covers a fusing
   // cluster that lies strictly inside a match, e.g. `..` over "éX"). `hi`
@@ -13224,7 +13252,7 @@ private:
     size_t prev_pos = s, off = s;
     while (off < n) {
       // A printable-ASCII run after a code point that has no break property
-      // fuses with nothing (as in simple_from): skip it whole, and check what
+      // fuses with nothing (as in fused_from): skip it whole, and check what
       // follows against its last byte. Past `e`, nothing at `e` fused.
       if (have_prev && lp == GB::Unassigned && p[off] >= 0x20 &&
           p[off] < 0x7f) {
@@ -13233,7 +13261,7 @@ private:
         prev_pos = off - 1;
         continue;
       }
-      char32_t cp; // (a stray: see simple_from)
+      char32_t cp; // (a stray: see fused_from)
       const size_t bytes = unicode::utf8::decode_or_byte(d + off, n - off, cp);
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       bool fuse =
@@ -13253,15 +13281,15 @@ private:
   // Walk the non-ASCII cluster neighborhood starting at `off` (a non-ASCII
   // byte that starts an element: a lead byte, or a stray), rejecting any
   // non-CR-LF multi-code-point cluster. Returns the resume offset (the next
-  // ASCII byte after the clusters close) or sets `bad` and returns SIZE_MAX
-  // when a disqualifying cluster is found. This is the one cluster walk:
-  // simple_from_crlf_ok's eligibility pass and the fused EGC scans all run
-  // it. The left neighbor is ASCII whenever the scan resumed from an ASCII
-  // run; at a call start it may be a match end whose left byte is a UTF-8
-  // continuation byte — start fresh there (the preceding match's end-fusion
-  // was already vetted by egc_match_clean).
+  // ASCII byte after the clusters close), or — a disqualifying cluster
+  // found — sets `fused` to where that cluster starts and returns SIZE_MAX.
+  // This is the one cluster walk: fused_from_crlf_ok's pass and the fused
+  // EGC scans all run it. The left neighbor is ASCII whenever the scan
+  // resumed from an ASCII run; at a call start it may be a match end whose
+  // left byte is a UTF-8 continuation byte — start fresh there (the
+  // preceding match's end-fusion was already vetted by egc_match_clean).
   static size_t egc_cluster_walk(std::string_view text, size_t off,
-                                 bool &bad) {
+                                 size_t &fused) {
     using GB = unicode::GraphemeBreak;
     const char *d = text.data();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(d);
@@ -13270,15 +13298,18 @@ private:
     GB lp = have_prev
                 ? unicode::_grapheme_break_properties::get_value(p[off - 1])
                 : GB::Unassigned;
+    size_t lp_at = off - (have_prev ? 1 : 0); // where lp's code point starts
     while (off < n) {
-      char32_t cp; // (a stray: see simple_from)
+      char32_t cp; // (a stray: see fused_from)
+      const size_t at = off;
       off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
       GB rp = unicode::_grapheme_break_properties::get_value(cp);
       if (have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF)) {
-        bad = true;
+        fused = lp_at;
         return SIZE_MAX;
       }
       lp = rp;
+      lp_at = at;
       have_prev = true;
       // An ASCII byte next closes the cluster unless it fuses — only after a
       // Prepend, and not onto a control (GB5: U+0600 then `\t` is two clusters,
@@ -13295,7 +13326,7 @@ private:
   // ASCII prefix `needle` (via its rare byte at `probe`, or the pair probe)
   // WHILE verifying the scanned gap introduces no non-CR-LF multi-code-point
   // cluster — one pass over the subject instead of a separate
-  // simple_from_crlf_ok gate. Returns the hit start offset, -1 if none remain
+  // fused_from_crlf_ok gate. Returns the hit start offset, -1 if none remain
   // (the tail scanned clean), and sets `bad` and returns -1 if a
   // disqualifying cluster was found (caller bails to the Pike). Only for
   // (crlf_byte_safe_ OR collapse-tier) && !can_match_empty_ patterns. The
@@ -13351,8 +13382,12 @@ private:
         if (off >= static_cast<size_t>(n)) break; // scanned clean to the end
         // p[off] >= 0x80: fall through to the cluster walk.
       }
-      off = egc_cluster_walk(text, off, bad);
-      if (bad) return -1;
+      size_t fused = SIZE_MAX;
+      off = egc_cluster_walk(text, off, fused);
+      if (fused != SIZE_MAX) {
+        bad = true;
+        return -1;
+      }
     }
     return -1;
   }
@@ -13376,8 +13411,12 @@ private:
         if (p[off] < 0x80) return static_cast<int>(off); // anchor occurrence
         // non-ASCII: fall through to the cluster walk
       }
-      off = egc_cluster_walk(text, off, bad);
-      if (bad) return -1;
+      size_t fused = SIZE_MAX;
+      off = egc_cluster_walk(text, off, fused);
+      if (fused != SIZE_MAX) {
+        bad = true;
+        return -1;
+      }
     }
     return -1;
   }
@@ -13403,13 +13442,13 @@ private:
 
   // Whether the EGC byte family serves this subject (`i` its first non-ASCII
   // byte, shared with ascii_grapheme_ok at the dispatch site so the subject
-  // is classified once): one the byte programs answer for (byte_sound), and
-  // not pure ASCII — the plain ASCII tier is faster there and handles it —
-  // EXCEPT a CR-LF-bearing one that a byte program reads as the grapheme
-  // engine does: collapsed, or a crlf_byte_safe, non-empty pattern's, which
-  // matches `\r\n`'s two bytes exactly (byte_sound on pure ASCII, spelled
-  // out) — the subjects Plan::crlf_fused_lit_ keeps from the ASCII tier
-  // among them.
+  // is classified once): one the byte programs answer for (byte_unsound_at
+  // reaches its end), and not pure ASCII — the plain ASCII tier is faster
+  // there and handles it — EXCEPT a CR-LF-bearing one that a byte program
+  // reads as the grapheme engine does: collapsed, or a crlf_byte_safe,
+  // non-empty pattern's, which matches `\r\n`'s two bytes exactly
+  // (byte_unsound_at on pure ASCII, spelled out) — the subjects
+  // Plan::crlf_fused_lit_ keeps from the ASCII tier among them.
   bool egc_byte_path(std::string_view text, size_t i) const {
     if (!plan_->byte_path_) return false;
     if (i == text.size())
@@ -13419,19 +13458,22 @@ private:
                        contains_crlf(text);
     return family_sound(kFamEgcByte, text, i);
   }
-  // Whether the byte programs' engine answers for `text` as the grapheme
-  // engine does (`i` its first non-ASCII byte). The CRLF-collapse programs
-  // treat a CR-LF pair as one element, reproducing the grapheme engine on any
-  // subject whose only multi-code-point cluster is a paired CR-LF (no lone
-  // CR/LF). The others do on CRLF subjects (e.g. Windows-newline prose) when
-  // the pattern cannot touch a CR-LF cluster: simple_from_crlf_ok permits
-  // exactly the simple_from subjects plus CRLF-only ones, so it subsumes the
-  // strict check in a single pass.
-  bool byte_sound(std::string_view text, size_t i) const {
-    if (plan_->byte_crlf_collapse_)
-      return (i == text.size() || simple_from_crlf_ok(text, i)) &&
-             no_lone_crlf(text);
-    return egc_simple_from(text, i);
+  // Where, read from its start, `text` stops being a subject the byte
+  // programs' engine answers for as the grapheme engine does (`i` its first
+  // non-ASCII byte): the first cluster they cannot serve, or its size. The
+  // CRLF-collapse programs treat a CR-LF pair as one element, reproducing
+  // the grapheme engine up to the first multi-code-point cluster that is not
+  // a paired CR-LF, or a lone CR/LF before it. The others do on CRLF
+  // subjects (e.g. Windows-newline prose) when the pattern cannot touch a
+  // CR-LF cluster: fused_from_crlf_ok then finds the clusters fused_from
+  // does but the CR-LF pairs, so it subsumes the strict check in one pass.
+  size_t byte_unsound_at(std::string_view text, size_t i) const {
+    if (!plan_->byte_crlf_collapse_) return egc_fused_from(text, i);
+    const size_t k = fused_from_crlf_ok(text, i);
+    // A lone CR or LF before that cluster is the first the collapsed
+    // programs cannot serve. (A CR just before it is one: the cluster at `k`
+    // starts with neither CR nor LF, which fuse with nothing but each other.)
+    return std::min(k, lone_crlf_at(text.substr(0, k)));
   }
 
   // Whether family `f`'s engine answers for `text` as the unit's own does
@@ -13441,19 +13483,38 @@ private:
   // `text`, or its start (the ASCII family asks for the first exactly, and
   // refuses anything else). A CodePoint family's: every subject — its byte
   // automata, like the unit, match no stray byte (utf8::kStrayCp).
+  // Whether family_unsound_at reaches the end of `text`; an ASCII family
+  // refuses a non-ASCII byte without looking for where its cluster starts,
+  // and no family is no subject's (family_unsound_at's 0 is the end of an
+  // empty text).
   REGEXLIB_ALWAYS_INLINE bool family_sound(Family f, std::string_view text,
                                            size_t i) const {
     switch (f) {
-    case kFamUsDfa:
-    case kFamUsAssert: return true;
     case kFamAscii:
     case kFamAssertAscii: return ascii_grapheme_ok(text, i);
+    case kFamilyCount: return false;
+    default: return family_unsound_at(f, text, i) == text.size();
+    }
+  }
+  // Where, read from its start, `text` stops being a subject family `f`
+  // answers for: the start of the first grapheme cluster its engine cannot
+  // read as the unit's does, or text.size() if none (`i` as family_sound's).
+  // The one definition of a family's soundness; family_sound asks it of the
+  // whole subject.
+  REGEXLIB_ALWAYS_INLINE size_t family_unsound_at(Family f,
+                                                  std::string_view text,
+                                                  size_t i) const {
+    switch (f) {
+    case kFamUsDfa:
+    case kFamUsAssert: return text.size();
+    case kFamAscii:
+    case kFamAssertAscii: return ascii_unsound_at(text, i);
     case kFamEgcByte:
-    case kFamEgcByteIp: return byte_sound(text, i);
-    case kFamAssertByte: return egc_simple_from(text, i);
+    case kFamEgcByteIp: return byte_unsound_at(text, i);
+    case kFamAssertByte: return egc_fused_from(text, i);
     case kFamilyCount: break;
     }
-    return false;
+    return 0;
   }
 
   // A guess (match() and from0_rest: Plan::match_guesses_; find_rest:
@@ -13491,11 +13552,12 @@ private:
     return end;
   }
 
-  // True iff every CR is immediately followed by LF and every LF immediately
-  // preceded by CR (no lone CR/LF). The collapsed byte program consumes CR-LF
-  // only as an atomic pair, so a lone CR/LF would diverge from the grapheme
-  // engine (which matches it as its own cluster).
-  static bool no_lone_crlf(std::string_view t) {
+  // Where the first CR not immediately followed by LF, or LF not immediately
+  // preceded by CR (a lone CR/LF), is in `t`, or its size if every CR and LF
+  // is in a pair. The collapsed byte program consumes CR-LF only as an
+  // atomic pair, so a lone CR/LF would diverge from the grapheme engine
+  // (which matches it as its own cluster).
+  static size_t lone_crlf_at(std::string_view t) {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(t.data());
     size_t n = t.size(), i = 0;
     // CR-LF pairing is a per-position bit identity: a byte is the LF of a pair
@@ -13503,8 +13565,9 @@ private:
     // equal the CR bitmap shifted up by one (lf == cr << 1), with a carry across
     // the 16-byte block boundary (a CR in the last lane expects an LF in the
     // next block's first lane). Any mismatch bit is a lone CR (expected LF
-    // absent) or a lone LF (LF with no preceding CR). One branchless pass over
-    // the subject — vs the old two memchr passes that STOPPED at every CR and
+    // absent: the CR is the byte before) or a lone LF (LF with no preceding
+    // CR), and the lowest one is the first. One branchless pass over the
+    // subject — vs the old two memchr passes that STOPPED at every CR and
     // every LF (~26k stops on a CRLF-dense corpus), which dominated find_all.
     bool pending_cr = false; // previous byte was CR (expects LF here)
 #if defined(REGEXLIB_NEON)
@@ -13523,7 +13586,10 @@ private:
           vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8(v, lf)),
                                           4)),
           0);
-      if (lfm != ((crm << 4) | carry)) return false;
+      if (const uint64_t bad = lfm ^ ((crm << 4) | carry)) {
+        const size_t j = static_cast<size_t>(detail::bit_ctz64(bad)) >> 2;
+        return (lfm >> (4 * j)) & 1u ? i + j : i + j - 1;
+      }
       carry = (crm >> 60) & 0xFu; // byte 15 was CR -> expect LF next block
     }
     pending_cr = carry != 0;
@@ -13538,7 +13604,10 @@ private:
           static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, cr)));
       unsigned lfm =
           static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, lf)));
-      if (lfm != (((crm << 1) | carry) & 0xFFFFu)) return false;
+      if (const unsigned bad = lfm ^ (((crm << 1) | carry) & 0xFFFFu)) {
+        const size_t j = static_cast<size_t>(detail::bit_ctz32(bad));
+        return (lfm >> j) & 1u ? i + j : i + j - 1;
+      }
       carry = (crm >> 15) & 1u;
     }
     pending_cr = carry != 0;
@@ -13547,14 +13616,17 @@ private:
     // carries the pending-CR state in from the last SIMD block.
     for (; i < n; i++) {
       if (pending_cr) {
-        if (p[i] != '\n') return false; // CR not followed by LF
+        if (p[i] != '\n') return i - 1; // CR not followed by LF
         pending_cr = false;
         continue; // the LF is consumed; it cannot also open a new pair
       }
-      if (p[i] == '\n') return false; // LF with no preceding CR
+      if (p[i] == '\n') return i; // LF with no preceding CR
       if (p[i] == '\r') pending_cr = true;
     }
-    return !pending_cr; // a trailing CR has no LF
+    return pending_cr ? n - 1 : n; // a trailing CR has no LF
+  }
+  static bool no_lone_crlf(std::string_view t) {
+    return lone_crlf_at(t) == t.size();
   }
 
   // Advance past an empty match in UnicodeScalar mode: step by one whole
@@ -14004,7 +14076,7 @@ private:
   // Fused-eligibility variant of suffix_find (crlf_byte_safe_ patterns only):
   // the suffix memmem scan also verifies the scanned gap is EGC-eligible
   // (egc_literal_fused_find), and each match is checked by egc_match_clean, so
-  // no separate simple_from_crlf_ok gate runs. Returns the match end (writes the
+  // no separate fused_from_crlf_ok gate runs. Returns the match end (writes the
   // start to s_out), -1 if none, or LazyDfa::kCap on a DFA cap OR an ineligible
   // subject (caller falls back to the gate + Pike). The candidate loop is
   // internal, so the caller's cursor is never advanced past an unverified match.

@@ -247,7 +247,7 @@ Rust・Go と同じくテキストの末尾だけです。PCRE2・Python・Java 
 - **Grapheme**：その中の書記素がすべて 1 コードポイント——CR-LF は、それを分け得ない
   パターンなら可。迷子のバイトは、何にもマッチしない独立した書記素なので可——であることを、
   前に何が来ても繋がらない境界から前向きに確かめる
-  （`egc_simple_from`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
+  （`egc_fused_from`）。境界は、融合する対を越え、また左が `Extend` か `ZWJ` の対
   （さらに前を見る規則 GB9c と GB11）も越えて遡って求める。こうすればバイト
   プログラムも、範囲内でグループを解決するコードポイントのプログラムも、書記素
   エンジンと同じものを見ます。そのため、以前は主題全体の書記素 Pike に回っていた、
@@ -444,7 +444,7 @@ bitstate を溢れる場合は、その span の上でコードポイント Pike
 CR-LF の対（グループの境界でも分割できない——`crlf_run_ends`）なので、特定した
 span の中で見つかるグループは書記素エンジンのものと一致する。`Dfa/EgcByte` の
 グループが拠って立つのと同じ理屈。迷子のバイトは、どちらのエンジンもマッチしない独立した
-書記素（Controlとして区切られる）なので、`simple_from`もクラスタの歩行もそれを通し、
+書記素（Controlとして区切られる）なので、`fused_from`もクラスタの歩行もそれを通し、
 2つのエンジンの答えは一致する。末尾が単独のUTF-8先頭バイトのsubjectで、`([^ ]+)$`は
 どちらでもマッチしない。
 非 ASCII の文章 4 MB（Grapheme）で、`(\w+)$` の
@@ -531,9 +531,10 @@ Grapheme の find と真偽値が純 ASCII の対象でそのまま取る系統�
 最初の一歩にインライン化されると、書き並べたものは畳まれ、系統を回すループは畳まれない
 からです。
 系統を定義する場所は `ladder_family` の 1 か所、find が主題に系統を選ぶ場所は
-`ladder_gated`（`ladder_classify` が呼びます）の 1 か所、系統が主題を受け持てるかの判定は
-`family_sound` の 1 か所（問うのはゲート、読んだ範囲についての推測〔下を参照〕、
-`end_region_ok` です）、系統の中の
+`ladder_gated`（`ladder_classify` が呼びます）の 1 か所、主題を先頭から読んで、どこで
+系統が受け持てなくなるかの定義は`family_unsound_at`の1か所（それが与えられた範囲の
+末尾かどうかを問うのが`family_sound`で、それを問うのはゲート、読んだ範囲についての推測
+〔下を参照〕、`end_region_ok`です）、系統の中の
 段の順序を書く場所は `ladder_pick` の 1 か所です（系統より前の段は系統のものでは
 ありません。それ自体で位置が決まるプランやテキスト先頭固定のプランは `ladder_plan` が
 そこから始め、融合スキャンは、主題が ASCII でない Grapheme の走査を `ladder_classify` が
@@ -679,7 +680,7 @@ find は絞り込みのないスキャンで最初からやり直すからです
 - `search()` と `test()` は、最初のマッチで答えが決まります。
 
 それでも以前は、まず主題の全体を見ていました。Graphemeの系統を選ぶゲート
-（`first_nonascii`、続いて`simple_from`か`contains_crlf`）は、どれも主題全体を読みます。
+（`first_nonascii`、続いて`fused_from`か`contains_crlf`）は、どれも主題全体を読みます。
 どこかに迷子のバイトや結合文字が1つあれば、Pikeに回って主題全体を分割していました。
 
 今は推測します。ある系統を、主題がその系統の受け持つものであるかのように走らせます。
@@ -718,7 +719,7 @@ find は絞り込みのないスキャンで最初からやり直すからです
     77nsから100nsに。
 - **Grapheme の `search()` / `test()`** は、`Classify` で（`find_rest`。`guess_begin`、
   走査の`find_run`、そして判定）検索対象の最初の非 ASCII バイトを求めます（速いパス）。
-  まとまりの検査（遅いパス：`egc_simple_from` は 1 バイトあたり約 5 命令、
+  まとまりの検査（遅いパス：`egc_fused_from` は 1 バイトあたり約 5 命令、
   `first_nonascii` は 0.25 命令）はしません。
   - 純 ASCII の対象は、プランの ASCII 系統（`Plan::ascii_route_`）へそのまま進みます。
     推測ではありません（そこでは健全です）。
@@ -766,8 +767,9 @@ find は絞り込みのないスキャンで最初からやり直すからです
     コードポイントで判定されます。
   - ゲートは経路の選択と健全性に分けてあり、問うのは健全性だけです。経路の選択は、
     純 ASCII の主題を速い ASCII 系統へ送ること（`egc_byte_path`）。健全性は、バイト
-    プログラムがその主題に答えられるかどうか（`byte_sound`）です。健全性の判定は
-    `Regex::family_sound` の 1 つで、ゲート・推測・末尾アンカーの検査
+    プログラムがその主題のどこまで答えられるか（`byte_unsound_at`）です。健全性の判定は
+    `Regex::family_sound`の1つ（系統が受け持てない最初のクラスタを
+    `family_unsound_at`が末尾に置くかどうか）で、ゲート・推測・末尾アンカーの検査
     （`end_region_ok`）がどれもこれを呼びます（CodePointの系統はどの主題でも成り立ちます）。
   - 閉じ方は、走査が報告するものではなくGrapheme単位の性質です（`guess_end`）。
 - **Pike でよい理由**：Pike が基準のエンジンだからです。
@@ -1083,21 +1085,24 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
 をコンパイルし `byte_path_` を立てます。順序付き+cut バイト DFA は任意 `dfa_ok_`
 パターンに対し leftmost-first——longest-safe 述語なし、ASCII と同様。
 
-### `simple_from` — subject ごとのゲート
+### `fused_from` — subject ごとのゲート
 
 `egc_byte_path(text)` が subject ごとに判定。最初の非ASCII バイトまで（ベクトル化）
 スキャンし、純 ASCII subject は安い ASCII tier へ抜け、非ASCII subject は残りだけ
-チェックを払う。`simple_from(s8, start)` は subject に**多コードポイントクラスタが
-ない**（=コードポイント≡書記素、バイト DFA の答えが書記素エンジンと一致）とき true。
-単一前進パスで：ASCII 前置を `CR×LF` 融合についてチェック；`start` から、隣接2
-コードポイントが融合した瞬間に棄却（`gb_fuses`）；**印字可能 ASCII ラン を SIMD で
+チェックを払う。`fused_from(s8, start)`はsubjectの最初の**多コードポイントクラスタ**
+の開始位置を返し、無ければsubjectの長さを返す。無いsubjectでは、コードポイント≡書記素で、
+バイトDFAの答えが書記素エンジンと一致する。単一前進パスで：ASCII前置を
+`CR×LF`融合についてチェック；`start`から、隣接2コードポイントが融合した瞬間に止まる
+（`gb_fuses`。左のコードポイントがクラスタの先頭）；**印字可能ASCIIランをSIMDで
 スキップ**（印字可能 ASCII ランは多コードポイントクラスタを含めない）。融合があれば
 書記素 Pike へフォールバック。（`match()` は同じことを、主題全体ではなく走査が読んだ
-接頭辞に問います。§2「系統を推測し、走査が読んだ範囲で判定する」を参照。）
+接頭辞に問います。§2「系統を推測し、走査が読んだ範囲で判定する」を参照。）ほかのゲートも
+同じく位置で答えます：`fused_from_crlf_ok`、`lone_crlf_at`、`crlf_at`、系統ごとには
+`family_unsound_at`。
 
 ### CRLF — 崖と `crlf_byte_safe`
 
-`simple_from` は全 `\r\n` を棄却するので CRLF 散文はバイトパスに乗りませんでした。
+`fused_from` は全 `\r\n` で止まるので CRLF 散文はバイトパスに乗りませんでした。
 しかし CR-LF クラスタが問題になるのは、*パターン*が1クラスタ CR-LF と2バイト
 `\r``\n` を区別できるときだけ。多くは区別できません。`crlf_byte_safe(node)` は構造的
 述語——どの要素も差を観測しなければ安全:
@@ -1127,7 +1132,7 @@ Unicode モードのパターンは1つの AST から最大2プログラムを�
 `can_match_empty_`（nullable）は CRLF 許容に**非空**マッチを追加要求します（空マッチ
 がクラスタ内部の LF に落ちうる——バイトモードには在るが書記素モードには無い位置）。
 
-`simple_from_crlf_ok` は `simple_from` ＋「CR×LF クラスタを許可」で、ASCII ラン全体
+`fused_from_crlf_ok` は `fused_from` ＋「CR×LF クラスタを許可」で、ASCII ラン全体
 （`\r\n` 改行を含む）を次の非ASCII バイトまで SIMD スキップします。
 
 リテラル規則自身に落とし穴があります: ペアは byte-safe ですが**書記素プログラムでは
@@ -1183,7 +1188,7 @@ CR-LF ペアを 1 要素として消費し（書記素エンジンの 1 クラ�
 `.{13}` の DFA 状態爆発であって崖ではありません。
 
 collapse パターンが**必須の接尾アンカー**を持つ場合、per-call のゲート
-（`simple_from_crlf_ok` + `no_lone_crlf`、接尾 prefilter 自身のパスに先立つ 2 回の
+（`fused_from_crlf_ok` + `no_lone_crlf`、接尾 prefilter 自身のパスに先立つ 2 回の
 O(n) パス）を接尾スキャン自体に融合します（`egc_fused_collapse_ok` →
 `egc_literal_fused_find` の `collapse=true`）。クラスタ条件はスキャンの非ASCII停止に
 相乗りします。lone CR/LF 条件はそもそも**スキャンしません**：lone な CR/LF が問題に
@@ -1217,7 +1222,7 @@ ASCII DFA tier に乗ります。var-pre の接尾は scalar chain 検証が担�
 ### 書記素 Pike に残るもの
 
 真に多コードポイントクラスタ——結合マーク、ZWJ 絵文字、ハングル jamo、地域指標旗、
-`Prepend` ラン——を含む subject は `simple_from` で落ち、分割が状態依存で正しい書記素
+`Prepend` ラン——を含む subject は `fused_from` で落ち、分割が状態依存で正しい書記素
 Pike で走ります。この残余崖は本質的（状態依存の書記素 `.` のバイトオートマトンは
 存在しない）；§5 が逃げ道です。
 
@@ -1879,7 +1884,7 @@ fuzz の実行時間の 8 割、ASan では 17 分のうち 14 分を占めて�
   どのパターン種別も黙って非 Perl な答えにならない。
 - **書記素意味論が契約** — クラスはクラスタのベースコードポイントで判定；`.` は1
   クラスタ；オフセットはクラスタ境界。EGC バイトパスは純粋なアクセラレータで、
-  `simple_from` / `simple_from_crlf_ok` でゲートし、さもなくば書記素 Pike へ後退。
+  `fused_from` / `fused_from_crlf_ok` でゲートし、さもなくば書記素 Pike へ後退。
 - **各アクセラレータ == 強制ベースライン** — 差分ファザが常時保証（DFA、バイトパス、
   キャプチャエンジン、プレフィルタ、両 view コンテナ）、span **と**キャプチャを、
   生成 subject に CR/LF と大小ペアを含めて照合。
