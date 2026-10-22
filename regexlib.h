@@ -16282,12 +16282,12 @@ public:
     // where it began, the bytes the family's steps read (those that stood,
     // to their match's end; the others, to the cut), and the DFAs' code
     // points out of their tables then. Set where the cut texts begin; read
-    // only over them.
+    // only over them (initialized all the same: a Finder is copied whole).
     struct Spent {
       int from, family;
       uint32_t aside0;
-    } spent_;
-    bool pike_only_; // the cut texts given up (pays)
+    } spent_{};
+    bool pike_only_ = false; // the cut texts given up (pays)
   };
 
   // Lazy single-pass scan over the non-overlapping matches (see Regex::find_iter).
