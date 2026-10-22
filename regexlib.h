@@ -2073,20 +2073,156 @@ struct CharClass {
 
 namespace detail {
 
-// Holds a UTF-8 string segmented into extended grapheme clusters, retaining
-// the byte offset of each cluster boundary so matches can be reported as byte
-// offsets into the original string.
+// Holds a UTF-8 string segmented into extended grapheme clusters (or, for the
+// CodePoint unit, code points), retaining the byte offset of each cluster
+// boundary so matches can be reported as byte offsets into the original
+// string.
+//
+// The clusters are those of `source` from `origin` on, a cluster boundary:
+// graphemes[i] holds cluster i's code points and byte_begin[i] its first
+// byte, and byte_begin.back() is where the clusters segmented so far end. A
+// segmentation made whole (segment, segment_cp) is `done` at once; one made
+// lazily (segment_lazily) is extended as its reader asks (extend_to,
+// extend_to_byte), so a Pike that answers early segments only what it read.
+// Extending changes nothing a reader already saw — the clusters are the
+// subject's, materialized on demand — hence the members are mutable.
+//
+// Every Pike segmentation starts at 0 so far: the Pike's readers take
+// cluster 0 for the subject's start (`^`, `\A`, a `\b` there). A lazy one
+// leaves `ascii` false whatever the subject, which only forgoes the Pike's
+// ASCII skips (pike_candidate, pike_step) where a DFA gave a pure-ASCII
+// subject up.
 struct Segmented {
-  std::vector<std::u32string> graphemes; // code points of each cluster
-  std::vector<size_t> byte_begin;        // size == graphemes.size() + 1
-  std::string_view source;               // the original UTF-8 subject
-  bool ascii = false; // all bytes < 0x80, so grapheme index == byte index
+  mutable std::vector<std::u32string> graphemes; // code points of each cluster
+  mutable std::vector<size_t> byte_begin;        // size == graphemes.size() + 1
+  std::string_view source;                       // the original UTF-8 subject
+  size_t origin = 0;     // where cluster 0 starts
+  bool ascii = false;    // all bytes < 0x80, so grapheme index == byte index
+  bool code_points = false; // one entry per code point (the CodePoint unit)
+  mutable bool done = true; // segmented to the end of `source`
   // The Pike's lookaround answers over this subject, one table per lookaround
   // body (keyed by its Program): entry sp says whether the body matches at sp.
   // Built on first use and kept with the segmentation, so the find_all runs
   // over one subject share them.
   mutable std::vector<std::pair<const void *, std::vector<bool>>> look_tables;
+
+  // Segment until cluster `g` exists or the subject ends.
+  void extend_to(size_t g) const {
+    while (!done && graphemes.size() <= g) extend(0);
+  }
+  // ... until a cluster ends past byte `b` or the subject ends.
+  void extend_to_byte(size_t b) const {
+    while (!done && byte_begin.back() <= b) extend(0);
+  }
+  // The number of clusters if done, else an upper bound on it.
+  size_t length_bound() const {
+    return graphemes.size() + (done ? 0 : source.size() - byte_begin.back());
+  }
+  // Segment the next stretch of the subject: at least `want` bytes of it
+  // (0: as many as are segmented already, for a doubling, and at least
+  // kChunk), committing every cluster the stretch shows the end of.
+  void extend(size_t want) const;
+  // How many clusters this thread has segmented so far, by extend (how much
+  // of their subjects the Pike has read, for the tests).
+  static size_t &made() {
+    static thread_local size_t n = 0;
+    return n;
+  }
 };
+
+// A segmentation of `s8` to be made as it is read, from `origin` (a cluster
+// boundary) on.
+inline Segmented segment_lazily(std::string_view s8, size_t origin,
+                                bool code_points) {
+  Segmented seg;
+  seg.source = s8;
+  seg.origin = origin;
+  seg.code_points = code_points;
+  seg.byte_begin.push_back(origin);
+  seg.done = origin >= s8.size();
+  return seg;
+}
+
+inline void Segmented::extend(size_t want) const {
+  constexpr size_t kChunk = 256;
+  const size_t n = source.size();
+  const size_t from = byte_begin.back();
+  if (want == 0) want = std::max(kChunk, from - origin);
+  const char *d = source.data();
+  // Room for `m` more entries. A segmentation that has grown past a few
+  // thousand entries is being read on: room for one per remaining byte, the
+  // most the rest of the subject can hold, so its entries move once more at
+  // most, not at every doubling.
+  const auto make_room = [&](size_t m) {
+    if (graphemes.capacity() >= graphemes.size() + m) return;
+    const size_t cap =
+        graphemes.size() >= 4096
+            ? graphemes.size() + (n - from)
+            : std::max(2 * graphemes.capacity(), graphemes.size() + m);
+    graphemes.reserve(cap);
+    byte_begin.reserve(cap + 1);
+  };
+  const size_t had = graphemes.size();
+  if (code_points) {
+    // A code point is an entry of its own, which the next one never
+    // extends: decode straight into the entries (at most one per byte).
+    const size_t to = std::min(n, from + want);
+    make_room(to - from);
+    size_t off = from;
+    while (off < to) {
+      char32_t cp;
+      off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
+      graphemes.emplace_back(1, cp);
+      byte_begin.push_back(off);
+    }
+    made() += graphemes.size() - had;
+    done = off >= n;
+    return;
+  }
+  // Decode at least `want` bytes' worth of code points, remembering where
+  // each starts, then cut them into clusters.
+  std::vector<char32_t> cps;
+  std::vector<size_t> at;
+  for (;;) {
+    cps.clear();
+    at.clear();
+    const size_t to = std::min(n, from + want);
+    cps.reserve(to - from + 4); // (a byte is at most a code point)
+    at.reserve(to - from + 5);
+    size_t off = from;
+    while (off < to) {
+      char32_t cp;
+      at.push_back(off);
+      off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
+      cps.push_back(cp);
+    }
+    const bool end = off >= n;
+    at.push_back(off);
+    const size_t m = cps.size();
+    make_room(m); // every cluster the stretch can hold
+    size_t i = 0;
+    while (i < m) {
+      // An ASCII code point but CR, before another, is a cluster of its own:
+      // two ASCII code points fuse only as CR-LF, and one at a cluster's
+      // start follows no Prepend.
+      size_t len = cps[i] < 0x80 && cps[i] != U'\r' && i + 1 < m &&
+                           cps[i + 1] < 0x80
+                       ? 1
+                       : unicode::grapheme_length(cps.data() + i, m - i);
+      if (len == 0) len = 1;
+      // A cluster that reaches the end of what was decoded may go on past
+      // it, unless that is the end of the subject.
+      if (!end && i + len >= m) break;
+      graphemes.emplace_back(cps.data() + i, len);
+      byte_begin.push_back(at[i + len]);
+      i += len;
+    }
+    made() += graphemes.size() - had;
+    if (end && i >= m) done = true;
+    if (i > 0 || done) return;
+    want *= 2; // one cluster longer than the stretch: read more of it
+  }
+}
 
 inline bool all_ascii(std::string_view s8) {
   for (unsigned char c : s8)
@@ -2122,36 +2258,8 @@ inline Segmented segment(std::string_view s8) {
   // proxy for the CR-LF pair since `\r` in text is almost always CRLF).
   if (all_ascii(s8) && memchr(s8.data(), '\r', s8.size()) == nullptr)
     return segment_ascii_bytes(s8);
-
-  // Decode to code points while remembering each code point's byte offset.
-  // Code-point count is bounded by byte count; reserve to avoid regrowth.
-  std::u32string cps;
-  std::vector<size_t> cp_byte;
-  cps.reserve(s8.size());
-  cp_byte.reserve(s8.size());
-  size_t off = 0;
-  while (off < s8.size()) {
-    char32_t cp;
-    size_t bytes =
-        unicode::utf8::decode_or_byte(s8.data() + off, s8.size() - off, cp);
-    cps.push_back(cp);
-    cp_byte.push_back(off);
-    off += bytes;
-  }
-
-  Segmented seg;
-  seg.graphemes.reserve(cps.size());
-  seg.byte_begin.reserve(cps.size() + 1);
-  size_t i = 0;
-  while (i < cps.size()) {
-    size_t len = unicode::grapheme_length(cps.data() + i, cps.size() - i);
-    if (len == 0) len = 1;
-    seg.byte_begin.push_back(cp_byte[i]);
-    seg.graphemes.emplace_back(cps.substr(i, len));
-    i += len;
-  }
-  seg.byte_begin.push_back(s8.size()); // sentinel = end of subject
-  seg.source = s8;
+  Segmented seg = segment_lazily(s8, 0, /*code_points=*/false);
+  if (!seg.done) seg.extend(s8.size()); // the whole subject, one stretch
   return seg;
 }
 
@@ -2164,21 +2272,8 @@ inline Segmented segment_cp(std::string_view s8) {
   // NOT fuse CR-LF (that is grapheme semantics), so unlike segment() this stays
   // byte-per-entry even with `\r\n` present.
   if (all_ascii(s8)) return segment_ascii_bytes(s8);
-
-  Segmented seg;
-  seg.graphemes.reserve(s8.size());
-  seg.byte_begin.reserve(s8.size() + 1);
-  size_t off = 0;
-  while (off < s8.size()) {
-    char32_t cp;
-    size_t bytes =
-        unicode::utf8::decode_or_byte(s8.data() + off, s8.size() - off, cp);
-    seg.byte_begin.push_back(off);
-    seg.graphemes.emplace_back(1, cp);
-    off += bytes;
-  }
-  seg.byte_begin.push_back(s8.size()); // sentinel = end of subject
-  seg.source = s8;
+  Segmented seg = segment_lazily(s8, 0, /*code_points=*/true);
+  if (!seg.done) seg.extend(s8.size()); // the whole subject, one stretch
   return seg;
 }
 
@@ -15279,9 +15374,44 @@ public:
   // (0 at the start; the mapped cursor after a downgrade or a seek).
   REGEXLIB_NOINLINE int ladder_segment(SegPtr &seg, std::string_view text,
                                        int pos) const {
-    seg = std::make_unique<detail::Segmented>(
-        plan_->us_ ? detail::segment_cp(text) : detail::segment(text));
+    seg = std::make_unique<detail::Segmented>(pike_segment(text));
     return byte_to_cp(*seg, pos);
+  }
+  // The program the unit's Pike runs: the code-point one in CodePoint mode,
+  // else the grapheme one. Whether a segmentation may be made as it is read
+  // (pike_segments_lazily) is decided on the program it is read by, so both
+  // are chosen here.
+  const detail::Program &pike_prog() const {
+    return plan_->us_ ? plan_->cp_prog_ : plan_->prog_;
+  }
+  detail::Segmented pike_segment(std::string_view text) const {
+    return pike_segment(pike_prog(), text, plan_->us_);
+  }
+  // The segmentation the Pike runs `prog` over `text` on, in code points or
+  // grapheme clusters: one it extends as it reads where it may
+  // (pike_segments_lazily), else the whole subject's.
+  detail::Segmented pike_segment(const detail::Program &prog,
+                                 std::string_view text,
+                                 bool code_points) const {
+    if (pike_segments_lazily(prog))
+      return detail::segment_lazily(text, 0, code_points);
+    return code_points ? detail::segment_cp(text) : detail::segment(text);
+  }
+  // Whether the Pike may run `prog` over a segmentation it extends as it
+  // reads, not knowing the subject's length until it reaches the end:
+  // nothing in `prog` asks for the length — no lookaround (whose tables
+  // cover the whole subject), no `\Z` (one before the end): dfa_assert_ok_
+  // excludes both, and a Loop with them, which reads no length — and the
+  // step budget, which is proportional to the length, cannot trip whatever
+  // it is. add_thread
+  // charges a position at most one step per call (a call per thread that
+  // consumed, and the seed) and two per instruction it closes over, so no
+  // more than 3 * size + 1; within kStepsPerPos a run stays under the
+  // budget of any length.
+  bool pike_segments_lazily(const detail::Program &prog) const {
+    return plan_->dfa_assert_ok_ &&
+           3 * static_cast<long>(prog.insts.size()) + 1 <=
+               limits::kStepsPerPos;
   }
   // A DFA gave up mid-scan: continue on the Pike VM from the current byte
   // cursor (the Pike rung segments, and maps the cursor, on its first
@@ -15893,11 +16023,25 @@ private:
   // offsets (capture_saves_bytes). `prog` is the grapheme program (EGC) or
   // the code-point program (UnicodeScalar), with `seg` segmented to match (one grapheme / one
   // code point per entry) — the loop body is identical either way.
+  //
+  // A segmentation still being made (segment_lazily) is kept one cluster
+  // past the position the loop is at, or at the subject's end: so `n`, the
+  // clusters segmented so far, equals a position only where the subject
+  // ends, and every assertion that asks for the end (`$`, `\z`, a `\b`
+  // before it) reads it as it reads the whole subject's.
   bool run_saves(const detail::Program &prog, const detail::Segmented &seg,
                  int start, bool anchored, Scratch &sc,
                  std::vector<int> &out_saves) const {
     using Op = detail::Inst::Op;
     int n = static_cast<int>(seg.graphemes.size());
+    // Before position `sp` is read: segment a cluster past it (see above),
+    // and read `n` again.
+    auto segment_past = [&](int sp) {
+      if (seg.done || sp + 1 < n) return;
+      seg.extend_to(static_cast<size_t>(sp) + 1);
+      n = static_cast<int>(seg.graphemes.size());
+    };
+    segment_past(start);
     int psz = static_cast<int>(prog.insts.size());
 
     sc.prepare(psz);
@@ -15918,12 +16062,18 @@ private:
     gen++;
     add_thread(prog, clist, visited, gen, 0, seed, seg, start, n);
 
-    long budget = step_budget(n);
+    // (Before the end, a lazy segmentation's length is a bound; the budget
+    // cannot trip for the programs it serves: pike_segments_lazily.)
+    long budget = step_budget(static_cast<int>(seg.length_bound()));
     for (int sp = start; sp <= n; sp++) {
-      if (clist.empty() && have) break;
+      // No thread left to extend a match: one is found, or none can be
+      // (an anchored run seeds only at `start`). A lazy segmentation stops
+      // here too.
+      if (clist.empty() && (have || anchored)) break;
       if (match_steps() > budget)
         throw RegexError(RegexError::Code::StepBudgetExceeded,
                          "regex match step budget exceeded");
+      segment_past(sp);
 
       int next_gen = ++gen;
       const std::u32string *g = (sp < n) ? &seg.graphemes[sp] : nullptr;
@@ -16111,7 +16261,8 @@ private:
     bool overflow = false;
     if (bitstate_bytes(plan_->cp_prog_, t, s, e, saves, overflow)) return true;
     if (!overflow) return false;
-    auto seg = detail::segment_cp(t); // rare: span too big for the backtracker
+    // Rare: a span too big for the backtracker.
+    const detail::Segmented seg = pike_segment(plan_->cp_prog_, t, true);
     if (!run_saves(plan_->cp_prog_, seg, byte_to_cp(seg, s), /*anchored=*/true, sc,
                    saves))
       return false;
@@ -17124,11 +17275,8 @@ private:
   template <class Out>
   REGEXLIB_NOINLINE int from0_pike(std::string_view text, Scratch &sc,
                                    Out &out) const {
-    const bool cp = plan_->us_;
-    const detail::Segmented seg =
-        cp ? detail::segment_cp(text) : detail::segment(text);
-    if (!run_saves(cp ? plan_->cp_prog_ : plan_->prog_, seg, 0,
-                   /*anchored=*/true, sc, sc.saves))
+    const detail::Segmented seg = pike_segment(text);
+    if (!run_saves(pike_prog(), seg, 0, /*anchored=*/true, sc, sc.saves))
       return -1;
     out.groups(*this, seg, sc.saves);
     return static_cast<int>(seg.byte_begin[static_cast<size_t>(sc.saves[1])]);
@@ -17263,9 +17411,10 @@ private:
   }
 
   // Byte offset (a code-point boundary, e.g. from the byte DFA) -> its index in
-  // a code-point segmentation. byte_begin is sorted, so a binary search
-  // suffices.
+  // a code-point segmentation, segmented that far first. byte_begin is
+  // sorted, so a binary search suffices.
   static int byte_to_cp(const detail::Segmented &seg, int byte_off) {
+    seg.extend_to_byte(static_cast<size_t>(byte_off));
     auto it = std::lower_bound(seg.byte_begin.begin(), seg.byte_begin.end(),
                                static_cast<size_t>(byte_off));
     return static_cast<int>(it - seg.byte_begin.begin());
@@ -17401,8 +17550,7 @@ private:
         }
       }
     }
-    if (!run_saves(cp ? plan_->cp_prog_ : plan_->prog_, seg, start,
-                   /*anchored=*/false, sc, saves))
+    if (!run_saves(pike_prog(), seg, start, /*anchored=*/false, sc, saves))
       return -1;
     out.groups(*this, seg, saves);
     return pike_resume(saves);
@@ -18316,9 +18464,13 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
       c.gpos = ladder_segment(d.seg, text,
                               l.has(Ladder::kSpec) ? 0 : c.pos);
     const detail::Segmented &sg = *d.seg;
-    const int gn = static_cast<int>(sg.graphemes.size());
     for (;;) {
-      if (c.gpos > gn) return Step::Over;
+      // The cursor stays within what is segmented — the Pike segments a
+      // cluster past every position it reads, and a match ends at one —
+      // so only past the subject's end is it past the last cluster (one
+      // index past it, after an empty match there). The count is read
+      // each time: under `All` the segmentation grows between matches.
+      if (c.gpos > static_cast<int>(sg.graphemes.size())) return Step::Over;
       int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out);
       if (nx < 0) return Step::Over;
       c.gpos = nx;

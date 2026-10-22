@@ -64,13 +64,11 @@ struct PlanProbe {
   // in CodePoint mode): one per lookaround of the pattern, however many
   // copies of it a counted repeat makes.
   static size_t look_programs(const Regex &re) {
-    const auto &p = *re.plan_;
-    return (p.us_ ? p.cp_prog_ : p.prog_).subs.size();
+    return re.pike_prog().subs.size();
   }
   // The literal and class pools of the Pike's program (as look_programs).
   static std::pair<size_t, size_t> operand_pools(const Regex &re) {
-    const auto &p = *re.plan_;
-    const auto &prog = p.us_ ? p.cp_prog_ : p.prog_;
+    const auto &prog = re.pike_prog();
     return {prog.lits.size(), prog.classes.size()};
   }
   // How many groups the plan reports as the whole match, run as its
@@ -2044,26 +2042,67 @@ template <class F> void each_dirty_subject(F agrees) {
   each_dirty_subject(agrees, kGuessBodies, offsets);
 }
 
+// ASCII, CR, LF, a CR-LF pair, a precomposed and an NFD accent, an emoji
+// with and without its presentation selector, a skin tone, a flag, a ZWJ
+// family, a Thai syllable (consonant and vowel mark), Hangul L V, a Prepend
+// (U+0600) and the letter it joins, an invalid byte (0xFF) and a stray
+// continuation byte: each way a cluster can begin or end.
+const char *const kClusterUnits[] = {
+    "a", "b", " ", "-", "\r", "\n", "\r\n", "\xC3\xA9", "e\xCC\x81",
+    "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x8D\xA3",
+    "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5",
+    "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7",
+    "\xE0\xB8\x81\xE0\xB8\xB8", "\xE1\x84\x80\xE1\x85\xA1",
+    ("\xD8\x80"
+     "a"),
+    "\xFF", "\x80"};
+// A segmentation of `s` that shares nothing with detail::Segmented's
+// (whose stretches, ASCII fast path and lazy commits are what it checks):
+// every code point decoded, then cut by unicode::grapheme_length alone, or
+// one per entry. `begin` gets each entry's first byte and then the size.
+std::vector<std::u32string> reference_clusters(std::string_view s,
+                                               bool code_points,
+                                               std::vector<size_t> &begin) {
+  std::u32string cps;
+  std::vector<size_t> at;
+  for (size_t off = 0; off < s.size();) {
+    char32_t cp;
+    at.push_back(off);
+    off += reg::unicode::utf8::decode_or_byte(s.data() + off, s.size() - off,
+                                              cp);
+    cps.push_back(cp);
+  }
+  at.push_back(s.size());
+  std::vector<std::u32string> out;
+  begin.clear();
+  for (size_t i = 0; i < cps.size();) {
+    size_t len = code_points ? 1
+                             : reg::unicode::grapheme_length(cps.data() + i,
+                                                             cps.size() - i);
+    if (len == 0) len = 1;
+    begin.push_back(at[i]);
+    out.push_back(cps.substr(i, len));
+    i += len;
+  }
+  begin.push_back(s.size());
+  return out;
+}
+
+// A subject of `units` of them drawn at random, with runs of up to
+// `max_run` ASCII bytes between them.
+std::string cluster_subject(std::mt19937 &rng, int units, size_t max_run) {
+  constexpr size_t kN = sizeof(kClusterUnits) / sizeof(kClusterUnits[0]);
+  std::string s;
+  for (int u = units; u > 0; u--)
+    s += rng() % 2 ? std::string(rng() % (max_run + 1), 'x')
+                   : kClusterUnits[rng() % kN];
+  return s;
+}
+
 // Where a subject, read from its start, stops being one a family answers
 // for (Regex::family_unsound_at), against a reference that shares no code
-// with the pairwise scans it checks: the clusters of detail::segment(), the
-// Pike's own segmentation.
+// with the pairwise scans it checks: reference_clusters.
 void test_unsound_positions() {
-  // ASCII, CR, LF, a CR-LF pair, a precomposed and an NFD accent, an emoji
-  // with and without its presentation selector, a skin tone, a flag, a ZWJ
-  // family, a Thai syllable (consonant and vowel mark), Hangul L V, a Prepend
-  // (U+0600) and the letter it joins, an invalid byte (0xFF) and a stray
-  // continuation byte.
-  static const char *const kUnits[] = {
-      "a", "b", " ", "-", "\r", "\n", "\r\n", "\xC3\xA9", "e\xCC\x81",
-      "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x8D\xA3",
-      "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB", "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5",
-      "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7",
-      "\xE0\xB8\x81\xE0\xB8\xB8", "\xE1\x84\x80\xE1\x85\xA1",
-      ("\xD8\x80"
-       "a"),
-      "\xFF", "\x80"};
-  constexpr size_t kN = sizeof(kUnits) / sizeof(kUnits[0]);
   // A plan for each way a family's soundness is decided: CR-LF pairs read
   // as the grapheme engine reads them, a nullable pattern (they are not),
   // the CR-LF collapse, a fused CR-LF literal.
@@ -2075,16 +2114,16 @@ void test_unsound_positions() {
   for (int it = 0; it < 3000; it++) {
     // Runs of ASCII between the units, so pairs straddle the 16-byte blocks
     // of the lone CR/LF scan and the printable-ASCII skip has runs to take.
-    std::string s;
-    for (int u = static_cast<int>(rng() % 40); u > 0; u--)
-      s += rng() % 2 ? std::string(rng() % 24, 'x') : kUnits[rng() % kN];
+    const std::string s =
+        cluster_subject(rng, static_cast<int>(rng() % 40), 23);
     const size_t n = s.size();
-    const auto seg = reg::detail::segment(s);
+    std::vector<size_t> begin;
+    const auto clusters = reference_clusters(s, false, begin);
     // The reference: the first cluster of each kind, n if none.
     size_t multi = n, multi_not_crlf = n, lone = n, crlf = n, non_ascii = n;
-    for (size_t g = 0; g < seg.graphemes.size(); g++) {
-      const std::u32string &c = seg.graphemes[g];
-      const size_t b = seg.byte_begin[g], e = seg.byte_begin[g + 1];
+    for (size_t g = 0; g < clusters.size(); g++) {
+      const std::u32string &c = clusters[g];
+      const size_t b = begin[g], e = begin[g + 1];
       const bool pair = c == U"\r\n";
       if (c.size() > 1) multi = std::min(multi, b);
       if (c.size() > 1 && !pair) multi_not_crlf = std::min(multi_not_crlf, b);
@@ -2117,6 +2156,81 @@ void test_unsound_positions() {
         CHECK(PlanProbe::family_sound(re, fam, s, fna) == (at == n));
       }
     }
+  }
+}
+
+// A segmentation made as it is read (detail::segment_lazily) is the
+// subject's, whatever steps it is made in and wherever it starts: each
+// stretch commits only the clusters it shows the end of. So is one made
+// whole (detail::segment, segment_cp), which is the stretch that reaches
+// the end. Both against reference_clusters. Runs of ASCII up to 600 bytes
+// put the stretches' ends (256 bytes, then doubling) inside clusters and
+// inside runs; a cluster of 400 bytes and more (an `e` and its marks) is
+// one no stretch shows the end of until it doubles. And the Pike segments
+// what it reads: a one-step find it answers at the start of 64 KB that
+// ends in a cluster (a (?i) probe's plan, which takes no guess) makes a
+// stretch or two, and so does an anchored one that fails on the second
+// cluster.
+void test_lazy_segmentation() {
+  std::mt19937 rng(0x5E6);
+  auto agree = [&](const std::string &s) {
+    for (const bool cp : {false, true}) {
+      std::vector<size_t> begin;
+      const auto ref = reference_clusters(s, cp, begin);
+      const auto whole =
+          cp ? reg::detail::segment_cp(s) : reg::detail::segment(s);
+      CHECK(whole.done && whole.graphemes == ref && whole.byte_begin == begin);
+      const size_t g0 = rng() % (ref.size() + 1);
+      const auto lazy = reg::detail::segment_lazily(s, begin[g0], cp);
+      // Each step's clusters are the reference's, from g0 on (the ones a
+      // step added: those before it are checked already).
+      size_t checked = 0;
+      auto agrees = [&] {
+        const size_t k = lazy.graphemes.size();
+        if (g0 + k > ref.size()) return false;
+        for (; checked < k; checked++)
+          if (lazy.graphemes[checked] != ref[g0 + checked] ||
+              lazy.byte_begin[checked + 1] != begin[g0 + checked + 1])
+            return false;
+        return lazy.byte_begin[0] == begin[g0];
+      };
+      while (!lazy.done) {
+        if (rng() % 2)
+          lazy.extend_to(lazy.graphemes.size() + rng() % 8);
+        else
+          lazy.extend_to_byte(lazy.byte_begin.back() + rng() % 64);
+        CHECK(agrees());
+      }
+      CHECK(agrees() && g0 + lazy.graphemes.size() == ref.size());
+    }
+  };
+  for (int it = 0; it < 300; it++)
+    agree(cluster_subject(rng, static_cast<int>(rng() % 60), 600));
+  std::string marks;
+  for (int k = 0; k < 200; k++) marks += "\xCC\x81";
+  for (const size_t run : {0, 1, 300})
+    for (const int clusters : {1, 2})
+      for (int it = 0; it < 4; it++) {
+        std::string s(run, 'x');
+        for (int c = 0; c < clusters; c++) s += "e" + marks;
+        agree(s + "yz");
+      }
+
+  const std::string prose =
+      "Sherlock " + std::string(65536, 'a') + " x\xE2\x9D\xA4\xEF\xB8\x8F";
+  const Regex icase("(?i)sherlock");
+  reg::detail::Segmented::made() = 0;
+  CHECK(icase.search(prose).matched());
+  CHECK(reg::detail::Segmented::made() < 1024);
+  const std::string led = "\xE2\x9D\xA4\xEF\xB8\x8F" + std::string(65536, 'a');
+  const Regex anchored("^.qzx\\w*");
+  for (int call = 0; call < 3; call++) {
+    reg::detail::Segmented::made() = 0;
+    const bool hit = call == 0   ? anchored.search(led).matched()
+                     : call == 1 ? anchored.test(led)
+                                 : anchored.match(led).matched();
+    CHECK(!hit);
+    CHECK(reg::detail::Segmented::made() < 1024);
   }
 }
 
@@ -7407,6 +7521,7 @@ int main() {
   test_assert_byte_groups();
   test_crlf_interior_anchors();
   test_unsound_positions();
+  test_lazy_segmentation();
   test_match_guess();
   test_find_guess();
   test_find_guess_grapheme();

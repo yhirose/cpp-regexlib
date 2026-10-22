@@ -91,9 +91,13 @@ UTF-8 subject への**バイトオフセット**で、常にクラスタ境界�
 ```cpp
 struct Segmented {
   std::vector<std::u32string> graphemes;  // 各クラスタのコードポイント
-  std::vector<size_t> byte_begin;         // size == graphemes.size() + 1（末尾=終端）
+  std::vector<size_t> byte_begin;         // size == graphemes.size() + 1（末尾=分割済みの終端）
   std::string_view source;                // 元の UTF-8 subject
+  size_t origin = 0;                      // クラスタ0の開始位置
   bool ascii = false;  // 全バイト < 0x80 → 書記素 index == バイト index
+  bool done = true;    // sourceの末尾まで分割済み
+  // extend_to(g)、extend_to_byte(b)：クラスタgができるまで／
+  // バイトbより先で終わるクラスタができるまで分割を続ける（クラスタはmutable：memo）
 };
 ```
 
@@ -103,6 +107,30 @@ struct Segmented {
 ます。`segment_cp()` は UnicodeScalar 用：1 コードポイント1エントリ——素の UTF-8
 デコードで**書記素分割ではない**。Pike VM はどちらの `Segmented` でも変更なく走り
 ます。
+
+一般パスは`Segmented::extend`で、分割は読みながら1区切りずつ（256バイト、その後は
+分割済みと同じだけ、倍々）作ることもできます（`segment_lazily`）。コードポイントは
+復号したそのままエントリにします。クラスタでは、区切りごとに終わりが見えたクラスタを
+すべて確定します。区切りの末尾に届くクラスタは、次のコードポイントで伸びうるので
+確定しません（何も確定しなかった区切りは倍にします）。`segment()`は末尾まで届く1回の
+区切りです。区切りの中では、CR以外のASCIIのコードポイントで次もASCIIのものは、
+`grapheme_length`にかけずにそれだけで1クラスタとします（ASCIIどうしが融合するのは
+CR-LFだけで、クラスタの先頭のものの前に`Prepend`はありません）。Swiftの正規表現エンジン
+（`_quickASCIICharacter`）と同種の局所的な判定です。Pikeは、プログラムが許すとき
+（`pike_segments_lazily`）に読みながら作る分割を使い、今の位置の1つ先のクラスタまで、
+または末尾まで分割しておきます。そのため分割済みのクラスタ数`n`がある位置と等しくなるのは
+主題の末尾だけで、`$`、`\z`、末尾の前の`\b`は主題全体のときと同じに読めます。先頭に
+固定した実行は、スレッドが尽きたところで止まります。長さを問うプログラム（先読み・後読みは
+表が主題全体にわたる、`\Z`）と`Loop`を含むプログラム（`dfa_assert_ok_`がこの3つを
+除きます）は全体を分割します。長さに比例する手数の上限に届きうる大きさのプログラム
+（命令が`kStepsPerPos / 3`より多い。`add_thread`は1位置あたり高々`3 * size + 1`手）も
+同じです。こうして早く答えるPikeは読んだ分だけを分割します。推測を取らない`(?i)holmes`を、
+末尾に❤️を足したSherlockにかけた`search()`は1.9億命令から25万命令になりました
+（`/usr/bin/time -l`、Apple clang -O3）。数千クラスタを超えて読み進む分割は、残りの
+1バイトにつき1クラスタ（残りが持ちうる最大）を一度に確保するので、クラスタが動くのは
+高々もう1回です。ASCIIの判定と合わせて、その主題の全体を読むPikeは命令が以前より
+16〜24%少なく（`\w+`、`(\w+)`、`(?i)Sherlock`、`\b\w+n\b`のfind_all、マッチの無い
+`test()`）、全体を分割する先読みのパターンでは11%少なく済みます。
 
 ### クラス所属はベースコードポイントで判定
 

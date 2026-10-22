@@ -95,9 +95,13 @@ performance cliff (§4): a byte automaton sees bytes, not clusters.
 ```cpp
 struct Segmented {
   std::vector<std::u32string> graphemes;  // code points of each cluster
-  std::vector<size_t> byte_begin;         // size == graphemes.size() + 1 (last = end)
+  std::vector<size_t> byte_begin;         // size == graphemes.size() + 1 (last = end so far)
   std::string_view source;                // the original UTF-8 subject
+  size_t origin = 0;                      // where cluster 0 starts
   bool ascii = false;  // all bytes < 0x80, so grapheme index == byte index
+  bool done = true;    // segmented to the end of source
+  // extend_to(g), extend_to_byte(b): segment on until cluster g exists /
+  // a cluster ends past byte b (the clusters are mutable: a memo)
 };
 ```
 
@@ -107,6 +111,36 @@ own cluster, `byte_begin[i] == i`, no decode/break work) and a **general path**
 `reg::unicode::grapheme_length`). `segment_cp()` is the UnicodeScalar counterpart:
 one entry per code point — a plain UTF-8 decode, **not** grapheme breaking. The
 Pike VM runs over either `Segmented` unchanged.
+
+The general path is `Segmented::extend`, and a segmentation can be made by
+it as it is read (`segment_lazily`), a stretch at a time (256 bytes, then as
+many as are done, doubling). Code points it decodes straight into entries.
+For clusters, each stretch commits every cluster it shows the end of — not
+one that reaches the stretch's end, which the next code point may extend (a
+stretch that commits nothing doubles). `segment()` is the stretch that
+reaches the end. Within a stretch an ASCII code point but CR, before
+another, is a cluster of its own without `grapheme_length` (two ASCII code
+points fuse only as CR-LF, and one that starts a cluster follows no
+`Prepend`): the kind of local check Swift's regex engine makes
+(`_quickASCIICharacter`). The Pike reads a lazy one where its program
+allows (`pike_segments_lazily`), keeping it one cluster past the position it
+is at, or at the end: so `n`, the clusters so far, equals a position only
+where the subject ends, and `$`, `\z` and a `\b` before the end read as they
+do over the whole subject. An anchored run stops once its threads are gone.
+A program that asks for the length (lookaround, whose tables cover the
+subject, or `\Z`) is segmented whole, as is one with a `Loop`
+(`dfa_assert_ok_` excludes all three); so is one big enough that the step
+budget, proportional to the length, could trip (more than
+`kStepsPerPos / 3` instructions: `add_thread` charges a position at most
+`3 * size + 1`). So a Pike that answers early segments what it read:
+`(?i)holmes`, which takes no guess, over Sherlock with a ❤️ appended,
+`search()` 190 M instructions to 0.25 M (`/usr/bin/time -l`, Apple clang
+-O3). A segmentation read on past a few thousand clusters reserves one
+cluster per remaining byte, the most the rest can hold, so its clusters
+move once more at most; with the ASCII check, a Pike that
+reads that whole subject retires 16-24% fewer instructions than before
+(`\w+`, `(\w+)`, `(?i)Sherlock`, `\b\w+n\b` find_all, a no-match `test()`),
+and one over a lookaround pattern, segmented whole, 11% fewer.
 
 ### Class membership is decided by the base code point
 
