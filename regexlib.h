@@ -2087,11 +2087,13 @@ namespace detail {
 // Extending changes nothing a reader already saw — the clusters are the
 // subject's, materialized on demand — hence the members are mutable.
 //
-// Every Pike segmentation starts at 0 so far: the Pike's readers take
-// cluster 0 for the subject's start (`^`, `\A`, a `\b` there). A lazy one
-// leaves `ascii` false whatever the subject, which only forgoes the Pike's
-// ASCII skips (pike_candidate, pike_step) where a DFA gave a pure-ASCII
-// subject up.
+// The Pike's readers take cluster 0 for the subject's start (`^`, `\A`, a
+// `\b` there): a segmentation that starts later (a Finder's, made where its
+// Pike starts: Regex::Finder::pike_at) starts at the cluster before the
+// position the Pike starts at, which it reads as the context, and the Pike
+// never reads its cluster 0 as a position. A lazy one leaves `ascii` false
+// whatever the subject, which only forgoes the Pike's ASCII skips
+// (pike_candidate, pike_step) where a DFA gave a pure-ASCII subject up.
 struct Segmented {
   mutable std::vector<std::u32string> graphemes; // code points of each cluster
   mutable std::vector<size_t> byte_begin;        // size == graphemes.size() + 1
@@ -2122,6 +2124,16 @@ struct Segmented {
   // (0: as many as are segmented already, for a doubling, and at least
   // kChunk), committing every cluster the stretch shows the end of.
   void extend(size_t want) const;
+  // A lazy segmentation of the same subject from `at` (a cluster boundary)
+  // on, in the storage this one had: where segment_lazily's starts.
+  void restart(size_t at) {
+    graphemes.clear();
+    byte_begin.clear();
+    byte_begin.push_back(at);
+    origin = at;
+    ascii = false;
+    done = at >= source.size();
+  }
   // How many clusters this thread has segmented so far, by extend (how much
   // of their subjects the Pike has read, for the tests).
   static size_t &made() {
@@ -2136,10 +2148,8 @@ inline Segmented segment_lazily(std::string_view s8, size_t origin,
                                 bool code_points) {
   Segmented seg;
   seg.source = s8;
-  seg.origin = origin;
   seg.code_points = code_points;
-  seg.byte_begin.push_back(origin);
-  seg.done = origin >= s8.size();
+  seg.restart(origin);
   return seg;
 }
 
@@ -5303,6 +5313,9 @@ public:
 
   void clear() noexcept { n_ = 0; }
 
+  // Back to the first `n` cells (n <= size()).
+  void truncate(size_t n) noexcept { n_ = n; }
+
   // `k` more cells, unwritten: the caller writes every one of them. (Inlined
   // by name, the growing kept out of line: with both left to the compiler a
   // row would cost find_iter a call.)
@@ -6284,11 +6297,19 @@ private:
       kInnerOff = 1 << 7,
       kPrefixOff = 1 << 10,
       kGivenUp = kSuffixOff | kInnerOff | kPrefixOff,
-      // A guess (find_rest): the family is assumed to serve the subject and
-      // judged on what its scan read.
+      // A guess (find_rest), or a step over a cut text (Finder::cut_step):
+      // the family is assumed to serve the subject and judged on what its
+      // scan read.
       kSpec = 1 << 8,
       // The assert family: a boolean takes the find (Plan::assert_bool_finds).
       kBoolFind = 1 << 9,
+      // A step over a cut text (Finder::cut_step): the text ends where the
+      // family stops being sound, not where the subject does, and the Pike
+      // does not run on it — a family that steps down to the Pike (a DFA
+      // that gave up) ends the step there, and every step after it, the
+      // ladder standing on the Pike from then on: the Finder's Pike steps
+      // over the subject.
+      kCut = 1 << 11,
     };
     static constexpr uint16_t kTraitBits = // every FamilyTrait
         kTraitAssert | kTraitByte | kTraitWalkByte | kTraitGrapheme;
@@ -12445,7 +12466,9 @@ private:
   // groups it finds in the located span are the grapheme engine's — as for
   // the Dfa/EgcByte tier's. A stray, a cluster of its own that neither
   // matches, changes nothing there (`([^ ]+)$` over "ab\xC3": no match).
-  bool assert_byte_path_ok(std::string_view text, size_t fna) const {
+  // `unsound` as egc_byte_path's.
+  bool assert_byte_path_ok(std::string_view text, size_t fna,
+                           size_t &unsound) const {
     if (!plan_->byte_assert_path_) return false;
     if (fna == text.size())
       // Pure ASCII belongs to the cheaper ASCII assert tier — EXCEPT a
@@ -12458,7 +12481,8 @@ private:
       // pattern pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
-    return family_sound(kFamAssertByte, text, fna);
+    unsound = family_unsound_at(kFamAssertByte, text, fna);
+    return unsound == text.size();
   }
 
   // Priority-ordered ε-closure with the leftmost-first match cut, for the
@@ -13557,15 +13581,18 @@ private:
   // reads as the grapheme engine does: collapsed, or a crlf_byte_safe,
   // non-empty pattern's, which matches `\r\n`'s two bytes exactly
   // (byte_unsound_at on pure ASCII, spelled out) — the subjects
-  // Plan::crlf_fused_lit_ keeps from the ASCII tier among them.
-  bool egc_byte_path(std::string_view text, size_t i) const {
+  // Plan::crlf_fused_lit_ keeps from the ASCII tier among them. Over a
+  // subject that is not, `unsound` receives where the family stops serving
+  // it (family_unsound_at), for a cut there (ladder_gated).
+  bool egc_byte_path(std::string_view text, size_t i, size_t &unsound) const {
     if (!plan_->byte_path_) return false;
     if (i == text.size())
       return plan_->byte_crlf_collapse_
                  ? contains_crlf(text) && no_lone_crlf(text)
                  : plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
                        contains_crlf(text);
-    return family_sound(kFamEgcByte, text, i);
+    unsound = family_unsound_at(kFamEgcByte, text, i);
+    return unsound == text.size();
   }
   // Where, read from its start, `text` stops being a subject the byte
   // programs' engine answers for as the grapheme engine does (`i` its first
@@ -15205,10 +15232,14 @@ public:
   //   groups(re, text, saves) byte-offset saves, ncap_ + 1 pairs
   //   groups(re, seg, saves)  grapheme / code-point index saves (the Pike)
   //   kGroups                 whether the caller reads groups at all
+  // and, for a scan's step whose match may not stand (a guess's, a cut
+  // text's: Finder::cut_step), clear() or mark() and drop(mark).
   // RowSink appends one columnar row per match (find_all, find_iter).
   struct RowSink {
     static constexpr bool kGroups = true;
     detail::SpanRows &rows;
+    size_t mark() const { return rows.size(); }
+    void drop(size_t m) { rows.truncate(m); }
     // A capture-free match [s, e): the begin, end pair. (Inlined by name:
     // left to the compiler, find_iter made a call of it per match — 18
     // instructions for the two stores.)
@@ -15235,6 +15266,8 @@ public:
     static constexpr bool kGroups = true;
     MatchResult &r;
     void clear() { r = MatchResult{}; } // a guess's match that did not hold
+    size_t mark() const { return 0; }
+    void drop(size_t) { clear(); }
     void span(const Regex &re, std::string_view text, int s, int e) {
       re.set_dfa_result(r, text, s, e);
     }
@@ -15373,22 +15406,50 @@ public:
   // ladder_gated: a Grapheme scan passes through here on its first step,
   // where two calls handing a Ladder back and forth through memory weigh
   // on a short test().
+  // `cut`, unless null (a Finder's scan: Finder::classify), takes a subject
+  // no family serves whole onto the family that serves the most of it,
+  // over a text cut where it stops being sound (Finder::cut_step), and
+  // receives that position.
   REGEXLIB_ALWAYS_INLINE Ladder ladder_classify(std::string_view text,
                                                 Ladder l, size_t &fna,
-                                                Plan::IcaseScan &probe) const;
-  // The same out of line, for the step's own Classify case: a scan that is
-  // stored (Finder) passes through it once, and a one-step find only after
-  // a bail (find_once classifies inline).
+                                                Plan::IcaseScan &probe,
+                                                size_t *cut = nullptr) const;
+  // The same out of line, for the step's own Classify case: a one-step
+  // find after a bail (find_once classifies inline), or a scan that comes
+  // back to Classify mid-step (an end anchor's DFA that gave up).
   REGEXLIB_NOINLINE Ladder ladder_reclassify(std::string_view text, Ladder l,
                                              size_t &fna,
                                              Plan::IcaseScan &probe) const {
     return ladder_classify(text, l, fna, probe);
   }
   // The families that need the subject classified up front (everything
-  // the fused rungs are not).
+  // the fused rungs are not). `cut` as ladder_classify's.
   REGEXLIB_ALWAYS_INLINE Ladder ladder_gated(std::string_view text, Ladder l,
                                              size_t &fna,
-                                             Plan::IcaseScan &probe) const;
+                                             Plan::IcaseScan &probe,
+                                             size_t *cut = nullptr) const;
+  // The EGC byte family for `text`: with the (?i) prefix probe if one
+  // applies (chosen into `probe`, once: the fast-probe guard is O(n)).
+  Family byte_family(std::string_view text, Plan::IcaseScan &probe) const {
+    const Plan &p = *plan_;
+    return p.ncap_ == 0 && p.icase_prefix_.active() &&
+                   icase_choose_probe(text, probe)
+               ? kFamEgcByteIp
+               : kFamEgcByte;
+  }
+  // The family a Finder's scan steps on over a cut text (Finder::cut_step):
+  // the plan's byte family, sound on the most subjects (no cluster of more
+  // than one code point but CR-LF); kFamilyCount if it has none. (A
+  // Grapheme plan has an ASCII family only where it has a byte one: the
+  // DFA family's find and the byte path are one condition, dfa_find_ok, and
+  // the assert ASCII tier's program is built where the byte assert tier's
+  // is. The probe's guard, that no lead byte is in the subject, holds for
+  // every part of it.)
+  Family cut_family(std::string_view text, Plan::IcaseScan &probe) const {
+    const Plan &p = *plan_;
+    if (p.byte_path_) return byte_family(text, probe);
+    return p.byte_assert_path_ ? kFamAssertByte : kFamilyCount;
+  }
   // ... and where a fused rung lands when its lazy eligibility scan finds
   // the subject ineligible for the COLLAPSED byte path (a lone CR/LF — e.g.
   // plain Unix-newline text — or a fusing cluster), or runs out of budget:
@@ -15414,17 +15475,19 @@ public:
   const detail::Program &pike_prog() const {
     return plan_->us_ ? plan_->cp_prog_ : plan_->prog_;
   }
-  detail::Segmented pike_segment(std::string_view text) const {
-    return pike_segment(pike_prog(), text, plan_->us_);
+  detail::Segmented pike_segment(std::string_view text,
+                                 size_t origin = 0) const {
+    return pike_segment(pike_prog(), text, plan_->us_, origin);
   }
   // The segmentation the Pike runs `prog` over `text` on, in code points or
   // grapheme clusters: one it extends as it reads where it may
-  // (pike_segments_lazily), else the whole subject's.
+  // (pike_segments_lazily), from `origin` (a boundary: a Finder's Pike over
+  // cut texts starts one later), else the whole subject's.
   detail::Segmented pike_segment(const detail::Program &prog,
-                                 std::string_view text,
-                                 bool code_points) const {
+                                 std::string_view text, bool code_points,
+                                 size_t origin = 0) const {
     if (pike_segments_lazily(prog))
-      return detail::segment_lazily(text, 0, code_points);
+      return detail::segment_lazily(text, origin, code_points);
     return code_points ? detail::segment_cp(text) : detail::segment(text);
   }
   // Whether the Pike may run `prog` over a segmentation it extends as it
@@ -15607,7 +15670,9 @@ public:
   // included, and it reads no DFA — a cache the inner driver fetched holds
   // no reach of this step); else the match's end, or past it as far as the
   // readers Cursor::reach counts or a DFA scan of the family's programs
-  // read.
+  // read. (A cut text's step passes `walked` false: its DFAs' reach counts
+  // from the last step that did not stand, never from a call before the
+  // scan, so the walk's answer is held to it too: Finder::cut_step.)
   static int step_reach(std::string_view text, const Scr &scr,
                         const Ladder &l, const Cursor &c, bool walked,
                         bool found) {
@@ -15616,16 +15681,73 @@ public:
                   : std::max(std::max(c.pos, c.reach),
                              scr.cache->reach(l.trait(kTraitByte)));
   }
+  // Where, from `at` (a cluster boundary) on, `text` stops being one family
+  // `f` serves: the start of the next cluster it cannot serve, or the
+  // text's size. It reads as far as that, over a window that doubles: a
+  // family's soundness is two scans, each to the first of its own kind (the
+  // first non-ASCII byte and the first CR-LF; the first fusing cluster and
+  // the first lone CR or LF), and the nearer one alone ends the stretch. A
+  // window hides a cluster it ends in, reads the code point it cuts as a
+  // stray, and shows a CR it ends on as lone: what it finds more than a
+  // code point short of its end is the text's.
+  size_t cut_from(Family f, std::string_view text, size_t at) const {
+    for (size_t w = 64;; w *= 2) {
+      const std::string_view r = text.substr(at, w);
+      const size_t k = family_unsound_at(f, r, first_nonascii(r));
+      if (k + 4 < r.size() || at + r.size() >= text.size()) return at + k;
+    }
+  }
+  // Where the cluster that ends at `p` (> 0) starts, in a stretch of `text`
+  // where every cluster is one code point or a CR-LF — one a family serves.
+  static size_t cluster_before(std::string_view text, size_t p) {
+    size_t q = p - static_cast<size_t>(cp_before(text, static_cast<int>(p)).len);
+    if (text[q] == '\n' && q > 0 && text[q - 1] == '\r') q--;
+    return q;
+  }
+  // One Pike match from the cursor (`c.gpos`, a cluster index of `sg`),
+  // handed to `out`, and the cursor past it; false when none remains. Past
+  // the subject's last cluster (one index past it, after an empty match
+  // there) none does. The Pike segments a cluster past every position it
+  // reads, and a match ends at one, so the cursor is never past what is
+  // segmented short of that; the count is read each time, as it grows
+  // between matches.
+  template <class Out>
+  bool pike_once(const detail::Segmented &sg, Cursor &c, Scr &scr,
+                 Out &out) const {
+    if (c.gpos > static_cast<int>(sg.graphemes.size())) return false;
+    const int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out);
+    if (nx < 0) return false;
+    c.gpos = nx;
+    return true;
+  }
+  // The byte the Pike's cursor `gpos` stands on in `sg`, or one past the
+  // subject's end when no scan position remains (gpos past the last cluster).
+  static size_t pike_byte(const detail::Segmented &sg, int gpos) {
+    return static_cast<size_t>(gpos) <= sg.graphemes.size()
+               ? sg.byte_begin[static_cast<size_t>(gpos)]
+               : sg.source.size() + 1;
+  }
 
   // A scan that outlives the call that started it (find_iter, find_all,
   // find_at): the ladder, the cursor and what the rungs keep between
   // matches, stored. The steps are the ones find_once takes.
+  //
+  // A subject no family serves whole — a Grapheme one with a cluster the
+  // family cannot read as the grapheme engine does: an emoji with its
+  // presentation selector, an NFD accent, Thai — it scans as cut texts
+  // (docs/design.md, "Cut texts"). The family steps over the subject cut
+  // where it stops being sound, from a cursor whose cluster before it is
+  // sound, and its match stands if the step read nothing at or past the cut
+  // (step_reach); else the Pike steps over the subject, around that cluster.
+  // A subject with none such ahead of the cursor scans as any other.
   class Finder {
   public:
     // `cache` null: this thread's, fetched by the first step that needs one.
     Finder(const Regex &re, std::string_view text, FindCache *cache)
         : re_(&re), text_(text), cache_(cache), l_(re.plan_->start_[0]),
-          budget_(text.size()) {}
+          budget_(text.size()),
+          cut_(re.plan_->start_[0].rung == Rung::Classify ? kToClassify
+                                                          : kNoCut) {}
 
     // The next match, handed to `out`; false when none remains. Over the
     // caller's scratch (the iterator's own, which lives as long as the scan
@@ -15660,18 +15782,182 @@ public:
     // text size; gpos == gn + 1 means no scan positions remain).
     size_t resume_byte() const {
       if (l_.rung != Rung::Pike) return static_cast<size_t>(c_.pos);
-      size_t gn = deep_.seg->graphemes.size();
-      return static_cast<size_t>(c_.gpos) <= gn
-                 ? deep_.seg->byte_begin[c_.gpos]
-                 : text_.size() + 1;
+      return pike_byte(*deep_.seg, c_.gpos);
     }
 
   private:
+    // cut_ when the scan steps as any other, and before it classifies.
+    static constexpr int kNoCut = -1, kToClassify = -2;
+
     template <bool All, class Out>
     REGEXLIB_ALWAYS_INLINE bool step(Scr &scr, Out &out) {
+      if (cut_ != kNoCut) {
+        const Step st = cut_steps<All>(scr, out);
+        if (st != Step::Again) return st == Step::Yield;
+      }
       bool chain_once = false;
       return re_->ladder_step<All>(text_, scr, l_, c_, budget_, deep_,
                                    chain_once, out);
+    }
+    // The steps of a scan yet to classify its subject (the first) or over
+    // cut texts, as a rung's: one match handed to `out` (Yield; under All,
+    // every one while the scan is over them), none left (Over), or Again
+    // when the scan steps as any other from here on (no cut, or none left
+    // ahead).
+    template <bool All, class Out>
+    REGEXLIB_NOINLINE Step cut_steps(Scr &scr, Out &out) {
+      if (cut_ == kToClassify) {
+        classify();
+        if (cut_ != kNoCut) read_afresh(scr);
+      }
+      while (cut_ != kNoCut) {
+        const Step st = cut_step(scr, out);
+        if (st != Step::Yield || !All) return st;
+      }
+      return Step::Again;
+    }
+    // The scan's Classify (ladder_reclassify's), with a cut where no family
+    // serves the subject whole.
+    REGEXLIB_NOINLINE void classify() {
+      size_t cut = text_.size();
+      l_ = re_->ladder_classify(text_, l_, deep_.fna, deep_.probe, &cut);
+      cut_ = kNoCut;
+      if (!l_.has(Ladder::kCut)) return;
+      if (cut < text_.size())
+        cut_ = static_cast<int>(cut);
+      else
+        uncut();
+    }
+    // One step over cut texts, from the cursor p, as cut_steps' (Yield,
+    // Over, or Again out of the cut texts). The family over text[0, cut_)
+    // when p is short of the cut, and its match if the step read nothing at
+    // or past it (step_reach: the cut is a cluster boundary, so no code
+    // point it completes reaches past it); else, or where the family cannot
+    // read from p, the Pike from p over the subject — from where the step
+    // started: the family may have moved the cursor past candidates the cut
+    // failed (a prefilter that bailed).
+    //
+    // What the steps read is counted from the last one that did not stand
+    // (read_afresh), not from each: every step that stood read short of the
+    // cut, which only moves forward, so what the steps before it read keeps
+    // none from standing. A scan of another subject in between, on the same
+    // cache, can raise the counts (costing a step that stood its match) or
+    // set them back to 0 (forgetting only what the steps before read),
+    // never hide what this step reads.
+    template <class Out>
+    REGEXLIB_ALWAYS_INLINE Step cut_step(Scr &scr, Out &out) {
+      const int n = static_cast<int>(text_.size());
+      const int p = c_.pos;
+      if (p > n) return Step::Over;
+      if (p > cut_) place(p);
+      if (cut_ == n) {
+        uncut();
+        return Step::Again;
+      }
+      if (p < cut_) {
+        const size_t mark = out.mark();
+        const std::string_view cut(text_.data(), static_cast<size_t>(cut_));
+        bool chain_once = false;
+        if (re_->ladder_step<false>(cut, scr, l_, c_, budget_, deep_,
+                                    chain_once, out) &&
+            step_reach(cut, scr, l_, c_, /*walked=*/false, /*found=*/true) <
+                cut_)
+          return Step::Yield;
+        out.drop(mark);
+        c_.pos = p;
+        read_afresh(scr);
+      }
+      pike_at(p);
+      if (!re_->pike_once(*deep_.seg, c_, scr, out)) return Step::Over;
+      c_.pos = static_cast<int>(pike_byte(*deep_.seg, c_.gpos));
+      return Step::Yield;
+    }
+    // Count what the cut steps read from here: the family's readers
+    // (Cursor::reach) and its DFAs (FindCache::reach_from_zero).
+    void read_afresh(Scr &scr) {
+      c_.reach = 0;
+      scr.cache->reach_from_zero(l_.trait(kTraitByte));
+    }
+    // The index of byte `p` (a cluster boundary the segmentation holds):
+    // the Pike's cursor if it stands on p there — after a Pike step it
+    // does — else looked up.
+    int index_of(const detail::Segmented &s, int p) const {
+      const size_t g = static_cast<size_t>(c_.gpos);
+      return g < s.byte_begin.size() &&
+                     s.byte_begin[g] == static_cast<size_t>(p)
+                 ? c_.gpos
+                 : byte_to_cp(s, p);
+    }
+    // Move the cut past the clusters behind `p` (> cut_, a cluster
+    // boundary) that the family cannot serve: to the next one ahead of p
+    // if the cluster before p is not one, else to the start of that one —
+    // the Pike reads on from p, where the family would read that cluster
+    // for the context. After a Pike step its segmentation holds that
+    // cluster, and the next one from its start is the answer — the cluster
+    // itself, without a scan, if it holds more than one code point and is
+    // no CR-LF: every family reads a code point at a time, and none serves
+    // such a cluster (test_cut_text checks it of each). A find_at's first
+    // step steps over them from the cut instead, one at a time, each
+    // segmented from its start.
+    void place(int p) {
+      const detail::Segmented *s = deep_.seg.get();
+      if (s && s->origin < static_cast<size_t>(p) &&
+          static_cast<size_t>(p) <= s->byte_begin.back()) {
+        const size_t g = static_cast<size_t>(index_of(*s, p)) - 1;
+        const size_t q = s->byte_begin[g];
+        const std::u32string &before = s->graphemes[g];
+        cut_ = before.size() > 1 && before[0] != U'\r'
+                   ? static_cast<int>(q)
+                   : static_cast<int>(re_->cut_from(l_.fam, text_, q));
+        return;
+      }
+      for (;;) {
+        const detail::Segmented &s = seg_from(static_cast<size_t>(cut_));
+        const int e = static_cast<int>(
+            s.byte_begin[static_cast<size_t>(byte_to_cp(s, cut_)) + 1]);
+        if (e >= p) return; // the cluster at the cut ends at p
+        cut_ = static_cast<int>(
+            re_->cut_from(l_.fam, text_, static_cast<size_t>(e)));
+        if (cut_ >= p) return;
+      }
+    }
+    // The Pike's segmentation, holding byte `q` (a cluster boundary, at most
+    // the subject's end): the one there is if it starts at or before q and
+    // is segmented that far, else one made from q on — or, for a Pike that
+    // cannot read one made as it goes, the whole subject's (pike_segment),
+    // which holds every q: so one there is that does not is a lazy one, to
+    // be made again in its storage.
+    detail::Segmented &seg_from(size_t q) {
+      detail::Segmented *s = deep_.seg.get();
+      if (s && s->origin <= q && q <= s->byte_begin.back()) return *s;
+      if (s)
+        s->restart(q);
+      else
+        deep_.seg =
+            std::make_unique<detail::Segmented>(re_->pike_segment(text_, q));
+      return *deep_.seg;
+    }
+    // Ready the Pike to step from `p`: its cursor on p, in a segmentation
+    // that holds the cluster before p, which it reads for the context. One
+    // that is there and holds it (the Pike's or place's: the cluster may be
+    // one the family cannot serve), else one made from that cluster's start
+    // — a cluster the family serves, one code point or a CR-LF.
+    void pike_at(int p) {
+      const detail::Segmented *s = deep_.seg.get();
+      const size_t b = static_cast<size_t>(p);
+      if (!s || !(b == 0 ? s->origin == 0 : s->origin < b) ||
+          b > s->byte_begin.back())
+        seg_from(b == 0 ? 0 : cluster_before(text_, b));
+      c_.gpos = index_of(*deep_.seg, p);
+    }
+    // Out of the cut texts: the family's ladder over the rest of the
+    // subject, as a scan that never had a cut (a Pike it steps down to
+    // segments from 0).
+    void uncut() {
+      l_.set(Ladder::kSpec, false);
+      l_.set(Ladder::kCut, false);
+      cut_ = kNoCut;
+      deep_.seg.reset();
     }
     // What a step works over. A scan on a rung that is the whole plan (the
     // literal ones: they never leave themselves) reads none of it and gets
@@ -15730,6 +16016,12 @@ public:
     Cursor c_;
     WalkBudget budget_; // shared by every candidate+verify rung of this scan
     Deep deep_;
+    // Over cut texts: where the one at the cursor ends — the start of the
+    // next cluster the family cannot serve, short of the subject's end —
+    // and while the cursor is short of it, the cluster before the cursor
+    // is one the family serves (or the cursor is at 0). kNoCut, kToClassify
+    // otherwise.
+    int cut_;
   };
 
   // Lazy single-pass scan over the non-overlapping matches (see Regex::find_iter).
@@ -17991,7 +18283,8 @@ inline void Regex::ladder_plan(Plan &p) {
 
 inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
                                             size_t &fna,
-                                            Plan::IcaseScan &probe) const {
+                                            Plan::IcaseScan &probe,
+                                            size_t *cut) const {
   const Plan &p = *plan_;
   // A CodePoint plan's family serves every subject.
   if (p.us_) return ladder_guessed(l);
@@ -18016,12 +18309,12 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
     l.rung = l.below = Rung::FusedSuffix;
     return l;
   }
-  return ladder_gated(text, l, fna, probe);
+  return ladder_gated(text, l, fna, probe, cut);
 }
 
 inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
-                                         size_t &fna,
-                                         Plan::IcaseScan &probe) const {
+                                         size_t &fna, Plan::IcaseScan &probe,
+                                         size_t *cut) const {
   const Plan &p = *plan_;
   // (A boolean is admitted where a find is not: see Plan::dfa_family_ok;
   // likewise the assert family, with no leftmost-first assert program.)
@@ -18029,19 +18322,31 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
   // Classify once; the gates share it.
   if (fna == kUnclassified) fna = first_nonascii(text);
   Family f;
-  if (egc_byte_path(text, fna)) {
-    // (?i) clean-prefix prefilter: choose the probe once (the fast-probe guard
-    // is O(n)); the family has no such rung if no probe applies.
-    f = p.ncap_ == 0 && p.icase_prefix_.active() &&
-                icase_choose_probe(text, probe)
-            ? kFamEgcByteIp
-            : kFamEgcByte;
+  // Where the byte family the gates asked of a non-ASCII subject stops
+  // serving it (the plan has one byte family at most: the byte path and
+  // the byte assert path are dfa_ok_ and not).
+  size_t unsound = kUnclassified;
+  if (egc_byte_path(text, fna, unsound)) {
+    // (?i) clean-prefix prefilter: the family has no such rung if no probe
+    // applies.
+    f = byte_family(text, probe);
   } else if (p.ascii_family(test) != kFamilyCount &&
              family_sound(kFamAscii, text, fna)) {
     // (Both ASCII families are sound on the same subjects.)
     f = p.ascii_family(test);
-  } else if (assert_byte_path_ok(text, fna)) {
+  } else if (assert_byte_path_ok(text, fna, unsound)) {
     f = kFamAssertByte;
+  } else if (cut && (f = cut_family(text, probe)) != kFamilyCount) {
+    // A Finder's scan: the family over the text up to where it stops being
+    // sound, and the Pike around what it cannot serve (Finder::cut_step) —
+    // where its gate found it stops, or (a pure-ASCII subject, which the
+    // gates do not scan for clusters) found here.
+    *cut = unsound != kUnclassified ? unsound
+                                    : family_unsound_at(f, text, fna);
+    l = ladder_on(f, l);
+    l.set(Ladder::kSpec);
+    l.set(Ladder::kCut);
+    return l;
   } else { // [Tier: Pike]
     return pike_ladder(l.want);
   }
@@ -18570,20 +18875,13 @@ inline Regex::Step Regex::ladder_deep(Rung r, std::string_view text, Scr &scr,
   // move the cursor past candidates it failed, as Rung::Prefix does on a
   // bail), and guess_open takes the Pike's answer as the reference.
   case Rung::Pike: {
+    if (l.has(Ladder::kCut)) return Step::Over; // (see Ladder::kCut)
     if (!d.seg)
       c.gpos = ladder_segment(d.seg, text,
                               l.has(Ladder::kSpec) ? 0 : c.pos);
     const detail::Segmented &sg = *d.seg;
     for (;;) {
-      // The cursor stays within what is segmented — the Pike segments a
-      // cluster past every position it reads, and a match ends at one —
-      // so only past the subject's end is it past the last cluster (one
-      // index past it, after an empty match there). The count is read
-      // each time: under `All` the segmentation grows between matches.
-      if (c.gpos > static_cast<int>(sg.graphemes.size())) return Step::Over;
-      int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out);
-      if (nx < 0) return Step::Over;
-      c.gpos = nx;
+      if (!pike_once(sg, c, scr, out)) return Step::Over;
       if (!All) return Step::Yield;
     }
   }

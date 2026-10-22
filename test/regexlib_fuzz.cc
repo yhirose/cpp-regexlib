@@ -2474,6 +2474,103 @@ void invariant_fuzz_word_bool(int iters) {
   }
 }
 
+// --- Cut texts: subjects no family serves whole. ---
+//
+// A subject with a cluster the plan's family cannot read as the grapheme
+// engine does scans as cut texts (Regex::Finder): the family over the
+// subject cut at the next such cluster, its match standing if the step read
+// nothing at or past the cut, and the Pike around them. gen_alt's patterns
+// over gen_subject's pieces with one to three such clusters among them,
+// anywhere — side by side, at the ends, by a match: an emoji with its
+// selector or a skin tone, a flag, a ZWJ pair, an a, b or c with a mark (a
+// base the patterns match), a Thai syllable, a CR-LF and a lone CR or LF
+// (for a pattern that could split a pair, and for the CR-LF collapse);
+// for one pattern in two, one subject behind or ahead of a kilobyte of
+// newlines (a walk's budget, seeded with a short subject's length, hides
+// what goes wrong; each newline is a cut for the CR-LF collapse; and the
+// Pike reference, which some of gen_alt's patterns keep a thread alive
+// across all of them in, at every match, costs a sixteenth of what it does
+// over 4 KB). check_pattern compares them with the Pike; and a
+// fresh scan placed at a match's end (find_at: Finder::place, which then
+// has no segmentation to read the clusters behind it off) goes on as
+// find_all does, for up to eight steps.
+std::string gen_cut_subject() {
+  static const char *const kCuts[] = {
+      "\xE2\x9D\xA4\xEF\xB8\x8F",                      // a heart, selector
+      "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB",              // a skin tone
+      "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5",              // a flag
+      "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9",  // a ZWJ pair
+      "a\xCC\x81", "b\xCC\xA7", "c\xCC\x8C",           // bases and marks
+      "\xE0\xB8\x81\xE0\xB9\x88",                      // Thai ko, mai ek
+      "\r\n", "\r", "\n"};
+  std::string s = gen_subject();
+  for (int k = U(1, 3); k > 0; k--) {
+    s.insert(static_cast<size_t>(U(0, static_cast<int>(s.size()))),
+             kCuts[U(0, 10)]);
+    if (U(0, 1)) s += gen_subject();
+  }
+  return s;
+}
+
+void check_find_at_on(const reg::Regex &re, const std::string &subj,
+                      const std::vector<reg::MatchResult> &all,
+                      const std::string &pat) {
+  // (find_at starts at the end of one of them, drawn at random.)
+  std::vector<size_t> nonempty; // indices of the non-empty matches
+  for (size_t i = 0; i < all.size(); i++)
+    if (all[i].end() > all[i].begin()) nonempty.push_back(i);
+  if (nonempty.empty()) return;
+  size_t i = nonempty[static_cast<size_t>(
+      U(0, static_cast<int>(nonempty.size()) - 1))];
+  size_t pos = all[i].end();
+  try {
+    for (int k = 0; k < 8; k++) {
+      const reg::Regex::FindAt r = re.find_at(subj, pos);
+      if (++i >= all.size()) {
+        if (r.m.matched()) fail("find_at past the last match", pat, subj);
+        return;
+      }
+      if (!r.m.matched()) {
+        fail("find_at found none where find_all has one", pat, subj);
+        return;
+      }
+      if (!compare_groups(r.m, all[i], "find_at vs find_all", pat, subj))
+        return;
+      pos = r.next_pos;
+    }
+  } catch (...) {
+    fail("find_at threw", pat, subj);
+  }
+}
+
+void invariant_fuzz_cut(int iters) {
+  const std::string lines(1024, '\n');
+  for (int it = 0; it < iters; it++) {
+    const std::string pat = gen_alt(3);
+    std::vector<std::string> subjects;
+    for (int s = 0; s < 3; s++) {
+      std::string subj = gen_cut_subject();
+      if (s == 0 && U(0, 1)) subj = U(0, 1) ? lines + subj : subj + lines;
+      subjects.push_back(std::move(subj));
+    }
+    check_pattern(pat, subjects);
+    reg::Regex *re = nullptr;
+    try {
+      re = new reg::Regex(pat);
+    } catch (...) {
+      continue;
+    }
+    for (const std::string &subj : subjects) {
+      try {
+        check_find_at_on(*re, subj, find_all(*re, subj), pat);
+      } catch (...) {
+        fail("find_all threw", pat, subj);
+      }
+    }
+    delete re;
+  }
+}
+
 void invariant_fuzz_assert_unicode(int iters) {
   for (int it = 0; it < iters; it++) {
     std::string pat = gen_alt(3); // produces ^ $ \b \d \w \s . [...] groups alt
@@ -2741,6 +2838,10 @@ void run_worker(std::uint32_t base, int jobs, int t, int inv, int parser_it,
   // A tenth: four subjects of up to a kilobyte or so per pattern, about a
   // third of the patterns kept.
   invariant_fuzz_word_bool(share(inv / 10));
+  // A tenth: three short subjects with clusters no family serves per
+  // pattern, for half of them one behind or ahead of a kilobyte, through
+  // the Pike reference and find_at.
+  invariant_fuzz_cut(share(inv / 10));
 }
 
 int main(int argc, char **argv) {

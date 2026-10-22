@@ -2301,6 +2301,106 @@ void test_step_reach() {
   CHECK(m.matched() && m.begin() == 3 && m.end() == 5);
 }
 
+// A subject no family serves whole scans as cut texts (Regex::Finder): the
+// family steps over the subject cut where it stops being sound, and its
+// match stands if the step read nothing at or past the cut; the Pike steps
+// around the clusters it cannot serve. Each rule with an input it is for,
+// at the subject's start, between and at the end of a kilobyte of prose
+// (a walk's budget, seeded with a short subject's length, would hide
+// them), against the Pike on every find surface (all_agree: find_at
+// stepped from 0 among them):
+//   - a step that read the cut does not stand: `\w+` over "abc" + an NFD é
+//     + "f" is one word, which the cut text ends after "abc"; and
+//     `\w+(?:-\w+)?` decides on "abc-" at the cut;
+//   - the family does not step from a cluster it cannot serve: over "y", an
+//     NFD é and "x", `\bx|y.` matches "y" and the é, and not the x — the
+//     é is a `\w` by its base, and the family would read its mark, no `\w`,
+//     for a boundary before the x;
+//   - the Pike reads the cluster before where it starts: `a|\Bb.` over
+//     "ab" + an NFD é starts it at the b, after the a's match;
+//   - empty matches around a cut, clusters side by side, and the cut of
+//     each family: a CR-LF where a pattern could split one (`\w+\s\w+`), a
+//     lone LF of the CR-LF collapse (`[^a]{2}` over LF text), the (?i)
+//     probe's family, the assert family;
+//   - a family whose DFA gives up on a cut text leaves every step after to
+//     the Pike (a cache too small for it).
+// The Pike reads around the cluster alone: over 4 KB, a heart and 4 KB, a
+// few stretches of its segmentation (Segmented::made()), not all of it.
+// And no family serves a cluster of more than one code point that is no
+// CR-LF — what Finder::place takes such a cluster for without asking.
+void test_cut_text() {
+  static const char *const kWords[] = {"alpha", "beta", "gamma", "delta",
+                                       "nine",  "seven", "ten",  "run",
+                                       "x1",    "on"};
+  auto prose = [](const char *sep, unsigned x, size_t size = 1024) {
+    std::string s;
+    while (s.size() < size) {
+      x = x * 1664525u + 1013904223u;
+      s += kWords[(x >> 16) % 10];
+      s += (x >> 8) % 7 ? " " : sep;
+    }
+    return s;
+  };
+  const std::string nfd_e = "e\xCC\x81", heart = "\xE2\x9D\xA4\xEF\xB8\x8F";
+  struct Case {
+    const char *pat;
+    std::string mid;
+    const char *sep; // between the prose's words, now and then
+  } cases[] = {
+      {"\\w+", "abc" + nfd_e + "f", ", "},
+      {"\\w+(?:-\\w+)?", "abc-" + nfd_e, ", "},
+      {"\\bx|y.", "y" + nfd_e + "x", ", "},
+      {"a|\\Bb.", "ab" + nfd_e, ", "},
+      {"x*", "a" + heart + "x" + nfd_e + heart, ", "},
+      {"\\w+", heart + heart + "x" + heart + "ac" + heart, ", "},
+      {"\\w+\\s\\w+", "ab\r\ncd" + nfd_e + " ef\r\n", "\r\n"},
+      {"[^a]{2}", "\xC3\xA9 a\n\nb" + heart, "\n"},
+      {"(?i)seven", "SEVEN" + heart + "seven", ", "},
+      {"\\b\\w+n\\b", "ten" + heart + "on" + nfd_e + "n", ", "},
+  };
+  CHECK(PlanProbe::crlf_collapse(Regex("[^a]{2}")));
+  for (const Case &c : cases) {
+    const Regex re(c.pat), pike = pike_twin(c.pat);
+    const std::string a = prose(c.sep, 1), b = prose(c.sep, 2);
+    for (const std::string &s : {c.mid + a, a + c.mid + b, a + c.mid})
+      CHECK(all_agree(re, pike, s));
+  }
+  const Regex word("\\w+"), word_pike = pike_twin("\\w+");
+  const std::string around =
+      prose(", ", 3, 4096) + heart + prose(", ", 4, 4096);
+  for (const size_t bytes : {size_t{280}, size_t{700}}) {
+    PlanProbe::dfa_cache(word, bytes, 0);
+    CHECK(all_agree(word, word_pike, prose(", ", 5) + heart + prose(", ", 6)));
+  }
+  PlanProbe::dfa_cache(word, reg::limits::kDfaCacheBytes,
+                       reg::limits::kDfaMinClears);
+  for (const char *pat : {"\\w+", "(\\w+)", "\\b\\w+n\\b"}) {
+    const Regex re(pat);
+    for (const bool lazy : {false, true}) {
+      reg::detail::Segmented::made() = 0;
+      (void)flat_spans(re, around, lazy);
+      CHECK(reg::detail::Segmented::made() < 1024);
+    }
+  }
+  // Every Grapheme family of plans for each way a family's soundness is
+  // decided (see test_unsound_positions), the assert ones among them.
+  const Regex plans[] = {Regex("\\w+"), Regex("\\w*"), Regex("[^c-za]a?"),
+                         Regex("x\r\ny"), Regex("\\b\\w+\\b")};
+  const std::string clusters[] = {
+      nfd_e, heart, "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5", // a flag
+      "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB",               // a skin tone
+      "\xE0\xB8\x81\xE0\xB9\x88",                       // Thai ko + mai ek
+      "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9"};  // a ZWJ pair
+  for (const Regex &re : plans)
+    for (const char fam : std::string_view("biaAB"))
+      for (const std::string &cl : clusters) {
+        const std::string s = cl + "x";
+        size_t fna = 0;
+        while (static_cast<unsigned char>(s[fna]) < 0x80) fna++;
+        CHECK(PlanProbe::family_unsound_at(re, fam, s, fna) == 0);
+      }
+}
+
 // match() does not classify its subject. It tries the plan's families in
 // turn, each anchored at 0 (Plan::match_guesses_), and the first whose
 // answer holds for the subject as far as its scan read answers
@@ -7590,6 +7690,7 @@ int main() {
   test_unsound_positions();
   test_lazy_segmentation();
   test_step_reach();
+  test_cut_text();
   test_match_guess();
   test_find_guess();
   test_find_guess_grapheme();

@@ -140,7 +140,11 @@ cluster per remaining byte, the most the rest can hold, so its clusters
 move once more at most; with the ASCII check, a Pike that
 reads that whole subject retires 16-24% fewer instructions than before
 (`\w+`, `(\w+)`, `(?i)Sherlock`, `\b\w+n\b` find_all, a no-match `test()`),
-and one over a lookaround pattern, segmented whole, 11% fewer.
+and one over a lookaround pattern, segmented whole, 11% fewer. A Pike over
+cut texts starts a lazy one at the cluster before where it starts, which
+it reads as the context, and starts it again from another boundary in the
+same storage (`Segmented::restart`) where the family has served the
+stretch between (§2, "Cut texts").
 
 ### Class membership is decided by the base code point
 
@@ -889,11 +893,12 @@ The rules:
   gates are split into the route and the soundness — `egc_byte_path` sends a
   pure-ASCII subject to the ASCII family, which is faster there, and
   `byte_unsound_at` is where the byte programs stop answering for it — and
-  only the soundness is asked: `Regex::family_sound`, the one test of it
-  (whether `family_unsound_at` puts the first cluster the family cannot
-  serve at the end), which the gates, the guesses and the end anchor's
-  check (`end_region_ok`) all call (a CodePoint family's holds for every
-  subject). The closure is the
+  only the soundness is asked: whether `family_unsound_at`, the one
+  definition of it, puts the first cluster the family cannot serve at the
+  end — `Regex::family_sound`, which the guesses and the end anchor's check
+  (`end_region_ok`) call, and the byte gates spell out, to keep the
+  position for a cut (a CodePoint family's holds for every subject). The
+  closure is the
   Grapheme unit's (`guess_end`), not something a scan reports.
 - **Why the Pike may answer**: it is the reference. And it is no more often
   the Pike than before: a gate that holds for the whole subject holds for
@@ -917,6 +922,123 @@ and Japanese Markdown, JSON, CSV; twelve patterns of the kind such text is
 searched with — line by line 4–12% fewer, document by document 17% fewer
 to 0.7% more (the worst single pattern and corpus 11% more). On ~60-byte
 subjects 10% fewer (ASCII), 7% (accented), 2% (starting with CJK).
+
+### Cut texts: the family where it is sound, the Pike around the rest
+
+A scan that outlives its call (`Finder`: `find_iter`, `find_all`, `find_at`,
+`split`, `replace`) classifies its subject once, at `Classify`. One cluster
+anywhere that the family cannot read as the grapheme engine does — an emoji
+with its presentation selector or a skin tone, a flag, an NFD accent, Thai
+or Devanagari everywhere, a CR-LF where the pattern could split one, a lone
+CR or LF under the CR-LF collapse — used to send all of it to the Pike:
+`\w+` over the Sherlock corpus with one ❤️ (U+2764 U+FE0F) appended ran at
+12 MB/s, where without it it runs at 235.
+
+Now the family serves the stretches between such clusters, and the Pike the
+clusters and what reads them:
+
+- **The family** (`cut_family`): the plan's byte family (EGC byte, with the
+  (?i) probe where one applies, or the byte assert family), sound on the most
+  subjects (a Grapheme plan has an ASCII family only where it has a byte
+  one). `ladder_gated` keeps its order and its answers; only where no
+  family serves the subject whole, and only for a Finder
+  (`Finder::classify` passes `cut`), it stands the scan on that family with
+  `Ladder::kSpec | Ladder::kCut` and reports where the family stops being
+  sound, which that family's gate has just found (`family_unsound_at`): the
+  cut.
+- **A step** (`Finder::cut_step`) runs the family's ladder over the subject
+  cut there, `text[0, cut)`, from the cursor, and its match stands if the
+  step read nothing at or past the cut — `step_reach`, the definition the
+  guesses use: the cut is a cluster boundary, so the code point `reach`
+  completes ends at or before it. A step that does not stand has its row
+  taken back (the sinks' `mark` / `drop`) and the Pike steps over the
+  subject from where the family's step started (a prefilter that bailed
+  may have moved the cursor past candidates the cut failed). The cut text
+  is what bounds a family's step: it cannot read past the cut, so a step
+  that does not stand costs no more than the Pike's step from the same
+  start reads anyway; whether it stands is the reach's to say (the family
+  handed the whole subject would answer the same, at the cost of reading
+  past the cut). A family that steps down to the Pike (a DFA that gave
+  up) does not run it on the cut text (`kCut`): its step, and every step
+  after it, the ladder standing on the Pike from then on, ends there, and
+  the Finder's Pike steps over the subject.
+- **The left**: the family reads one code point, or a CR-LF, before its
+  cursor (a DFA's start context, a `\b`'s decode; every reverse scan is
+  floored at the cursor), so the cluster before the cursor must be one it
+  serves. Past a cluster it does not, the Pike steps on: `\bx` right after
+  an NFD é is no match, the cluster being a `\w` by its base, and the
+  family would read its mark, no `\w`, for a boundary before the x.
+- **Moving the cut** (`Finder::place`): after a Pike step past the cut, from
+  the start of the cluster before the cursor, which the Pike's
+  segmentation holds: that cluster is one the family cannot serve if it
+  holds more than one code point and is no CR-LF (every family reads a
+  code point at a time; `test_cut_text` checks each), else the next one
+  from there (`Regex::cut_from`). Each family's soundness is two scans,
+  each to the first of its own kind (the first non-ASCII byte and the
+  first CR-LF; the first fusing cluster and the first lone CR or LF), the
+  first of which can be far past the next cut; `cut_from` asks them over a
+  window that doubles from 64 bytes, and takes what the window finds more
+  than a code point short of its end (a window hides a cluster it ends in,
+  reads the code point it cuts as a stray, and shows a CR it ends on as
+  lone), so a cut costs the stretch it ends. A
+  `find_at`'s fresh scan has no segmentation to read: it steps over the
+  clusters from the first cut, one at a time, each segmented from its
+  start.
+- **The Pike's segmentation** (`Finder::pike_at`) starts at the cluster
+  before where the Pike starts, which it reads as the context (so the
+  Pike never reads a later segmentation's cluster 0 as a position:
+  `^`, `\A` and a `\b` there stay the subject's start's); it is used again
+  while it holds that, and made again otherwise (`Segmented::restart`),
+  so a stretch the family serves between two far clusters is not
+  segmented. Where the Pike steps often it is: the segmentation is made a
+  stretch of 256 bytes at a time, doubling, and the Pike's starts land in
+  what the last ones made, so over English chat with an emoji a line
+  (`\w+`) it segments 96% of the clusters, a quarter of the scan's
+  instructions; one heart every 4 KB of prose, 9%. The Pike's cursor,
+  after a Pike step, is the index of where the next step starts
+  (`Finder::index_of` checks it against the segmentation), with no lookup.
+- **What a step read** is counted from the last step that did not stand
+  (`read_afresh`), not from each: every step that stood read short of the
+  cut, which only moves forward, so what the steps before it read keeps
+  none from standing. A scan of another subject in between, on the same
+  cache, can raise the counts (costing a step that stood its match) or set
+  them back to 0 (forgetting only what the steps before read), never hide
+  what this step reads.
+- **Out of the cut**: when the cut reaches the subject's end, the scan
+  stands on the family's ladder without the flags, as any scan
+  (`Finder::uncut`), `find_all`'s loop over it in place included. While it
+  is over cut texts, `find_all` takes a match a step, as `find_iter` does.
+
+Linear: a family's step that does not stand read from its start to the
+cut at most, and the Pike's step from the same start reads at least as far
+(the next match is past the cut, or was decided there, by threads alive as
+far); each Pike step is one the whole-subject Pike took; `place` and the
+segmentation only move forward.
+
+Not cut: the one-step calls (`search`, `test`, `match`: their guess, when it
+does not hold, still takes the Pike over the subject), a `Classify` that a
+step comes back to midway (an end anchor's DFA that gave up, the fused
+rungs' `ladder_unfused`: `ladder_reclassify` and `ladder_unfused` pass no
+cut), and the fused
+rungs themselves (a cluster they cannot vet sends the scan to the Pike from
+the cursor).
+
+Measured (`find_iter`, Apple clang -O3; times the median of 25 runs
+alternating, with and without the cluster, in one process): over the
+Sherlock corpus with one ❤️ at the end, `\w+` 12 to 210 MB/s (0.89× its
+twin without the ❤️), `(\w+)` 0.86×, `\b\w+n\b` 0.92×; in instructions
+`\w+` 637 M to 51 M (41 M without the ❤️). A CR-LF subject of a pattern that
+could split a pair, `\w+\s\w+`, 606 M to 276 M; the CR-LF collapse's
+`[^a]{2}` over LF prose, 898 M to 253 M; English chat with an emoji a line,
+`\w+`, 563 M to 247 M; CJK prose with one ❤️ at the end, `\w+`, 273 M to
+151 M (149 M without the ❤️). Where nearly every cluster is one no family
+serves, the bookkeeping costs a little: Thai `\w+` 5% more instructions,
+Devanagari 8% (1% and 5% more than before the Pike segmented as it reads,
+§1). The limits: a match that ends at a cut (`\b\w+\b` over Japanese chat,
+a word before every emoji) is decided there, its step does not stand, and
+the Pike reads the word again: 12% more (9%); a pattern whose next match is
+far (`(?i)Sherlock` past its last occurrence, a `test()` with no match)
+still has the Pike read from the step's start to it.
 
 ### Linearity (the O(n²) trap)
 
@@ -1388,9 +1510,13 @@ the exception is keyed on the unit (`bflags`).
 
 A subject that genuinely contains a multi-code-point cluster — combining marks,
 ZWJ emoji, Hangul jamo, regional-indicator flags, a `Prepend` run — fails
-`fused_from` and runs on the grapheme Pike, where breaking is stateful and
-correct. That residual cliff is inherent (no byte automaton for a stateful
-grapheme `.`); §5 is the escape hatch.
+`fused_from`, and the grapheme Pike, where breaking is stateful and correct,
+reads those clusters. A find over it (`find_iter`, `find_all`, ...) runs the
+Pike around them alone, the byte family over the stretches between (§2, "Cut
+texts"); a one-step call whose guess does not hold, the fused rungs, and the
+plans no family runs still take the Pike over the whole subject. Where such
+clusters are everywhere (Thai, Devanagari) the cliff is inherent (no byte
+automaton for a stateful grapheme `.`); §5 is the escape hatch.
 
 **CR-LF on a pure-ASCII subject.** The ASCII fast path assumes byte ≡ code point
 ≡ cluster, which holds for every ASCII byte except a CR-LF pair (one cluster per
