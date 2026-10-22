@@ -2323,9 +2323,18 @@ void test_step_reach() {
 //     lone LF of the CR-LF collapse (`[^a]{2}` over LF text), the (?i)
 //     probe's family, the assert family;
 //   - a family whose DFA gives up on a cut text leaves every step after to
-//     the Pike (a cache too small for it).
+//     the Pike (a cache too small for it);
+//   - the family goes on from where the Pike hands the scan back, inside a
+//     word too: over "x", an NFD é and "abcg", `\b\w{1,3}g\b` has no match
+//     (the word starts at the x), and the word walk does not go back past
+//     where it was asked to start for one at the a.
 // The Pike reads around the cluster alone: over 4 KB, a heart and 4 KB, a
-// few stretches of its segmentation (Segmented::made()), not all of it.
+// few stretches of its segmentation (Segmented::made()), not all of it —
+// for patterns that match nowhere after the heart too, where the Pike
+// hands the scan back to the family once every thread it answers for is
+// gone ((?i): no literal to skip to; a `\b`; a word walk), and for one that
+// matches nowhere at all, where it starts at the heart: no match under way
+// there starts before it.
 // And no family serves a cluster of more than one code point that is no
 // CR-LF — what Finder::place takes such a cluster for without asking.
 void test_cut_text() {
@@ -2357,6 +2366,7 @@ void test_cut_text() {
       {"[^a]{2}", "\xC3\xA9 a\n\nb" + heart, "\n"},
       {"(?i)seven", "SEVEN" + heart + "seven", ", "},
       {"\\b\\w+n\\b", "ten" + heart + "on" + nfd_e + "n", ", "},
+      {"\\b\\w{1,3}g\\b", "x" + nfd_e + "abcg", ", "},
   };
   CHECK(PlanProbe::crlf_collapse(Regex("[^a]{2}")));
   for (const Case &c : cases) {
@@ -2374,11 +2384,41 @@ void test_cut_text() {
   }
   PlanProbe::dfa_cache(word, reg::limits::kDfaCacheBytes,
                        reg::limits::kDfaMinClears);
-  for (const char *pat : {"\\w+", "(\\w+)", "\\b\\w+n\\b"}) {
-    const Regex re(pat);
+  // Where the cut texts do not pay, the Pike takes the rest of the scan
+  // (Finder::pays): Japanese lines that end in an emoji and Devanagari, under
+  // a pattern whose family's look DFA reads each of their code points out of
+  // its table (`\b`, `^`/`$`), and under one whose does not, which goes on
+  // over cut texts.
+  {
+    static const char *const kLines[] = {
+        "\xE4\xBB\x8A\xE6\x97\xA5\xE3\x81\xAF\xE6\x99\xB4\xE3\x82\x8C",
+        "\xE6\x98\x8E\xE6\x97\xA5\xE3\x81\xAE\xE4\xBC\x9A\xE8\xAD\xB0",
+        "\xE4\xBA\x86\xE8\xA7\xA3\xE3\x80\x81\xE3\x81\x82\xE3\x82\x8A"};
+    std::string chat, hindi;
+    for (unsigned k = 0; chat.size() < 8192; k++)
+      chat += std::string(kLines[k % 3]) + (k % 5 < 3 ? heart : "") + "\n";
+    while (hindi.size() < 8192)
+      hindi += "\xE0\xA4\xAD\xE0\xA4\xBE\xE0\xA4\xB0\xE0\xA4\xA4 "
+               "\xE0\xA4\x8F\xE0\xA4\x95 \xE0\xA4\xA6\xE0\xA5\x87\xE0\xA4\xB6 ";
+    for (const char *pat : {"\\b\\w+\\b", "(?m)^.*$", "\\s+", "(\\w+)"})
+      for (const std::string *s : {&chat, &hindi})
+        CHECK(all_agree(Regex(pat), pike_twin(pat), *s));
+  }
+  std::string filler;
+  while (filler.size() < 4096) filler += "lorem ipsum dolor sit amet, ";
+  const std::string before = prose(", ", 3, 4096) + heart + filler;
+  struct Around {
+    const char *pat;
+    const std::string &s;
+  } arounds[] = {{"\\w+", around},          {"(\\w+)", around},
+                 {"\\b\\w+n\\b", around},    {"\\bqzx\\w*\\b", around},
+                 {"(?i)gamma", before},      {"\\bgamma\\b", before},
+                 {"\\w+a\\b", before}};
+  for (const Around &a : arounds) {
+    const Regex re(a.pat);
     for (const bool lazy : {false, true}) {
       reg::detail::Segmented::made() = 0;
-      (void)flat_spans(re, around, lazy);
+      (void)flat_spans(re, a.s, lazy);
       CHECK(reg::detail::Segmented::made() < 1024);
     }
   }

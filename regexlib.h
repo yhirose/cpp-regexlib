@@ -1712,6 +1712,22 @@ constexpr int kBoolSkipBytes = 64;
 // with nothing is the look itself, and it grows with this bound.
 constexpr int kBoolFloorBytes = 32;
 
+// How long a stretch between two clusters a scan over cut texts hands back
+// to the family (Regex::Finder::pike_more): one shorter stays the Pike's. A
+// return costs a Pike run's set-up and a family step's, about what the
+// Pike reads in a few bytes, and a step over a stretch that short most
+// often reads it to the next cut and does not stand, after which the Pike
+// reads it again.
+constexpr int kCutGapBytes = 16;
+// When a scan over cut texts gives them up for the Pike over the rest of
+// the subject (Regex::Finder::pays), as RE2's DFA and Rust's lazy DFA give
+// a search up once they make too little headway: after kCutSampleBytes, if
+// the family steps a code point out of its DFA's table (a look DFA over
+// non-ASCII text) every kCutMinBytesPerAside bytes it reads or more often:
+// RE2's bound for a state computation, below which its NFA is as fast.
+constexpr int kCutSampleBytes = 4096;
+constexpr int kCutMinBytesPerAside = 10;
+
 } // namespace limits
 
 //------------------------------------------------------------------------------
@@ -1855,6 +1871,11 @@ constexpr NibbleSet ascii_word_nibbles() {
 inline constexpr NibbleSet kAsciiWordNibbles = ascii_word_nibbles();
 inline bool ascii_word_byte(unsigned char c) {
   return nibble_set_has(kAsciiWordNibbles.data(), c);
+}
+// is_word_cp, an ASCII code point the short way.
+inline bool word_cp(char32_t cp) {
+  return cp < 0x80 ? ascii_word_byte(static_cast<unsigned char>(cp))
+                   : is_word_cp(cp);
 }
 
 inline bool is_space_cp(char32_t cp) { return unicode::is_white_space(cp); }
@@ -12279,7 +12300,9 @@ private:
   // \w count is within [rmin, rmax]. Pure code-point walk, no DFA — O(word
   // length) per real candidate, the rest skipped by the memmem and the trailing
   // check. Correct on any subject the assert tier serves (single-cp clusters or
-  // ASCII, so code point == grapheme).
+  // ASCII, so code point == grapheme), from a position no \w-run goes on
+  // through (0, or a match's end: one ends at a boundary) — the walk would
+  // take the run's start before `from` for the match's (see resumes_at).
   REGEXLIB_NOINLINE bool assert_word_find(std::string_view text, int from,
                                           int &s_out, int &e_out) const {
     const unsigned char *p =
@@ -12305,10 +12328,7 @@ private:
       int ws = ls, wlen = 0;
       while (ws > 0) {
         const Decoded d = cp_before(text, ws);
-        if (!(d.cp < 0x80
-                  ? detail::ascii_word_byte(static_cast<unsigned char>(d.cp))
-                  : detail::is_word_cp(d.cp)))
-          break;
+        if (!detail::word_cp(d.cp)) break;
         ws -= d.len;
         wlen++;
       }
@@ -12321,6 +12341,16 @@ private:
       scan = ls + 1;
     }
     return false;
+  }
+  // Whether a family's step can go on from byte `at` (a cluster boundary)
+  // of `text` as from a match's end, no match starting before it
+  // (Finder::pike_more): every reader can but the word scan, which a
+  // \w-run going on through `at` sends back to that run's start
+  // (assert_word_find) — the cost of a floor there was 1-3% of the scan's.
+  bool resumes_at(std::string_view text, int at) const {
+    if (!plan_->assert_.word_suffix || at <= 0) return true;
+    return !detail::word_cp(cp_before(text, at).cp) ||
+           !word_cp_at(text, at, static_cast<int>(text.size()));
   }
 
   // Required-trailing-literal assert prefilter: memmem the literal; each
@@ -12657,6 +12687,7 @@ private:
     bool reverse = false; // look: steps right to left (a reverse program),
                           // so the context is what stands to the RIGHT
     bool bytewise = false; // look: every byte is a step (see columns())
+    uint8_t any_ctx = 0;   // the context start_any's state was made in
     // How far forward the scans since FindCache::reach_from_zero read: the
     // position the furthest of them stopped at (a skip included).
     int hi = 0;
@@ -12729,6 +12760,15 @@ private:
     std::vector<char> seen;        // closure scratch (per program inst)
     std::vector<int> seeds_, out_; // a step's scratch: no allocation per miss
     std::vector<uint8_t> key_;     // ... and the packed form of out_
+    // What only a Finder over cut texts reads, last (laid after the rest,
+    // the scans' members keep the places they had; any_ctx sits in the
+    // padding after bytewise): the start from every instruction
+    // (start_any), made in context any_ctx; and the code points
+    // a look scan stepped out of the table (look_next's decode and kind of
+    // a non-ASCII one), ever, which Finder::pays weighs the family's reading
+    // by (it reads a difference, which the count's wrapping keeps).
+    uint32_t any_start = kUnknown;
+    uint32_t aside = 0;
 
     // `reseed` is part of the DFA's identity: the transition tables for the
     // unanchored (re-seeding) and anchored runs differ, so each needs its own
@@ -12909,6 +12949,7 @@ private:
       pcs.clear();
       slots.assign(64, 0);
       std::fill(std::begin(start_state), std::end(start_state), kUnknown);
+      any_start = kUnknown;
       scanned = 0;
       clears++;
     }
@@ -12918,13 +12959,27 @@ private:
     // calls start() several times per match on the reused DFAs.
     uint32_t start(uint8_t ctx = 0) {
       if (start_state[ctx] != kUnknown) return start_state[ctx];
-      return make_start(ctx);
+      return make_start(ctx, /*any=*/false);
+    }
+    // ... and the closure of every instruction: a reverse scan from a
+    // position then accepts where a match that is under way there, in
+    // whatever state, can have started (Finder::under_way, which asks in
+    // one context: the end of a cut text). The states and the steps are the
+    // program's, whichever start a scan took, so a reverse DFA keeps both
+    // starts and shares the rest. (The closure takes no assertion for
+    // granted: every state is in it anyway.)
+    uint32_t start_any(uint8_t ctx = 0) {
+      if (any_start != kUnknown && any_ctx == ctx) return any_start;
+      return make_start(ctx, /*any=*/true);
     }
 
-    REGEXLIB_NOINLINE uint32_t make_start(uint8_t ctx) {
+    REGEXLIB_NOINLINE uint32_t make_start(uint8_t ctx, bool any) {
       if (!stride) columns();
       if (slots.empty()) slots.assign(64, 0);
       std::vector<int> sp, seeds{0};
+      if (any)
+        for (int pc = 1; pc < static_cast<int>(prog->insts.size()); pc++)
+          seeds.push_back(pc);
       if (look)
         sp = seeds;
       else
@@ -12933,6 +12988,10 @@ private:
       uint32_t h;
       uint32_t s = find(sp, ctx, h);
       if (s == kUnknown) s = add(sp, ctx, h);
+      if (any) { // (no scan skips ahead from it: not marked kStart)
+        any_ctx = ctx;
+        return any_start = s;
+      }
       if (!look) tr[s - 1] |= kStart; // (with look, add() marks it)
       return start_state[ctx] = s;
     }
@@ -12994,7 +13053,8 @@ private:
         clear();
         kept = false;
         if (!look) {
-          make_start(0); // every scan starts there, and skips there
+          // (every scan starts there, and skips there)
+          make_start(0, /*any=*/false);
           nxt = find(out_, tag, h); // (the start state itself, possibly)
           if (nxt != kUnknown) return nxt;
         }
@@ -13148,6 +13208,7 @@ private:
       }
       const Decoded ahead = reverse ? cp_before(text, at) : cp_at(text, at);
       const uint8_t in = side(ahead.cp);
+      aside++;
       uint32_t i = step(s, kind_column(in), [&](uint32_t from) {
         return static_cast<uint8_t>(cross(from, in) | kInside << kTagFlags);
       });
@@ -13874,11 +13935,14 @@ private:
   // the same one; a state then says whether the boundary it was stepped FROM
   // accepts, and the boundary at `floor` takes a step of its own, over what
   // stands to its left. `First`: any start answers (a boolean) — the scan
-  // stops at the first accept.
-  template <bool Look = false, bool First = false>
+  // stops at the first accept. `Any`: from every instruction
+  // (LazyDfa::start_any), for where a match under way at `e` can have
+  // started.
+  template <bool Look = false, bool First = false, bool Any = false>
   int dfa_reverse_scan(LazyDfa &d, std::string_view text, int e, int floor,
                        int *low_out = nullptr) const {
-    size_t s = Look ? d.start(d.context(text, e)) : d.start();
+    size_t s = Any ? (Look ? d.start_any(d.context(text, e)) : d.start_any())
+                   : (Look ? d.start(d.context(text, e)) : d.start());
     const uint32_t *tr = d.tr.data();
     uint32_t f = tr[s - 1];
     int leftmost = (f & LazyDfa::kAccept) ? e : -1; // empty match [e, e)
@@ -15050,6 +15114,15 @@ public:
       if (d[kDfaFwda] && d[kDfaFwda]->hi > hi) hi = d[kDfaFwda]->hi;
       return hi;
     }
+    // The code points one program set's DFAs stepped out of their tables
+    // (LazyDfa::aside), all told.
+    uint32_t aside(bool byte) const {
+      const std::optional<LazyDfa> *d = set(byte);
+      uint32_t k = 0;
+      for (int r = 0; r < kDfaRoles; r++)
+        if (d[r]) k += d[r]->aside;
+      return k;
+    }
 
     // One program set's DFAs. (A branch on `byte`, not dfas_[byte]: GCC
     // compiles the index into more code around it.)
@@ -15233,13 +15306,20 @@ public:
   //   groups(re, seg, saves)  grapheme / code-point index saves (the Pike)
   //   kGroups                 whether the caller reads groups at all
   // and, for a scan's step whose match may not stand (a guess's, a cut
-  // text's: Finder::cut_step), clear() or mark() and drop(mark).
+  // text's: Finder::cut_step), clear() or mark() and drop(mark), and
+  // span_since(mark): the match written since ({-1, -1}: none).
   // RowSink appends one columnar row per match (find_all, find_iter).
   struct RowSink {
     static constexpr bool kGroups = true;
     detail::SpanRows &rows;
     size_t mark() const { return rows.size(); }
     void drop(size_t m) { rows.truncate(m); }
+    // (A row's first two cells are its match's.)
+    std::pair<int, int> span_since(size_t m) const {
+      if (rows.size() <= m) return {-1, -1};
+      return {static_cast<int>(rows.data()[m]),
+              static_cast<int>(rows.data()[m + 1])};
+    }
     // A capture-free match [s, e): the begin, end pair. (Inlined by name:
     // left to the compiler, find_iter made a call of it per match — 18
     // instructions for the two stores.)
@@ -15268,6 +15348,10 @@ public:
     void clear() { r = MatchResult{}; } // a guess's match that did not hold
     size_t mark() const { return 0; }
     void drop(size_t) { clear(); }
+    std::pair<int, int> span_since(size_t) const {
+      if (!r.matched()) return {-1, -1};
+      return {static_cast<int>(r.begin()), static_cast<int>(r.end())};
+    }
     void span(const Regex &re, std::string_view text, int s, int e) {
       re.set_dfa_result(r, text, s, e);
     }
@@ -15303,6 +15387,29 @@ public:
     // family's word walk and the suffix rung's scalar verifier (see
     // step_reach).
     int reach = 0;
+  };
+  // Where a Pike over cut texts stops answering (Finder::pike_turn): for the
+  // starts up to index `last`. Once every thread that started there is
+  // gone with no match (run_saves), or no candidate starts there
+  // (pike_step), it asks `more(ctx, at)` — `at` the earliest start still
+  // alive, else the position: no match starts before it — for a later
+  // `last`, or -1, and then stops with `resume` = at (extend).
+  struct PikeStop {
+    int last;
+    int (*more)(void *ctx, int at);
+    void *ctx;
+    int resume = -1;
+    // The question at `at`: true with a later `last`, or false with
+    // `resume` = at, the Pike to stop answering.
+    bool extend(int at) {
+      const int m = more(ctx, at);
+      if (m < 0) {
+        resume = at;
+        return false;
+      }
+      last = m;
+      return true;
+    }
   };
   // The cache and scratch a step works with. A one-step find fetches them
   // only when the rung it lands on reads them (see find_once).
@@ -15710,12 +15817,13 @@ public:
   // there) none does. The Pike segments a cluster past every position it
   // reads, and a match ends at one, so the cursor is never past what is
   // segmented short of that; the count is read each time, as it grows
-  // between matches.
+  // between matches. With a `stop` (PikeStop), false too when it stops
+  // answering (the cursor is left where it was).
   template <class Out>
-  bool pike_once(const detail::Segmented &sg, Cursor &c, Scr &scr,
-                 Out &out) const {
+  bool pike_once(const detail::Segmented &sg, Cursor &c, Scr &scr, Out &out,
+                 PikeStop *stop = nullptr) const {
     if (c.gpos > static_cast<int>(sg.graphemes.size())) return false;
-    const int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out);
+    const int nx = pike_step(sg, c.gpos, *scr.sc, *scr.saves, out, stop);
     if (nx < 0) return false;
     c.gpos = nx;
     return true;
@@ -15808,10 +15916,15 @@ public:
     REGEXLIB_NOINLINE Step cut_steps(Scr &scr, Out &out) {
       if (cut_ == kToClassify) {
         classify();
-        if (cut_ != kNoCut) read_afresh(scr);
+        if (cut_ != kNoCut) {
+          read_afresh(scr);
+          spent_ = {c_.pos, 0, scr.cache->aside(l_.trait(kTraitByte))};
+          pike_only_ = false;
+        }
       }
       while (cut_ != kNoCut) {
         const Step st = cut_step(scr, out);
+        if (st == Step::Again) continue; // (the loop's test tells which)
         if (st != Step::Yield || !All) return st;
       }
       return Step::Again;
@@ -15832,10 +15945,12 @@ public:
     // Over, or Again out of the cut texts). The family over text[0, cut_)
     // when p is short of the cut, and its match if the step read nothing at
     // or past it (step_reach: the cut is a cluster boundary, so no code
-    // point it completes reaches past it); else, or where the family cannot
-    // read from p, the Pike from p over the subject — from where the step
-    // started: the family may have moved the cursor past candidates the cut
-    // failed (a prefilter that bailed).
+    // point it completes reaches past it), or if it read to the cut but no
+    // match the cut can change starts at or before its own (read_to_cut);
+    // else, or where the family cannot read from p, the Pike over the
+    // subject — from where the step started (the family may have moved the
+    // cursor past candidates the cut failed: a prefilter that bailed), or
+    // later, where such a match can start.
     //
     // What the steps read is counted from the last one that did not stand
     // (read_afresh), not from each: every step that stood read short of the
@@ -15844,11 +15959,20 @@ public:
     // cache, can raise the counts (costing a step that stood its match) or
     // set them back to 0 (forgetting only what the steps before read),
     // never hide what this step reads.
+    //
+    // The Pike answers only for the starts around the cut (pike_turn), and
+    // hands the scan back to the family where no match starts before: at a
+    // cluster boundary, then, not only a match's end — one every family
+    // reader goes on from as from a match's end (resumes_at).
+    //
+    // Again, too, when the Pike hands the scan back (pike_turn): the cut
+    // texts go on (cut_ stays), the cursor where the family goes on.
     template <class Out>
     REGEXLIB_ALWAYS_INLINE Step cut_step(Scr &scr, Out &out) {
       const int n = static_cast<int>(text_.size());
       const int p = c_.pos;
       if (p > n) return Step::Over;
+      if (pike_only_) return pike_turn(scr, out, p, p);
       if (p > cut_) place(p);
       if (cut_ == n) {
         uncut();
@@ -15858,25 +15982,160 @@ public:
         const size_t mark = out.mark();
         const std::string_view cut(text_.data(), static_cast<size_t>(cut_));
         bool chain_once = false;
-        if (re_->ladder_step<false>(cut, scr, l_, c_, budget_, deep_,
-                                    chain_once, out) &&
-            step_reach(cut, scr, l_, c_, /*walked=*/false, /*found=*/true) <
-                cut_)
+        const bool found = re_->ladder_step<false>(cut, scr, l_, c_, budget_,
+                                                   deep_, chain_once, out);
+        if (found && step_reach(cut, scr, l_, c_, /*walked=*/false,
+                                /*found=*/true) < cut_) {
+          spent_.family += c_.pos - p;
           return Step::Yield;
-        out.drop(mark);
-        c_.pos = p;
-        read_afresh(scr);
+        }
+        return read_to_cut(scr, out, p, mark, found);
       }
-      pike_at(p);
-      if (!re_->pike_once(*deep_.seg, c_, scr, out)) return Step::Over;
-      c_.pos = static_cast<int>(pike_byte(*deep_.seg, c_.gpos));
-      return Step::Yield;
+      return pike_turn(scr, out, p, p);
+    }
+    // A step from p over the cut text that read to the cut: its match
+    // stands if it starts before every match that is under way at the cut
+    // (under_way) — no path from there or before reaches the cut, so the
+    // text past it would change none of them — else the Pike goes on from
+    // the earliest of those (from p if the family stepped down to the Pike
+    // and answered nothing). A match that runs to the cut is one under way
+    // there: it does not stand, and the reverse scan, which would read it
+    // back to start the Pike no later than it, is not taken — the Pike
+    // reads it again anyway, and the scan could save it no more than the
+    // stretch before the match (a word before an emoji: the space before
+    // the word). A match that stands is counted afresh after, as one that
+    // did not stand: the reads reached the cut. Out of line, as pike_turn.
+    template <class Out>
+    REGEXLIB_NOINLINE Step read_to_cut(Scr &scr, Out &out, int p,
+                                       size_t mark, bool found) {
+      int start = p;
+      const std::pair<int, int> m =
+          found ? out.span_since(mark) : std::pair<int, int>{-1, -1};
+      if (l_.rung != Rung::Pike && m.second != cut_) {
+        start = under_way(
+            scr, std::string_view(text_.data(), static_cast<size_t>(cut_)), p);
+        if (found && m.first < start) {
+          spent_.family += c_.pos - p;
+          read_afresh(scr);
+          return Step::Yield;
+        }
+      }
+      spent_.family += cut_ - p;
+      out.drop(mark);
+      c_.pos = p;
+      read_afresh(scr);
+      return pike_turn(scr, out, p, start);
+    }
+    // The earliest position from p on where a match still under way at the
+    // end of `cut` (the text cut at cut_) can have started: the reverse
+    // program from every instruction (LazyDfa::start_any), floored at p.
+    // The cut if there is none, p if the DFA gives up.
+    int under_way(Scr &scr, std::string_view cut, int p) const {
+      LazyDfa &rv = scr.cache->dfa(*re_, l_.trait(kTraitByte), kDfaRev);
+      const int e = static_cast<int>(cut.size());
+      constexpr bool kFirst = false, kAny = true;
+      const int s =
+          rv.look
+              ? re_->dfa_reverse_scan</*Look=*/true, kFirst, kAny>(rv, cut, e, p)
+              : re_->dfa_reverse_scan</*Look=*/false, kFirst, kAny>(rv, cut, e,
+                                                                    p);
+      return s == LazyDfa::kCap ? p : s < 0 ? e : s;
+    }
+    // The Pike's turn in cut_step for a step from p, from `start` (no match
+    // starts in between): for the starts up to the end of the cluster at
+    // the cut — or up to p itself, past a cluster before it that the family
+    // cannot serve — and on through the next cut while the stretch before
+    // it is too short to hand back (pike_more). Yield or Over as
+    // cut_step's, or Again when every thread that started there is gone
+    // with no match: the cursor then on the earliest start still alive, no
+    // match starting before it, for the family. Out of line: the steps that
+    // stand keep cut_steps' registers.
+    template <class Out>
+    REGEXLIB_NOINLINE Step pike_turn(Scr &scr, Out &out, int p, int start) {
+      if (!pike_only_ && !pays(scr)) {
+        pike_only_ = true;
+        start = p;
+      }
+      pike_at(start);
+      const detail::Segmented &sg = *deep_.seg;
+      // (The cut texts given up, the Pike runs to its next match: no stop.)
+      PikeStop stop{0, &pike_more, this};
+      if (!pike_only_) stop.last = cut_ >= p ? end_of(sg, cut_) : c_.gpos;
+      if (re_->pike_once(sg, c_, scr, out, pike_only_ ? nullptr : &stop)) {
+        c_.pos = static_cast<int>(pike_byte(sg, c_.gpos));
+        return Step::Yield;
+      }
+      if (stop.resume < 0) return Step::Over;
+      c_.gpos = stop.resume;
+      c_.pos = static_cast<int>(pike_byte(sg, stop.resume));
+      return Step::Again;
+    }
+    // Whether the cut texts still pay (limits::kCutSampleBytes and
+    // kCutMinBytesPerAside): the family reads at its DFAs' speed.
+    bool pays(Scr &scr) const {
+      if (c_.pos - spent_.from < limits::kCutSampleBytes) return true;
+      const uint32_t aside =
+          scr.cache->aside(l_.trait(kTraitByte)) - spent_.aside0;
+      return spent_.family >= int64_t{aside} * limits::kCutMinBytesPerAside;
+    }
+    // The cut Pike's question at index `at` (PikeStop::more), no match
+    // starting before it: the stretch from there to the cut a scan going on
+    // there has (cut_for) is handed back — all the rest of the subject, if
+    // there is none — if it is kCutGapBytes long or more, and a family's
+    // step can go on from `at` (resumes_at: not inside a word, for the word
+    // scan). Else the Pike answers through the cluster at that cut too — or
+    // only for `at` itself, if the cut is the cluster before it, which a
+    // family reading from `at` would read, or if no step can go on from it.
+    static int pike_more(void *ctx, int at) {
+      Finder &f = *static_cast<Finder *>(ctx);
+      const detail::Segmented &sg = *f.deep_.seg;
+      const size_t g = static_cast<size_t>(at);
+      sg.extend_to(g);
+      if (g >= sg.graphemes.size()) return -1; // the subject's end
+      const size_t b = sg.byte_begin[g];
+      const size_t next = f.cut_for(sg, g);
+      if (next < b) return at;
+      if (next >= f.text_.size() ||
+          next - b >= static_cast<size_t>(limits::kCutGapBytes))
+        return f.re_->resumes_at(f.text_, static_cast<int>(b)) ? -1 : at;
+      return f.end_of(sg, static_cast<int>(next));
     }
     // Count what the cut steps read from here: the family's readers
     // (Cursor::reach) and its DFAs (FindCache::reach_from_zero).
     void read_afresh(Scr &scr) {
       c_.reach = 0;
       scr.cache->reach_from_zero(l_.trait(kTraitByte));
+    }
+    // Where the next cluster the family cannot serve starts, at or after
+    // the one at index `g` of `s` (segmented): that one itself if it holds
+    // more than one code point and is no CR-LF — every family reads a code
+    // point at a time, and none serves such a cluster (test_cut_text checks
+    // it of each) — without a scan, else the one cut_from finds from there.
+    size_t cut_at(const detail::Segmented &s, size_t g) const {
+      const std::u32string &c = s.graphemes[g];
+      return c.size() > 1 && c[0] != U'\r'
+                 ? s.byte_begin[g]
+                 : re_->cut_from(l_.fam, text_, s.byte_begin[g]);
+    }
+    // The cut for a scan that goes on at index `g` (> 0) of `s`: the start
+    // of the cluster before g if the family cannot serve it — the family
+    // would read it for the context — else of the next one it cannot
+    // (cut_at from the cluster before g). Every cluster from where a scan
+    // asked to the cut it got has the same one, so the last stretch asked
+    // is kept (stretch_): the Pike's questions and place's over one stretch
+    // scan it once.
+    size_t cut_for(const detail::Segmented &s, size_t g) {
+      const int q = static_cast<int>(s.byte_begin[g - 1]);
+      if (!(stretch_.first <= q && q <= stretch_.second))
+        stretch_ = {q, static_cast<int>(cut_at(s, g - 1))};
+      return static_cast<size_t>(stretch_.second);
+    }
+    // The index of the end of the cluster that starts at byte `b` in `s`,
+    // segmented that far.
+    int end_of(const detail::Segmented &s, int b) const {
+      const int g = index_of(s, b);
+      s.extend_to(static_cast<size_t>(g));
+      return g + 1;
     }
     // The index of byte `p` (a cluster boundary the segmentation holds):
     // the Pike's cursor if it stands on p there — after a Pike step it
@@ -15893,22 +16152,15 @@ public:
     // if the cluster before p is not one, else to the start of that one —
     // the Pike reads on from p, where the family would read that cluster
     // for the context. After a Pike step its segmentation holds that
-    // cluster, and the next one from its start is the answer — the cluster
-    // itself, without a scan, if it holds more than one code point and is
-    // no CR-LF: every family reads a code point at a time, and none serves
-    // such a cluster (test_cut_text checks it of each). A find_at's first
-    // step steps over them from the cut instead, one at a time, each
-    // segmented from its start.
+    // cluster, and the answer is cut_for's. A find_at's first step steps
+    // over them from the cut instead, one at a time, each segmented from
+    // its start.
     void place(int p) {
       const detail::Segmented *s = deep_.seg.get();
       if (s && s->origin < static_cast<size_t>(p) &&
           static_cast<size_t>(p) <= s->byte_begin.back()) {
-        const size_t g = static_cast<size_t>(index_of(*s, p)) - 1;
-        const size_t q = s->byte_begin[g];
-        const std::u32string &before = s->graphemes[g];
-        cut_ = before.size() > 1 && before[0] != U'\r'
-                   ? static_cast<int>(q)
-                   : static_cast<int>(re_->cut_from(l_.fam, text_, q));
+        cut_ = static_cast<int>(
+            cut_for(*s, static_cast<size_t>(index_of(*s, p))));
         return;
       }
       for (;;) {
@@ -16022,6 +16274,20 @@ public:
     // is one the family serves (or the cursor is at 0). kNoCut, kToClassify
     // otherwise.
     int cut_;
+    // The stretch cut_for asked last: from the cluster start it asked at to
+    // the cut it got (none yet: an empty one). The family is the scan's,
+    // classified once.
+    std::pair<int, int> stretch_{1, 0};
+    // What the scan over cut texts has spent since they began (classify):
+    // where it began, the bytes the family's steps read (those that stood,
+    // to their match's end; the others, to the cut), and the DFAs' code
+    // points out of their tables then. Set where the cut texts begin; read
+    // only over them.
+    struct Spent {
+      int from, family;
+      uint32_t aside0;
+    } spent_;
+    bool pike_only_; // the cut texts given up (pays)
   };
 
   // Lazy single-pass scan over the non-overlapping matches (see Regex::find_iter).
@@ -16367,9 +16633,14 @@ private:
   // clusters segmented so far, equals a position only where the subject
   // ends, and every assertion that asks for the end (`$`, `\z`, a `\b`
   // before it) reads it as it reads the whole subject's.
+  //
+  // With a `limit` (a Finder's Pike over cut texts: PikeStop), the run
+  // answers for the starts up to its `last` alone. A thread's start is its
+  // slot 0, the first thing the program saves.
   bool run_saves(const detail::Program &prog, const detail::Segmented &seg,
                  int start, bool anchored, Scratch &sc,
-                 std::vector<int> &out_saves) const {
+                 std::vector<int> &out_saves,
+                 PikeStop *limit = nullptr) const {
     using Op = detail::Inst::Op;
     int n = static_cast<int>(seg.graphemes.size());
     // Before position `sp` is read: segment a cluster past it (see above),
@@ -16408,6 +16679,17 @@ private:
       // (an anchored run seeds only at `start`). A lazy segmentation stops
       // here too.
       if (clist.empty() && (have || anchored)) break;
+      // (The threads stand in the order of their starts, earliest first: a
+      // seed goes after every thread already under way, and a thread's
+      // successors take its place. So the first one's start is the
+      // earliest.)
+      if (limit && sp > limit->last && !have) {
+        const int first = clist.empty() ? sp : (*clist.front().saves)[0];
+        if (first > limit->last) {
+          if (!limit->extend(first)) return false;
+          n = static_cast<int>(seg.graphemes.size()); // (more segments on)
+        }
+      }
       if (match_steps() > budget)
         throw RegexError(RegexError::Code::StepBudgetExceeded,
                          "regex match step budget exceeded");
@@ -17817,18 +18099,27 @@ private:
   // grapheme-cluster boundary (e.g. a prefix beginning with '\n' must not match
   // the LF inside a CR-LF cluster). This keeps the find_all grapheme fallback
   // linear on non-ASCII prose, which would otherwise drop onto a throughput
-  // cliff. Caller guards prefix_.ascii.
-  int prefix_skip_nonascii(const detail::Segmented &seg, int start) const {
+  // cliff. Caller guards prefix_.ascii. With a `last` (a PikeStop's), only a
+  // candidate that starts at or before index `last` (one the segmentation
+  // holds): -1 when there is none.
+  static constexpr int kNoLast = 0x7FFFFFFF;
+  int prefix_skip_nonascii(const detail::Segmented &seg, int start,
+                           int last = kNoLast) const {
     const char *base = seg.source.data();
-    size_t slen = seg.source.size();
+    const size_t plen = plan_->prefix_.text.size();
+    // Where the bytes a candidate can lie in end.
+    const size_t slen =
+        last == kNoLast
+            ? seg.source.size()
+            : std::min(seg.source.size(),
+                       seg.byte_begin[static_cast<size_t>(last)] + plen);
     size_t b = (start <= 0) ? 0 : seg.byte_begin[start];
     while (true) {
-      if (b + plan_->prefix_.text.size() > slen) return -1;
+      if (b + plen > slen) return -1;
       const unsigned char *hit = find_substr(
           reinterpret_cast<const unsigned char *>(base + b), slen - b,
           reinterpret_cast<const unsigned char *>(plan_->prefix_.text.data()),
-          plan_->prefix_.text.size(), plan_->prefix_.probe,
-          plan_->prefix_.probe2);
+          plen, plan_->prefix_.probe, plan_->prefix_.probe2);
       if (!hit) return -1;
       size_t hb = static_cast<size_t>(
           hit - reinterpret_cast<const unsigned char *>(base));
@@ -17845,9 +18136,11 @@ private:
   // begin with the prefix, so nothing in between can match. The scan stays
   // unanchored (one linear pass), NOT an anchored retry per occurrence: a weak
   // prefix like "a" matches at almost every position, and a per-occurrence
-  // retry would be quadratic.
-  int pike_candidate(const detail::Segmented &seg, int start,
-                     bool &filtered) const {
+  // retry would be quadratic. `last` as prefix_skip_nonascii's (the skips
+  // over an ASCII segmentation, which no Pike over cut texts reads, take
+  // none: a hit past it is the caller's to see).
+  int pike_candidate(const detail::Segmented &seg, int start, bool &filtered,
+                     int last = kNoLast) const {
     filtered = false; // a start-filter pinned `start` to a real candidate
     if (plan_->prefix_.active() && seg.ascii) {
       const char *base = seg.source.data();
@@ -17873,7 +18166,7 @@ private:
       // Non-ASCII subject, case-sensitive ASCII prefix: memmem-skip is sound.
       // A case-insensitive prefix is NOT skipped here — find_substr_icase is
       // unsound on UTF-8 (a fold byte could land inside a multi-byte cluster).
-      int gi = prefix_skip_nonascii(seg, start);
+      int gi = prefix_skip_nonascii(seg, start, last);
       if (gi < 0) return -1;
       start = gi;
       filtered = true;
@@ -17902,6 +18195,21 @@ private:
     return start;
   }
 
+  // pike_candidate for a Pike over cut texts: the first candidate at or
+  // after `start` that starts at or before the limit's `last`, asking for a
+  // later `last` from the index after it where there is none; -1 when it
+  // stops answering (the limit's `resume` set).
+  int limited_candidate(const detail::Segmented &seg, int start,
+                        bool &filtered, PikeStop &limit) const {
+    for (;;) {
+      const int at = pike_candidate(seg, start, filtered, limit.last);
+      if (at >= 0 && at <= limit.last) return at;
+      start = limit.last + 1;
+      seg.extend_to(static_cast<size_t>(start));
+      if (!limit.extend(start)) return -1;
+    }
+  }
+
   // One Pike match at or after index `start` of `seg`, handed to `out`;
   // returns the index to continue from, or -1 when no match remains. The
   // Pike rung of the find ladder. The code-point Pike (CodePoint mode)
@@ -17918,13 +18226,19 @@ private:
   // later), so it is restricted to short subjects where a miss wastes at most
   // O(prog_size * subject) — the cpp-httplib header case. Large subjects
   // stay on the Pike unfiltered.
+  //
+  // With a `limit` (PikeStop), -1 too when it stops answering; a candidate
+  // it answers for starts at or before its `last`, and where none does it
+  // asks about the index after.
   template <class Out>
   int pike_step(const detail::Segmented &seg, int start, Scratch &sc,
-                std::vector<int> &saves, Out &out) const {
+                std::vector<int> &saves, Out &out,
+                PikeStop *limit = nullptr) const {
     const bool cp = plan_->us_;
     if (!cp) {
       bool filtered = false;
-      start = pike_candidate(seg, start, filtered);
+      start = limit ? limited_candidate(seg, start, filtered, *limit)
+                    : pike_candidate(seg, start, filtered);
       if (start < 0) return -1;
       if (plan_->cap_bitstate_ && plan_->ncap_ > 0 && seg.ascii &&
           (filtered ||
@@ -17939,7 +18253,8 @@ private:
         }
       }
     }
-    if (!run_saves(pike_prog(), seg, start, /*anchored=*/false, sc, saves))
+    if (!run_saves(pike_prog(), seg, start, /*anchored=*/false, sc, saves,
+                   limit))
       return -1;
     out.groups(*this, seg, saves);
     return pike_resume(saves);

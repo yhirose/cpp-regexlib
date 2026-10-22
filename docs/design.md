@@ -950,10 +950,26 @@ clusters and what reads them:
   cut there, `text[0, cut)`, from the cursor, and its match stands if the
   step read nothing at or past the cut — `step_reach`, the definition the
   guesses use: the cut is a cluster boundary, so the code point `reach`
-  completes ends at or before it. A step that does not stand has its row
-  taken back (the sinks' `mark` / `drop`) and the Pike steps over the
-  subject from where the family's step started (a prefilter that bailed
-  may have moved the cursor past candidates the cut failed). The cut text
+  completes ends at or before it. That is the cheap test; a step that
+  read to the cut is settled exactly (`Finder::read_to_cut`): a reverse scan of
+  the family's program from every instruction (`LazyDfa::start_any`, the
+  reverse DFA's second start), back from the cut and floored at the step's
+  start (`Finder::under_way`), finds the earliest position where a match
+  still under way at the cut can have started. A match that starts before
+  it stands: no path from there or before reaches the cut, so the text past
+  it changes none of them, groups included ("see you at five ❤️": the step
+  read the space before the ❤️ to end `five`). Otherwise the row is taken
+  back (the sinks' `mark` / `drop`; `span_since` gives the match) and the
+  Pike steps over the subject from that position: a match that starts
+  before it is the cut text's, which the family would have found. (From the
+  step's start, where the family stepped down to the Pike and answered
+  nothing; from the cut, where nothing is under way.) A match that runs to
+  the cut is one under way there: it does not stand, and the scan, which
+  would read it back to start the Pike no later than it, is not taken — the
+  Pike reads it again anyway, and the scan could save no more than the
+  stretch before it (a word before an emoji: the space before the word;
+  over Japanese chat, where the `\b` DFA steps each non-ASCII code point
+  out of its table, the scan cost `(?m)^.*$` 31%). The cut text
   is what bounds a family's step: it cannot read past the cut, so a step
   that does not stand costs no more than the Pike's step from the same
   start reads anyway; whether it stands is the reach's to say (the family
@@ -962,6 +978,24 @@ clusters and what reads them:
   up) does not run it on the cut text (`kCut`): its step, and every step
   after it, the ladder standing on the Pike from then on, ends there, and
   the Finder's Pike steps over the subject.
+- **The Pike's turn** (`Finder::pike_turn`) answers for the starts up to the
+  end of the cluster at the cut (`PikeStop::last`), and gives the scan back
+  once every thread that started there is gone with no match (`run_saves`:
+  the threads stand in the order of their starts, so the first one's slot
+  0 is the earliest still alive; `limited_candidate` where a literal
+  prefix skips to none): the family goes on from the earliest start still
+  alive, no match starting before it. Where the next cut is less than
+  `limits::kCutGapBytes` (16) away, a stretch whose family step would most
+  often read to that cut and not stand, the Pike answers through it too
+  (`Finder::pike_more`, asked as the threads die out). A Pike that ran to
+  its next match would read, for a pattern with none past the cut, the rest
+  of the subject. The family then goes on from a cluster boundary, not only
+  a match's end, and every reader takes one as it takes a match's end but
+  the word scan (`assert_word_find`), which walks back from a candidate over
+  the `\w`-run before it: inside a run, where it would take the run's start
+  for the match's, the Pike answers on (`Regex::resumes_at`). (A floor in
+  the walk cost every word scan 1–3%: its matches are a few hundred
+  instructions each.)
 - **The left**: the family reads one code point, or a CR-LF, before its
   cursor (a DFA's start context, a `\b`'s decode; every reverse scan is
   floored at the cursor), so the cluster before the cursor must be one it
@@ -980,7 +1014,11 @@ clusters and what reads them:
   window that doubles from 64 bytes, and takes what the window finds more
   than a code point short of its end (a window hides a cluster it ends in,
   reads the code point it cuts as a stray, and shows a CR it ends on as
-  lone), so a cut costs the stretch it ends. A
+  lone), so a cut costs the stretch it ends. The Pike's questions and
+  `place` ask the same thing (`Finder::cut_for`: the cut for a scan that
+  goes on at a position), and every position from where one asked to the
+  cut it got has the same answer, so the last stretch is kept and scanned
+  once. A
   `find_at`'s fresh scan has no segmentation to read: it steps over the
   clusters from the first cut, one at a time, each segmented from its
   start.
@@ -1003,16 +1041,30 @@ clusters and what reads them:
   none from standing. A scan of another subject in between, on the same
   cache, can raise the counts (costing a step that stood its match) or set
   them back to 0 (forgetting only what the steps before read), never hide
-  what this step reads.
+  what this step reads. A step that `read_to_cut` lets stand read to the cut,
+  so the count starts afresh after it as after one that did not stand
+  (left as it is, every step after would fail the cheap test and scan
+  back from the cut).
+- **Giving the cut texts up** (`Finder::pays`): where they do not pay, the
+  Pike takes the rest of the scan, as it took all of it before: from the
+  scan's first 4 KB on (`limits::kCutSampleBytes`), when the family's look
+  DFA steps a code point out of its table (`LazyDfa::aside`) every 10 bytes
+  it reads or more often (`limits::kCutMinBytesPerAside`: RE2's DFA gives a
+  search up below 10 bytes a state computation, where its NFA is as fast;
+  Rust's lazy DFA by bytes per state). It is no guess at what comes next:
+  it weighs what the scan has spent. Japanese and Devanagari text under a
+  `\b` or `^`/`$` pattern give up; English chat, a CR-LF subject and a
+  heart in prose do not.
 - **Out of the cut**: when the cut reaches the subject's end, the scan
   stands on the family's ladder without the flags, as any scan
   (`Finder::uncut`), `find_all`'s loop over it in place included. While it
   is over cut texts, `find_all` takes a match a step, as `find_iter` does.
 
 Linear: a family's step that does not stand read from its start to the
-cut at most, and the Pike's step from the same start reads at least as far
-(the next match is past the cut, or was decided there, by threads alive as
-far); each Pike step is one the whole-subject Pike took; `place` and the
+cut at most, and the reverse scan that settles it reads within the same
+stretch (floored at the step's start); the Pike's turn reads from a start
+no earlier than that step's to where every thread it answers for is gone,
+which a thread alive there read too; `place`, `cut_for`'s stretch and the
 segmentation only move forward.
 
 Not cut: the one-step calls (`search`, `test`, `match`: their guess, when it
@@ -1034,11 +1086,19 @@ could split a pair, `\w+\s\w+`, 606 M to 276 M; the CR-LF collapse's
 151 M (149 M without the ❤️). Where nearly every cluster is one no family
 serves, the bookkeeping costs a little: Thai `\w+` 5% more instructions,
 Devanagari 8% (1% and 5% more than before the Pike segmented as it reads,
-§1). The limits: a match that ends at a cut (`\b\w+\b` over Japanese chat,
-a word before every emoji) is decided there, its step does not stand, and
-the Pike reads the word again: 12% more (9%); a pattern whose next match is
-far (`(?i)Sherlock` past its last occurrence, a `test()` with no match)
-still has the Pike read from the step's start to it.
+§1). With the Pike's turn bounded, its start from the reverse scan and the
+budget (instructions, `find_all`, against the scan before them): the
+Sherlock corpus with one ❤️, `(?i)Sherlock` 87% fewer and `\bqzx\w*\b`
+(no match) 99.9% fewer; English chat `\w+` 49% fewer; the CR-LF corpus
+`\s{2}` 72% and `\w+\s\w+` 17% fewer; a short message with an emoji 45–52%
+fewer a call. The uses that never cut (the per-call table, line scans over
+LF text, logs, code, CJK, lookarounds, CodePoint mode) are within 1%.
+The limits, over subjects made of a few sentences repeated: Devanagari
+`\s+` takes 15% more instructions than the whole subject's Pike, `\w+`
+9–10%, Thai `\s+` 8% (the Pike reads nearly all of it, and the cut texts'
+bookkeeping is on top: the budget weighs the family's DFA, not that); and a
+one-step call (`search`, `test`) whose guess does not hold still has the
+Pike read the subject.
 
 ### Linearity (the O(n²) trap)
 
