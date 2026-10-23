@@ -15930,6 +15930,20 @@ public:
   static bool guess_open(const Ladder &l) {
     return l.has(Ladder::kSpec) && l.rung != Rung::Pike;
   }
+  // A guess's step and its verdict, the one place they are put together
+  // (find_rest's, from 0; Finder::next_at's, from `pos` = `lo`): the step on
+  // `l` from the cursor (find_run; `found`, its match in `out`), then
+  //   Over: the scan left the guess (guess_open): a boolean's, a ladder with
+  //     no guess in it, or the Pike, whose answer is the reference's;
+  //   Held: what the scan read holds the family out (guess_held; `fna`,
+  //     `unsound` and `lo` as its);
+  //   Dropped: it does not, and `out` is not to be trusted.
+  enum class Guess : uint8_t { Over, Held, Dropped };
+  template <class Out>
+  REGEXLIB_ALWAYS_INLINE Guess guess_step(std::string_view text, Scr &scr,
+                                          Ladder &l, Cursor &c, Out &out,
+                                          bool &found, size_t fna,
+                                          size_t *unsound, size_t lo) const;
   // How far a guess's step (find_run's, `found` and `walked` its answers)
   // read — the answer depends on no byte past the code point there (see
   // guess_held): the whole subject when there is no match; the walk's own
@@ -16079,12 +16093,9 @@ public:
         Scr scr = scratch(nullptr);
         Cursor c;
         c.pos = static_cast<int>(pos);
-        bool walked = false;
-        const bool found = re_->find_run(text_, scr, g, c, walked, out);
-        if (guess_open(g) &&
-            re_->guess_held(g.fam, text_,
-                            step_reach(text_, scr, g, c, walked, found),
-                            kUnclassified, nullptr, pos)) {
+        bool found;
+        if (re_->guess_step(text_, scr, g, c, out, found, kUnclassified,
+                            nullptr, pos) == Guess::Held) {
           if (found) c_.pos = c.pos;
           return found;
         }
@@ -18958,15 +18969,27 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   const size_t fna = guess_begin(text, l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
   Cursor c;
-  bool walked = false;
-  const bool found = find_run(text, scr, l, c, walked, out);
-  if (!guess_open(l)) return found;
+  bool found;
   size_t unsound;
-  if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found), fna,
-                 &unsound))
+  if (guess_step(text, scr, l, c, out, found, fna, &unsound, 0) !=
+      Guess::Dropped)
     return found;
   return find_unguessed(text, scr.cache, l.fam, found, GuessSeen{fna, unsound},
                         out);
+}
+
+template <class Out>
+inline Regex::Guess Regex::guess_step(std::string_view text, Scr &scr,
+                                      Ladder &l, Cursor &c, Out &out,
+                                      bool &found, size_t fna, size_t *unsound,
+                                      size_t lo) const {
+  bool walked = false;
+  found = find_run(text, scr, l, c, walked, out);
+  if (!guess_open(l)) return Guess::Over;
+  return guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found),
+                    fna, unsound, lo)
+             ? Guess::Held
+             : Guess::Dropped;
 }
 
 // A guess that does not hold: the first step of the scan a Finder takes —
