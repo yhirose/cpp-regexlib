@@ -1372,8 +1372,10 @@ safe ではありません**。パーサは `\r\n` を1書記素に融合し（`
 `[1,3)` を返す一方 `test` だけが不一致でした。
 
 失格したパターンが Pike ではなくバイト tier に着地するよう、2つのバイト側ゲートが
-対になる例外を持ちます。`egc_byte_path` は `byte_path_` パターンのために純 ASCII の
-CRLF subject を許容し、`assert_byte_path_ok` は assert パターン（`byte_path_` を
+対になる例外を持ちます。`egc_byte_path` は、ASCII 系統が取れない（融合した CR-LF
+リテラル。`Plan::ascii_takes_pure_ascii` が偽）`byte_path_` パターンのために純 ASCII の
+CRLF subject を許容します（ASCII 系統が取るパターンには聞かず、subject から CR-LF を
+探すこともしません）。`assert_byte_path_ok` は assert パターン（`byte_path_` を
 持たないので前者を使えない）のために同じことをします——条件も理由も同じ
 （`crlf_byte_safe_ && !can_match_empty_`）。後者が無いと `\r\n` リテラルを持つ assert
 パターンは書記素 Pike まで落ち、512 KB の純 ASCII HTTP ヘッダに対して

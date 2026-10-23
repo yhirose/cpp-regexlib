@@ -242,6 +242,12 @@ struct PlanProbe {
     Regex::Plan::IcaseScan probe;
     return rung(re.ladder_classify(s, l, fna, probe).rung);
   }
+  // Whether the EGC byte family takes the pure-ASCII subject `s` (a gate:
+  // egc_byte_path).
+  static bool byte_takes_ascii(const Regex &re, std::string_view s) {
+    size_t unsound = Regex::kUnclassified;
+    return re.egc_byte_path(s, s.size(), unsound);
+  }
   // Whether guess_begin looks at `s` (finds its first non-ASCII byte) before
   // the first step of a find.
   static bool guess_reads(const Regex &re, std::string_view s) {
@@ -2801,6 +2807,19 @@ void test_find_guess_grapheme() {
       CHECK(PlanProbe::classified(re, s, true) == rung);
       CHECK(!PlanProbe::guess_reads(re, s));
     }
+  }
+  // A pure-ASCII subject is the ASCII family's, a CR-LF in it or not, and no
+  // gate searches it for one: the byte family takes it only where the ASCII
+  // family cannot, a fused CR-LF literal.
+  for (const char *pat : {"\\w+", "[a-z]+ing", "(\\w+)@(\\w+)"}) {
+    const Regex re = make_egc(pat);
+    CHECK(!PlanProbe::byte_takes_ascii(re, "ab cd\r\nef"));
+    CHECK(!PlanProbe::byte_takes_ascii(re, "ab cd ef"));
+  }
+  {
+    const Regex re = make_egc("a\r\nb");
+    CHECK(PlanProbe::byte_takes_ascii(re, "xa\r\nb"));
+    CHECK(!PlanProbe::byte_takes_ascii(re, "xa b"));
   }
   // Where a DFA of the guess gives up, the guess ends (the Pike, or the
   // subject classified whole): on caches too small, over letters that take

@@ -1525,7 +1525,10 @@ Without it, `\r\n$` over `"x\r\n"` was a no-match where the grapheme Pike matche
 
 Both byte gates then carry the matching exception, so a disqualified pattern
 lands on a byte tier instead of the Pike. `egc_byte_path` admits a pure-ASCII
-CRLF subject for a `byte_path_` pattern, and `assert_byte_path_ok` does the same
+CRLF subject for a `byte_path_` pattern whose ASCII family cannot take it
+(`Plan::ascii_takes_pure_ascii` false: a fused CR-LF literal; a pattern the
+ASCII family does take is not asked, nor is the subject searched for a CR-LF),
+and `assert_byte_path_ok` does the same
 for an assert pattern (which has no `byte_path_`, so it cannot use the first) —
 same `crlf_byte_safe_ && !can_match_empty_` condition, same reason. Without the
 second, an assert pattern with a `\r\n` literal fell all the way to the grapheme

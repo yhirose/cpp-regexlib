@@ -10901,6 +10901,13 @@ private:
     bool ascii_crlf_sound() const {
       return crlf_byte_safe_ && !can_match_empty_ && !crlf_fused_lit_;
     }
+    // ... and the plan has an ASCII family for a find and for a boolean: a
+    // pure-ASCII subject is theirs whole, whether it holds a CR-LF or not,
+    // and no gate need look for one.
+    bool ascii_takes_pure_ascii() const {
+      return ascii_crlf_sound() && ascii_family(false) != kFamilyCount &&
+             ascii_family(true) != kFamilyCount;
+    }
     // Whole pattern is a single printable-ASCII literal (capture-free,
     // !icase): every match is the exact literal bytes — as standalone
     // graphemes, in Grapheme mode — so a memmem + O(1) boundary check finds
@@ -13658,10 +13665,12 @@ private:
   // byte, shared with ascii_grapheme_ok at the dispatch site so the subject
   // is classified once): one the byte programs answer for (byte_unsound_at
   // reaches its end), and not pure ASCII — the plain ASCII tier is faster
-  // there and handles it — EXCEPT a CR-LF-bearing one that a byte program
-  // reads as the grapheme engine does: collapsed, or a crlf_byte_safe,
-  // non-empty pattern's, which matches `\r\n`'s two bytes exactly
-  // (byte_unsound_at on pure ASCII, spelled out) — the subjects
+  // there and handles it — EXCEPT a CR-LF-bearing one that the ASCII tier
+  // refuses (Plan::ascii_takes_pure_ascii: it takes every pure-ASCII subject
+  // of a plan it serves, and no gate searches the subject for a CR-LF) and a
+  // byte program reads as the grapheme engine does: collapsed, or a
+  // crlf_byte_safe, non-empty pattern's, which matches `\r\n`'s two bytes
+  // exactly (byte_unsound_at on pure ASCII, spelled out) — the subjects
   // Plan::crlf_fused_lit_ keeps from the ASCII tier among them. Over a
   // subject that is not, `unsound` receives where the family stops serving
   // it (family_unsound_at), for a cut there (ladder_gated).
@@ -13671,7 +13680,7 @@ private:
       return plan_->byte_crlf_collapse_
                  ? contains_crlf(text) && no_lone_crlf(text)
                  : plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
-                       contains_crlf(text);
+                       !plan_->ascii_takes_pure_ascii() && contains_crlf(text);
     gate_unsound(kFamEgcByte, text, i, unsound);
     return unsound == text.size();
   }
