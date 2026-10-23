@@ -640,7 +640,7 @@ inline GraphemeBreak get_value(char32_t cp) {
 }  // namespace _grapheme_break_properties
 
 // U+0080..U+FFFF 64-code-point blocks with no grapheme break property
-// (GraphemeBreakProperty.txt); backs the cluster walk's plain_cp_len.
+// (GraphemeBreakProperty.txt); backs the cluster walk's plain_3_at and plain_2_at.
 // Bit b = block b = cp >> 6.
 static const uint64_t _grapheme_plain_blocks[16] = {
  0x00000000043BCFF8ULL,0xFF7600EA0FFFDF08ULL,
@@ -13667,29 +13667,31 @@ private:
     return true;
   }
 
-  // The length (2 or 3) of the well-formed code point at `off` when it lies in
-  // a plain block (_grapheme_plain_blocks), else 0. Its lead and middle bytes
-  // name the block (cp >> 6), so no decode and no property lookup. Surrogates
-  // and overlong forms are not in a plain block (the table leaves them out).
+  // Whether block b (cp >> 6) has no grapheme break property (the table).
   static bool plain_block(size_t b) {
     return (unicode::_grapheme_plain_blocks[b >> 6] >> (b & 63)) & 1;
   }
-  static size_t plain_cp_len(const unsigned char *p, size_t n, size_t off) {
-    // The 3-byte lead is tested first: CJK is the case this is tuned for.
-    const unsigned char l = p[off];
-    if ((l & 0xF0) == 0xE0)
-      return n - off >= 3 && (p[off + 1] & 0xC0) == 0x80 &&
-                     (p[off + 2] & 0xC0) == 0x80 &&
-                     plain_block((static_cast<size_t>(l & 0x0F) << 6) |
-                                 (p[off + 1] & 0x3F))
-                 ? 3
-                 : 0;
-    if ((l & 0xE0) == 0xC0)
-      return n - off >= 2 && (p[off + 1] & 0xC0) == 0x80 &&
-                     plain_block(l & 0x1F)
-                 ? 2
-                 : 0;
-    return 0;
+  // Whether the bytes at `off` hold a 3- (or 2-) byte code point in a plain
+  // block. The lead byte, and for 3 bytes the next one, name the block, so no
+  // decode and no property lookup. Surrogates are in no plain block (the table
+  // leaves them out). A 3-byte overlong form (E0 80..9F) names a 2-byte block
+  // and passes when that block is plain: read as Other rather than as a stray
+  // (Control), it can only report a fusion that is not there, never hide one.
+  // The 3-byte test comes first and keeps the form it had before 2-byte letters
+  // were added: the CJK loop is measurably sensitive to its shape (a length
+  // returned from one function and a ternary cost kanji about 9%).
+  static bool plain_3_at(const unsigned char *p, size_t n, size_t off) {
+    if (n - off < 3) return false;
+    const unsigned char l = p[off], m = p[off + 1], c = p[off + 2];
+    if ((l & 0xF0) != 0xE0 || (m & 0xC0) != 0x80 || (c & 0xC0) != 0x80)
+      return false;
+    return plain_block((static_cast<size_t>(l & 0x0F) << 6) | (m & 0x3F));
+  }
+  static bool plain_2_at(const unsigned char *p, size_t n, size_t off) {
+    if (n - off < 2) return false;
+    const unsigned char l = p[off], m = p[off + 1];
+    if ((l & 0xE0) != 0xC0 || (m & 0xC0) != 0x80) return false;
+    return plain_block(l & 0x1F);
   }
 
   // Walk the non-ASCII cluster neighborhood starting at `off` (a non-ASCII
@@ -13720,9 +13722,10 @@ private:
       // with nothing but a Prepend before it, so a plain code point after an
       // Other one takes no look.) The check runs before the decode, which is
       // what makes CJK runs cheap.
-      const size_t plain = lp == GB::Unassigned ? plain_cp_len(p, n, off) : 0;
-      if (plain) {
-        off += plain;
+      if (lp == GB::Unassigned && plain_3_at(p, n, off)) {
+        off += 3;
+      } else if (lp == GB::Unassigned && plain_2_at(p, n, off)) {
+        off += 2;
       } else {
         char32_t cp; // (a stray: see fused_from)
         off += unicode::utf8::decode_or_byte(d + off, n - off, cp);

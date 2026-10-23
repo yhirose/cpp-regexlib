@@ -397,7 +397,7 @@ def emit_plain_blocks(out, bits):
     for b in bits:
         words[b >> 6] |= 1 << (b & 63)
     out.write("// U+0080..U+FFFF 64-code-point blocks with no grapheme break property\n")
-    out.write("// (GraphemeBreakProperty.txt); backs the cluster walk's plain_cp_len.\n")
+    out.write("// (GraphemeBreakProperty.txt); backs the cluster walk's plain_3_at and plain_2_at.\n")
     out.write("// Bit b = block b = cp >> 6.\n")
     out.write("static const uint64_t _grapheme_plain_blocks[16] = {\n")
     _wrap(out, ["0x%016XULL," % w for w in words], 2)
