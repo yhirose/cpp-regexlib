@@ -404,6 +404,42 @@ def emit_plain_blocks(out, bits):
     out.write("};\n")
 
 
+# The categories of regexlib's \w above U+007F ('_' is Pc, so it is in the set).
+# Keep in step with is_word_cp in regexlib.h, which answers the same set above
+# U+FFFF; the exhaustive check over every code point is what ties the two together.
+WORD_CATEGORIES = {"Lu", "Ll", "Lt", "Lm", "Lo", "Nd", "Pc"}
+
+
+def word_tables(gc_vals):
+    """The word property (\\w) over U+0080..U+FFFF in two levels: block (cp >> 6)
+    -> pattern index, and the distinct 64-bit patterns. Blocks 0 and 1 (ASCII)
+    are left zero: no ASCII byte is answered from the table."""
+    words = [0] * 1024
+    for cp in range(0x80, 0x10000):
+        if gc_vals[cp] in WORD_CATEGORIES:
+            words[cp >> 6] |= 1 << (cp & 63)
+    index = {}
+    block_pattern = []
+    for w in words:
+        if w not in index:
+            index[w] = len(index)
+        block_pattern.append(index[w])
+    patterns = sorted(index, key=index.get)
+    return block_pattern, patterns
+
+
+def emit_word_tables(out, gc_vals):
+    block_pattern, patterns = word_tables(gc_vals)
+    out.write("// \\w over U+0080..U+FFFF (General_Category Lu Ll Lt Lm Lo Nd Pc), two levels:\n")
+    out.write("// block (cp >> 6) -> pattern, then bit (cp & 63) of the pattern.\n")
+    out.write("static const uint16_t _word_block_pattern[%d] = {\n" % len(block_pattern))
+    _wrap(out, ["%d," % p for p in block_pattern], 16)
+    out.write("};\n")
+    out.write("static const uint64_t _word_patterns[%d] = {\n" % len(patterns))
+    _wrap(out, ["0x%016XULL," % w for w in patterns], 2)
+    out.write("};\n")
+
+
 def emit_incb(out, ranges):
     emit_enum(out, "Incb", ["None", "Consonant", "Extend", "Linker"])
     out.write("// Indic_Conjunct_Break (DerivedCoreProperties.txt); backs grapheme GB9c.\n")
@@ -472,6 +508,8 @@ def build_block(ucd):
     gc_def, gc_vals = parse_general_category(ucd)
     emit_page_table(out, "_general_category_properties", "GeneralCategory",
                     GC_ORDER, gc_def, gc_vals)
+    out.write("\n")
+    emit_word_tables(out, gc_vals)
     out.write("\n")
 
     # --- GraphemeBreak (enum value list is version-dependent) ---
@@ -544,6 +582,12 @@ def cmd_verify(ucd):
     assert (0x0301 >> 6) not in plain  # a 2-byte combining mark (Extend)
     assert (0x3099 >> 6) not in plain  # a kana voiced mark (Extend)
     assert (0x20D0 >> 6) not in plain  # a combining mark (Extend)
+    bp, pats = word_tables(gc_vals)
+    def word(cp):
+        return (pats[bp[cp >> 6]] >> (cp & 63)) & 1
+
+    assert word(0x6F22) and word(0x0410) and word(0x03B1)  # kanji, Cyrillic, Greek
+    assert not word(0x0301) and not word(0x3001) and not word(0xD800)  # mark, ideographic comma, surrogate
     emo_order, _ = parse_enum_prop(ucd, "emoji/emoji-data.txt")
     assert "Extended_Pictographic" in emo_order
     incb = parse_incb(ucd)
