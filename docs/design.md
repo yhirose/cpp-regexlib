@@ -1073,6 +1073,16 @@ takes the first step of the scan a Finder takes (`Regex::find_rest`; a
 `find_at` steps), where classifying the subject whole sent all of it to the
 Pike: `\bqzx\w*\b` with no match over 4 KB, a heart and 4 KB segments 250
 clusters, not 8196. (`match` anchors at 0, and its guesses are local.)
+Nothing the guess read is read again. Its step stands for the cut texts'
+first (`Finder::next_after_guess`, through `read_to_cut`), and what it
+classified goes to the scan's classifying (`GuessSeen`,
+`Finder::begin_seen`): the subject's first non-ASCII byte, which
+`guess_begin` found and `guess_held` takes from it, and where the byte
+family stops serving the subject, where the guess's prefix settles it, by
+the rule `cut_from`'s windows keep (`prefix_settles`). That test over the
+Sherlock text with a heart at its end takes 0.8% more instructions than
+without the heart, and over 600 KB of Japanese the same (classifying the
+subject again took 33% more and twice as many).
 
 Not cut: a `Classify` that a
 step comes back to midway (an end anchor's DFA that gave up, the fused

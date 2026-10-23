@@ -2459,6 +2459,20 @@ void test_cut_text() {
     CHECK(m.matched() && w.matched() && m.begin() == w.begin() &&
           m.end() == w.end());
   }
+  // What a failed guess classified is handed to the scan that takes over
+  // (GuessSeen) only where its prefix settles it: a cluster the guess's
+  // last code point begins (`b` and the accent after it) is found again
+  // over the subject — and wherever it lies, the answer is the Pike's.
+  for (const char *tail : {"", "\xCC\x81", "\xCC\x81 ab", "\xE2\x9D\xA4"}) {
+    const std::string s = prose(", ", 5, 4096) + " ab" + tail + " qzx ab";
+    for (const char *pat : {"\\bab", "ab\\b", "\\bqzx\\b", "\\bqzy\\b"}) {
+      const reg::MatchResult m = Regex(pat).search(s),
+                             w = pike_twin(pat).search(s);
+      CHECK(m.matched() == w.matched() &&
+            (!m.matched() || (m.begin() == w.begin() && m.end() == w.end())));
+      CHECK(Regex(pat).test(s) == w.matched());
+    }
+  }
   // Every Grapheme family of plans for each way a family's soundness is
   // decided (see test_unsound_positions), the assert ones among them.
   const Regex plans[] = {Regex("\\w+"), Regex("\\w*"), Regex("[^c-za]a?"),

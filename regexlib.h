@@ -12511,8 +12511,15 @@ private:
       // pattern pays the contains_crlf scan.
       return plan_->crlf_fused_lit_ && plan_->crlf_byte_safe_ &&
              !plan_->can_match_empty_ && contains_crlf(text);
-    unsound = family_unsound_at(kFamAssertByte, text, fna);
+    gate_unsound(kFamAssertByte, text, fna, unsound);
     return unsound == text.size();
+  }
+  // A byte family's gate: where it stops serving `text` (`fna` its first
+  // non-ASCII byte), into `unsound`, unless that is known (a failed
+  // guess's, the same: guess_held, prefix_settles).
+  REGEXLIB_ALWAYS_INLINE void gate_unsound(Family f, std::string_view text,
+                                           size_t fna, size_t &unsound) const {
+    if (unsound == kUnclassified) unsound = family_unsound_at(f, text, fna);
   }
 
   // Priority-ordered ε-closure with the leftmost-first match cut, for the
@@ -13652,7 +13659,7 @@ private:
                  ? contains_crlf(text) && no_lone_crlf(text)
                  : plan_->crlf_byte_safe_ && !plan_->can_match_empty_ &&
                        contains_crlf(text);
-    unsound = family_unsound_at(kFamEgcByte, text, i);
+    gate_unsound(kFamEgcByte, text, i, unsound);
     return unsound == text.size();
   }
   // Where, read from its start, `text` stops being a subject the byte
@@ -13684,13 +13691,20 @@ private:
   // refuses a non-ASCII byte without looking for where its cluster starts,
   // and no family is no subject's (family_unsound_at's 0 is the end of an
   // empty text).
+  // `unsound`, unless null, receives where it found the text stops being
+  // one (a byte family's only: the ASCII families' soundness is not theirs).
   REGEXLIB_ALWAYS_INLINE bool family_sound(Family f, std::string_view text,
-                                           size_t i) const {
+                                           size_t i,
+                                           size_t *unsound = nullptr) const {
     switch (f) {
     case kFamAscii:
     case kFamAssertAscii: return ascii_grapheme_ok(text, i);
     case kFamilyCount: return false;
-    default: return family_unsound_at(f, text, i) == text.size();
+    default: {
+      const size_t u = family_unsound_at(f, text, i);
+      if (unsound) *unsound = u;
+      return u == text.size();
+    }
     }
   }
   // Where, read from its start, `text` stops being a subject family `f`
@@ -13725,12 +13739,35 @@ private:
   // read it. A gate that holds for the whole subject holds for R, so a
   // subject no guess holds for is one no family served either. (A
   // CodePoint family's holds for every subject: family_sound.)
+  //
+  //
+  // `fna`: the subject's first non-ASCII byte, if known (guess_begin's),
+  // else kUnclassified. A guess that does not hold has classified the
+  // subject as far as R, and `unsound`, unless null, receives where the
+  // plan's byte family stops serving it, if R settles that (else
+  // kUnclassified), for the scan that takes over (Finder::begin_seen).
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
-                                         int reach) const {
+                                         int reach, size_t fna = kUnclassified,
+                                         size_t *unsound = nullptr) const {
     if (!family_has<kTraitGrapheme>(f)) return true;
     // (Not substr: guess_end is within `text`, and GCC calls substr here.)
     const std::string_view r(text.data(), guess_end(text, reach));
-    return family_sound(f, r, first_nonascii(r));
+    const size_t i =
+        fna != kUnclassified ? std::min(fna, r.size()) : first_nonascii(r);
+    size_t u = kUnclassified; // (a byte family's: the plan has one)
+    if (family_sound(f, r, i, unsound ? &u : nullptr)) return true;
+    if (unsound)
+      *unsound =
+          u != kUnclassified && prefix_settles(u, r, text) ? u : kUnclassified;
+    return false;
+  }
+  // Whether where a family stops serving a prefix `r` of `text`, `u`, is
+  // where it stops serving the text: found more than a code point short of
+  // r's end (a prefix hides a cluster it ends in, reads the code point it
+  // cuts as a stray, and shows a CR it ends on as lone), or r the text.
+  static bool prefix_settles(size_t u, std::string_view r,
+                             std::string_view text) {
+    return u + 4 < r.size() || r.size() == text.size();
   }
   // ... R's end (a Grapheme family's): [0, reach) and the code point at
   // `reach`, completed — the stop means what it does only if that code point
@@ -15508,7 +15545,9 @@ public:
   // `cut`, unless null (a Finder's scan: Finder::classify), takes a subject
   // no family serves whole onto the family that serves the most of it,
   // over a text cut where it stops being sound (Finder::cut_step), and
-  // receives that position.
+  // receives that position; it holds, on the way in, where the plan's byte
+  // family stops serving the subject if that is known (a failed guess's:
+  // GuessSeen), else kUnclassified.
   REGEXLIB_ALWAYS_INLINE Ladder ladder_classify(std::string_view text,
                                                 Ladder l, size_t &fna,
                                                 Plan::IcaseScan &probe,
@@ -15715,10 +15754,18 @@ public:
   template <class Out>
   REGEXLIB_ALWAYS_INLINE bool find_rest(std::string_view text, Ladder l,
                                         Out &out) const;
+  // What a guess that does not hold classified of the subject, for the
+  // scan that takes over (Finder::begin_seen): its first non-ASCII byte
+  // (guess_begin's), and where the plan's byte family stops serving it if
+  // the guess settled that (guess_held), else kUnclassified.
+  struct GuessSeen {
+    size_t fna, unsound;
+  };
   template <class Out>
   REGEXLIB_NOINLINE bool find_unguessed(std::string_view text,
                                         FindCache *cache, Family fam,
-                                        bool found, Out &out) const;
+                                        bool found, const GuessSeen &seen,
+                                        Out &out) const;
   // A boolean over a short subject gives the interior-literal rung up
   // before trying it (limits::kBoolSkipBytes; see ladder_caller): it starts
   // on the third ladder, the boolean's with that rung given up.
@@ -15735,21 +15782,24 @@ public:
   // guess: it is sound there), any other guesses the byte family — where
   // the plan has them (see ladder_plan). (A CodePoint scan has nothing to
   // guess: its family serves every subject.)
-  REGEXLIB_ALWAYS_INLINE void guess_begin(std::string_view text,
-                                          Ladder &l) const {
-    if (plan_->us_) return;
+  // It returns that byte, for guess_held (kUnclassified if it did not look).
+  REGEXLIB_ALWAYS_INLINE size_t guess_begin(std::string_view text,
+                                            Ladder &l) const {
+    if (plan_->us_) return kUnclassified;
     const Plan::Row row = guess_row(l);
     const Family route = plan_->ascii_route_[row],
                  guess = plan_->find_guess_[row];
     if (l.rung != Rung::Classify ||
         (route == kFamilyCount && guess == kFamilyCount))
-      return;
-    const bool ascii = first_nonascii(text) == text.size();
+      return kUnclassified;
+    const size_t fna = first_nonascii(text);
+    const bool ascii = fna == text.size();
     const Family f = ascii ? route : guess;
-    if (f == kFamilyCount) return;
+    if (f == kFamilyCount) return fna;
     l = ladder_on(f, l);
-    if (ascii) return; // sound: no guess
+    if (ascii) return fna; // sound: no guess
     l.set(Ladder::kSpec);
+    return fna;
   }
   // A one-step scan on `l` from 0, to its first answer: the walk first,
   // then — only if the walk did not answer — this thread's cache and the
@@ -15789,15 +15839,13 @@ public:
   // text's size. It reads as far as that, over a window that doubles: a
   // family's soundness is two scans, each to the first of its own kind (the
   // first non-ASCII byte and the first CR-LF; the first fusing cluster and
-  // the first lone CR or LF), and the nearer one alone ends the stretch. A
-  // window hides a cluster it ends in, reads the code point it cuts as a
-  // stray, and shows a CR it ends on as lone: what it finds more than a
-  // code point short of its end is the text's.
+  // the first lone CR or LF), and the nearer one alone ends the stretch.
+  // What a window finds is the text's where it settles (prefix_settles).
   size_t cut_from(Family f, std::string_view text, size_t at) const {
     for (size_t w = 64;; w *= 2) {
       const std::string_view r = text.substr(at, w);
       const size_t k = family_unsound_at(f, r, first_nonascii(r));
-      if (k + 4 < r.size() || at + r.size() >= text.size()) return at + k;
+      if (prefix_settles(k, r, text.substr(at))) return at + k;
     }
   }
   // Where the cluster that ends at `p` (> 0) starts, in a stretch of `text`
@@ -15863,6 +15911,15 @@ public:
     bool next(ResultSink &out) {
       Scr scr = scratch(nullptr);
       return step<false>(scr, out);
+    }
+    // Before the first step of a one-step call whose guess did not hold
+    // (find_unguessed): its classifying, from what the guess classified of
+    // the subject (`seen`), not the subject read again.
+    void begin_seen(const GuessSeen &seen) {
+      if (cut_ != kToClassify) return; // (a plan no Classify starts)
+      Scr scr = scratch(nullptr);
+      deep_.fna = seen.fna;
+      begin_cut(scr, seen.unsound);
     }
     // The first step of a one-step call whose guess did not hold
     // (find_unguessed): the guess's step — family `fam`'s from 0 over the
@@ -15938,18 +15995,19 @@ public:
       return Step::Again;
     }
     // The first step's classifying, and the counts the cut texts begin with
-    // if it cut.
-    void begin_cut(Scr &scr) {
-      classify();
+    // if it cut. `unsound` as classify's.
+    void begin_cut(Scr &scr, size_t unsound = kUnclassified) {
+      classify(unsound);
       if (cut_ == kNoCut) return;
       read_afresh(scr);
       spent_ = {c_.pos, 0, scr.cache->aside(l_.trait(kTraitByte))};
       pike_only_ = false;
     }
     // The scan's Classify (ladder_reclassify's), with a cut where no family
-    // serves the subject whole.
-    REGEXLIB_NOINLINE void classify() {
-      size_t cut = text_.size();
+    // serves the subject whole; `unsound`, where the plan's byte family
+    // stops serving it if known (a failed guess's: begin_seen).
+    REGEXLIB_NOINLINE void classify(size_t unsound) {
+      size_t cut = unsound;
       l_ = re_->ladder_classify(text_, l_, deep_.fna, deep_.probe, &cut);
       cut_ = kNoCut;
       if (!l_.has(Ladder::kCut)) return;
@@ -18656,8 +18714,8 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
   Family f;
   // Where the byte family the gates asked of a non-ASCII subject stops
   // serving it (the plan has one byte family at most: the byte path and
-  // the byte assert path are dfa_ok_ and not).
-  size_t unsound = kUnclassified;
+  // the byte assert path are dfa_ok_ and not), if known coming in.
+  size_t unsound = cut ? *cut : kUnclassified;
   if (egc_byte_path(text, fna, unsound)) {
     // (?i) clean-prefix prefilter: the family has no such rung if no probe
     // applies.
@@ -18671,8 +18729,9 @@ inline Regex::Ladder Regex::ladder_gated(std::string_view text, Ladder l,
   } else if (cut && (f = cut_family(text, probe)) != kFamilyCount) {
     // A Finder's scan: the family over the text up to where it stops being
     // sound, and the Pike around what it cannot serve (Finder::cut_step) —
-    // where its gate found it stops, or (a pure-ASCII subject, which the
-    // gates do not scan for clusters) found here.
+    // where its gate (or a failed guess, the same: GuessSeen) found it
+    // stops, or (a pure-ASCII subject, which the gates do not scan for
+    // clusters) found here.
     *cut = unsound != kUnclassified ? unsound
                                     : family_unsound_at(f, text, fna);
     l = ladder_on(f, l);
@@ -18751,31 +18810,38 @@ inline bool Regex::find_rest(std::string_view text, Ladder l, Out &out) const {
   // (The short boolean's ladder, past the shallow rungs and the find from
   // 0: they have no interior-literal rung to give up.)
   if constexpr (!Out::kGroups) l = ladder_short_test(text, l);
-  guess_begin(text, l);
+  const size_t fna = guess_begin(text, l);
   Scr scr; // filled by the rung that needs it (scr_walk, scr_fetch)
   Cursor c;
   bool walked = false;
   const bool found = find_run(text, scr, l, c, walked, out);
   if (!guess_open(l)) return found;
-  if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found)))
+  size_t unsound;
+  if (guess_held(l.fam, text, step_reach(text, scr, l, c, walked, found), fna,
+                 &unsound))
     return found;
-  return find_unguessed(text, scr.cache, l.fam, found, out);
+  return find_unguessed(text, scr.cache, l.fam, found, GuessSeen{fna, unsound},
+                        out);
 }
 
 // A guess that does not hold: the first step of the scan a Finder takes —
 // the family over the stretches it serves, the Pike around the clusters it
 // does not (cut texts), where classifying the subject whole sent all of it
 // to the Pike — with the guess's step (family `fam`'s, `found` and in
-// `out`) for its family's first (Finder::next_after_guess): the subject is
-// not read again up to the cut. Through a ResultSink, the Finder find_at
-// steps: a boolean's match, whose place the guess did not keep, is found
-// again, built and dropped. Out of line: search() and test() inline
-// find_rest, and keep their code.
+// `out`) for its family's first (Finder::next_after_guess), and what it
+// classified of the subject (`seen`) for the scan's classifying
+// (Finder::begin_seen): the subject is not read again up to the cut.
+// Through a ResultSink, the Finder find_at steps: a boolean's match, whose
+// place the guess did not keep, is found again, built and dropped. Out of
+// line: search() and test() inline find_rest, and keep their code.
 template <class Out>
 REGEXLIB_NOINLINE bool Regex::find_unguessed(std::string_view text,
                                              FindCache *cache, Family fam,
-                                             bool found, Out &out) const {
+                                             bool found,
+                                             const GuessSeen &seen,
+                                             Out &out) const {
   Finder f(*this, text, cache);
+  f.begin_seen(seen);
   if constexpr (std::is_same_v<Out, ResultSink>) {
     return f.next_after_guess(out, fam, found);
   } else {
