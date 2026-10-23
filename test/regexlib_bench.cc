@@ -272,6 +272,30 @@ static string make_thai(size_t target_bytes) {
   return out;
 }
 
+// ~target_bytes of Japanese prose: kanji and kana with no spaces between words,
+// and a few 、 and 。. Each kanji and kana is one code point with no combining
+// mark, so no cluster here has more than one code point (the Thai prose above
+// is the opposite case).
+static string make_japanese(size_t target_bytes) {
+  static const char *const kSentences[] = {
+      "日本語の文章は、漢字と仮名を混ぜて書かれます。",
+      "東京都は日本の首都であり、多くの人が住んでいます。",
+      "今日はよい天気なので、公園まで散歩に行きました。",
+      "私は毎朝コーヒーを飲みながら新聞を読みます。",
+      "彼は大学で数学と物理学を専攻していました。",
+      "この店のラーメンは、スープが濃くておいしいです。",
+  };
+  mt19937 rng(0x1A9);
+  uniform_int_distribution<int> pick(0, 5), sep(0, 4);
+  string out;
+  out.reserve(target_bytes + 128);
+  while (out.size() < target_bytes) {
+    out += kSentences[pick(rng)];
+    out += sep(rng) == 0 ? '\n' : ' ';
+  }
+  return out;
+}
+
 // ~target_bytes of "key=value" pairs separated by spaces (key/value are 2..8
 // lowercase letters). Drives multi-group captures like (\w+)=(\w+), where each
 // group is a distinct span — the case the code-point one-pass engine targets.
@@ -898,6 +922,19 @@ static void run_sherlock_bench(int iters) {
       {"Thai: words \\w+", "\\w+", false, {thai}},
   };
   for (auto &c : thai_cases)
+    run_case(c, iters);
+
+  // Japanese prose (kanji and kana, no spaces): the word rows over a subject
+  // of one-code-point words, the CJK path the code-point walks and the
+  // plain-block cluster step serve. Watches for a regression in that path.
+  string ja = make_japanese(text.size());
+  cout << "\n\nJapanese prose  (" << (ja.size() / 1024) << " KB)\n"
+       << string(72, '=') << endl;
+  vector<Case> ja_cases = {
+      {"Japanese: words \\w+", "\\w+", false, {ja}},
+      {"Japanese: word \\b\\w+\\b", "\\b\\w+\\b", false, {ja}},
+  };
+  for (auto &c : ja_cases)
     run_case(c, iters);
 }
 
