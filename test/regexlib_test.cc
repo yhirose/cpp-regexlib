@@ -267,6 +267,16 @@ struct PlanProbe {
     Regex::Ladder l = re.plan_->start_[0];
     return re.guess_begin(s, l) != Regex::kUnclassified;
   }
+  // Whether find_at's step at `pos` stood on its guess: the Finder is
+  // still to classify the subject after it (a step that did not hold the
+  // guess has classified it, Finder::next_at). `m` receives the step's match.
+  static bool find_at_guessed(const Regex &re, std::string_view s, size_t pos,
+                              reg::MatchResult &m) {
+    Regex::Finder f(re, s, nullptr);
+    Regex::ResultSink out{m};
+    f.next_at(pos, out);
+    return f.cut_ == Regex::Finder::kToClassify;
+  }
   // The rung family `fam` (a letter of kFamilies) leads a find with.
   static char family_find(const Regex &re, char fam) {
     return rung(re.plan_->family_[kFamilies.find(fam)][0].rung);
@@ -2523,6 +2533,60 @@ void test_cut_text() {
         while (static_cast<unsigned char>(s[fna]) < 0x80) fna++;
         CHECK(PlanProbe::family_unsound_at(re, fam, s, fna) == 0);
       }
+}
+
+// find_at's first step does not classify its subject. It guesses as
+// search() does, from `pos`, and the answer stands if what the scan read
+// from `pos` holds it out (guess_held with lo = pos). So from the first
+// positions a scan stops at (the reference Pike's), over each piece of
+// kDirt placed at some offsets of the first 48 bytes and further on:
+// find_at gives the Pike's step, groups, resume position and all, in both
+// units. (A few steps and offsets: each is a Pike step over the subject.)
+// And what lies before `pos`, or past what the step read, does not decide
+// it.
+bool find_at_agrees(const Regex &re, const Regex &pike, std::string_view s) {
+  size_t pos = 0;
+  for (int step = 0; step < 8 && pos <= s.size(); step++) {
+    const auto want = pike.find_at(s, pos), got = re.find_at(s, pos);
+    if (got.next_pos != want.next_pos || !same_groups(got.m, want.m))
+      return false;
+    if (!want.m.matched()) break;
+    if (want.next_pos <= pos) return false;
+    pos = want.next_pos;
+  }
+  return true;
+}
+void test_find_at_guess() {
+  const char *pats[] = {"\\w+",      ".",         "[a-z]+ing",
+                        "[^ ]+ [^ ]+", "(?i)the",   "\\w*",
+                        "[^x]{2}",   "\\s+",       "(\\w+) (\\w+)",
+                        "x*",        "\\w+\\r\\n", "\\b\\w+\\b",
+                        "\\w+$"};
+  for (const char *pat : pats)
+    for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint}) {
+      const Regex re(pat, 0, unit), pike = pike_twin(pat, 0, unit);
+      each_dirty_subject(
+          [&](std::string_view s) { return find_at_agrees(re, pike, s); },
+          kGuessBodies, std::vector<size_t>{0, 3, 11, 24, 47, 100});
+    }
+
+  // The guess stands from `pos` on whatever precedes it: a skin-toned hand,
+  // an NFD accent and a flag before it, and 64 KB of prose past what the
+  // step reads that ends in a combining mark. (A Pike match reads the first
+  // word after `pos`; only the word is judged.)
+  const std::string before = "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBB" "e\xCC\x81"
+                             "\xF0\x9F\x87\xAF\xF0\x9F\x87\xB5 ";
+  const std::string s = before + "ab cd " + accented_prose(1u << 16) + "\xCC\x81";
+  const Regex word("\\w+");
+  reg::MatchResult m;
+  CHECK(PlanProbe::find_at_guessed(word, s, before.size(), m));
+  CHECK(m.matched() && m.begin() == before.size() && m.end() == before.size() + 2);
+  // ... but not when what it reads fuses: the step's word ends in a mark.
+  const std::string fused = "ab cd e\xCC\x81 ef";
+  CHECK(!PlanProbe::find_at_guessed(word, fused, 6, m));
+  CHECK(m.matched() && m.begin() == 6);
+  // A plan that gets no byte guess (an assert plan) classifies, as before.
+  CHECK(!PlanProbe::find_at_guessed(Regex("\\b\\w+\\b"), s, before.size(), m));
 }
 
 // match() does not classify its subject. It tries the plan's families in
@@ -7956,6 +8020,7 @@ int main() {
   test_step_reach();
   test_cut_text();
   test_match_guess();
+  test_find_at_guess();
   test_find_guess();
   test_find_guess_grapheme();
   test_text_anchored_find();

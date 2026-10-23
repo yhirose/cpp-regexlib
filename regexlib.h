@@ -13811,19 +13811,31 @@ private:
   // subject as far as R, and `unsound`, unless null, receives where the
   // plan's byte family stops serving it, if R settles that (else
   // kUnclassified), for the scan that takes over (Finder::begin_seen).
+  //
+  // `lo`: a guess that began at a scan position (find_at) is judged on R
+  // from `lo` on, the position itself: a cluster boundary, so what the
+  // family reads from there is the unit's whatever stands before it (no
+  // byte family reads left of its cursor). `fna` is the subject's, so it
+  // serves lo == 0 only; `unsound` is a position in `text`.
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach, size_t fna = kUnclassified,
-                                         size_t *unsound = nullptr) const {
+                                         size_t *unsound = nullptr,
+                                         size_t lo = 0) const {
     if (!family_has<kTraitGrapheme>(f)) return true;
     // (Not substr: guess_end is within `text`, and GCC calls substr here.)
-    const std::string_view r(text.data(), guess_end(text, reach));
-    const size_t i =
-        fna != kUnclassified ? std::min(fna, r.size()) : first_nonascii(r);
+    const std::string_view r(text.data() + lo, guess_end(text, reach) - lo);
+    const size_t i = fna != kUnclassified && lo == 0
+                         ? std::min(fna, r.size())
+                         : first_nonascii(r);
     size_t u = kUnclassified; // (a byte family's: the plan has one)
     if (family_sound(f, r, i, unsound ? &u : nullptr)) return true;
     if (unsound)
-      *unsound =
-          u != kUnclassified && prefix_settles(u, r, text) ? u : kUnclassified;
+      *unsound = u != kUnclassified &&
+                         prefix_settles(u, r,
+                                        std::string_view(text.data() + lo,
+                                                         text.size() - lo))
+                     ? lo + u
+                     : kUnclassified;
     return false;
   }
   // Whether where a family stops serving a prefix `r` of `text`, `u`, is
@@ -15870,9 +15882,27 @@ public:
   // the byte family — where the plan has them (see ladder_plan). (A
   // CodePoint scan has nothing to guess: its family serves every subject.)
   // It returns that byte, for guess_held (kUnclassified if it did not look).
+  //
+  // guess_unread is the part that needs no look: a plan with a DFA family on
+  // a ladder still to classify moves onto its byte family, a guess, and says
+  // so. (find_at's first step asks it alone: Finder::next_at.)
+  REGEXLIB_ALWAYS_INLINE bool guess_unread(Ladder &l) const {
+    if (plan_->us_ || l.rung != Rung::Classify ||
+        plan_->fused_ == Plan::Fused::Prefix ||
+        plan_->fused_ == Plan::Fused::Suffix ||
+        plan_->find_guess_[guess_row(l)] != kFamEgcByte)
+      return false;
+    // The byte family on any subject, unread: guess_held judges the guess on
+    // the prefix it read. (A plan with a DFA family has no route: see
+    // Plan::ascii_route_.)
+    l = ladder_on(kFamEgcByte, l);
+    l.set(Ladder::kSpec);
+    return true;
+  }
   REGEXLIB_ALWAYS_INLINE size_t guess_begin(std::string_view text,
                                             Ladder &l) const {
     if (plan_->us_) return kUnclassified;
+    if (guess_unread(l)) return kUnclassified;
     const Plan::Row row = guess_row(l);
     const Family route = plan_->ascii_route_[row],
                  guess = plan_->find_guess_[row];
@@ -15882,14 +15912,6 @@ public:
         plan_->fused_ == Plan::Fused::Suffix ||
         (route == kFamilyCount && guess == kFamilyCount))
       return kUnclassified;
-    if (guess == kFamEgcByte) {
-      // The byte family on any subject, unread: guess_held judges the
-      // guess on the prefix it read. (A plan with a DFA family has no
-      // route: see Plan::ascii_route_.)
-      l = ladder_on(guess, l);
-      l.set(Ladder::kSpec);
-      return kUnclassified;
-    }
     const size_t fna = first_nonascii(text);
     const bool ascii = fna == text.size();
     const Family f = ascii ? route : guess;
@@ -16048,6 +16070,35 @@ public:
       step<true>(scr, out);
     }
 
+    // find_at()'s first step, from `pos` (a valid scan position, as seek's):
+    // a guess where the plan has one, as search() takes: the byte family
+    // from `pos`, unread, its answer standing if what it read from `pos`
+    // holds it out (guess_held). Else, or if it does not hold, the step as
+    // next()'s, which classifies the subject whole. A held guess leaves the
+    // scan as a seek to its resume position would, still to classify. (A
+    // guess that fell to the Pike does not hold: the Pike's step in a guess
+    // begins at 0, whatever the cursor: guess_open.)
+    bool next_at(size_t pos, ResultSink &out) {
+      seek(pos);
+      Ladder g = l_;
+      if (cut_ == kToClassify && re_->guess_unread(g)) {
+        Scr scr = scratch(nullptr);
+        Cursor c;
+        c.pos = static_cast<int>(pos);
+        bool walked = false;
+        const bool found = re_->find_run(text_, scr, g, c, walked, out);
+        if (guess_open(g) &&
+            re_->guess_held(g.fam, text_,
+                            step_reach(text_, scr, g, c, walked, found),
+                            kUnclassified, nullptr, pos)) {
+          if (found) c_.pos = c.pos;
+          return found;
+        }
+        out.clear();
+      }
+      return next(out);
+    }
+
     // find_at() support: position this scan at byte offset `pos` (a valid
     // scan position — 0 or a previously returned resume position) before the
     // first step. The Pike cursor is mapped from it when the first Pike
@@ -16064,6 +16115,7 @@ public:
     }
 
   private:
+    friend struct detail::PlanProbe;
     // cut_ when the scan steps as any other, and before it classifies.
     static constexpr int kNoCut = -1, kToClassify = -2;
 
@@ -19435,9 +19487,8 @@ inline Regex::FindAt Regex::find_at_step(std::string_view text, size_t pos,
   r.next_pos = text.size() + 1;
   if (pos > text.size()) return r; // past the last scan position
   Finder f(*this, text, cache);
-  f.seek(pos);
   ResultSink out{r.m};
-  if (f.next(out)) r.next_pos = f.resume_byte();
+  if (f.next_at(pos, out)) r.next_pos = f.resume_byte();
   return r;
 }
 

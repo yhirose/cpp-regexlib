@@ -855,6 +855,26 @@ holds.
   anywhere and no match (a prefilter's skip passes the byte), and guessing
   the byte family first runs the slower engine on the ASCII subjects that
   are most of what a line-by-line search meets.
+- **`find_at`** (`Finder::next_at`) starts its one step from `pos` the same
+  way. The Finder classified the subject whole at its first step, so a step
+  cost the length of the subject (512 KiB: 148 thousand instructions over
+  ASCII, 13 million over Japanese text, 1 KB of Japanese 40 thousand), and a
+  tokenizer loop over a long subject was quadratic. A plan that guesses its
+  byte family (`guess_unread`, the part of `guess_begin` that reads
+  nothing) runs the step from `pos` (`find_run`, as `find_rest` does), and
+  the answer stands if the subject is one the family serves *from `pos`*
+  to where the step read (`guess_held` with `lo = pos`). `pos` is a cluster
+  boundary (the precondition of `find_at`), the byte family reads nothing
+  left of its cursor (no assertions), and the clusters from a boundary on
+  depend on nothing before it, so what lies before `pos` does not decide the
+  guess. A held guess leaves the Finder as a seek to the resume position
+  would: still to classify, so a later `next()` is as it was. One that does
+  not hold, or that fell to the Pike (which a guess enters at 0, whatever
+  the cursor), is thrown away and the step is `next()`'s, as before: the
+  worst case is the old cost plus the guess's scan. Left alone: a step that
+  finds no match reads to the end of the subject (`step_reach`), and
+  `find_iter`'s first step, which would only move its classifying to the
+  second.
 
 The rules:
 
