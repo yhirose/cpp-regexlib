@@ -7865,27 +7865,38 @@ void test_stray_matches_nothing() {
 // cut in the middle of a plain run, CR-LF, ASCII, and runs that cross 64-code-
 // point blocks. Every find surface agrees with the Pike on each.
 void test_plain_cluster_run() {
-  std::string run; // 300 plain code points, crossing block boundaries
-  const char *const cps[] = {"\xE6\x9D\xB1", "\xE4\xBA\xAC", "\xE5\xA4\xA7",
-                             "\xE9\x98\xAA", "\xE9\x83\xBD", "\xE8\xB2\xA0"};
-  for (int i = 0; i < 300; i++) run += cps[i % 6];
-  const std::string subs[] = {
-      "a" + run + "\xCC\x81" + "x",                    // 2-byte Extend
-      "a" + run + "\xE2\x83\x90" + "x",                // 3-byte Extend (U+20D0)
-      "x\xE0\xB5\x8E" + run + "y",                     // Prepend (U+0D4E), then plain
-      "x" + run + "\xE0\xB5\x8E" + "y" + run,          // Prepend between two runs
-      run + "\xE6\x9D" + "xy" + run,                   // stray in the run
-      run + "\r\n" + run + "\n" + run,                 // CR-LF and lone LF
-      run + " " + run + "\xEF\xBB\xBF" + run,          // space, then BOM (Control)
+  // 300 code points cycling through `cps`, so a run crosses block boundaries.
+  auto make_run = [](std::initializer_list<const char *> cps) {
+    std::string run;
+    for (int i = 0; i < 300; i++) run += *(cps.begin() + i % cps.size());
+    return run;
+  };
+  const std::string runs[] = {
+      make_run({"\xE6\x9D\xB1", "\xE4\xBA\xAC", "\xE5\xA4\xA7", "\xE9\x98\xAA",
+                "\xE9\x83\xBD", "\xE8\xB2\xA0"}), // 3-byte (CJK)
+      make_run({"\xD0\x9F", "\xD1\x80", "\xD0\xB8", "\xD0\xB2", "\xD0\xB5",
+                "\xD1\x82"}), // 2-byte (Cyrillic)
   };
   const char *const pats[] = {"\\w+",     "\\S+", "[^ ]+", ".",
                               "(\\w+) (\\w+)", "\\b\\w+", "\xE6\x9D\xB1+",
                               "x.",       ".*y",  "(?s).{2}y"};
-  for (const std::string &s : subs)
-    for (const char *pat : pats) {
-      const Regex re(pat), pike = pike_twin(pat);
-      CHECK(all_agree(re, pike, s));
-    }
+  for (const std::string &run : runs) {
+    const std::string subs[] = {
+        "a" + run + "\xCC\x81" + "x",          // 2-byte Extend (U+0301)
+        "a" + run + "\xE2\x83\x90" + "x",      // 3-byte Extend (U+20D0)
+        "x\xE0\xB5\x8E" + run + "y",           // 3-byte Prepend (U+0D4E)
+        "x\xD8\x80" + run + "y",               // 2-byte Prepend (U+0600)
+        "x" + run + "\xE0\xB5\x8E" + "y" + run, // Prepend between two runs
+        run + "\xE6\x9D" + "xy" + run,         // stray in the run
+        run + "\r\n" + run + "\n" + run,       // CR-LF and lone LF
+        run + " " + run + "\xEF\xBB\xBF" + run, // space, then BOM (Control)
+    };
+    for (const std::string &s : subs)
+      for (const char *pat : pats) {
+        const Regex re(pat), pike = pike_twin(pat);
+        CHECK(all_agree(re, pike, s));
+      }
+  }
 }
 
 // An empty string_view may carry a null data(). A scan that finds nothing in
