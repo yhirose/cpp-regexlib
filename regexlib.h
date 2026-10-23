@@ -15877,20 +15877,20 @@ public:
   // the byte family — where the plan has them (see ladder_plan). (A
   // CodePoint scan has nothing to guess: its family serves every subject.)
   // It returns that byte, for guess_held (kUnclassified if it did not look).
-  //
-  // guess_unread is the part that needs no look: a plan with a DFA family on
-  // a ladder still to classify moves onto its byte family, a guess, and says
-  // so. (find_at's first step asks it alone: Finder::next_at.)
-  // (A fused scan reads the subject as it goes, pure ASCII included: the
-  // classify puts it on the fused rung with no look at the bytes.)
+
+  // Whether a ladder may guess at all: one still to classify, on a plan that
+  // is not US and not fused. (A fused scan reads the subject as it goes,
+  // pure ASCII included: the classify puts it on the fused rung with no look
+  // at the bytes.)
   REGEXLIB_ALWAYS_INLINE bool may_guess(const Ladder &l) const {
     return !plan_->us_ && l.rung == Rung::Classify &&
            plan_->fused_ != Plan::Fused::Prefix &&
            plan_->fused_ != Plan::Fused::Suffix;
   }
-  REGEXLIB_ALWAYS_INLINE bool guess_unread(Ladder &l) const {
-    if (!may_guess(l) || plan_->find_guess_[guess_row(l)] != kFamEgcByte)
-      return false;
+  // A plan with a DFA family moves a ladder that may guess onto its byte
+  // family, a guess that needs no look at the subject, and says so.
+  REGEXLIB_ALWAYS_INLINE bool take_byte_guess(Ladder &l) const {
+    if (plan_->find_guess_[guess_row(l)] != kFamEgcByte) return false;
     // The byte family on any subject, unread: guess_held judges the guess on
     // the prefix it read. (A plan with a DFA family has no route: see
     // Plan::ascii_route_.)
@@ -15898,10 +15898,14 @@ public:
     l.set(Ladder::kSpec);
     return true;
   }
+  // (find_at's first step asks for that guess alone: Finder::next_at.)
+  REGEXLIB_ALWAYS_INLINE bool guess_unread(Ladder &l) const {
+    return may_guess(l) && take_byte_guess(l);
+  }
   REGEXLIB_ALWAYS_INLINE size_t guess_begin(std::string_view text,
                                             Ladder &l) const {
     if (!may_guess(l)) return kUnclassified;
-    if (guess_unread(l)) return kUnclassified;
+    if (take_byte_guess(l)) return kUnclassified;
     const Plan::Row row = guess_row(l);
     const Family route = plan_->ascii_route_[row],
                  guess = plan_->find_guess_[row];
