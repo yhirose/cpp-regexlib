@@ -7798,6 +7798,31 @@ void test_stray_matches_nothing() {
     }
 }
 
+// An empty string_view may carry a null data(). A scan that finds nothing in
+// it, or only an empty match, must not read through that pointer: the
+// guessing scans judge a guess on the prefix they read, and an empty match
+// reads "one past" the end of an empty subject.
+void test_null_data_subject() {
+  const char *pats[] = {"x*",     "a|b",  "\\w*",     "\\w+",
+                        "(\\d*)", "(?m)^", "$",       "\\b",
+                        "^$",     "abc",  "(?i)sherlock"};
+  const std::string_view null_view(nullptr, 0);
+  const std::string_view empty_view("");
+  for (auto unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const char *pat : pats) {
+      const Regex re = make_unit(unit, pat, 0);
+      CHECK(re.test(null_view) == re.test(empty_view));
+      CHECK(re.search(null_view).matched() == re.search(empty_view).matched());
+      CHECK(re.match(null_view).matched() == re.match(empty_view).matched());
+      CHECK(re.find_at(null_view, 0).m.matched() ==
+            re.find_at(empty_view, 0).m.matched());
+      size_t a = 0, b = 0;
+      for (auto m : re.find_iter(null_view)) (void)m, a++;
+      for (auto m : re.find_iter(empty_view)) (void)m, b++;
+      CHECK(a == b);
+    }
+}
+
 // Under IgnoreCase a class range holds a code point when ANY of its case
 // variants lies in the range. (Comparing the folds of the range's ends was no
 // such test: fold is not monotonic, so `(?i)[@-Z]` took `_` and `(?i)[Z-a]`
@@ -7989,6 +8014,7 @@ int main() {
   test_utf8_decoder_strict();
   test_invalid_utf8_tiers();
   test_stray_matches_nothing();
+  test_null_data_subject();
   test_icase_class_ranges();
   test_error_messages();
 

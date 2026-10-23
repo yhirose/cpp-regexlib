@@ -13843,7 +13843,9 @@ private:
                                                  int reach) {
     const size_t n = text.size();
     const unsigned char *p = reinterpret_cast<const unsigned char *>(text.data());
-    size_t end = static_cast<size_t>(reach);
+    // (A scan can report a reach past the text: an empty match tests the
+    // end of an empty text, and read it.)
+    size_t end = std::min(static_cast<size_t>(reach), n);
     if (end < n) end++;
     while (end < n && (p[end] & 0xC0) == 0x80) end++;
     if (end < n && p[end] == '\n' && end > 0 && p[end - 1] == '\r')
