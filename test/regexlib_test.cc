@@ -229,10 +229,24 @@ struct PlanProbe {
   //   i (?i) prefix   p literal prefix   S suffix   I interior literal
   //   W the walk   C the chain   c the assert chain   B the boolean scan
   //   P the Pike
-  //   F / f the fused prefix / suffix scans (never a start: the subject
-  //   has to be looked at first)
+  //   F / f the fused prefix / suffix scans (never a start: Classify puts a
+  //   scan on one, with no look at the subject's bytes: `classified`)
   static char start(const Regex &re, bool test) {
     return rung(re.plan_->start_[test ? 1 : 0].rung);
+  }
+  // The rung a find of `s` stands on once Classify has put it on a family,
+  // from the start of a find or of a boolean.
+  static char classified(const Regex &re, std::string_view s, bool test) {
+    Regex::Ladder l = re.plan_->start_[test ? 1 : 0];
+    size_t fna = Regex::kUnclassified;
+    Regex::Plan::IcaseScan probe;
+    return rung(re.ladder_classify(s, l, fna, probe).rung);
+  }
+  // Whether guess_begin looks at `s` (finds its first non-ASCII byte) before
+  // the first step of a find.
+  static bool guess_reads(const Regex &re, std::string_view s) {
+    Regex::Ladder l = re.plan_->start_[0];
+    return re.guess_begin(s, l) != Regex::kUnclassified;
   }
   // The rung family `fam` (a letter of kFamilies) leads a find with.
   static char family_find(const Regex &re, char fam) {
@@ -2772,6 +2786,20 @@ void test_find_guess_grapheme() {
       CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(ascii); }));
       CHECK(m.matched() && m.begin() < 64);
       CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(ascii)); }));
+    }
+  }
+  // A fused scan vets the clusters it passes, so no subject is looked at
+  // first: pure ASCII, with a CR-LF or accented too, Classify puts the scan on
+  // its fused rung, and the guess reads nothing.
+  for (const auto &[pat, rung] : std::initializer_list<
+           std::pair<const char *, char>>{{"quick \\w+", 'F'},
+                                          {"\\w+ fox", 'f'}}) {
+    const Regex re = make_egc(pat);
+    for (const char *s :
+         {"the quick brown fox", "the quick brown\r\nfox", "caf\xC3\xA9 quick fox"}) {
+      CHECK(PlanProbe::classified(re, s, false) == rung);
+      CHECK(PlanProbe::classified(re, s, true) == rung);
+      CHECK(!PlanProbe::guess_reads(re, s));
     }
   }
   // Where a DFA of the guess gives up, the guess ends (the Pike, or the

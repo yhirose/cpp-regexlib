@@ -619,7 +619,9 @@ by each guess of what it read — see below — and by `end_region_ok`), and
 order of a family's rungs is written (the rungs ahead of the families are
 not a family's: a plan that is its own locate, or text-anchored, starts
 there by `ladder_plan`, and the fused scans are where `ladder_classify`
-puts a Grapheme scan whose subject is not ASCII). Within a family:
+puts a Grapheme scan of such a plan, whatever its subject: they vet the
+clusters as they go, so no look at the subject's bytes comes first). Within a
+family:
 
 - `(?i)` prefix; then the suffix scan; then the interior literal — a
   capture-free find takes the rare-literal prefilters before the walk (they

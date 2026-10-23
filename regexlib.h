@@ -6205,7 +6205,7 @@ private:
     // subject's class.
     Classify,
     // DFA family.
-    FusedPrefix, // EGC, non-ASCII subject: literal prefix scan that vets
+    FusedPrefix, // EGC, any subject: literal prefix scan that vets
     FusedSuffix, // the clusters it passes (no upfront classification)
     IcasePrefix, // (?i) literal prefix: pair probe + anchored verify
     Prefix,      // rare literal prefix + anchored verify
@@ -15803,7 +15803,10 @@ public:
     const Plan::Row row = guess_row(l);
     const Family route = plan_->ascii_route_[row],
                  guess = plan_->find_guess_[row];
-    if (l.rung != Rung::Classify ||
+    // (A fused scan reads the subject as it goes, pure ASCII included: the
+    // classify below puts it on the fused rung with no look at the bytes.)
+    if (l.rung != Rung::Classify || plan_->fused_ == Plan::Fused::Prefix ||
+        plan_->fused_ == Plan::Fused::Suffix ||
         (route == kFamilyCount && guess == kFamilyCount))
       return kUnclassified;
     if (guess == kFamEgcByte) {
@@ -18708,12 +18711,9 @@ inline Regex::Ladder Regex::ladder_classify(std::string_view text, Ladder l,
   // the rationale). A cluster they cannot vet downgrades to the Pike from
   // the cursor.
   if (p.fused_ == Plan::Fused::Prefix || p.fused_ == Plan::Fused::Suffix) {
-    if (fna == kUnclassified) fna = first_nonascii(text);
-    if (fna < text.size()) {
-      l.rung = l.below = p.fused_ == Plan::Fused::Prefix ? Rung::FusedPrefix
-                                                         : Rung::FusedSuffix;
-      return l;
-    }
+    l.rung = l.below = p.fused_ == Plan::Fused::Prefix ? Rung::FusedPrefix
+                                                       : Rung::FusedSuffix;
+    return l;
   }
   // [Tier: Dfa/EgcByte] fused-collapse rung (see egc_fused_collapse_ok):
   // the suffix scan itself verifies eligibility (clusters AND lone CR/LF),
