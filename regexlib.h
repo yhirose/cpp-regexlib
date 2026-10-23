@@ -639,6 +639,20 @@ inline GraphemeBreak get_value(char32_t cp) {
 }
 }  // namespace _grapheme_break_properties
 
+// U+0800..U+FFFF 64-code-point blocks with no grapheme break property
+// (GraphemeBreakProperty.txt); backs the cluster walk's plain_cp_at.
+// Bit b = block b = cp >> 6.
+static const uint64_t _grapheme_plain_blocks[16] = {
+ 0x0000000000000000ULL,0xFF7600EA0FFFDF08ULL,
+ 0xFF57FFFFFFFFFFF4ULL,0xFFFFFFFFFFFFFFFAULL,
+ 0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,
+ 0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,
+ 0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,
+ 0x00007002F1FFFFFFULL,0x0000000000000000ULL,
+ 0x0000000000000000ULL,0x0000000000000000ULL,
+ 0xFFFFFFFFFFFFFFFFULL,0x36FFEFFFFFFFFFFFULL,
+};
+
 enum class Emoji {
   Unassigned,
   Emoji,
@@ -13542,6 +13556,19 @@ private:
     return true;
   }
 
+  // Whether the code point at `off` is a well-formed 3-byte one in a plain
+  // block (_grapheme_plain_blocks): its first two bytes name the block (cp >>
+  // 6), so no decode and no property lookup. Surrogates and overlong forms
+  // are not in a plain block (the table leaves them out).
+  static bool plain_cp_at(const unsigned char *p, size_t n, size_t off) {
+    if (n - off < 3) return false;
+    const unsigned char l = p[off], m = p[off + 1], c = p[off + 2];
+    if ((l & 0xF0) != 0xE0 || (m & 0xC0) != 0x80 || (c & 0xC0) != 0x80)
+      return false;
+    const size_t b = (static_cast<size_t>(l & 0x0F) << 6) | (m & 0x3F);
+    return (unicode::_grapheme_plain_blocks[b >> 6] >> (b & 63)) & 1;
+  }
+
   // Walk the non-ASCII cluster neighborhood starting at `off` (a non-ASCII
   // byte that starts an element: a lead byte, or a stray), rejecting any
   // non-CR-LF multi-code-point cluster. Returns the resume offset (the next
@@ -13564,13 +13591,25 @@ private:
                 : GB::Unassigned;
     size_t lp_at = off - (have_prev ? 1 : 0); // where lp's code point starts
     while (off < n) {
-      char32_t cp; // (a stray: see fused_from)
       const size_t at = off;
-      off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
-      GB rp = unicode::_grapheme_break_properties::get_value(cp);
-      if (have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF)) {
-        fused = lp_at;
-        return SIZE_MAX;
+      GB rp = GB::Unassigned;
+      // (GB::Unassigned is the no-property default: Other, GB999. Other fuses
+      // with nothing but a Prepend before it, so a plain code point after an
+      // Other one takes no look.) The check runs before the decode, which is
+      // what makes CJK runs cheap. Its price is paid by every other script's
+      // code point: a 2-byte letter (Cyrillic, Greek) fails it and then
+      // decodes, +8% instructions per byte on Cyrillic against HEAD (no-match
+      // search, 64 KiB). Tuned for CJK first, deliberately.
+      if (lp == GB::Unassigned && plain_cp_at(p, n, off)) {
+        off += 3;
+      } else {
+        char32_t cp; // (a stray: see fused_from)
+        off += unicode::utf8::decode_or_byte(d + off, n - off, cp);
+        rp = unicode::_grapheme_break_properties::get_value(cp);
+        if (have_prev && gb_fuses(lp, rp) && !(lp == GB::CR && rp == GB::LF)) {
+          fused = lp_at;
+          return SIZE_MAX;
+        }
       }
       lp = rp;
       lp_at = at;

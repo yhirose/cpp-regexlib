@@ -379,6 +379,31 @@ def emit_white_space(out, ranges):
     )
 
 
+def plain_blocks(gcb_vals, defval="Unassigned"):
+    """Block numbers b (b = cp >> 6) of U+0800..U+FFFF whose 64 code points
+    have no grapheme break property, i.e. all Other (UAX #29): no two of them
+    fuse (GB999). Surrogates are excluded (no valid UTF-8 encodes them)."""
+    bits = []
+    for b in range(0x800 >> 6, 0x10000 >> 6):
+        if 0xD800 <= b << 6 <= 0xDFFF:
+            continue
+        if all(gcb_vals[c] == defval for c in range(b << 6, (b << 6) + 64)):
+            bits.append(b)
+    return bits
+
+
+def emit_plain_blocks(out, bits):
+    words = [0] * 16
+    for b in bits:
+        words[b >> 6] |= 1 << (b & 63)
+    out.write("// U+0800..U+FFFF 64-code-point blocks with no grapheme break property\n")
+    out.write("// (GraphemeBreakProperty.txt); backs the cluster walk's plain_cp_at.\n")
+    out.write("// Bit b = block b = cp >> 6.\n")
+    out.write("static const uint64_t _grapheme_plain_blocks[16] = {\n")
+    _wrap(out, ["0x%016XULL," % w for w in words], 2)
+    out.write("};\n")
+
+
 def emit_incb(out, ranges):
     emit_enum(out, "Incb", ["None", "Consonant", "Extend", "Linker"])
     out.write("// Indic_Conjunct_Break (DerivedCoreProperties.txt); backs grapheme GB9c.\n")
@@ -456,6 +481,8 @@ def build_block(ucd):
     emit_page_table(out, "_grapheme_break_properties", "GraphemeBreak",
                     gcb_order, "Unassigned", gcb_vals, stray="Control")
     out.write("\n")
+    emit_plain_blocks(out, plain_blocks(gcb_vals))
+    out.write("\n")
 
     # --- Emoji (Extended_Pictographic etc., for GB11) ---
     emo_order, emo_vals = parse_enum_prop(ucd, "emoji/emoji-data.txt")
@@ -509,6 +536,11 @@ def cmd_verify(ucd):
     gcb_order, gcb_vals = parse_enum_prop(ucd, "auxiliary/GraphemeBreakProperty.txt")
     assert gcb_vals[0x0D] == "LF" or gcb_vals[0x0A] == "LF"
     assert "ZWJ" in gcb_order and "Extend" in gcb_order
+    # CJK ideographs and kana are plain blocks; a block holding a combining mark is not.
+    plain = plain_blocks(gcb_vals)
+    assert (0x4E00 >> 6) in plain and (0x3042 >> 6) in plain
+    assert (0x3099 >> 6) not in plain  # a kana voiced mark (Extend)
+    assert (0x20D0 >> 6) not in plain  # a combining mark (Extend)
     emo_order, _ = parse_enum_prop(ucd, "emoji/emoji-data.txt")
     assert "Extended_Pictographic" in emo_order
     incb = parse_incb(ucd)

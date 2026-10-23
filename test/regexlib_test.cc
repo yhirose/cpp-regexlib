@@ -624,16 +624,12 @@ using reg::Multiline;
 using reg::Regex;
 using reg::RegexError;
 
-// Construct a Regex in CodePoint (UnicodeScalar) match-unit mode. The mode is a
-// process-wide default (set_default_match_unit), frozen into the Regex at
-// construction, so flip it, build, and restore Grapheme.
+// Construct a Regex in match unit `u`, pinned at construction (no reliance on
+// the process-wide default, which must not be flipped here: a throw from an
+// invalid pattern, as code_of builds on purpose, would leak it).
 inline Regex make_unit(reg::MatchUnit u, const std::string &pat,
                        unsigned flags = 0) {
-  reg::MatchUnit prev = reg::default_match_unit();
-  reg::set_default_match_unit(u);
-  Regex r(pat, flags);
-  reg::set_default_match_unit(prev);
-  return r;
+  return Regex(pat, flags, u);
 }
 inline Regex make_us(const std::string &pat, unsigned flags = 0) {
   return make_unit(reg::MatchUnit::CodePoint, pat, flags);
@@ -7862,6 +7858,36 @@ void test_stray_matches_nothing() {
     }
 }
 
+// The cluster walk steps over a plain 3-byte code point (a block of Other
+// code points) by its lead and middle bytes alone. The step must hold where a
+// neighbor fuses with it: a Prepend before a run of plain code points (it
+// fuses with the first), a mark after one (Extend, 2- and 3-byte), a stray
+// cut in the middle of a plain run, CR-LF, ASCII, and runs that cross 64-code-
+// point blocks. Every find surface agrees with the Pike on each.
+void test_plain_cluster_run() {
+  std::string run; // 300 plain code points, crossing block boundaries
+  const char *const cps[] = {"\xE6\x9D\xB1", "\xE4\xBA\xAC", "\xE5\xA4\xA7",
+                             "\xE9\x98\xAA", "\xE9\x83\xBD", "\xE8\xB2\xA0"};
+  for (int i = 0; i < 300; i++) run += cps[i % 6];
+  const std::string subs[] = {
+      "a" + run + "\xCC\x81" + "x",                    // 2-byte Extend
+      "a" + run + "\xE2\x83\x90" + "x",                // 3-byte Extend (U+20D0)
+      "x\xE0\xB5\x8E" + run + "y",                     // Prepend (U+0D4E), then plain
+      "x" + run + "\xE0\xB5\x8E" + "y" + run,          // Prepend between two runs
+      run + "\xE6\x9D" + "xy" + run,                   // stray in the run
+      run + "\r\n" + run + "\n" + run,                 // CR-LF and lone LF
+      run + " " + run + "\xEF\xBB\xBF" + run,          // space, then BOM (Control)
+  };
+  const char *const pats[] = {"\\w+",     "\\S+", "[^ ]+", ".",
+                              "(\\w+) (\\w+)", "\\b\\w+", "\xE6\x9D\xB1+",
+                              "x.",       ".*y",  "(?s).{2}y"};
+  for (const std::string &s : subs)
+    for (const char *pat : pats) {
+      const Regex re(pat), pike = pike_twin(pat);
+      CHECK(all_agree(re, pike, s));
+    }
+}
+
 // An empty string_view may carry a null data(). A scan that finds nothing in
 // it, or only an empty match, must not read through that pointer: the
 // guessing scans judge a guess on the prefix they read, and an empty match
@@ -8080,6 +8106,7 @@ int main() {
   test_invalid_utf8_tiers();
   test_stray_matches_nothing();
   test_null_data_subject();
+  test_plain_cluster_run();
   test_icase_class_ranges();
   test_error_messages();
 
