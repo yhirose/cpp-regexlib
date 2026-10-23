@@ -1114,7 +1114,13 @@ The limits, over subjects made of a few sentences repeated: Devanagari
 9–10%, Thai `\s+` 8% (the Pike reads nearly all of it, and the cut texts'
 bookkeeping is on top: the budget weighs the family's DFA, not that); and a
 plan a literal leads (`nine\d`, `[q]zx`) steps on its literal rungs, which
-do not classify the subject, so it never cuts.
+do not classify the subject, so it never cuts. `(?i)Sherlock` over the
+Sherlock text with a heart at its end finds all at 0.32 times the rate
+without the heart, for a reason that is not the cluster: the `(?i)`
+prefix probes' guard (`icase_leads_absent`) looks for the lead bytes of
+the fold pre-images (`0xE2` of U+212A KELVIN SIGN, `0xC5` of U+017F LONG
+S), so any `0xE2` (a heart, a curly quote, a dash) turns the pair probe
+off; one curly quote does the same without the cluster.
 
 ### Linearity (the O(n²) trap)
 
@@ -1852,7 +1858,7 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   inside a cluster, so the prefilter instead works in raw UTF-8: a `memchr2` over
   **two rare case-folded probe bytes** — one drawn from an *unclean* fold orbit,
   one from a *clean* (single-byte) orbit — each pruned/guarded so a multi-byte fold
-  pre-image (Kelvin `K`, long-s `ſ`, whose leading byte is `0xE2`) is never skipped,
+  pre-image (Kelvin `K`, lead byte `0xE2`; long-s `ſ`, lead byte `0xC5`) is never skipped,
   then a bounded anchored verify over the located window. Candidate starts are
   pre-pruned by the byte first-byte set (`byte_first_bytes_.set`); the orbits come from
   `case_fold_groups()`. Lifted non-ASCII `(?i)Sherlock` ~1035 → ~6316 MB/s
