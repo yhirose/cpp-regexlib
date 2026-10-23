@@ -13150,14 +13150,23 @@ private:
     // `make(s)` leaves the pcs of the state it leads to in out_ and returns
     // its tag — settled and noted. kQuit when the DFA has given up (and from
     // kQuit: a path of steps that gave up part-way along stays given up).
-    template <class Make> uint32_t step(uint32_t s, uint32_t col, Make make) {
+    // The hit is inline and the miss out of line. A look scan makes several
+    // steps per code point, nearly all of them hits after warm-up; with the
+    // hit out of line, Japanese `\b[xz]\w+\b` measured about 20% more
+    // instructions per byte (no-match test, -O3).
+    template <class Make>
+    REGEXLIB_ALWAYS_INLINE uint32_t step(uint32_t s, uint32_t col, Make make) {
       if (s == kQuit) return kQuit;
-      uint32_t nxt = tr[s + col];
+      const uint32_t nxt = tr[s + col];
       if (nxt != kUnknown) return nxt;
+      return miss(s, col, make);
+    }
+    template <class Make>
+    REGEXLIB_NOINLINE uint32_t miss(uint32_t s, uint32_t col, Make make) {
       if (quit) return kQuit;
       const uint8_t tag = make(s);
       bool kept;
-      nxt = settle(tag, kept);
+      uint32_t nxt = settle(tag, kept);
       if (kept && nxt != kQuit) tr[s + col] = nxt;
       return nxt;
     }
