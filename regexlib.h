@@ -13815,8 +13815,8 @@ private:
   // `lo`: a guess that began at a scan position (find_at) is judged on R
   // from `lo` on, the position itself: a cluster boundary, so what the
   // family reads from there is the unit's whatever stands before it (no
-  // byte family reads left of its cursor). `fna` is the subject's, so it
-  // serves lo == 0 only; `unsound` is a position in `text`.
+  // byte family reads left of its cursor). It takes neither `fna` (the
+  // subject's) nor `unsound` (R's, a position in `text`).
   REGEXLIB_ALWAYS_INLINE bool guess_held(Family f, std::string_view text,
                                          int reach, size_t fna = kUnclassified,
                                          size_t *unsound = nullptr,
@@ -13824,18 +13824,13 @@ private:
     if (!family_has<kTraitGrapheme>(f)) return true;
     // (Not substr: guess_end is within `text`, and GCC calls substr here.)
     const std::string_view r(text.data() + lo, guess_end(text, reach) - lo);
-    const size_t i = fna != kUnclassified && lo == 0
-                         ? std::min(fna, r.size())
-                         : first_nonascii(r);
+    const size_t i =
+        fna != kUnclassified ? std::min(fna, r.size()) : first_nonascii(r);
     size_t u = kUnclassified; // (a byte family's: the plan has one)
     if (family_sound(f, r, i, unsound ? &u : nullptr)) return true;
     if (unsound)
-      *unsound = u != kUnclassified &&
-                         prefix_settles(u, r,
-                                        std::string_view(text.data() + lo,
-                                                         text.size() - lo))
-                     ? lo + u
-                     : kUnclassified;
+      *unsound =
+          u != kUnclassified && prefix_settles(u, r, text) ? u : kUnclassified;
     return false;
   }
   // Whether where a family stops serving a prefix `r` of `text`, `u`, is
@@ -15886,11 +15881,15 @@ public:
   // guess_unread is the part that needs no look: a plan with a DFA family on
   // a ladder still to classify moves onto its byte family, a guess, and says
   // so. (find_at's first step asks it alone: Finder::next_at.)
+  // (A fused scan reads the subject as it goes, pure ASCII included: the
+  // classify puts it on the fused rung with no look at the bytes.)
+  REGEXLIB_ALWAYS_INLINE bool may_guess(const Ladder &l) const {
+    return !plan_->us_ && l.rung == Rung::Classify &&
+           plan_->fused_ != Plan::Fused::Prefix &&
+           plan_->fused_ != Plan::Fused::Suffix;
+  }
   REGEXLIB_ALWAYS_INLINE bool guess_unread(Ladder &l) const {
-    if (plan_->us_ || l.rung != Rung::Classify ||
-        plan_->fused_ == Plan::Fused::Prefix ||
-        plan_->fused_ == Plan::Fused::Suffix ||
-        plan_->find_guess_[guess_row(l)] != kFamEgcByte)
+    if (!may_guess(l) || plan_->find_guess_[guess_row(l)] != kFamEgcByte)
       return false;
     // The byte family on any subject, unread: guess_held judges the guess on
     // the prefix it read. (A plan with a DFA family has no route: see
@@ -15901,17 +15900,12 @@ public:
   }
   REGEXLIB_ALWAYS_INLINE size_t guess_begin(std::string_view text,
                                             Ladder &l) const {
-    if (plan_->us_) return kUnclassified;
+    if (!may_guess(l)) return kUnclassified;
     if (guess_unread(l)) return kUnclassified;
     const Plan::Row row = guess_row(l);
     const Family route = plan_->ascii_route_[row],
                  guess = plan_->find_guess_[row];
-    // (A fused scan reads the subject as it goes, pure ASCII included: the
-    // classify below puts it on the fused rung with no look at the bytes.)
-    if (l.rung != Rung::Classify || plan_->fused_ == Plan::Fused::Prefix ||
-        plan_->fused_ == Plan::Fused::Suffix ||
-        (route == kFamilyCount && guess == kFamilyCount))
-      return kUnclassified;
+    if (route == kFamilyCount && guess == kFamilyCount) return kUnclassified;
     const size_t fna = first_nonascii(text);
     const bool ascii = fna == text.size();
     const Family f = ascii ? route : guess;
