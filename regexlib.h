@@ -7366,6 +7366,8 @@ private:
           analyze_crlf_byte_safe(root); // EGC CRLF gate (US has no graphemes)
         analyze_assert_literal(root); // fixed matched-text literal -> prefilter
         analyze_assert_suffix(root);  // required trailing literal -> prefilter
+        analyze_head_run(root);       // `\b [class] \w{m,n} \b` -> code-point walk
+        assert_.word_walk = assert_.word_suffix || assert_.head_run;
         analyze_assert_prefix(root);  // required leading literal -> prefilter
         plan_assert_anchor();         // ... and which of the two drives
       }
@@ -8295,15 +8297,12 @@ private:
       // predicate (no ranges/uprops, not negated), so the walked run is exactly
       // what `\w` matches — the word-scan reproduces the regex semantics.
       if (assert_.suffix_wb && lo == 2 && last + 2 == nk &&
-          root.kids[0].kind == K::WordBoundary && root.kids[1].kind == K::Repeat &&
-          root.kids[1].kids[0].kind == K::Class) {
-        const CharClass &c = root.kids[1].kids[0].cls;
+          root.kids[0].kind == K::WordBoundary &&
+          exact_word_repeat(root.kids[1])) {
         bool all_word = true;
         for (unsigned char b : assert_.suffix)
           if (!is_word_byte(b)) all_word = false;
-        if (!c.negate && c.ranges.empty() && c.uprops.empty() &&
-            c.preds.size() == 1 && c.preds[0] == CharClass::Pred::Word &&
-            all_word) {
+        if (all_word) {
           assert_.word_suffix = true;
           assert_.ws_rmin = root.kids[1].rmin;
           assert_.ws_rmax = root.kids[1].rmax;
@@ -8348,6 +8347,42 @@ private:
         prefix_.icase = true;
       }
       set_probes(prefix_.text, prefix_.probe, prefix_.probe2);
+    }
+
+    // The head-run shape `\b [class] \w{rmin,rmax} \b` (AssertPrefilter::
+    // head_run): the class's members are all ASCII word bytes, and the body is
+    // the exact `\w` repeat. A literal head is not taken: its leading literal
+    // already has a prefilter (analyze_assert_prefix), which measured faster.
+    // The leading `\b` means the code point before the head is not a word
+    // character (the head is a word byte); the trailing one is the run's end.
+    void analyze_head_run(const detail::Node &root) {
+      using K = detail::Node::Kind;
+      assert_.head_run = false;
+      assert_.head_bytes = {};
+      if (icase_ || ncap_ != 0 || root.kind != K::Concat) return;
+      if (root.kids.size() != 4 || root.kids[0].kind != K::WordBoundary ||
+          root.kids[1].kind != K::Class || !exact_word_repeat(root.kids[2]) ||
+          root.kids[3].kind != K::WordBoundary)
+        return;
+      const CharClass &hc = root.kids[1].cls;
+      if (!hc.preds.empty() || !node_head_word_only(root.kids[1])) return;
+      for (const auto &rg : hc.ranges)
+        for (char32_t b = rg.first; b <= rg.second; b++)
+          detail::nibble_set_add(assert_.head_bytes,
+                                 static_cast<unsigned char>(b));
+      assert_.head_run = true;
+      assert_.ws_rmin = root.kids[2].rmin;
+      assert_.ws_rmax = root.kids[2].rmax;
+    }
+    // A Repeat of exactly the `\w` class (the Word predicate and nothing else):
+    // the code-point word walks reproduce its run.
+    static bool exact_word_repeat(const detail::Node &n) {
+      using K = detail::Node::Kind;
+      if (n.kind != K::Repeat || n.kids.empty() || n.kids[0].kind != K::Class)
+        return false;
+      const CharClass &c = n.kids[0].cls;
+      return !c.negate && c.ranges.empty() && c.uprops.empty() &&
+             c.preds.size() == 1 && c.preds[0] == CharClass::Pred::Word;
     }
 
     // Generalization of the literal prefix to a leading first-byte set. When
@@ -10733,7 +10768,17 @@ private:
       // point word-boundary walk (no DFA reverse/forward) — the assert_word_find
       // fast path, which beats a per-candidate DFA verify when the suffix is common.
       bool word_suffix = false;
-      int ws_rmin = 0, ws_rmax = -1; // the \w{rmin,rmax} bounds
+      // Exactly `\b [class] \w{rmin,rmax} \b`, the class's members all ASCII word
+      // bytes (head_bytes, their set). Every match is a whole word that starts
+      // with one of them: found by a code-point walk over the word after it, no
+      // DFA (assert_head_run_find). Walks on the byte family, and on the ASCII
+      // one when wop_ is not built (head_run_walks).
+      bool head_run = false;
+      detail::NibbleSet head_bytes{};
+      // The \w{rmin,rmax} bounds of the word walk (word_suffix or head_run: the
+      // two shapes differ in their head, so never both).
+      int ws_rmin = 0, ws_rmax = -1;
+      bool word_walk = false; // word_suffix or head_run: the code-point walks
     };
     AssertPrefilter assert_;
 
@@ -10874,24 +10919,30 @@ private:
     bool word_scan_sparse() const {
       return wop_.ok && !wop_after_anchor_ && !anchor_.scan_dense();
     }
+    // Whether a find on the assert family (`byte`: the byte one) takes the
+    // head-run walk (assert_head_run_find). An ASCII subject keeps the word
+    // one-pass when it is built: that tier is the faster one there.
+    bool head_run_walks(bool byte) const {
+      return assert_.head_run && (byte || !wop_.ok);
+    }
     // Whether a boolean on the assert family (`byte`: the byte one) takes
     // the assert find (Ladder::kBoolFind): when a literal anchor leads it
     // and what follows a hit is bounded by the match up to that literal —
     // the whole match as one fixed text, a trailing literal (the verify runs
-    // backwards from it), the word-suffix scan. A LEADING literal is not
+    // backwards from it), the word-suffix scan, the head-run walk (it ends
+    // where the word does, on either family). A LEADING literal is not
     // such an anchor: its verify walks forward to the leftmost-first end,
     // which can be the end of the line, where the boolean scan stops at the
     // first accept — and skips to that literal itself (LazyDfa::kSkipAssert).
-    // The word scan is
-    // bounded too — a walk ends where the word does — and where it is sparse
-    // it reads sixteen positions at a time, where the boolean scan steps
-    // every byte. ASCII only: the walk
-    // has no byte form. (And the ASCII family has a find at all only with
+    // The word scan is bounded too — a walk ends where the word does — and
+    // where it is sparse it reads sixteen positions at a time, where the
+    // boolean scan steps every byte. ASCII only: the word one-pass has no
+    // byte form. (And the ASCII family has a find at all only with
     // assert_ascii_tier.)
     bool assert_bool_finds(bool byte) const {
       if (!byte && !assert_ascii_tier()) return false;
-      const bool bounded = !assert_.lit.empty() || assert_.word_suffix ||
-                           !assert_.suffix.empty();
+      const bool bounded = !assert_.lit.empty() || !assert_.suffix.empty() ||
+                           assert_.word_suffix || head_run_walks(byte);
       return bounded || (!byte && word_scan_sparse());
     }
 
@@ -12419,6 +12470,51 @@ private:
     }
     return false;
   }
+  // The head-run walk (AssertPrefilter::head_run) for `\b [class] \w{rmin,rmax}
+  // \b`: a candidate is a head byte whose previous code point is not a word
+  // character (or the text start). Walk the run of word code points after it,
+  // counting them: L. The run's end is a word boundary (the next code point is
+  // not a word character, or the text ends), so the trailing `\b` holds exactly
+  // when L is in [rmin, rmax]; a longer run puts the end inside the word, and a
+  // shorter one leaves the `\w` repeat no room to match. The first candidate
+  // that matches is the leftmost, and greedy. A failed candidate skips its
+  // whole run: every byte in it has a word character before it.
+  REGEXLIB_NOINLINE bool assert_head_run_find(std::string_view text, int from,
+                                              int &s_out, int &e_out) const {
+    const auto &a = plan_->assert_;
+    const unsigned char *p =
+        reinterpret_cast<const unsigned char *>(text.data());
+    const int n = static_cast<int>(text.size());
+    for (int cand = from; cand < n; cand++) {
+      // (A byte >= 0x80 is no head byte; testing it first leaves Japanese
+      // text, where most bytes are, at one compare.)
+      if (p[cand] >= 0x80 || !detail::nibble_set_has(a.head_bytes.data(), p[cand]))
+        continue;
+      if (cand > 0 && detail::word_cp(cp_before(text, cand).cp)) continue;
+      int q = cand + 1, len = 0;
+      while (q < n) {
+        if (p[q] < 0x80) { // ASCII word bytes, a block at a time
+          const int r = static_cast<int>(run_scan(
+              p, static_cast<size_t>(n), static_cast<size_t>(q),
+              detail::kAsciiWordNibbles.data()));
+          len += r - q;
+          q = r;
+          if (q >= n || p[q] < 0x80) break;
+        }
+        const Decoded d = cp_at(text, q);
+        if (!detail::word_cp(d.cp)) break;
+        q += d.len;
+        len++;
+      }
+      if (len >= a.ws_rmin && (a.ws_rmax < 0 || len <= a.ws_rmax)) {
+        s_out = cand;
+        e_out = q;
+        return true;
+      }
+      cand = q - 1; // (the loop's ++ resumes at the run's end)
+    }
+    return false;
+  }
   // Whether a family's step can go on from byte `at` (a cluster boundary)
   // of `text` as from a match's end, no match starting before it
   // (Finder::pike_more): every reader can but the word scan, which a
@@ -12517,7 +12613,13 @@ private:
     const auto none = [](int r) { return r == LazyDfa::kCap ? r : 0; };
     if (!plan_->assert_.lit.empty())
       return assert_lit_find(fc, text, from, s, e, byte);
-    if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
+    // One flag gates both code-point word walks, so a pattern with neither
+    // tests that one flag per find.
+    if (plan_->assert_.word_walk) {
+      if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
+      if (plan_->head_run_walks(byte))
+        return assert_head_run_find(text, from, s, e);
+    }
     // [Tier: WordOnePass] one walk per candidate replaces the forward scan +
     // per-match reverse start recovery (ASCII subjects: the walk has no byte
     // form). It looks at every byte, so a literal anchor the plan priced

@@ -96,6 +96,8 @@ struct PlanProbe {
   static bool crlf_byte_safe(const Regex &re) {
     return re.plan_->crlf_byte_safe_;
   }
+  // Whether the plan admits the head-run shape `\b H \w{m,n} \b`.
+  static bool head_run(const Regex &re) { return re.plan_->assert_.head_run; }
   static bool word_scan_after_anchor(const Regex &re) {
     return re.plan_->wop_.ok && re.plan_->wop_after_anchor_;
   }
@@ -7899,6 +7901,51 @@ void test_plain_cluster_run() {
   }
 }
 
+// The head-run walk (`\b [class] \w{rmin,rmax} \b`, an ASCII word class) is a
+// code-point walk with no DFA: it must agree with the Pike on every find
+// surface, in both units. Its gate must keep it off the subjects with
+// combining marks, strays, CR-LF, kana and kanji; its walk must count right at
+// the text edges, for runs longer than the bounds, and for candidates inside a
+// run (which a failed walk skips).
+void test_head_run_walk() {
+  // The shape is admitted for these, and not for the ones next to them.
+  for (const char *pat : {"\\b[xz]\\w+\\b", "\\b[xz]\\w{2,4}\\b",
+                          "\\b[a-c]\\w{0,3}\\b", "\\b[xz]\\w{3}\\b"})
+    CHECK(PlanProbe::head_run(Regex(pat)));
+  // A literal head keeps its prefilter; the rest keep the other routes.
+  for (const char *pat : {"\\bfoo\\w+\\b", "\\bf\\w*\\b", "\\b[^xz]\\w+\\b",
+                          "\\b[x.]\\w+\\b", "\\b\\w+\\b", "(?i)\\b[xz]\\w+\\b",
+                          "\\b([xz])\\w+\\b", "\\b[\xC3\xA9]\\w+\\b",
+                          "\\b[xz]\\W+\\b", "x\\w+\\b", "\\b[xz]\\w+"})
+    CHECK(!PlanProbe::head_run(Regex(pat)));
+
+  // The first four are head-run shapes; the literal-led ones check the route
+  // a literal head is left to.
+  const char *const pats[] = {"\\b[xz]\\w+\\b", "\\b[xz]\\w{2,4}\\b",
+                              "\\b[xz]\\w{0,3}\\b", "\\b[xz]\\w{3}\\b",
+                              "\\bfoo\\w+\\b",   "\\bfoo\\w{1,2}\\b",
+                              "\\bf\\w*\\b",     "\\b[x.]\\w+\\b"};
+  const std::string long_run = "x" + std::string(20000, 'y');
+  const std::string subs[] = {
+      "xab x\xE7\x8C\xAB zz",   "\xE7\x8C\xAB" "xab \xE7\x8C\xAB" "x",
+      "a xe\xCC\x81 x\xCC\x81y xyz", // a mark after a candidate's run
+      "x\xCC\x81yz x",          "xyz\xCC\x81 xy",
+      "x",                      "xx xy",
+      "xzxzxz xzxz xyyyyzzzzz", // candidates inside failed runs
+      "foo food foobar fo",     "afoo foo_bar foo\xE7\x8C\xAB",
+      "foo\xCC\x81 foo",        "\xE3\x81\x82xyz",
+      "x\r\nxyz\r\n",           "\xFFxyz x\xFFz",
+      "x\xE0\xB5\x8E" "x",      "a_x_b",
+      " \xE3\x80\x81xy",        "xyzw xyzwxyzwxy",
+      long_run + " x" + std::string(3, 'z'), std::string(30, 'x'),
+  };
+  for (reg::MatchUnit unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
+    for (const char *pat : pats) {
+      const Regex re = make_unit(unit, pat), pike = pike_twin(pat, 0, unit);
+      for (const std::string &s : subs) CHECK(all_agree(re, pike, s));
+    }
+}
+
 // An empty string_view may carry a null data(). A scan that finds nothing in
 // it, or only an empty match, must not read through that pointer: the
 // guessing scans judge a guess on the prefix they read, and an empty match
@@ -8118,6 +8165,7 @@ int main() {
   test_stray_matches_nothing();
   test_null_data_subject();
   test_plain_cluster_run();
+  test_head_run_walk();
   test_icase_class_ranges();
   test_error_messages();
 
