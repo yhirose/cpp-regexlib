@@ -1125,13 +1125,14 @@ The limits, over subjects made of a few sentences repeated: Devanagari
 9–10%, Thai `\s+` 8% (the Pike reads nearly all of it, and the cut texts'
 bookkeeping is on top: the budget weighs the family's DFA, not that); and a
 plan a literal leads (`nine\d`, `[q]zx`) steps on its literal rungs, which
-do not classify the subject, so it never cuts. `(?i)Sherlock` over the
-Sherlock text with a heart at its end finds all at 0.32 times the rate
+do not classify the subject, so it never cuts. (`(?i)Sherlock` over the
+Sherlock text with a heart at its end once found all at 0.32 times the rate
 without the heart, for a reason that is not the cluster: the `(?i)`
 prefix probes' guard (`icase_leads_absent`) looks for the lead bytes of
 the fold pre-images (`0xE2` of U+212A KELVIN SIGN, `0xC5` of U+017F LONG
-S), so any `0xE2` (a heart, a curly quote, a dash) turns the pair probe
-off; one curly quote does the same without the cluster.
+S), so any `0xE2` (a heart, a curly quote, a dash) turned the pair probe
+off. A prefix with a guarded probe has a clean pair now, which needs no
+guard: see §7.)
 
 ### Linearity (the O(n²) trap)
 
@@ -1885,6 +1886,23 @@ literal find on a pure-ASCII subject would pay the gates, not the find.
   their exact prefix distance. Byte distances being fixed, a hit pins the
   single candidate start — no window walk. Stops on the CRLF Sherlock corpus
   3681 → 771; `(?i)Sherlock` ~6.3 → ~8.6 GB/s, `(?i)Holmes` ~2.7 → ~9.0.
+  - *The guard read the subject.* `icase_leads_absent` is a `memchr` over the
+    whole subject for each lead byte, 0.44 instructions a byte each, before
+    the first byte is searched; and a lead byte that is no fold pre-image of
+    the prefix at all (`0xE2` of a heart, a curly quote, a dash) turned the
+    pair probe off. Where a probe is guarded, the plan now has a *clean pair*
+    (`IcasePrefix::clean_pair`): the two chars with the rarest product of
+    commonness, both with no multi-byte fold pre-image and with only such
+    chars between them (at most 48 apart). Each is one byte on any UTF-8
+    subject and the distance is fixed, so the scan is sound with no look at
+    the subject (`icase_choose_probe` does not read it). The chars before the
+    pair may be wider (`s` is U+017F, two bytes), so a hit has a window of
+    candidate starts, `[hp − maxlead, hp − j1]`, as a single probe's: the
+    first hit at or past the leftmost start `s*` plus `j1` holds `s*`, and
+    the hits before it have windows that end before `s*`. `(?i)Sherlock` over
+    512 KiB, `find_all`, instructions: ASCII 795k → 570k, with a heart
+    1.94M → 668k, with curly quotes 2.08M → 1.29M. A short ASCII `search`
+    takes 70–170 instructions more.
 - **Teddy — SIMD multi-literal.** A literal alternation (`fox|dog|cat`) has no
   single prefix and a first-byte skip stops at every `f`/`d`/`c`. Teddy (the
   Hyperscan / Rust aho-corasick "slim" design; `Regex::Teddy`) looks for the

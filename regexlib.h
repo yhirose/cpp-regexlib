@@ -9407,6 +9407,7 @@ private:
       // needed".
       icase_prefix_.fast_pair = false;
       icase_prefix_.pair_leads.clear();
+      icase_prefix_.clean_pair = false;
       // Pair partner: the rarest char at any OTHER index. Taken only when
       // the fast char is common enough that its stops dominate (each stop
       // also pays the candidate-window walk; a case-sensitive literal
@@ -9443,6 +9444,37 @@ private:
             icase_prefix_.fast_pair = true;
             icase_prefix_.pair_leads = std::move(leads);
           }
+        }
+      }
+      // Where a probe above is guarded, the pair that needs no guard: of the
+      // pairs of clean chars with only clean chars between them (at most 48
+      // apart, as pair_probe's), the one whose chars are together the rarest.
+      if (!icase_prefix_.fast_leads.empty() ||
+          !icase_prefix_.pair_leads.empty()) {
+        const size_t n = prefix_.text.size();
+        int best = std::numeric_limits<int>::max(), ba = -1, bb = -1;
+        for (size_t a = 0; a < n; a++) {
+          const auto ca = static_cast<unsigned char>(prefix_.text[a]);
+          if (icase_fold_maxlen(ca) != 1) continue;
+          for (size_t b = a + 1; b < n && b - a <= 48; b++) {
+            const auto cb = static_cast<unsigned char>(prefix_.text[b]);
+            if (icase_fold_maxlen(cb) != 1) break; // not clean between
+            const int cost = byte_commonness(ca) * byte_commonness(cb);
+            if (cost < best) {
+              best = cost;
+              ba = static_cast<int>(a);
+              bb = static_cast<int>(b);
+            }
+          }
+        }
+        if (ba >= 0) {
+          icase_prefix_.clean_pair = true;
+          icase_prefix_.clean1 = {
+              static_cast<unsigned char>(prefix_.text[ba]), ba,
+              icase_prefix_maxlead(ba)};
+          icase_prefix_.clean2 = {
+              static_cast<unsigned char>(prefix_.text[bb]), bb,
+              icase_prefix_maxlead(bb)};
         }
       }
     }
@@ -10745,6 +10777,15 @@ private:
       // the subject, i.e. the subject holds no pre-image lead byte of ANY
       // prefix char (pair_leads guard) — then byte distances are fixed and
       // a hit pins the single candidate start hp - j1 (no window walk).
+      // The pair scan that needs no guard: two clean chars (no multi-byte
+      // fold pre-image: one byte each, on any UTF-8 subject), with only clean
+      // chars between them, so a fixed distance apart. Chosen where the
+      // probes above are guarded (a pre-image lead byte anywhere in the
+      // subject sends them to the safe probe: a ❤️ or a “ is one, E2), so
+      // that the subject is not read to choose. The chars before the pair
+      // may be wider (clean1.maxlead: the candidate window).
+      bool clean_pair = false;
+      IcaseProbe clean1, clean2; // clean1.j < clean2.j
       IcaseProbe fast2;          // pair partner (fast2.j != fast.j)
       bool fast_pair = false;    // pair scan available for this pattern
       std::vector<unsigned char>
@@ -10760,6 +10801,8 @@ private:
       IcaseProbe pr;     // primary probe (window semantics in single mode)
       IcaseProbe pr2;    // pair partner (pair mode only)
       bool pair = false;
+      bool wide = false; // the clean pair: chars before it may be wider than
+                         // a byte, so a hit has a window of candidate starts
     };
 
     // The Teddy searcher over the leading bytes every match begins with, when
@@ -14495,15 +14538,22 @@ private:
     return icase_leads_absent(text, plan_->icase_prefix_.fast_leads);
   }
 
-  // The scan to drive a (?i) prefix search over `text`: the PAIR scan when the
-  // subject holds no pre-image lead of ANY prefix char (every prefix char is
+  // The scan to drive a (?i) prefix search over `text`: the clean pair, where
+  // the plan has one (it reads nothing of the subject); else the PAIR scan
+  // when the subject holds no pre-image lead of ANY prefix char (every prefix char is
   // then one byte, distances are fixed and a hit pins a single candidate);
   // else the fast (rarest) windowed probe when its own guard passes, else the
   // safe (clean) probe. Returns false when none applies — the caller then
   // falls back to the full byte DFA loop.
   bool icase_choose_probe(std::string_view text, Plan::IcaseScan &out) const {
     const auto &ip = plan_->icase_prefix_;
-    out.pair = false;
+    out.pair = out.wide = false;
+    if (ip.clean_pair) { // sound on any subject: no look at it
+      out.pair = out.wide = true;
+      out.pr = ip.clean1;
+      out.pr2 = ip.clean2;
+      return true;
+    }
     if (ip.fast_pair && icase_leads_absent(text, ip.pair_leads)) {
       out.pair = true;
       out.pr = ip.fast;
@@ -14550,11 +14600,13 @@ private:
         reinterpret_cast<const unsigned char *>(text.data());
     int n = static_cast<int>(text.size());
     if (sc.pair) {
-      // Pair mode: every prefix char is one byte on this subject (the
-      // pair_leads guard), so the two probe chars sit at FIXED byte offsets
-      // j1 < j2 from the start and a hit pins the single candidate hp - j1 —
-      // no window walk, and an order of magnitude fewer stops than a single
-      // common probe char.
+      // Pair mode: the two probe chars sit at FIXED byte offsets j1 < j2
+      // apart. Guarded (the subject holds no pre-image lead of any prefix
+      // char, pair_leads), every prefix char is one byte on this subject, so a
+      // hit pins the single candidate hp - j1 — no window walk, and an order
+      // of magnitude fewer stops than a single common probe char. The clean
+      // pair (sc.wide) holds on any subject, but the chars before it may be
+      // wider, and a hit has the window a single probe's has.
       const std::string &pre = plan_->icase_prefix_.prefix;
       const int j1 = sc.pr.j < sc.pr2.j ? sc.pr.j : sc.pr2.j;
       const int j2 = sc.pr.j < sc.pr2.j ? sc.pr2.j : sc.pr.j;
@@ -14568,8 +14620,18 @@ private:
         size_t hp = scan64(p, static_cast<size_t>(n),
                            static_cast<size_t>(scan), pp);
         if (hp >= static_cast<size_t>(n)) return -1;
-        int s = static_cast<int>(hp) - j1;
-        if (plan_->byte_first_bytes_.set[p[s]]) {
+        const int s_hi = static_cast<int>(hp) - j1;
+        int s_lo = s_hi;
+        if (sc.wide) { // the clean pair: the chars before it may be wider
+          // (As a single probe's window: the first hit with hp >= s* + j1
+          // holds the leftmost start s*, and the hits before it have windows
+          // that end before s*.)
+          s_lo = static_cast<int>(hp) -
+                 (sc.pr.j < sc.pr2.j ? sc.pr.maxlead : sc.pr2.maxlead);
+          if (s_lo < from) s_lo = from;
+        }
+        for (int s = s_lo; s <= s_hi; s++) {
+          if (!plan_->byte_first_bytes_.set[p[s]]) continue;
           int reach = 0;
           // anchored verify (a boolean caller: to its first accept)
           int e = dfa_forward_end(blfa, text, s, span, &reach);

@@ -242,6 +242,19 @@ struct PlanProbe {
     Regex::Plan::IcaseScan probe;
     return rung(re.ladder_classify(s, l, fna, probe).rung);
   }
+  // The (?i) prefix scan chosen for `s` (Regex::icase_choose_probe): 'w' the
+  // clean pair, 'p' the guarded pair, 's' a single probe, '-' none (the plan
+  // has no probe).
+  static char icase_scan(const Regex &re, std::string_view s) {
+    Regex::Plan::IcaseScan sc;
+    if (!re.icase_choose_probe(s, sc)) return '-';
+    return sc.wide ? 'w' : sc.pair ? 'p' : 's';
+  }
+  // Whether the plan has a clean pair (the (?i) prefix scan that reads nothing
+  // of the subject to be sound).
+  static bool icase_clean_pair(const Regex &re) {
+    return re.plan_->icase_prefix_.clean_pair;
+  }
   // Whether the EGC byte family takes the pure-ASCII subject `s` (a gate:
   // egc_byte_path).
   static bool byte_takes_ascii(const Regex &re, std::string_view s) {
@@ -5190,6 +5203,71 @@ void test_ascii_icase_prefilter() {
   CHECK(ok(ns, "a"));    // single byte over UTF-8 (no fire inside é/α/ñ bytes)
 }
 
+// A (?i) prefix with a letter that has a multi-byte fold source (s: U+017F
+// long s, k: U+212A Kelvin sign) gets the clean pair: two letters with no such
+// source, and only such letters between them. It reads nothing of the subject
+// to be sound, so a long s or a Kelvin sign anywhere, or any other three-byte
+// lead (E2: a heart, a quotation mark), changes nothing; the letters before
+// the pair may be wider than a byte, which a hit's window of candidates
+// covers.
+void test_icase_clean_pair() {
+  const char *pats[] = {"sherlock", "holmes", "skate",  "kites", "stock",
+                        "slick",    "streak", "sks",    "abck",  "ssh",
+                        "k",        "ab",     "esse",   "eke"};
+  // The plan has one where a probe is guarded, and the scan does not depend
+  // on the subject.
+  for (const char *pat : {"sherlock", "holmes", "skate", "kites", "stock"}) {
+    const Regex re(pat, reg::IgnoreCase);
+    CHECK(PlanProbe::icase_clean_pair(re));
+    for (const char *s : {"", "plain", "\xC5\xBF" "herlock",
+                          "sherloc\xE2\x84\xAA", "\xE2\x9D\xA4\xEF\xB8\x8F",
+                          "\xE2\x80\x9C" "x\xE2\x80\x9D"})
+      CHECK(PlanProbe::icase_scan(re, s) == 'w');
+  }
+  // ... and does not where no probe is guarded (the, no letter with a fold
+  // source) or none is clean (sk).
+  CHECK(!PlanProbe::icase_clean_pair(Regex("the", reg::IgnoreCase)));
+  CHECK(!PlanProbe::icase_clean_pair(Regex("sk", reg::IgnoreCase)));
+  // ... nor where the clean letters have an unclean one between them: their
+  // distance is not fixed (e, a long s or two, e).
+  CHECK(!PlanProbe::icase_clean_pair(Regex("esse", reg::IgnoreCase)));
+  CHECK(PlanProbe::icase_scan(Regex("sk", reg::IgnoreCase), "plain") != 'w');
+  // The matches, against the Pike's, over subjects that put a long s or a
+  // Kelvin sign at every place in and around a match.
+  const char *pieces[] = {"sherlock", "SHERLOCK", "\xC5\xBF" "herlock",
+                          "sherloc\xE2\x84\xAA", "\xC5\xBF" "herloc\xE2\x84\xAA",
+                          "holmes", "HOLMES", "\xC5\xBF" "tock",
+                          "stoc\xE2\x84\xAA", "skate", "\xC5\xBF" "kate",
+                          "\xC5\xBF\xE2\x84\xAA" "s", "sk\xE2\x84\xAAs",
+                          "abc\xE2\x84\xAA", "ABCk", "x", "\xC3\xA9",
+                          "\xE2\x9D\xA4\xEF\xB8\x8F", "slic\xE2\x84\xAA",
+                          "\xC5\xBF" "trea\xE2\x84\xAA", " ", "\r\n",
+                          "esse", "e\xC5\xBF" "se", "e\xC5\xBF\xC5\xBF" "e",
+                          "e\xE2\x84\xAA" "e", "EKE"};
+  const int np = sizeof(pieces) / sizeof(*pieces);
+  uint32_t rng = 12345;
+  const auto next = [&] {
+    rng = rng * 1664525u + 1013904223u;
+    return rng >> 8;
+  };
+  for (const char *pat : pats) {
+    const Regex re(pat, reg::IgnoreCase);
+    const Regex pike = pike_twin(pat, reg::IgnoreCase);
+    for (const char *s : {"\xC5\xBF" "herlock", "x\xC5\xBF" "herlock",
+                          "\xC5\xBF\xC5\xBF" "herlock",
+                          "\xC5\xBF" "tock \xC5\xBF" "tock", "ab\xE2\x84\xAA",
+                          "e\xC5\xBF" "se", "e\xC5\xBF\xC5\xBF" "e",
+                          "e\xE2\x84\xAA" "e"})
+      CHECK(all_agree(re, pike, s));
+    for (int t = 0; t < 300; t++) {
+      std::string s;
+      const int len = 1 + static_cast<int>(next() % 7);
+      for (int k = 0; k < len; k++) s += pieces[next() % np];
+      CHECK(all_agree(re, pike, s));
+    }
+  }
+}
+
 void test_assert_dfa() {
   auto same = [](const std::string &s, const std::string &p) {
     Regex bare(p), pike = pike_twin(p);
@@ -7875,6 +7953,7 @@ int main() {
   test_assert_literal_prefilter();
   test_ascii_literal_prefilter();
   test_ascii_icase_prefilter();
+  test_icase_clean_pair();
   test_assert_dfa();
   test_lookahead();
   test_lookaround_linear();
