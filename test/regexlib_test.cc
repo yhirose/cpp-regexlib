@@ -5760,7 +5760,9 @@ void test_dfa_cache() {
     std::string s;
     for (char c : noise(300, "0123456789", 5)) s += pieces[c - '0'];
     s += pieces[2]; // a word at the end, for `\w+$`
-    for (const char *pat : {"\\b\\w+\\b", "\\w+$", "(?m)^\\w+$", "\\B\\w\\b"})
+    // (`(?i)\b\w+\b`: the head-run walk takes the case-sensitive `\b\w+\b`, so
+    // this one stays on the DFA the cache test is about.)
+    for (const char *pat : {"(?i)\\b\\w+\\b", "\\w+$", "(?m)^\\w+$", "\\B\\w\\b"})
       for (bool us : {false, true}) {
         const std::vector<size_t> want = spans(
             us ? pike_twin(pat, 0, reg::MatchUnit::CodePoint) : pike_twin(pat),
@@ -7901,7 +7903,8 @@ void test_plain_cluster_run() {
   }
 }
 
-// The head-run walk (`\b [class] \w{rmin,rmax} \b`, an ASCII word class) is a
+// The head-run walk (`\b [class] \w{rmin,rmax} \b`, an ASCII word class, or
+// `\b \w{rmin,rmax} \b` with rmin >= 1, whose head is any word code point) is a
 // code-point walk with no DFA: it must agree with the Pike on every find
 // surface, in both units. Its gate must keep it off the subjects with
 // combining marks, strays, CR-LF, kana and kanji; its walk must count right at
@@ -7910,21 +7913,24 @@ void test_plain_cluster_run() {
 void test_head_run_walk() {
   // The shape is admitted for these, and not for the ones next to them.
   for (const char *pat : {"\\b[xz]\\w+\\b", "\\b[xz]\\w{2,4}\\b",
-                          "\\b[a-c]\\w{0,3}\\b", "\\b[xz]\\w{3}\\b"})
+                          "\\b[a-c]\\w{0,3}\\b", "\\b[xz]\\w{3}\\b",
+                          "\\b\\w+\\b", "\\b\\w{2,4}\\b", "\\b\\w{1}\\b"})
     CHECK(PlanProbe::head_run(Regex(pat)));
   // A literal head keeps its prefilter; the rest keep the other routes.
   for (const char *pat : {"\\bfoo\\w+\\b", "\\bf\\w*\\b", "\\b[^xz]\\w+\\b",
-                          "\\b[x.]\\w+\\b", "\\b\\w+\\b", "(?i)\\b[xz]\\w+\\b",
-                          "\\b([xz])\\w+\\b", "\\b[\xC3\xA9]\\w+\\b",
+                          "\\b[x.]\\w+\\b", "\\b\\w{0,3}\\b", "(?i)\\b[xz]\\w+\\b",
+                          "(?i)\\b\\w+\\b", "\\b([xz])\\w+\\b", "\\b[\xC3\xA9]\\w+\\b",
                           "\\b[xz]\\W+\\b", "x\\w+\\b", "\\b[xz]\\w+"})
     CHECK(!PlanProbe::head_run(Regex(pat)));
 
   // The first four are head-run shapes; the literal-led ones check the route
-  // a literal head is left to.
+  // a literal head is left to. The last four are the any-word head shape.
   const char *const pats[] = {"\\b[xz]\\w+\\b", "\\b[xz]\\w{2,4}\\b",
                               "\\b[xz]\\w{0,3}\\b", "\\b[xz]\\w{3}\\b",
                               "\\bfoo\\w+\\b",   "\\bfoo\\w{1,2}\\b",
-                              "\\bf\\w*\\b",     "\\b[x.]\\w+\\b"};
+                              "\\bf\\w*\\b",     "\\b[x.]\\w+\\b",
+                              "\\b\\w+\\b",      "\\b\\w{2,4}\\b",
+                              "\\b\\w{1,2}\\b",  "\\b\\w+?\\b"};
   const std::string long_run = "x" + std::string(20000, 'y');
   const std::string subs[] = {
       "xab x\xE7\x8C\xAB zz",   "\xE7\x8C\xAB" "xab \xE7\x8C\xAB" "x",
@@ -7938,6 +7944,12 @@ void test_head_run_walk() {
       "x\xE0\xB5\x8E" "x",      "a_x_b",
       " \xE3\x80\x81xy",        "xyzw xyzwxyzwxy",
       long_run + " x" + std::string(3, 'z'), std::string(30, 'x'),
+      // Any-word heads: kanji and kana runs, a mark or a stray at a run's edge.
+      "\xE5\x90\xBE\xE8\xBC\xA9\xE3\x81\xAF\xE7\x8C\xAB \xE6\xBC\xA2\xE5\xAD\x97",
+      "x\xE6\xBC\xA2\xE5\xAD\x97y \xE5\xAD\x97x \xE6\xBC\xA2z\xE5\xAD\x97",
+      "\xE6\xBC\xA2\xE5\xAD\x97\xCC\x81 \xE3\x81\x82\xE3\x82\x99 z1\xE3\x81\x82",
+      "\xE6\xBC\xA2\xE5\xAD\x97\xFF\xE6\xBC\xA2 \xE6\xBC\xA2\xE5\xAD\x97\r\n\xE6\xBC\xA2",
+      "\xE3\x81\x82\xE3\x82\x99\xE3\x81\x82 \xE0\xB8\x81\xE0\xB8\xB1x\xE0\xB8\x81",
   };
   for (reg::MatchUnit unit : {reg::MatchUnit::Grapheme, reg::MatchUnit::CodePoint})
     for (const char *pat : pats) {

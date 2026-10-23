@@ -8502,30 +8502,48 @@ private:
       set_probes(prefix_.text, prefix_.probe, prefix_.probe2);
     }
 
-    // The head-run shape `\b [class] \w{rmin,rmax} \b` (AssertPrefilter::
-    // head_run): the class's members are all ASCII word bytes, and the body is
-    // the exact `\w` repeat. A literal head is not taken: its leading literal
-    // already has a prefilter (analyze_assert_prefix), which measured faster.
-    // The leading `\b` means the code point before the head is not a word
-    // character (the head is a word byte); the trailing one is the run's end.
+    // The head-run shapes (AssertPrefilter::head_run): `\b [class] \w{rmin,rmax}
+    // \b`, the class's members all ASCII word bytes and the body the exact `\w`
+    // repeat; and `\b \w{rmin,rmax} \b` with rmin >= 1, whose head is the
+    // word's own first code point (any word code point, head_any_word), so the
+    // body is `\w{rmin-1,rmax-1}`. A literal head is not taken: its leading
+    // literal already has a prefilter (analyze_assert_prefix), which measured
+    // faster. The leading `\b` means the code point before the head is not a
+    // word character (the head is a word code point); the trailing one is the
+    // run's end.
     void analyze_head_run(const detail::Node &root) {
       using K = detail::Node::Kind;
       assert_.head_run = false;
       assert_.head_bytes = {};
+      assert_.head_any_word = false;
       if (icase_ || ncap_ != 0 || root.kind != K::Concat) return;
-      if (root.kids.size() != 4 || root.kids[0].kind != K::WordBoundary ||
-          root.kids[1].kind != K::Class || !exact_word_repeat(root.kids[2]) ||
-          root.kids[3].kind != K::WordBoundary)
+      const size_t nk = root.kids.size();
+      if ((nk != 3 && nk != 4) || root.kids[0].kind != K::WordBoundary ||
+          !exact_word_repeat(root.kids[nk - 2]) ||
+          root.kids[nk - 1].kind != K::WordBoundary)
         return;
-      const CharClass &hc = root.kids[1].cls;
-      if (!hc.preds.empty() || !node_head_word_only(root.kids[1])) return;
-      for (const auto &rg : hc.ranges)
-        for (char32_t b = rg.first; b <= rg.second; b++)
-          detail::nibble_set_add(assert_.head_bytes,
-                                 static_cast<unsigned char>(b));
+      const detail::Node &w = root.kids[nk - 2];
+      // 1 when the head is the word's own first code point: the body is then
+      // one `\w` shorter than the pattern's repeat.
+      int shift = 0;
+      if (nk == 3) {
+        if (w.rmin < 1) return;
+        assert_.head_bytes = detail::kAsciiWordNibbles;
+        assert_.head_any_word = true;
+        shift = 1;
+      } else {
+        const CharClass &hc = root.kids[1].cls;
+        if (root.kids[1].kind != K::Class || !hc.preds.empty() ||
+            !node_head_word_only(root.kids[1]))
+          return;
+        for (const auto &rg : hc.ranges)
+          for (char32_t b = rg.first; b <= rg.second; b++)
+            detail::nibble_set_add(assert_.head_bytes,
+                                   static_cast<unsigned char>(b));
+      }
       assert_.head_run = true;
-      assert_.ws_rmin = root.kids[2].rmin;
-      assert_.ws_rmax = root.kids[2].rmax;
+      assert_.ws_rmin = w.rmin - shift;
+      assert_.ws_rmax = w.rmax < 0 ? -1 : w.rmax - shift;
     }
     // A Repeat of exactly the `\w` class (the Word predicate and nothing else):
     // the code-point word walks reproduce its run.
@@ -10922,14 +10940,19 @@ private:
       // fast path, which beats a per-candidate DFA verify when the suffix is common.
       bool word_suffix = false;
       // Exactly `\b [class] \w{rmin,rmax} \b`, the class's members all ASCII word
-      // bytes (head_bytes, their set). Every match is a whole word that starts
-      // with one of them: found by a code-point walk over the word after it, no
-      // DFA (assert_head_run_find). Walks on the byte family, and on the ASCII
-      // one when wop_ is not built (head_run_walks).
+      // bytes (head_bytes, their set), or `\b \w{rmin,rmax} \b` with rmin >= 1
+      // (head_any_word: the head is any word code point, head_bytes its ASCII
+      // part). Every match is a whole word that starts with a head: found by a
+      // code-point walk over the word after it, no DFA (assert_head_run_find).
+      // Walks on the byte family, and on the ASCII one when wop_ is not built
+      // (head_run_walks).
       bool head_run = false;
       detail::NibbleSet head_bytes{};
-      // The \w{rmin,rmax} bounds of the word walk (word_suffix or head_run: the
-      // two shapes differ in their head, so never both).
+      bool head_any_word = false;
+      // The bounds of the word walk's count: the code points after the head
+      // (head_run; for head_any_word the pattern's rmin-1, rmax-1), or before
+      // the literal (word_suffix). The two shapes differ in their head, so
+      // never both.
       int ws_rmin = 0, ws_rmax = -1;
       bool word_walk = false; // word_suffix or head_run: the code-point walks
     };
@@ -12623,15 +12646,27 @@ private:
     }
     return false;
   }
+  // The byte length of the word code point at `at` (a byte >= 0x80), or 0 when
+  // it is no word code point (a stray, a continuation byte, a non-word lead).
+  // Out of line, so the decode stays out of the walk's loop body: only the
+  // head-any-word shape calls it.
+  REGEXLIB_NOINLINE static int word_head_len(std::string_view text, int at) {
+    const Decoded h = cp_at(text, at);
+    return detail::word_cp(h.cp) ? h.len : 0;
+  }
   // The head-run walk (AssertPrefilter::head_run) for `\b [class] \w{rmin,rmax}
-  // \b`: a candidate is a head byte whose previous code point is not a word
-  // character (or the text start). Walk the run of word code points after it,
+  // \b` (and `\b \w{rmin,rmax} \b`, whose head is the word's first code point):
+  // a candidate is a head whose previous code point is not a word character
+  // (or the text start). Walk the run of word code points after it,
   // counting them: L. The run's end is a word boundary (the next code point is
   // not a word character, or the text ends), so the trailing `\b` holds exactly
-  // when L is in [rmin, rmax]; a longer run puts the end inside the word, and a
-  // shorter one leaves the `\w` repeat no room to match. The first candidate
-  // that matches is the leftmost, and greedy. A failed candidate skips its
+  // when L is in [ws_rmin, ws_rmax]; a longer run puts the end inside the word,
+  // and a shorter one leaves the `\w` repeat no room to match. The first
+  // candidate that matches is the leftmost, and greedy. A failed candidate skips its
   // whole run: every byte in it has a word character before it.
+  // kAnyWord: the head is any word code point (head_any_word), a template
+  // parameter so the ASCII-head shape's loop keeps its one compare per byte.
+  template <bool kAnyWord>
   REGEXLIB_NOINLINE bool assert_head_run_find(std::string_view text, int from,
                                               int &s_out, int &e_out) const {
     const auto &a = plan_->assert_;
@@ -12639,12 +12674,20 @@ private:
         reinterpret_cast<const unsigned char *>(text.data());
     const int n = static_cast<int>(text.size());
     for (int cand = from; cand < n; cand++) {
-      // (A byte >= 0x80 is no head byte; testing it first leaves Japanese
-      // text, where most bytes are, at one compare.)
-      if (p[cand] >= 0x80 || !detail::nibble_set_has(a.head_bytes.data(), p[cand]))
-        continue;
+      const unsigned char c = p[cand];
+      int hl = 1; // the head's length in bytes
+      if (c < 0x80) {
+        if (!detail::nibble_set_has(a.head_bytes.data(), c)) continue;
+      } else {
+        // A byte >= 0x80 is no head byte unless the head is any word code
+        // point: then it is one only as the lead of one, a stray or a
+        // continuation byte or a non-word lead is not.
+        if (!kAnyWord) continue;
+        hl = word_head_len(text, cand);
+        if (hl == 0) continue;
+      }
       if (cand > 0 && detail::word_cp(cp_before(text, cand).cp)) continue;
-      int q = cand + 1, len = 0;
+      int q = cand + hl, len = 0;
       while (q < n) {
         if (p[q] < 0x80) { // ASCII word bytes, a block at a time
           const int r = static_cast<int>(run_scan(
@@ -12771,7 +12814,9 @@ private:
     if (plan_->assert_.word_walk) {
       if (plan_->assert_.word_suffix) return assert_word_find(text, from, s, e);
       if (plan_->head_run_walks(byte))
-        return assert_head_run_find(text, from, s, e);
+        return plan_->assert_.head_any_word
+                   ? assert_head_run_find<true>(text, from, s, e)
+                   : assert_head_run_find<false>(text, from, s, e);
     }
     // [Tier: WordOnePass] one walk per candidate replaces the forward scan +
     // per-match reverse start recovery (ASCII subjects: the walk has no byte
