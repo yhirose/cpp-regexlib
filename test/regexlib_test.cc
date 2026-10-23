@@ -2703,7 +2703,8 @@ void test_find_guess_grapheme() {
       "\\w+$", "(\\w+)\\b", "\\B\\w+", "(?m)^\\w+$", "(?i)holmes",
       "fox|dog", "quick", "[0-9]+", "\\W+", ".", "(?s).{3}", "[^\\x00-\\x7f]",
       "(\\w)(\\w*)\\s(\\w+)", "\\w+ \\d+", "\\w+qzxing", "qz\\w+",
-      "[^\\n]*[^\\n]*[ -~]", "[^\\n]+ing", "(?i)[^\\n]+=", "\\w\\s+\\w"};
+      "[^\\n]*[^\\n]*[ -~]", "[^\\n]+ing", "(?i)[^\\n]+=", "\\w\\s+\\w",
+      "\\w+\\s\\w+", "\\s+", "(\\w+)\\s(\\w+)"};
   for (const char *pat : pats) {
     const Regex re = make_egc(pat), pike = pike_twin(pat);
     each_dirty_subject(
@@ -2726,9 +2727,8 @@ void test_find_guess_grapheme() {
   // the byte family answers from the first bytes, where the subject's class
   // sends the find to the Pike, which segments it all.
   const std::string prose = accented_prose(1u << 20) + "\xCC\x81";
-  // (Not `(\\w+)\\s(\\w+)`: `\\s` takes a CR or an LF alone, so it is no
-  // guess.)
-  for (const char *pat : {"\\w+", "\\b\\w+\\b", "(\\w+) (\\w+)"}) {
+  for (const char *pat :
+       {"\\w+", "\\b\\w+\\b", "(\\w+) (\\w+)", "(\\w+)\\s(\\w+)"}) {
     const Regex re = make_egc(pat);
     reg::MatchResult m;
     CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(prose); }));
@@ -2756,6 +2756,22 @@ void test_find_guess_grapheme() {
       CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(s); }));
       CHECK(m.matched() == want);
       CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(s) == want); }));
+    }
+  }
+  // A pure-ASCII subject is no reason for a classification either: a CR-LF
+  // among its last bytes (a `\s` could split it) is a cluster the guess does
+  // not reach, and a pattern that can split one is no reason for the Pike.
+  {
+    std::string ascii;
+    while (ascii.size() < (1u << 20)) ascii += "the quick brown fox ";
+    ascii += "\r\n";
+    for (const char *pat :
+         {"(\\w+)\\s(\\w+)", "\\s+", "\\w+\\s\\w+", "\\w+"}) {
+      const Regex re = make_egc(pat);
+      reg::MatchResult m;
+      CHECK(!PlanProbe::pike_ran(re, [&] { m = re.search(ascii); }));
+      CHECK(m.matched() && m.begin() < 64);
+      CHECK(!PlanProbe::pike_ran(re, [&] { CHECK(re.test(ascii)); }));
     }
   }
   // Where a DFA of the guess gives up, the guess ends (the Pike, or the
@@ -2964,18 +2980,23 @@ void test_ladder_family() {
     CHECK(PlanProbe::guesses(re, 'f') == "u");
     CHECK(PlanProbe::guesses(re, 't') == "u");
   }
-  // Grapheme: a find's ASCII family (a pure-ASCII subject) and byte family
-  // (any other), where a CR-LF reads as the grapheme engine reads it; no
-  // byte guess where a fused rung or the (?i) prefix probe serves such a
-  // subject.
+  // Grapheme: a DFA plan guesses its byte family on every subject, a
+  // pure-ASCII one too (no route, and whether a CR-LF can be split does not
+  // matter: the guess is judged on what it read). An assert plan takes its
+  // ASCII family on a pure-ASCII subject where a CR-LF reads as the grapheme
+  // engine reads it, and guesses its byte family on any other. No byte guess
+  // where a fused rung or the (?i) prefix probe serves such a subject, which
+  // keeps the route.
   for (const auto &[pat, who, route, guess] :
        std::initializer_list<
            std::tuple<const char *, char, const char *, const char *>>{
-           {"\\w+", 'f', "a", "b"},
+           {"\\w+", 'f', "", "b"},
+           {"\\w+", 't', "", "b"},
            {"\\b\\w+\\b", 't', "A", "B"},
            {"x\\w*z", 'f', "a", ""},
            {"(?i)holmes", 'f', "a", ""},
-           {"(\\w+)\\s(\\w+)", 'f', "", ""}}) {
+           {"(\\w+)\\s(\\w+)", 'f', "", "b"},
+           {"\\s+", 't', "", "b"}}) {
     CHECK(PlanProbe::ascii_route(Regex(pat), who) == route);
     CHECK(PlanProbe::guesses(Regex(pat), who) == guess);
   }

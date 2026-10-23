@@ -603,8 +603,8 @@ test (`ladder_byte`, `ladder_assert`) is a bit test rather than a table
 load. The families a scan takes without classifying its subject are worked
 out once too (below): `match()`'s guesses in turn (`Plan::match_guesses_`),
 a find's and a boolean's guess (`Plan::find_guess_`), and the family a
-Grapheme find or boolean takes outright on a pure-ASCII subject
-(`Plan::ascii_route_`: no guess, it is sound there).
+Grapheme assert plan's find or boolean takes outright on a pure-ASCII
+subject (`Plan::ascii_route_`: no guess, it is sound there).
 The gates are not such a table: `ladder_gated` writes them as a chain, since
 each family's route has conditions of its own (a probe to choose, a pure-ASCII
 CR-LF exception), and inlined into a Grapheme scan's first step the chain
@@ -811,13 +811,21 @@ holds.
   guess costs what it costs `match()`: `^\w+\b` over "héllo world",
   `search()` 77 to 100 ns.
 - **A Grapheme `search()` / `test()`** at `Classify` (`find_rest`:
-  `guess_begin`, then the scan, `find_run`, then the verdict) finds
-  the subject's first non-ASCII byte, a fast pass, and does not check its
-  clusters, the slow one (`egc_fused_from`, some 5 instructions a byte
-  where `first_nonascii` is a quarter of one). A pure-ASCII subject takes
-  the plan's ASCII family outright (`Plan::ascii_route_`): no guess, it is
-  sound there. Any other guesses the byte family (`Plan::find_guess_`,
-  `ladder_on`) with `Ladder::kSpec` set. A rung runs many scans, so each
+  `guess_begin`, then the scan, `find_run`, then the verdict) does not
+  read the subject to choose a family. A plan with a DFA family guesses its
+  byte family (`Plan::find_guess_`, `ladder_on`) on every subject, with
+  `Ladder::kSpec` set: the ASCII family is no faster than the byte one
+  there, and finding the first non-ASCII byte (`first_nonascii`, a quarter
+  of an instruction a byte) read all of a pure-ASCII subject: 150 thousand
+  instructions over 600 KB, where the scan that answers from the first
+  words is a few hundred. So did a pattern that could split a CR-LF, which
+  searched a pure-ASCII subject for one (`crlf_at`) and sent it to the Pike
+  if it found one anywhere. An assert plan, whose ASCII tier has a word
+  scan the byte one lacks, still finds the first non-ASCII byte, a fast
+  pass, and does not check the clusters, the slow one (`egc_fused_from`,
+  some 5 instructions a byte): a pure-ASCII subject takes the plan's ASCII
+  family outright (`Plan::ascii_route_`), no guess, it is sound there; any
+  other guesses the byte family. A rung runs many scans, so each
   forward DFA scan raises its DFA's high-water mark (`LazyDfa::hi`, a
   start-state skip included), zeroed when the guess starts
   (`FindCache::reach_from_zero`). The answer is judged on what the scans
@@ -829,14 +837,15 @@ holds.
   is classified whole; at the Pike, which a guess's scan enters at 0
   whatever its cursor (a rung can move it past candidates it failed, which
   a guess vouches for no more than for anything else it read), the answer
-  stands. The route is taken only where a CR-LF reads as the grapheme
-  engine reads it (`crlf_byte_safe_`, non-empty, no fused CR-LF literal),
-  which makes the ASCII family sound on every pure-ASCII subject, and the
-  guess with it. The guess leaned on that while a walk's reach was taken
-  to be its match's end (past it a walk reads ASCII, which no cluster
-  changes the meaning of); a walk reports how far it read now (see the
-  rules), so it no longer does, though the guess is still taken only
-  there. No byte
+  stands. The assert route is taken only where a CR-LF reads as the
+  grapheme engine reads it (`Plan::ascii_crlf_sound`: `crlf_byte_safe_`,
+  non-empty, no fused CR-LF literal), which makes the ASCII family sound on
+  every pure-ASCII subject, and the guess with it. The guess leaned on
+  that while a walk's reach was taken to be its match's end (past it a walk
+  reads ASCII, which no cluster changes the meaning of); a walk reports
+  how far it read now (see the rules), so a DFA plan's guess does not: a
+  CR-LF its pattern could split is a cluster the reach decides, like any
+  other. No byte
   guess where the plan has a faster way over a non-ASCII subject that needs
   no classifying (the fused rungs; the (?i) prefix probe, chosen over the
   whole subject). The other orders were measured and dropped: guessing the

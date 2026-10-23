@@ -10243,9 +10243,14 @@ private:
     //     tried in turn.
     //   find_guess_: a find's and a boolean's (Row: Regex::guess_row) — a
     //     CodePoint plan's one family, which its scans start on; a Grapheme
-    //     plan's byte family, guessed on a subject that is not pure ASCII.
-    //   ascii_route_: a Grapheme find's or boolean's family on a pure-ASCII
-    //     subject, taken outright: it is sound there, so no guess.
+    //     plan's byte family, guessed on any subject (the subject is not
+    //     read to choose: the guess is judged on what the scan read).
+    //   ascii_route_: a Grapheme assert plan's family on a pure-ASCII
+    //     subject, taken outright: it is sound there, so no guess. (The assert
+    //     ASCII tier has a word scan the byte assert one lacks, so it keeps
+    //     the first look at the subject.) A DFA plan has none: its ASCII
+    //     family is no faster than the byte one, and the look at the whole
+    //     subject cost more than the difference.
     enum class Fused : uint8_t { None, Prefix, Suffix, Collapse };
     Fused fused_ = Fused::None;
     Ladder start_[3];
@@ -10888,6 +10893,14 @@ private:
     bool crlf_fused_lit_ = false;
     bool can_match_empty_ =
         true; // pattern matches the empty string (set in analyze_core)
+    // Whether a CR-LF reads to the ASCII programs as the grapheme engine
+    // reads it, so that they are sound on every pure-ASCII subject: the
+    // pattern cannot split a CR-LF pair, cannot match empty between its
+    // bytes, and holds no fused CR-LF literal (the one thing they cannot
+    // consume).
+    bool ascii_crlf_sound() const {
+      return crlf_byte_safe_ && !can_match_empty_ && !crlf_fused_lit_;
+    }
     // Whole pattern is a single printable-ASCII literal (capture-free,
     // !icase): every match is the exact literal bytes — as standalone
     // graphemes, in Grapheme mode — so a memmem + O(1) boundary check finds
@@ -15776,12 +15789,13 @@ public:
   }
   // A Grapheme scan that would classify its subject guesses instead
   // (Plan::find_guess_), and the answer stands if what the scan read holds
-  // it out (guess_held). At Classify it finds the subject's first non-ASCII
-  // byte, a fast pass, but does not check its clusters, which is the slow
-  // one: a pure-ASCII subject takes the plan's ASCII family outright (no
-  // guess: it is sound there), any other guesses the byte family — where
-  // the plan has them (see ladder_plan). (A CodePoint scan has nothing to
-  // guess: its family serves every subject.)
+  // it out (guess_held). A plan with a DFA family guesses its byte family
+  // without looking at the subject at all. An assert plan finds the
+  // subject's first non-ASCII byte, a fast pass, but does not check its
+  // clusters, which is the slow one: a pure-ASCII subject takes the plan's
+  // ASCII family outright (no guess: it is sound there), any other guesses
+  // the byte family — where the plan has them (see ladder_plan). (A
+  // CodePoint scan has nothing to guess: its family serves every subject.)
   // It returns that byte, for guess_held (kUnclassified if it did not look).
   REGEXLIB_ALWAYS_INLINE size_t guess_begin(std::string_view text,
                                             Ladder &l) const {
@@ -15792,6 +15806,14 @@ public:
     if (l.rung != Rung::Classify ||
         (route == kFamilyCount && guess == kFamilyCount))
       return kUnclassified;
+    if (guess == kFamEgcByte) {
+      // The byte family on any subject, unread: guess_held judges the
+      // guess on the prefix it read. (A plan with a DFA family has no
+      // route: see Plan::ascii_route_.)
+      l = ladder_on(guess, l);
+      l.set(Ladder::kSpec);
+      return kUnclassified;
+    }
     const size_t fna = first_nonascii(text);
     const bool ascii = fna == text.size();
     const Family f = ascii ? route : guess;
@@ -18603,21 +18625,25 @@ inline void Regex::ladder_plan(Plan &p) {
       byte = p.byte_path_ ? kFamEgcByte
              : p.byte_assert_path_ ? kFamAssertByte
                                    : kFamilyCount;
-      // A find's families (guess_begin), where a CR-LF reads as the
-      // grapheme engine reads it (crlf_byte_safe_, non-empty, no fused
-      // CR-LF literal): the route, which takes no guess, is sound there on
-      // every pure-ASCII subject. (The guess leaned on it too while a
-      // walk's reach was its match's end; see docs/design.md, "They guess
-      // now".)
-      // No byte guess where the plan has a faster way over a non-ASCII
-      // subject that needs no classifying: the fused rungs, and the (?i)
-      // prefix probe.
-      if (p.crlf_byte_safe_ && !p.can_match_empty_ && !p.crlf_fused_lit_) {
+      // A find's families (guess_begin). No byte guess where the plan has a
+      // faster way over a non-ASCII subject that needs no classifying: the
+      // fused rungs, and the (?i) prefix probe.
+      const bool guesses = p.fused_ == Plan::Fused::None &&
+                           !(p.ncap_ == 0 && p.icase_prefix_.active());
+      if (guesses && byte == kFamEgcByte) {
+        // The byte family on every subject, whatever its bytes: a pure-ASCII
+        // one too, where the ASCII family is no faster, and a CR-LF the
+        // pattern could split is a cluster the guess's reach decides
+        // (guess_held), not one the whole subject is searched for.
+        p.find_guess_[0] = p.find_guess_[1] = byte;
+      } else if (p.ascii_crlf_sound()) {
+        // Where a CR-LF reads as the grapheme engine reads it, the route,
+        // which takes no guess, is sound on every pure-ASCII subject. (The
+        // guess leaned on it too while a walk's reach was its match's end;
+        // see docs/design.md, "They guess now".)
         p.ascii_route_[Plan::kFindRow] = p.ascii_family(false);
         p.ascii_route_[Plan::kTestRow] = p.ascii_family(true);
-        if (p.fused_ == Plan::Fused::None &&
-            !(p.ncap_ == 0 && p.icase_prefix_.active()))
-          p.find_guess_[0] = p.find_guess_[1] = byte;
+        if (guesses) p.find_guess_[0] = p.find_guess_[1] = byte;
       }
     }
     const bool byte_first =
