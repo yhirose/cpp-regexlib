@@ -11,7 +11,7 @@ are no external dependencies.
 Four things distinguish it from a typical `std::regex`-style engine:
 
 1. **A single self-contained header, no dependencies.** The whole engine —
-   including the Unicode 17.0.0 tables it needs — is generated into `regexlib.h`,
+   including the Unicode 18.0.0 tables it needs — is generated into `regexlib.h`,
    so there is nothing to link, fetch, or build separately; just include it.
    The API is ordinary C++ (`reg::Regex`, value types, range-based `for`), not a
    C-style or FFI surface.
@@ -34,7 +34,7 @@ Four things distinguish it from a typical `std::regex`-style engine:
    [below](#stdregex-compatible-api).)
 
 4. **The matching unit is the Unicode extended grapheme cluster** (Unicode
-   17.0.0), not the code point. `.` consumes exactly one user-perceived
+   18.0.0), not the code point. `.` consumes exactly one user-perceived
    character, so `.+` against `"👨‍👩‍👧‍👦"` matches a single element. Match
    offsets are byte offsets into the original UTF-8 subject and always fall on
    grapheme-cluster boundaries. Opt into matching by **Unicode scalar value

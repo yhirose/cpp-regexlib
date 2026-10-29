@@ -1059,6 +1059,16 @@ void test_any_and_classes() {
   CHECK(Regex("\\S+").search("  hi  ").str() == "hi");
 }
 
+// GB9c (UAX #29 rev 49, Unicode 18): Linker Extend* x Consonant. The Linker
+// need not follow a Consonant, and an Extend between them does not break it.
+void test_grapheme_indic_conjunct() {
+  CHECK(Regex("^.$").test("\xE0\xA5\x8D\xE0\xA4\x95"));         // virama ka
+  CHECK(Regex("^.$").test("\xE0\xA5\x8D\xCC\x88\xE0\xA4\x95")); // virama, mark, ka
+  CHECK(Regex("^.$").test("\xE1\xB3\xB5\xE0\xA4\x95"));         // U+1CF5 ka
+  CHECK(Regex("^.$").test("\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7")); // क्ष
+  CHECK(!Regex("^.$").test("\xE0\xA4\x95\xCC\x88\xE0\xA4\x95"));    // no Linker
+}
+
 void test_posix_classes() {
   CHECK(Regex("[[:alpha:]]+").search("abcDEF").str() == "abcDEF");
   CHECK(Regex("[[:digit:]]+").search("x123y").str() == "123");
@@ -1890,7 +1900,8 @@ std::vector<std::string> cluster_subjects() {
       "\xED\x95\x9C",                                 // 한
       "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB",         // 한 as jamo L V T
       "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7",         // क्ष (GB9c)
-      "\xD8\x80",                                     // U+0600, a Prepend
+      "\xE0\xA5\x8D", "\xE0\xA4\x95", "\xE1\xB3\xB5", // a Linker, a Consonant
+      "\xD8\x80",                                   // U+0600, a Prepend
       "\xE6\xBC\xA2", "\xC2\x85",                     // 漢, NEL
       "\x80", "\xFF", "\xE6\xBC"};                    // stray bytes
   std::vector<std::string> subjects;
@@ -8095,6 +8106,7 @@ int main() {
   test_assert_us_unified();
   test_options();
   test_any_and_classes();
+  test_grapheme_indic_conjunct();
   test_posix_classes();
   test_quantifiers();
   test_alternation_and_groups();

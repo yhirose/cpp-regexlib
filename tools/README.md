@@ -24,7 +24,7 @@ not auto-derived from the spec; only the property data they read is.
 
 ## Pinned version
 
-The current target is recorded in `ucd/VERSION` (Unicode **17.0.0**) and pinned by
+The current target is recorded in `ucd/VERSION` (Unicode **18.0.0**) and pinned by
 SHA-256 in `ucd/SHA256SUMS`. The raw `*.txt` inputs are large and reproducible, so
 they are **not committed** (`ucd/.gitignore`); fetch them on demand.
 
@@ -57,7 +57,7 @@ The generated block lives between `// [BEGIN GENERATED UCD BLOCK]` and
   code points (General_Category, Grapheme_Cluster_Break, Emoji, White_Space, and
   simple case folding). Code points that have only a full fold (ß, İ, …) have no
   simple fold and return the code point unchanged.
-* **Official UAX #29 test** — `ucd/auxiliary/GraphemeBreakTest.txt` passes 766/766
+* **Official UAX #29 test** — `ucd/auxiliary/GraphemeBreakTest.txt` passes 853/853
   through `reg::unicode::is_grapheme_boundary`.
 * The regexlib test/fuzz/corpus suites pass with the generated tables.
 

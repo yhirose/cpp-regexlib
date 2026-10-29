@@ -296,6 +296,31 @@ def parse_enum_prop(ucd, relpath, defval="Unassigned"):
     return order, values
 
 
+def parse_grapheme_break(ucd):
+    """GraphemeBreakProperty.txt, refined for GB9c -> (ordered names, values[cp]).
+
+    GB9c (UAX #29 rev 49) is Linker Extend* x Consonant, and a Linker can open a
+    cluster (after a Control, at the start of a text). The pairwise walkers that
+    read only this table must therefore tell a Consonant, and a Linker whose
+    Grapheme_Cluster_Break is Other, from plain Other: they get the values
+    Consonant and Linker. (A Linker that is Extend stays Extend, which fuses
+    leftward already; is_grapheme_boundary reads InCB itself.)"""
+    order, vals = parse_enum_prop(ucd, "auxiliary/GraphemeBreakProperty.txt")
+    for lo, hi, v in parse_incb(ucd):
+        if v == "Extend":
+            continue
+        name = "Consonant" if v == "Consonant" else "Linker"
+        for c in range(lo, hi + 1):
+            if v == "Consonant":
+                assert vals[c] == "Unassigned", (hex(c), vals[c])
+            elif vals[c] != "Unassigned":
+                continue
+            vals[c] = name
+        if name not in order:
+            order.append(name)
+    return order, vals
+
+
 def parse_white_space_ranges(ucd):
     """PropList.txt White_Space -> sorted list of (lo, hi)."""
     ranges = []
@@ -513,7 +538,7 @@ def build_block(ucd):
     out.write("\n")
 
     # --- GraphemeBreak (enum value list is version-dependent) ---
-    gcb_order, gcb_vals = parse_enum_prop(ucd, "auxiliary/GraphemeBreakProperty.txt")
+    gcb_order, gcb_vals = parse_grapheme_break(ucd)
     emit_enum(out, "GraphemeBreak", gcb_order)
     # A stray is a cluster of its own: it breaks as a Control does (GB4/GB5).
     emit_page_table(out, "_grapheme_break_properties", "GraphemeBreak",
@@ -571,9 +596,13 @@ def cmd_verify(ucd):
     assert gc_vals[ord("a")] == "Ll"
     assert gc_vals[ord("0")] == "Nd"
     assert gc_vals[0x3042] == "Lo"  # HIRAGANA A
-    gcb_order, gcb_vals = parse_enum_prop(ucd, "auxiliary/GraphemeBreakProperty.txt")
+    gcb_order, gcb_vals = parse_grapheme_break(ucd)
     assert gcb_vals[0x0D] == "LF" or gcb_vals[0x0A] == "LF"
     assert "ZWJ" in gcb_order and "Extend" in gcb_order
+    # GB9c refinement: a Consonant, a Linker that is Other; a Linker that is
+    # Extend stays Extend.
+    assert gcb_vals[0x0915] == "Consonant" and gcb_vals[0x1CF5] == "Linker"
+    assert gcb_vals[0x094D] == "Extend"
     # CJK ideographs, kana and 2-byte letters (Cyrillic, Greek) are plain
     # blocks; a block holding a combining mark is not.
     plain = plain_blocks(gcb_vals)
